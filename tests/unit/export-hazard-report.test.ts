@@ -5,13 +5,13 @@
  * annotations; x = 1` produces a module Python refuses to compile, and Cellar
  * said `written: true` and nothing else. The module is still written (see
  * `exportNotebookToPy`'s header for why writing beats refusing on the
- * auto-on-save path), so the whole fix lives in the report - which means every
- * surface has to carry it, and a surface that quietly did not would put the
+ * paths that regenerate as a consequence of another call), so the whole fix lives
+ * in the report - which means every surface has to carry it, and a surface that quietly did not would put the
  * silence straight back.
  *
  * `export-py-future.test.ts` owns the DETECTION (with `compile()`, and its
  * measured boundary). This file owns the WIRING: the notebook view the export bar
- * renders, the live push that gives the auto-on-save path a UI home at all, the
+ * renders, the live push that lets the bar warn BEFORE the user exports, the
  * manual export result, and the agent surface - plus SOURCE-SHAPE guards on the
  * two Svelte halves, which prove only that the markup has the expected shape (see
  * that block's own header; their behaviour lives in
@@ -84,7 +84,7 @@ describe('the notebook view carries the hazard (what the export bar renders)', (
 	});
 });
 
-describe('the live push - the auto-on-save export finally has a UI home', () => {
+describe('the live push - a hazard reaches the bar without a reload', () => {
 	/** Collect every `notebook:export-hazards` event published while `fn` runs. */
 	async function captured(fn: () => Promise<void> | void) {
 		const seen: Array<{ nb: string; hazards: unknown[] }> = [];
@@ -101,8 +101,9 @@ describe('the live push - the auto-on-save export finally has a UI home', () => 
 
 	it('publishes when a save first makes the module uncompilable, and clears it when fixed', async () => {
 		const { target, cell } = await notebookWith('push.ipynb', 'X = 1');
-		// Editing the marked cell into the hazard: the module regenerates on this save,
-		// so the bar must learn about it without the user touching the export button.
+		// Editing the marked cell into the hazard. A hazard is a fact about the MARKED
+		// CELLS, so a save creates one even though a save no longer exports - and the
+		// bar must learn about it BEFORE the user presses the export button.
 		const appeared = await captured(() => {
 			nbmod.setSource(cell, JOINED, target);
 		});

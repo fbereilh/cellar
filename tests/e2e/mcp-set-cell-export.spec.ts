@@ -13,8 +13,8 @@ import { runtimeAvailable, bootCellar, killCellar, REPO } from './harness';
  * the same notebook.
  *
  * The point of `set_cell_export` is that the agent-side flow had no MIDDLE - it
- * could name the target (`set_export_target`) and cellar regenerated the module
- * on save, but WHICH cells go in it was settable only in the UI. So the check is
+ * could name the target (`set_export_target`), which regenerates the module, but
+ * WHICH cells go in it was settable only in the UI. So the check is
  * not "the setter returns ok" but: the agent names a target, marks cells, and a
  * real `.py` module appears on disk carrying exactly those cells - while the
  * human's open page shows the same marks with no reload.

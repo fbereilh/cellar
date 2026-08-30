@@ -1008,8 +1008,9 @@
 
 	// ---- nbdev-style export to a .py module -----------------------------------
 	// Delegate to the active notebook (it owns the target + the marked cells) and
-	// surface the result as a transient notice. The module also regenerates
-	// automatically on every save; this is the manual trigger.
+	// surface the result as a transient notice. An ordinary save does NOT write the
+	// module - only an explicit export action does, and this is the loudest of them
+	// (see `regenerateExportModule` in server/notebook.ts for the other two).
 	async function exportPy() {
 		const api = activeNotebookApi();
 		if (!api) return;

@@ -476,10 +476,12 @@ export function resolveExportTarget(doc: NotebookDoc): ResolvedExportTarget | nu
  * nothing — no mtime churn, no git diff). The write is path-guarded to the
  * workspace and creates parent directories as needed.
  *
- * Never throws for the "nothing to do" cases (no target / no marked cells): the
- * caller (auto-on-save) must not have a save broken by an absent target. A bad
- * target path (escapes the workspace) still throws — that is a real error the
- * manual button surfaces to the user.
+ * Never throws for the "nothing to do" cases (no target / no marked cells): two
+ * of its three explicit callers regenerate as a CONSEQUENCE of naming the target
+ * or the cells (`setExportTarget`, `setCellExports`), so an absent target must not
+ * break the notebook write they just made. A bad target path (escapes the
+ * workspace) still throws — that is a real error the manual button surfaces to the
+ * user.
  *
  * It also REFUSES to overwrite a file it did not generate. The write is a
  * whole-file replacement, so a target naming an ordinary source file would destroy
@@ -487,25 +489,30 @@ export function resolveExportTarget(doc: NotebookDoc): ResolvedExportTarget | nu
  * directive resolves straight to a path here without passing that setter, and a
  * `.py` path may perfectly well be a hand-written module. Every generated module
  * opens with `HEADER`, so testing the file already on disk for it rejects nothing
- * Cellar wrote. The refusal throws, which auto-on-save records as `lastExportError`
- * (never breaking the notebook save) and the manual button surfaces directly.
+ * Cellar wrote. The refusal throws, which the manual button surfaces directly and
+ * the two consequential callers record as `lastExportError` (never breaking the
+ * notebook write). This is the case that made the export EXPLICIT in the first
+ * place: in an established nbdev repository the target names a module nbdev
+ * generated, so while every save regenerated, every save hit this refusal and
+ * recorded it where no human surface reads it.
  *
  * An EMPTY file (zero bytes, or whitespace only) is overwritten, not refused: the
  * guard exists to protect CONTENT, and there is none. Pre-creating the module
  * (`touch utils.py`, or the explorer's "New file") before naming the target is an
- * ordinary workflow, and refusing it stopped the module regenerating on every
- * later save through a path no UI surface reads.
+ * ordinary workflow, and refusing it stopped the module regenerating through a
+ * path no UI surface reads.
  *
  * A module the marked cells make UNCOMPILABLE is WRITTEN, and REPORTED
  * (`ExportResult.hazards`) - it is never a refusal, and the choice is deliberate:
  *
- *   1. A refusal degrades SILENTLY on the path that matters. This runs on every
- *      save (`autoExportPy`), which is best-effort by design - a throw is recorded
- *      on the doc and that record has no UI home. Refusing would leave the
- *      PREVIOUS, compilable module on disk, quietly stale, while the notebook
- *      moved on: the user's edits would simply appear to have no effect. A module
- *      that fails `import` with Python's own `SyntaxError` naming `__future__` is
- *      loud; a stale one that imports fine is the more deceptive outcome.
+ *   1. A refusal degrades SILENTLY on the paths that matter. Two of the three
+ *      explicit callers (`setExportTarget`, `setCellExports`) regenerate
+ *      best-effort - a throw is recorded on the doc, and that record reaches only
+ *      the agent surface. Refusing would leave the PREVIOUS, compilable module on
+ *      disk, quietly stale, while the marks moved on: the user's edits would
+ *      simply appear to have no effect. A module that fails `import` with Python's
+ *      own `SyntaxError` naming `__future__` is loud; a stale one that imports
+ *      fine is the more deceptive outcome.
  *   2. It punishes the wrong scope. The hazard is one line in one cell, and the
  *      module may hold a dozen other exported cells; discarding all of them for it
  *      breaks the module/notebook lockstep every other guard here protects.
@@ -534,7 +541,7 @@ export function exportNotebookToPy(doc: NotebookDoc): ExportResult {
 	const hazards = exportHazards(exported);
 	// A configured-but-unresolvable target (base `git` with no repository, a path
 	// resolving outside the workspace, an unknown base) is a real error the manual
-	// button surfaces and auto-on-save records - exactly where the old
+	// button surfaces and the consequential callers record - exactly where the old
 	// `resolveInWorkspace` throw landed.
 	if (!info.ok) throw new Error(info.error);
 	const target = info.target;

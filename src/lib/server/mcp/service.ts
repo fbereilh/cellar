@@ -1830,8 +1830,9 @@ export function setReportView(enabled: boolean, nb?: string | null) {
  * MCP `set_export_target`. The notebook-level nbdev-style `#|default_exp` target:
  * the `.py` module the cells marked `cellar.export` are written to. Setting it
  * (or clearing it with null/'') persists in the allowlisted `cellar` namespace so
- * it round-trips through clean-on-save, and `persist` regenerates the module as a
- * side effect (auto-on-save) exactly like the UI's target input. Returns the
+ * it round-trips through clean-on-save, and the call regenerates the module -
+ * naming the module's file is one of the three EXPLICIT export actions, exactly
+ * like the UI's target input, which shares this doc-layer setter. Returns the
  * resulting `export_target` (the RESOLVED workspace-relative path, or null when
  * cleared); `get_notebook_map`'s `display` block reports the same value.
  *
@@ -1850,7 +1851,7 @@ export function setReportView(enabled: boolean, nb?: string | null) {
  *
  * A `.py` TEXT notebook is refused through the SAME `isPyTextNotebook` predicate
  * as its pair `setCellExport`, and that symmetry is the point: such a document is
- * written through jupytext, which stores no cellar metadata, and `autoExportPy`
+ * written through jupytext, which stores no cellar metadata, and the export
  * skips it entirely — so a target set here survives neither a reload nor a
  * regeneration. Accepting it while the other half refuses would leave an agent
  * following the export flow holding a target it was told is set, for a module
@@ -1858,8 +1859,8 @@ export function setReportView(enabled: boolean, nb?: string | null) {
  *
  * A path that ESCAPES the workspace is refused (`invalid`) rather than stored:
  * `setExportTargetDoc` validates through the exporter's own `resolveInWorkspace`,
- * because `autoExportPy` is best-effort, so such a target would otherwise sit in
- * the metadata generating nothing on every later save while this call reported it
+ * because the regeneration is best-effort, so such a target would otherwise sit in
+ * the metadata generating nothing on every later export while this call reported it
  * set. A path that is not a `.py` module is refused the same way and for a sharper
  * reason: the exporter WRITES to it, so an ordinary source file named here would be
  * overwritten the moment a cell is marked. Only a refusal of the PATH is reported as
@@ -1892,7 +1893,7 @@ export function setExportTarget(
 		setExportTargetDoc(target ?? null, nbTarget, undefined, base ?? null);
 	} catch (err) {
 		// A path that escapes the workspace is refused where it is SET, not stored to
-		// generate nothing on every later save (see `setExportTarget` in notebook.ts).
+		// generate nothing on every later export (see `setExportTarget` in notebook.ts).
 		if (err instanceof InvalidExportTargetError)
 			return { ok: false as const, invalid: err.message };
 		// NOT a refusal: the doc layer validates before it mutates, so the only other
@@ -1920,8 +1921,8 @@ export function setExportTarget(
  * on addressing: every ref resolves (and every marked cell is checked to BE a
  * code cell) before anything is written, so a bad handle - or a markdown cell -
  * in the fifth slot cannot leave the first four rewritten. Duplicates collapse,
- * and `setCellExports` makes the whole batch ONE document write, which matters
- * doubly here because `persist` regenerates the `.py` on every write.
+ * and `setCellExports` makes the whole batch ONE document write AND ONE module
+ * regeneration, rather than one of each per cell.
  *
  * Only a PYTHON code cell can be marked, tested with `canExportCell`
  * (`isExportCell`'s own eligibility half, shared with the doc-layer setter so the
@@ -2084,20 +2085,22 @@ function exportTargetFields(nb?: string | null): ExportTargetFields {
 
 /**
  * The generated module is NOT on disk as this notebook's marks describe it: the
- * last export attempt threw. `autoExportPy` is best-effort by design (a bad target
- * must not cost the user their notebook save), so a target whose parent is a file,
- * an EACCES or an ENOSPC left the module unwritten while the result claimed nothing
- * at all - and since `module` is CONDITIONAL, its absence is precisely what says the
- * module was regenerated, with no MCP export tool through which the agent could ever
- * learn otherwise.
+ * last export attempt threw. The regeneration these two tools drive is best-effort
+ * by design (a bad target must not cost the user the notebook write the same call
+ * just made), so a target whose parent is a file, an EACCES or an ENOSPC left the
+ * module unwritten while the result claimed nothing at all - and since `module` is
+ * CONDITIONAL, its absence is precisely what says the module was regenerated, with
+ * no MCP export tool through which the agent could ever learn otherwise.
  *
  * A STATE, not an attribution: `lastExportError` is doc state refreshed by every
- * persist, and an idempotent call (every cell already at the requested value) skips
- * the persist entirely, so the failure it reports may belong to an earlier write. The
- * agent-facing `reason` is worded for exactly that - it says what is on disk, never
- * that this call caused it.
+ * EXPLICIT export, and an idempotent call (every cell already at the requested
+ * value) neither persists nor regenerates, so the failure it reports may belong to
+ * an earlier one. The agent-facing `reason` is worded for exactly that - it says
+ * what is on disk, never that this call caused it. Since an ordinary save no longer
+ * exports, the record now describes the last time the module was actually asked
+ * for, which is strictly more useful here than the last keystroke was.
  *
- * Read back from the doc, i.e. from the attempt the persist ACTUALLY made, rather
+ * Read back from the doc, i.e. from the attempt the call ACTUALLY made, rather
  * than by re-running the export here - that would be a second export path, and a
  * second chance to disagree with the first.
  *
@@ -2132,8 +2135,15 @@ function moduleFailure(target: string, exportTarget: string | null) {
  * the one that stays `setCellExport`-only (see `moduleWarning`); a hazard is a
  * surprise on either path, never a restatement of what the caller just did.
  *
- * Needs no `wrote`/exists gate of its own: with nothing marked there are no
- * hazards, so it is silent in exactly the case where no module was written.
+ * "WAS WRITTEN" IS A CLAIM, so this is only ever reached where a write really
+ * happened: `setExportTarget` always regenerates, and `moduleWarning` calls it
+ * only on its `wrote` branch. A call that wrote nothing says so instead - the
+ * hazards are computed from the MARKS, which are no longer necessarily what is on
+ * disk now that an ordinary save does not export, so asserting them ABOUT that
+ * file would describe a module this call never wrote.
+ *
+ * Needs no exists gate of its own: with nothing marked there are no hazards, so
+ * it is silent in exactly the case where no module was written.
  */
 function moduleHazard(target: string, exportTarget: string | null) {
 	if (!exportTarget) return {};
@@ -2163,17 +2173,28 @@ function moduleHazard(target: string, exportTarget: string | null) {
  * or NOTHING IS MARKED - `exportNotebookToPy` returns early with `no-cells`, so it
  * neither rewrites nor removes the file, and unmarking the last marked cell leaves
  * the previously exported symbols on disk where an `import` still resolves them -
- * or the call WROTE NOTHING and no module is on disk.
+ * or the call WROTE NOTHING, which is what `wrote` is for.
  *
- * That third case is what `wrote` is for. `lastExportError` is doc state this
- * process may never have written: an idempotent call (every addressed cell already
- * at the requested value) skips the persist entirely, so on a freshly opened doc -
- * after a restart, with the module since deleted or replaced outside Cellar - the
- * record is null, no field is emitted, and under the conditional contract that
- * absence reads as a module that WAS regenerated. A call that really did write is
- * already covered: it either succeeded, so the module is there, or it threw, which
- * `moduleFailure` reports - so only the no-write path consults the disk, and it
- * decides from what is actually there rather than from a record nobody wrote.
+ * THAT THIRD CASE IS REPORTED WHETHER OR NOT A MODULE IS ON DISK, and only the
+ * reason differs. An ABSENT `module` field says the file matches the marks, and
+ * that held solely because every save re-exported. It no longer does, so a
+ * re-mark of an already-marked cell - which persists nothing and regenerates
+ * nothing - would otherwise vouch for a module assembled from sources the user has
+ * since edited. The two spellings state what is KNOWN and nothing beyond it: with
+ * no module of ours there, that there is none; with one there, that it is whatever
+ * the last export left and may predate the current cell sources. Neither asserts
+ * the file IS stale - this call cannot see that - and neither is folded into
+ * `moduleFailure`, which means something else entirely (nothing was written
+ * BECAUSE the write threw). Both name the one call an agent has that always
+ * regenerates, which is also what INSTRUCTIONS clause 5 tells it.
+ *
+ * `lastExportError` cannot stand in for any of it: it is doc state this process
+ * may never have written, so on a freshly opened doc - after a restart, with the
+ * module since deleted or replaced outside Cellar - the record is null. A call
+ * that really did write is already covered: it either succeeded, so the module is
+ * there and holds these marks, or it threw, which `moduleFailure` reports - so
+ * only the no-write path consults the disk, and it decides from what is actually
+ * there rather than from a record nobody wrote.
  *
  * A FOURTH case is reported through the same field but says the opposite thing, so
  * it carries its own key (`warning`, never `reason`): the module IS on disk as the
@@ -2214,17 +2235,23 @@ function moduleWarning(target: string, where: ExportTargetFields, wrote: boolean
 	if ('module' in failed) return failed;
 	if (!exportTarget) return {};
 	if (exportCellCount(listCells(target))) {
-		if (!(wrote || generatedModuleExists(exportTarget)))
-			return {
-				module: {
-					regenerated: false as const,
-					reason: `no Cellar-generated module is on disk at ${exportTarget} and this call wrote none (the addressed cells already carried the requested value) - edit a marked cell, or re-call set_export_target with ${setExportTargetArgs(where)}, to write it`,
-					warning: undefined
-				}
-			};
-		// The module matches the marks (the gate above) - so the remaining question is
-		// whether it can be IMPORTED.
-		return moduleHazard(target, exportTarget);
+		// A call that really WROTE assembled the module from the sources these marks
+		// name, so the file matches them and the remaining question is whether it can
+		// be IMPORTED. A call that wrote NOTHING knows only that: since an ordinary
+		// save no longer exports, whatever is on disk may predate the current cell
+		// sources, and an absent `module` field would claim the opposite.
+		if (wrote) return moduleHazard(target, exportTarget);
+		const remedy = (verb: string) =>
+			`re-call set_export_target with ${setExportTargetArgs(where)} to ${verb} it (that call always regenerates; editing a cell does not)`;
+		return {
+			module: {
+				regenerated: false as const,
+				reason: generatedModuleExists(exportTarget)
+					? `this call wrote nothing (the addressed cells already carried the requested value), so ${exportTarget} is whatever the last export left there and may predate the current cell sources - ${remedy('rewrite')}`
+					: `no Cellar-generated module is on disk at ${exportTarget} and this call wrote none (the addressed cells already carried the requested value) - ${remedy('write')}`,
+				warning: undefined
+			}
+		};
 	}
 	return {
 		module: {
