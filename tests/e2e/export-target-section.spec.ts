@@ -1,4 +1,4 @@
-import { test, expect, type APIRequestContext, type Page } from '@playwright/test';
+import { test, expect, type APIRequestContext, type Locator, type Page } from '@playwright/test';
 import { type ChildProcess } from 'node:child_process';
 import { spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
@@ -789,5 +789,122 @@ test('the export waits for the edit it raced, and says so when that edit never l
 	await expect(notice).toContainText('could not be saved');
 	expect(readFileSync(modulePath, 'utf8')).toContain('def after():');
 	expect(readFileSync(modulePath, 'utf8')).not.toContain('def never():');
+	await page.unroute('**/api/cells/**');
+});
+
+/**
+ * Hold every cell-SOURCE PATCH open, and let every other cell write straight
+ * through. Both travel to `/api/cells/:id`, so the body is what tells the flushed
+ * editor edit apart from the mark that races it - which is exactly the
+ * interleaving these two paths lose without the wait.
+ */
+async function holdSourcePatches(page: Page, ms = 1500): Promise<() => number> {
+	let held = 0;
+	await page.route('**/api/cells/**', async (route) => {
+		const req = route.request();
+		if (req.method() !== 'PATCH') return route.fallback();
+		let body: Record<string, unknown> | null = null;
+		try {
+			body = req.postDataJSON();
+		} catch {
+			body = null;
+		}
+		if (!body || typeof body.source !== 'string') return route.fallback();
+		held += 1;
+		await new Promise((r) => setTimeout(r, ms));
+		await route.continue();
+	});
+	return () => held;
+}
+
+/** Summon a cell's editor and replace its whole source, leaving the edit UNFLUSHED. */
+async function retypeCell(page: Page, cell: Locator, source: string): Promise<void> {
+	await cell.click();
+	const editor = cell.locator('.cm-content');
+	await expect(editor).toBeVisible();
+	await editor.click();
+	await page.keyboard.press(process.platform === 'darwin' ? 'Meta+a' : 'Control+a');
+	await page.keyboard.type(source);
+}
+
+test('marking a cell waits for the edit it raced, so the module holds the new source', async ({
+	page,
+	request
+}) => {
+	// The Export BUTTON is not the only path that regenerates: marking a cell is one
+	// of the three explicit export actions, and its click blurs the editor exactly
+	// the same way. If the mark PATCH is serviced before the flushed source PATCH,
+	// `setCellExports` builds the module from the PRE-edit source - and, unlike
+	// before export became explicit, nothing heals it.
+	const nb = await makeNotebook(request, 'mark-race.ipynb');
+	const cellId = await firstCellId(request, nb);
+	const modulePath = join(workspace, 'lib', 'markrace.py');
+
+	const seeded = await request.patch(`${baseURL}/api/cells/${cellId}`, {
+		data: { source: 'def before():\n    return 1', nb }
+	});
+	expect(seeded.ok(), await seeded.text()).toBeTruthy();
+	const target = await request.post(`${baseURL}/api/notebooks/export-py`, {
+		data: { op: 'set-target', target: 'lib/markrace.py', path: nb }
+	});
+	expect(target.ok(), await target.text()).toBeTruthy();
+	// Nothing marked yet, so the module does not exist - the mark below is what
+	// writes it, from whatever source the SERVER holds at that moment.
+	expect(existsSync(modulePath)).toBe(false);
+
+	await page.goto(`${baseURL}/?ws=${encodeURIComponent(workspace)}`);
+	await page.locator(`[data-testid="tree-file"][data-path="${nb}"]`).click();
+	const cell = page.locator('[data-testid="cell"]:visible').first();
+	await expect(cell).toBeVisible();
+
+	const heldCount = await holdSourcePatches(page);
+	await retypeCell(page, cell, 'def after():\n    return 2');
+	// Straight to the toggle - no poll, no settle.
+	await cell.getByTestId('toggle-export').click();
+
+	await expect.poll(() => existsSync(modulePath), { timeout: 15_000 }).toBe(true);
+	await expect
+		.poll(() => readFileSync(modulePath, 'utf8').includes('def after():'), { timeout: 15_000 })
+		.toBe(true);
+	expect(heldCount()).toBeGreaterThan(0);
+	expect(readFileSync(modulePath, 'utf8')).not.toContain('def before():');
+	await page.unroute('**/api/cells/**');
+});
+
+test('naming the target waits for the edit it raced, so the module holds the new source', async ({
+	page,
+	request
+}) => {
+	// The same shape through the other consequential path: committing the target
+	// input regenerates too, and reaching that input is what blurs the editor.
+	const nb = await makeNotebook(request, 'target-race.ipynb');
+	const cellId = await firstCellId(request, nb);
+	const modulePath = join(workspace, 'lib', 'targetrace.py');
+
+	// Marked but with NO target, so the module cannot exist until the commit below.
+	const seeded = await request.patch(`${baseURL}/api/cells/${cellId}`, {
+		data: { source: 'def before():\n    return 1', export: true, nb }
+	});
+	expect(seeded.ok(), await seeded.text()).toBeTruthy();
+	expect(existsSync(modulePath)).toBe(false);
+
+	await page.goto(`${baseURL}/?ws=${encodeURIComponent(workspace)}`);
+	await page.locator(`[data-testid="tree-file"][data-path="${nb}"]`).click();
+	const cell = page.locator('[data-testid="cell"]:visible').first();
+	await expect(cell).toBeVisible();
+
+	const heldCount = await holdSourcePatches(page);
+	await retypeCell(page, cell, 'def after():\n    return 2');
+	// Focusing the field is what blurs the editor; Enter commits the path.
+	const input = page.locator('[data-testid="export-target-input"]:visible');
+	await input.fill('lib/targetrace.py');
+	await input.press('Enter');
+
+	await expect.poll(() => existsSync(modulePath), { timeout: 15_000 }).toBe(true);
+	await expect
+		.poll(() => readFileSync(modulePath, 'utf8').includes('def after():'), { timeout: 15_000 })
+		.toBe(true);
+	expect(heldCount()).toBeGreaterThan(0);
+	expect(readFileSync(modulePath, 'utf8')).not.toContain('def before():');
 	await page.unroute('**/api/cells/**');
 });

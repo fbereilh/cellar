@@ -115,7 +115,7 @@
 		/** Why a CONFIGURED target cannot resolve (a `git` base outside any repo, a
 		 *  path resolving outside the workspace, an unknown hand-edited base), else
 		 *  null. Shown in the export section: a target in this state generates
-		 *  nothing on every save, and silence would read as configured-and-working. */
+		 *  nothing on every export, and silence would read as configured-and-working. */
 		exportResolveError?: string | null;
 		/** Constructs in the MARKED cells that make the generated module uncompilable
 		 *  (`$lib/exportHazard`). A fact about the MARKS, not about any file on disk,

@@ -455,7 +455,7 @@ describe('clearing is the universal repair (an unresolvable base is never a dead
 	// repository has gone - is only repairable if CLEARING is exempt from base
 	// validation: re-expression cannot help (the file cannot be located) and
 	// retyping the path under the stored base is refused, so a refused clear leaves
-	// a target silently generating no module on every save with no in-app way out.
+	// a target silently generating no module on every export with no in-app way out.
 	it('clears a target stored under an UNKNOWN hand-edited base, deleting both keys', () => {
 		const abs = writeIpynb('repair-unknown.ipynb', { export_target: 'x.py', export_base: 'weird' });
 		// The state the user is stuck in: configured, shown, and unresolvable.

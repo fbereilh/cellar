@@ -634,8 +634,8 @@ describe('a regeneration that FAILED is reported, never read as a success', () =
 	/**
 	 * The guard protects CONTENT, and an empty file has none. Pre-creating the module
 	 * (`touch utils.py`, the explorer's "New file") before naming the target is an
-	 * ordinary workflow, and refusing it stopped the module regenerating on EVERY
-	 * later save through a path no UI surface reads - a permanent silent dead end.
+	 * ordinary workflow, and refusing it stopped the module regenerating at all
+	 * through a path no UI surface reads - a permanent silent dead end.
 	 */
 	it('overwrites an EMPTY file at the target rather than refusing it', async () => {
 		const { target, code } = await makeNotebook('target-empty.ipynb');

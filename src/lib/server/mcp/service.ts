@@ -1893,7 +1893,7 @@ export function setExportTarget(
 		setExportTargetDoc(target ?? null, nbTarget, undefined, base ?? null);
 	} catch (err) {
 		// A path that escapes the workspace is refused where it is SET, not stored to
-		// generate nothing on every later save (see `setExportTarget` in notebook.ts).
+		// generate nothing on every later export (see `setExportTarget` in notebook.ts).
 		if (err instanceof InvalidExportTargetError)
 			return { ok: false as const, invalid: err.message };
 		// NOT a refusal: the doc layer validates before it mutates, so the only other
