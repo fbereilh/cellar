@@ -142,7 +142,12 @@
 		| { type: 'cell:rendered'; cellId: string }
 		| { type: 'cell:edited'; cellId: string; source: string }
 		| { type: 'notebook:export-target'; target: string | null; base?: string; resolved?: string | null; resolveError?: string | null }
-		| { type: 'notebook:export-hazards'; hazards?: ExportHazard[] }
+		| {
+				type: 'notebook:export-derived';
+				hazards?: ExportHazard[];
+				resolved?: string | null;
+				resolveError?: string | null;
+		  }
 		| { type: 'notebook:root'; root: string | null }
 		| { type: 'notebook:header-numbering'; levels: number[] }
 		| { type: 'notebook:hide-all-code'; hidden: boolean };
@@ -240,11 +245,13 @@
 	// Constructs in the MARKED cells that make the generated module uncompilable
 	// (`$lib/exportHazard`). Server-derived like the three fields above - the rule
 	// needs the Python line tokenizer, which is server-only - seeded on load and
-	// kept live by the `notebook:export-hazards` event, which the server publishes
-	// only when the set CHANGES. A hazard is a fact about the marked CELLS, so a
-	// SAVE is what creates one (editing a marked cell, or marking a cell that
-	// already holds one) even though a save no longer exports; the push is what
-	// lets the bar warn BEFORE the user presses Export.
+	// kept live, TOGETHER WITH `exportResolved`/`exportResolveError`, by the
+	// `notebook:export-derived` event, which the server publishes only when that
+	// state CHANGES. Both are facts about the DOCUMENT rather than about the file
+	// on disk, so a SAVE is what moves them - editing a marked cell, marking one
+	// that already holds a hazard, or editing a `#|default_exp` line - even though
+	// a save no longer exports; the push is what lets the bar say so BEFORE the
+	// user presses Export.
 	let exportHazards = $state<ExportHazard[]>([]);
 	let exportBaseBusy = $state(false);
 	// Code root: the workspace-relative directory THIS notebook's kernel runs in and
@@ -1648,10 +1655,17 @@
 			exportResolved = ev.resolved ?? null;
 			exportResolveError = ev.resolveError ?? null;
 			exportTarget = ev.target;
-		} else if (ev.type === 'notebook:export-hazards') {
-			// DERIVED state, not an echo: the server publishes it whenever the marked
-			// cells' hazards change (on any save, and after a manual export), with no
-			// `originId`, so every tab - the one that just typed included - renders it.
+		} else if (ev.type === 'notebook:export-derived') {
+			// DERIVED state, not an echo: the server publishes it whenever what the
+			// marks and the target RESOLVE TO changes (on any save, and after a manual
+			// export), with no `originId`, so every tab - the one that just typed
+			// included - renders it. It carries no `target`/`base`: those are the
+			// STORED setting, owned by `notebook:export-target`, whose `originId` echo
+			// suppression is what keeps this push from clobbering a field mid-edit.
+			// Without this the misplaced-`#|default_exp` message survived the very
+			// source edit that fixed it, until a reload.
+			exportResolved = ev.resolved ?? null;
+			exportResolveError = ev.resolveError ?? null;
 			exportHazards = (ev.hazards ?? []) as ExportHazard[];
 		} else if (ev.type === 'notebook:root') {
 			// The code root changed in another tab or from an agent (this tab's own
@@ -1935,7 +1949,7 @@
 			if (
 				pe.type?.startsWith('cell:') ||
 				pe.type === 'notebook:export-target' ||
-				pe.type === 'notebook:export-hazards' ||
+				pe.type === 'notebook:export-derived' ||
 				pe.type === 'notebook:header-numbering' ||
 				pe.type === 'notebook:hide-all-code' ||
 				pe.type === 'notebook:root'

@@ -84,12 +84,12 @@ describe('the notebook view carries the hazard (what the export bar renders)', (
 	});
 });
 
-describe('the live push - a hazard reaches the bar without a reload', () => {
-	/** Collect every `notebook:export-hazards` event published while `fn` runs. */
+describe('the live push - a hazard or a moved target reaches the bar without a reload', () => {
+	/** Collect every `notebook:export-derived` event published while `fn` runs. */
 	async function captured(fn: () => Promise<void> | void) {
-		const seen: Array<{ nb: string; hazards: unknown[] }> = [];
+		const seen: Array<{ nb: string; hazards: unknown[]; resolved: string | null; resolveError: string | null }> = [];
 		const off = events.subscribe((e: Record<string, unknown>) => {
-			if (e.type === 'notebook:export-hazards') seen.push(e as never);
+			if (e.type === 'notebook:export-derived') seen.push(e as never);
 		});
 		try {
 			await fn();
@@ -179,13 +179,74 @@ describe('the live push - a hazard reaches the bar without a reload', () => {
 		expect(nbmod.getNotebook(target).exportHazards).toEqual([]);
 	});
 
+	it('clears a misplaced-`#|default_exp` error on the SOURCE EDIT that fixes it', async () => {
+		// The regression: `exportResolved`/`exportResolveError` were written only by
+		// `load()` and by `notebook:export-target`, which only the SETTERS emit - so a
+		// user who followed the message and moved the line to the top of its cell kept
+		// reading it until a reload, i.e. the fix appeared to have failed. The remedy
+		// the message names is a source edit, so the per-persist push has to carry the
+		// resolution too.
+		const name = 'misplaced.ipynb';
+		writeFileSync(
+			join(WS, name),
+			JSON.stringify({
+				cells: [
+					{ cell_type: 'code', source: ['x = 1\n', '#| default_exp lib.late'], metadata: {}, outputs: [], execution_count: null, id: 'dir-cell' },
+					{ cell_type: 'code', source: ['Y = 2'], metadata: { cellar: { export: true } }, outputs: [], execution_count: null, id: 'marked-cell' }
+				],
+				metadata: {},
+				nbformat: 4,
+				nbformat_minor: 5
+			})
+		);
+		const target = abs(name);
+
+		// The seed the export bar renders on load: no target, and the reason why.
+		const seed = nbmod.getNotebook(target);
+		expect(seed.exportResolved).toBeNull();
+		expect(seed.exportResolveError).toContain('LEADING directive block');
+
+		// Now do exactly what the message prescribes.
+		const fixed = await captured(() => {
+			nbmod.setSource('dir-cell', '#| default_exp lib.late\nx = 1', target);
+		});
+		expect(fixed).toHaveLength(1);
+		expect(fixed[0].nb).toBe(target);
+		expect(fixed[0].resolveError).toBeNull();
+		expect(fixed[0].resolved).toBe('lib/late.py');
+		// ...and the read agrees, so a later reload cannot contradict the push.
+		expect(nbmod.getNotebook(target).exportResolveError).toBeNull();
+
+		// It works in the other direction too - breaking it again re-announces.
+		const broken = await captured(() => {
+			nbmod.setSource('dir-cell', 'x = 1\n#| default_exp lib.late', target);
+		});
+		expect(broken).toHaveLength(1);
+		expect(broken[0].resolved).toBeNull();
+		expect(broken[0].resolveError).toContain('LEADING directive block');
+	});
+
+	it('publishes the resolution alone, never the STORED target the setter owns', async () => {
+		// The stored `export_target`/`export_base` move only through the setters, whose
+		// own `notebook:export-target` event carries an `originId`. This push is
+		// un-suppressed and fires INSIDE that setter's persist, so carrying them here
+		// would clobber a field the user may have typed on since.
+		const { target, cell } = await notebookWith('push-fields.ipynb', 'X = 1');
+		const seen = await captured(() => {
+			nbmod.setSource(cell, JOINED, target);
+		});
+		expect(seen).toHaveLength(1);
+		expect(seen[0]).not.toHaveProperty('target');
+		expect(seen[0]).not.toHaveProperty('base');
+	});
+
 	it('carries no originId, so the tab that typed renders it too', async () => {
 		// DERIVED state, not an echo of one tab's action: an `originId` here would be
 		// echo-suppressed by exactly the tab that just created the hazard.
 		const { target, cell } = await notebookWith('push-origin.ipynb', 'X = 1');
 		const seen: Array<Record<string, unknown>> = [];
 		const off = events.subscribe((e: Record<string, unknown>) => {
-			if (e.type === 'notebook:export-hazards') seen.push(e);
+			if (e.type === 'notebook:export-derived') seen.push(e);
 		});
 		nbmod.setSource(cell, JOINED, target, 'tab-1');
 		off();
@@ -398,10 +459,10 @@ describe('the two Svelte halves - source SHAPE guards, not behaviour', () => {
 	it('LiveNotebook mentions the load seed and the live event in its dispatcher', () => {
 		const src = read('lib/LiveNotebook.svelte');
 		expect(src).toContain('body.notebook.exportHazards');
-		expect(src).toContain("ev.type === 'notebook:export-hazards'");
+		expect(src).toContain("ev.type === 'notebook:export-derived'");
 		// The event must reach `applyStructuralEvent` at all: the dispatcher routes by
 		// an explicit list, so an unlisted `notebook:*` type falls through to the RUN
 		// handler and is silently dropped.
-		expect(src).toContain("pe.type === 'notebook:export-hazards'");
+		expect(src).toContain("pe.type === 'notebook:export-derived'");
 	});
 });

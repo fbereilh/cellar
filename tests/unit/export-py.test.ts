@@ -120,7 +120,12 @@ describe('resolveExportTarget', () => {
 		// defect: a target resolved from text nbdev ignores, written to a file nbdev
 		// would never write (scout report section 5.2). It resolves to NO module -
 		// but it is reported, not dropped in silence (below).
-		const afterCode = doc({ cells: [{ id: 'a', cell_type: 'code', source: `${source}#|default_exp lib.cheap` }] });
+		const afterCode = doc({
+			cells: [
+				{ id: 'a', cell_type: 'code', source: `${source}#|default_exp lib.cheap` },
+				{ id: 'm', cell_type: 'code', source: 'X = 1', metadata: { cellar: { export: true } } }
+			]
+		});
 		expect(resolveExportTarget(afterCode)).toMatchObject({ ok: false, source: 'default_exp' });
 	});
 });
@@ -137,7 +142,10 @@ describe('resolveExportTarget', () => {
  */
 describe('a `#|default_exp` outside the leading block is REPORTED, not silently dropped', () => {
 	const doc = (over: Partial<NotebookDoc>): NotebookDoc => ({ path: '/ws/n.ipynb', cells: [], ...over });
-	const misplaced = (src: string) => resolveExportTarget(doc({ cells: [{ id: 'a', cell_type: 'code', source: src }] }));
+	/** A marked cell, so the notebook really does describe a module. */
+	const MARKED = { id: 'marked', cell_type: 'code' as const, source: 'X = 1', metadata: { cellar: { export: true } } };
+	const misplaced = (src: string) =>
+		resolveExportTarget(doc({ cells: [{ id: 'a', cell_type: 'code', source: src }, MARKED] }));
 
 	for (const [src, why] of [
 		['x = 1\n#|default_exp core', 'after code'],
@@ -166,13 +174,42 @@ describe('a `#|default_exp` outside the leading block is REPORTED, not silently 
 		expect(misplaced('x = 1\n# a note about default_exp')).toBeNull();
 	});
 
+	it('says NOTHING when the notebook marks no cell - it never asked for a module', () => {
+		// The harm this report exists for is a module the MARKS describe landing
+		// nowhere. A notebook demonstrating nbdev's directives, or quoting one in a
+		// docstring, asked for no module at all - and a standing sentence on the
+		// always-visible export bar claiming "no module is being generated" about one
+		// nobody wanted is the false nag `server/nbdev.ts` warns against.
+		const unmarked = doc({ cells: [{ id: 'a', cell_type: 'code', source: 'x = 1\n#|default_exp core' }] });
+		expect(resolveExportTarget(unmarked)).toBeNull();
+		// Marking one cell is the whole difference: the same document now speaks.
+		expect(resolveExportTarget(doc({ cells: [...unmarked.cells, MARKED] }))).toMatchObject({
+			ok: false,
+			source: 'default_exp'
+		});
+	});
+
+	it('counts an nbdev `#| export` DIRECTIVE as a mark, not only the metadata flag', () => {
+		// The gate asks the shared `isExportCell`, so a genuine nbdev notebook - which
+		// carries no `metadata.cellar.export` at all - is exactly the one that must be
+		// heard, and it is the notebook whose committed module goes stale.
+		const d = doc({
+			cells: [
+				{ id: 'a', cell_type: 'code', source: 'x = 1\n#|default_exp core' },
+				{ id: 'b', cell_type: 'code', source: '#| export\ndef f(): pass' }
+			]
+		});
+		expect(resolveExportTarget(d)).toMatchObject({ ok: false, source: 'default_exp' });
+	});
+
 	it('never speaks over a target that DOES resolve, wherever the stray line sits', () => {
 		// A real target elsewhere in the notebook wins: the report exists only for the
 		// case where nothing at all resolved.
 		const d = doc({
 			cells: [
 				{ id: 'a', cell_type: 'code', source: 'x = 1\n#|default_exp stray' },
-				{ id: 'b', cell_type: 'code', source: '#|default_exp real\ny = 2' }
+				{ id: 'b', cell_type: 'code', source: '#|default_exp real\ny = 2' },
+				MARKED
 			]
 		});
 		expect(resolveExportTarget(d)).toMatchObject({ ok: true, target: 'real.py' });
@@ -181,7 +218,7 @@ describe('a `#|default_exp` outside the leading block is REPORTED, not silently 
 	it('is outranked by an explicit notebook-level target', () => {
 		const d = doc({
 			metadata: { cellar: { export_target: 'utils.py' } },
-			cells: [{ id: 'a', cell_type: 'code', source: 'x = 1\n#|default_exp stray' }]
+			cells: [{ id: 'a', cell_type: 'code', source: 'x = 1\n#|default_exp stray' }, MARKED]
 		});
 		expect(resolveExportTarget(d)).toMatchObject({ ok: true, source: 'metadata', target: 'utils.py' });
 	});

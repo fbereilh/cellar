@@ -157,18 +157,19 @@ export interface NotebookDoc {
 	 */
 	lastExportError?: string | null;
 	/**
-	 * Runtime-only (never serialized): the compile hazards last BROADCAST for this
-	 * doc, joined into one comparison key. Held ONLY so `publishExportHazards` can
-	 * tell a change from a no-op - the hazards themselves are always recomputed
-	 * fresh, so nothing ever reads a stale value out of this.
+	 * Runtime-only (never serialized): the DERIVED export state last BROADCAST for
+	 * this doc - the target's resolution (or the reason it cannot resolve) and the
+	 * compile hazards the marks describe - joined into one comparison key. Held
+	 * ONLY so `publishExportDerived` can tell a change from a no-op; both halves
+	 * are always recomputed fresh, so nothing ever reads a stale value out of this.
 	 *
 	 * ABSENT means nothing has been broadcast YET, which is NOT the same as having
-	 * broadcast no hazards (`''`) - a doc loaded from disk already holding one
-	 * seeds the browser through `getNotebook` without ever publishing. Compare
-	 * strictly; coercing the sentinel swallows the event that CLEARS such a
-	 * hazard.
+	 * broadcast an empty state (`''`) - a doc loaded from disk already holding a
+	 * hazard (or an unresolvable target) seeds the browser through `getNotebook`
+	 * without ever publishing. Compare strictly; coercing the sentinel swallows the
+	 * event that CLEARS it.
 	 */
-	lastExportHazardKey?: string;
+	lastExportDerivedKey?: string;
 }
 
 /** Serializable notebook view for the browser (SSR + REST). */

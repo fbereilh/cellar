@@ -75,6 +75,26 @@ fallback, behind the same `includes('default_exp')` guard, and only for a cell t
 yielded no usable directive - so a notebook that resolves normally, and the far commoner one
 with no export configured at all, pay nothing.
 
+Two further rules keep that report honest rather than nagging:
+
+**It speaks only when a cell is MARKED.** The harm is a module the marks describe landing
+nowhere; a notebook that marks nothing never asked for one, so a tutorial DEMONSTRATING
+nbdev's directives - or a `#|default_exp` quoted inside a docstring - gets silence rather
+than a standing sentence on the always-visible export bar asserting "no module is being
+generated". Under-reporting is the safe direction for a notice (`server/nbdev.ts` states the
+same for the sibling nbdev warning), and one users learn to ignore protects nothing. The gate
+is on the REPORT only - the leading-block rule is untouched.
+
+**It refreshes on the source edit it prescribes.** `exportResolved`/`exportResolveError` were
+written only by `load()` and by `notebook:export-target`, which only the setters emit - so
+moving the line to the top of its cell left the message standing until a reload, i.e. the fix
+read as having failed. The per-persist push now carries the RESOLUTION alongside the hazards
+(`publishExportDerived` -> `notebook:export-derived`), on ONE event: both are derived from the
+same document by the same resolve, and two channels carrying overlapping derived state is how
+the halves come to disagree. It deliberately carries no `target`/`base` - those are the stored
+setting, and their `notebook:export-target` event is `originId`-suppressed precisely so the
+tab that typed a value is not fighting its own echo mid-edit.
+
 ---
 
 ## 3. The mark: which source wins, and why the question has no answer to argue about

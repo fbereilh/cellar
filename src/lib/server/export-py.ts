@@ -438,8 +438,9 @@ function storedExportTarget(
 	}
 	// Nothing resolved, and the notebook holds a `#|default_exp` line nbdev ignores.
 	// The RULE is untouched (it stays ignored); what changes is that the drop stops
-	// being SILENT - see `misplacedDefaultExpError`.
-	if (ignored !== null)
+	// being SILENT - see `misplacedDefaultExpError` for the harm, and for why the
+	// report needs a MARKED cell before it may speak.
+	if (ignored !== null && doc.cells.some((c: Cell) => isExportCell(c)))
 		return { path: '', base: 'workspace', source: 'default_exp', error: misplacedDefaultExpError(ignored) };
 	return null;
 }
@@ -459,6 +460,17 @@ function storedExportTarget(
  * It names the CAUSE (the line is not in its cell's leading directive block), that
  * nbdev ignores it there too (so "fixing" Cellar is not the answer), and both ways
  * out.
+ *
+ * NARROWED to a notebook with at least one export-MARKED cell, because that is the
+ * whole of the harm: the marks describe a module, and it is now landing nowhere.
+ * Without that gate the message is standing chrome on the always-visible export bar
+ * of a notebook that never asked for a module at all - a tutorial DEMONSTRATING
+ * nbdev's directives, or a line quoted inside a docstring - asserting "no module is
+ * being generated" about one nobody wanted. Under-reporting is the safe direction
+ * for a notice (`server/nbdev.ts` says so for the sibling nbdev warning), and a
+ * notice users learn to ignore protects nothing. The gate belongs to the REPORT
+ * alone: the leading-block RULE is not widened or weakened by it, and a marked
+ * notebook still resolves to nothing exactly as it did.
  */
 function misplacedDefaultExpError(value: string): string {
 	const mod = value.trim().split(/\s+/)[0];

@@ -250,7 +250,7 @@ describe('hazards still reach the bar on a SAVE, even though a save does not exp
 	async function captured(fn: () => Promise<void> | void) {
 		const seen: Array<{ nb: string; hazards: unknown[] }> = [];
 		const off = events.subscribe((e: Record<string, unknown>) => {
-			if (e.type === 'notebook:export-hazards') seen.push(e as never);
+			if (e.type === 'notebook:export-derived') seen.push(e as never);
 		});
 		try {
 			await fn();

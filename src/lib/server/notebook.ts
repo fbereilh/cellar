@@ -212,14 +212,15 @@ function setImportBindings(
  * A SAVE WRITES THE NOTEBOOK AND NOTHING ELSE. It deliberately does NOT
  * regenerate the nbdev-style `.py` module: that is `regenerateExportModule`, and
  * only the three EXPLICIT export-flow actions call it (see its header). What it
- * does still owe the export surfaces is the HAZARD broadcast, because a hazard is
- * a fact about the marked CELLS - which a save is exactly what changes - not
- * about the file on disk (see `publishExportHazards`).
+ * does still owe the export surfaces is the DERIVED broadcast - the target's
+ * resolution and the marks' compile hazards - because both are facts about the
+ * document, which a save is exactly what changes, not about the file on disk
+ * (see `publishExportDerived`).
  */
 function persist(doc: NotebookDoc): void {
 	if (doc.jpFormat) writePyNotebook(doc.path, doc.cells, doc.jpFormat);
 	else writeNotebook(doc.path, doc);
-	publishExportHazards(doc);
+	publishExportDerived(doc);
 }
 
 /**
@@ -275,7 +276,8 @@ function regenerateExportModule(doc: NotebookDoc): void {
 }
 
 /**
- * Broadcast the export's compile hazards when - and only when - they CHANGE.
+ * Broadcast everything the export DERIVES - the target's RESOLUTION and the marks'
+ * compile HAZARDS - when, and only when, they CHANGE.
  *
  * A HAZARD IS A FACT ABOUT THE MARKED CELLS, NOT ABOUT THE FILE ON DISK:
  * `docExportHazards` reads the document, never the module, so it answers "the
@@ -283,45 +285,65 @@ function regenerateExportModule(doc: NotebookDoc): void {
  * exported yet. That is why it is still published from `persist` now that the
  * export itself is EXPLICIT (`regenerateExportModule`): a save is exactly what
  * creates a hazard - editing a marked cell, or marking a cell that already holds
- * one - and the warning is worth more BEFORE the user exports than after.
- * Recomputing in `getNotebook` alone would leave the export bar stale until the
- * next `load()` (a reconnect, a seq gap, a restore) - i.e. usually never - so the
- * change is pushed like any other structural fact.
+ * one - and the warning is worth more BEFORE the user exports than after. The
+ * RESOLUTION is the same kind of fact and moves the same way, under the user's
+ * hands and nowhere near the export button: it moves the moment a `#|default_exp`
+ * line is added, removed, or shifted into (or out of) its cell's leading directive
+ * block, with no setter involved. Recomputing in `getNotebook` alone would leave
+ * the export bar stale until the next `load()` (a reconnect, a seq gap, a restore)
+ * - i.e. usually never - so the change is pushed like any other structural fact.
  *
- * The surfaces must therefore word it as a claim about what an export WOULD
- * produce, never as "the module was written and will not import": under explicit
- * export there may be no such file yet. `$lib/exportHazard`'s own message already
- * says "the module will not import", which reads correctly either way.
+ * The surfaces must therefore word the hazard as a claim about what an export
+ * WOULD produce, never as "the module was written and will not import": under
+ * explicit export there may be no such file yet. `$lib/exportHazard`'s own message
+ * already says "the module will not import", which reads correctly either way.
  *
- * Cheap by construction: computed behind a `__future__` substring pre-check over
- * MARKED cells only, and compared before publishing, so an ordinary notebook's
- * every-keystroke autosave emits nothing at all. The event carries no `originId`
- * on purpose - this is DERIVED state, not an echo of one tab's action, so every
- * tab (the initiating one included) must render it.
+ * BOTH halves ride ONE push, and that is the point rather than a convenience. They
+ * are derived from the same document by the same resolve, they are rendered by the
+ * same bar in a fixed precedence (an unresolvable target outranks a hazard), and
+ * two events carrying overlapping derived state is exactly how the two halves come
+ * to describe one notebook differently. The resolve is computed ONCE here and
+ * threaded into `docExportHazards`, so folding the resolution in costs nothing -
+ * that function resolved for itself before.
  *
- * Deliberately NOT folded into `notebook:export-target`: that event is about the
- * target, this is about the marked cells' content, and they move independently.
+ * It carries only what is DERIVED, never the STORED `export_target`/`export_base`:
+ * those change solely through `setExportTarget`/`setExportBase`, which emit
+ * `notebook:export-target` WITH an `originId` so the tab that typed the value is
+ * not fighting its own echo mid-edit. Putting them here too would arrive
+ * un-suppressed inside that setter's own persist and clobber a field the user may
+ * have typed on since. The two events are therefore disjoint: stored settings
+ * there, derived readings here.
+ *
+ * Cheap by construction: the hazard half is computed behind a `__future__`
+ * substring pre-check over MARKED cells only, and the whole state is compared
+ * before publishing, so an ordinary notebook's every-keystroke autosave emits
+ * nothing at all. The event carries no `originId` on purpose - this is DERIVED
+ * state, not an echo of one tab's action, so every tab (the initiating one
+ * included) must render it.
  *
  * The comparison is STRICT against the raw field and may never coerce the
  * `undefined` sentinel to `''`: a doc that has NEVER broadcast is not a doc whose
- * last broadcast carried no hazards. `loadDoc` never persists, so a notebook that
- * arrives from disk ALREADY holding a hazard seeds the browser with it through
- * `getNotebook` -> `exportTargetView` while this field is still unset - and
- * coerced, the user's FIX (the first persist since load) compared `''` against
- * `''`, returned here, and left the bar asserting a module will not import after
- * it had been repaired. The cost of the strict test is exactly ONE extra
- * empty-hazards event per document lifetime; the change-only rule above exists to
- * spare an event per KEYSTROKE, not per document. Seeding the key from
- * `getNotebook` instead is the WRONG repair - that is a READ, served to SSR and
- * to the agent surface with no browser attached, so it would suppress the event
- * for a client that never received the seed.
+ * last broadcast carried nothing. `loadDoc` never persists, so a notebook that
+ * arrives from disk ALREADY holding a hazard (or an unresolvable target) seeds the
+ * browser with it through `getNotebook` -> `exportTargetView` while this field is
+ * still unset - and coerced, the user's FIX (the first persist since load)
+ * compared `''` against `''`, returned here, and left the bar asserting a module
+ * will not import after it had been repaired. The cost of the strict test is
+ * exactly ONE extra empty event per document lifetime; the change-only rule above
+ * exists to spare an event per KEYSTROKE, not per document. Seeding the key from
+ * `getNotebook` instead is the WRONG repair - that is a READ, served to SSR and to
+ * the agent surface with no browser attached, so it would suppress the event for a
+ * client that never received the seed.
  */
-function publishExportHazards(doc: NotebookDoc): void {
-	const hazards = docExportHazards(doc);
-	const key = hazards.map((h) => h.message).join('\u0000');
-	if (key === doc.lastExportHazardKey) return;
-	doc.lastExportHazardKey = key;
-	emit(doc, 'notebook:export-hazards', { hazards });
+function publishExportDerived(doc: NotebookDoc): void {
+	const info = resolveExportTarget(doc);
+	const resolved = info && info.ok ? info.target : null;
+	const resolveError = info && !info.ok ? info.error : null;
+	const hazards = docExportHazards(doc, info);
+	const key = [resolved ?? '', resolveError ?? '', ...hazards.map((h) => h.message)].join('\u0000');
+	if (key === doc.lastExportDerivedKey) return;
+	doc.lastExportDerivedKey = key;
+	emit(doc, 'notebook:export-derived', { resolved, resolveError, hazards });
 }
 
 /**
@@ -1553,9 +1575,9 @@ export function exportPy(nb?: string | null): ExportResult {
 	} finally {
 		// This path writes the module WITHOUT going through `persist`, so it owes the
 		// same broadcast - in a `finally`, because a throw here still leaves the marks
-		// (and therefore the hazards) exactly as this call found them, and a bar left
-		// describing an older set is the staleness the push exists to remove.
-		publishExportHazards(doc);
+		// (and therefore the derived state) exactly as this call found them, and a bar
+		// left describing an older reading is the staleness the push exists to remove.
+		publishExportDerived(doc);
 	}
 }
 
