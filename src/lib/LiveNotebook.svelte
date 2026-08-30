@@ -25,7 +25,7 @@
 		selectionAfterRemoval,
 		stepFromUnwalkableHead
 	} from '$lib/cellSelection';
-	import { exportCellCount } from '$lib/exportRole';
+	import { exportCellCount, isExportCell } from '$lib/exportRole';
 	import { isExportBase } from '$lib/exportTarget';
 	import type { ExportHazard } from '$lib/exportHazard';
 	import type { ExportPyResult } from '$lib/types';
@@ -2218,8 +2218,9 @@
 	}
 
 	/**
-	 * How an in-flight cell-source PATCH ended, for the one caller that has to know:
-	 * the manual export, which writes the module from the source the SERVER holds.
+	 * How an in-flight cell-source PATCH ended, for the callers that have to know:
+	 * the three REGENERATING export paths, each of which writes the `.py` module
+	 * from the source the SERVER holds.
 	 *
 	 * - `committed`  the server took the new source
 	 * - `failed`     it did not (unreachable, or a refusal), so the server still
@@ -2227,36 +2228,56 @@
 	 */
 	type EditCommit = 'committed' | 'failed';
 	/**
-	 * The IN-FLIGHT source writes, keyed by cell, so the manual export can wait for
-	 * them to land - the `exportTargetCommit` treatment, for the sibling half of the
-	 * same blur-then-click hazard.
+	 * The IN-FLIGHT source writes, keyed by cell, so a regenerating path can wait
+	 * for the ones it depends on to land - the `exportTargetCommit` treatment, for
+	 * the sibling half of the same blur-then-click hazard.
 	 *
-	 * Pressing "Export to .py" blurs the editor, and `Cell.svelte`'s blur handler
-	 * flushes the pending edit fire-and-forget; the export POST then went out on its
-	 * own connection and could be serviced FIRST, writing the module from the
-	 * pre-edit source and reporting "Exported N cells" over it. Nothing healed that
-	 * afterwards once an ordinary save stopped re-exporting, so the export has to
-	 * await the write it raced.
+	 * Reaching any of those controls BLURS the editor, and `Cell.svelte`'s blur
+	 * handler flushes the pending edit fire-and-forget; the write that follows then
+	 * went out on its own connection and could be serviced FIRST, regenerating the
+	 * module from the pre-edit source and reporting success over it. Nothing healed
+	 * that afterwards once an ordinary save stopped re-exporting, so each of them
+	 * has to await the write it raced.
 	 *
 	 * Keyed by cell rather than kept as one promise because several cells can be in
-	 * flight at once (a Cmd/Ctrl+S flush, an unload flush), and each entry DROPS
-	 * ITSELF the moment it settles - the `exportTargetCommit` rule - so a write that
-	 * has already landed can never gate a later export.
+	 * flight at once (a Cmd/Ctrl+S flush, an unload flush) and because WHICH cells
+	 * matter differs per caller (`moduleSourceIds`), and each entry DROPS ITSELF the
+	 * moment it settles - the `exportTargetCommit` rule - so a write that has
+	 * already landed can never gate a later regeneration.
 	 */
 	const cellEditCommits = new Map<string, Promise<EditCommit>>();
 
 	/**
-	 * Wait out every cell-source write still on the wire, and report whether they
-	 * all landed. The ONE wait every REGENERATING path takes, so the three of them
-	 * cannot drift: `exportPy` (the button), `setExport` (marking a cell, which
-	 * regenerates because choosing the module's contents is an explicit export
-	 * action) and `commitExportTarget` (naming the module's file, likewise).
+	 * The cells whose SOURCE the next regeneration will read: the ones marked for
+	 * export right now (`isExportCell`, asked of the shared `$lib/exportRole` rule
+	 * rather than re-derived here), plus any `addressed` ids the caller is about to
+	 * put INTO the module.
 	 *
-	 * Each of those is reached by a click that BLURS the editor, so `Cell.svelte`'s
-	 * blur handler has just flushed the pending edit fire-and-forget; the write that
-	 * follows travels on its own connection and can be serviced FIRST, regenerating
-	 * the module from the pre-edit source. An ordinary save used to re-export and
-	 * heal that - nothing does now, so each of them waits for the write it raced.
+	 * This is what keeps every claim below true rather than merely safe. Waiting on
+	 * (and refusing for) EVERY in-flight edit was over-broad in both directions: an
+	 * unmarked cell mid-autosave whose PATCH failed refused an export whose module
+	 * would have matched exactly, under a sentence asserting it would not - the
+	 * assert-more-than-was-verified defect this whole change is about, reached
+	 * through its own fix.
+	 *
+	 * `addressed` exists because a cell being MARKED is not yet an export cell, so a
+	 * bare `isExportCell` sweep would skip exactly the edit that matters. It is
+	 * deliberately NOT passed on an UNMARK: that cell is leaving the module, so its
+	 * source stops being read and refusing for it would be the same false claim with
+	 * the sign flipped.
+	 */
+	function moduleSourceIds(addressed: readonly string[] = []): string[] {
+		const ids = new Set(addressed);
+		for (const c of cells) if (isExportCell(c)) ids.add(c.id);
+		return [...ids];
+	}
+
+	/**
+	 * Wait out the cell-source writes still on the wire FOR THOSE ids, and report
+	 * whether they all landed. The ONE wait every REGENERATING path takes, so the
+	 * three of them cannot drift: `exportPy` (the button), `setExport` (marking a
+	 * cell, which regenerates because choosing the module's contents is an explicit
+	 * export action) and `commitExportTarget` (naming the module's file, likewise).
 	 *
 	 * SCOPED TO WHAT IS STILL IN FLIGHT, the same bound `exportTargetCommit` states
 	 * for itself: `editCell`'s `drop` removes an entry the microtask after its PATCH
@@ -2264,8 +2285,24 @@
 	 * the time any of this reads it. Widening that is the pre-existing
 	 * silent-autosave-failure problem and is deliberately not attempted here.
 	 */
-	async function settleCellEdits(): Promise<EditCommit[]> {
-		return Promise.all([...cellEditCommits.values()]).catch(() => ['failed' as const]);
+	async function settleCellEdits(ids: readonly string[]): Promise<EditCommit[]> {
+		const pending = ids.map((id) => cellEditCommits.get(id)).filter((p) => p !== undefined);
+		return Promise.all(pending).catch(() => ['failed' as const]);
+	}
+
+	/**
+	 * The ONE sentence every regenerating path says when a source write it depended
+	 * on did not land, so a reword can never reach only one of them (the
+	 * `unknownTokenWarning` precedent). The shared clause is the FACT; the parameter
+	 * is what this caller then DID about it, which is the only thing that differs -
+	 * the export ABORTS (the module is its whole product), while a mark and a target
+	 * are the user's document intent and are still written.
+	 */
+	const UNSAVED_EXPORT_EDIT = 'a cell edit that belongs in the .py module could not be saved';
+	function unsavedExportEditNotice(outcome: 'skipped' | 'proceeding'): string {
+		return outcome === 'skipped'
+			? `Export skipped: ${UNSAVED_EXPORT_EDIT}, so the module would not have matched the notebook. Fix the edit and export again.`
+			: `${UNSAVED_EXPORT_EDIT[0].toUpperCase()}${UNSAVED_EXPORT_EDIT.slice(1)}, so the module may not include it. Fix the edit and export again.`;
 	}
 
 	async function editCell(id: string, source: string, { keepalive = false }: { keepalive?: boolean } = {}) {
@@ -2284,10 +2321,10 @@
 	}
 
 	/**
-	 * The PATCH itself, split out so its outcome is a value the export can read.
-	 * It never rejects: a rejected write has always been swallowed here (an
-	 * autosave has no surface to report on), and the export is the one caller that
-	 * needs to know, so it reads `failed` rather than an exception.
+	 * The PATCH itself, split out so its outcome is a value a regenerating path can
+	 * read. It never rejects: a rejected write has always been swallowed here (an
+	 * autosave has no surface to report on), and those paths are the only callers
+	 * that need to know, so they read `failed` rather than catch an exception.
 	 */
 	async function commitCellEdit(id: string, source: string, keepalive: boolean): Promise<EditCommit> {
 		// Only the page-unload flush opts into `keepalive`: the browser caps the
@@ -2418,6 +2455,10 @@
 	 * so an edit that did not land never cancels it; it is REPORTED instead, since a
 	 * module quietly built from a source the notebook has moved past is the same
 	 * confident-looking lie the export button's wait exists to remove.
+	 *
+	 * It waits on `moduleSourceIds` rather than on every in-flight edit, and the
+	 * addressed cell rides along only when it is being MARKED: on an unmark that
+	 * cell is leaving the module, so its source stops being read.
 	 */
 	async function setExport(id: string, exported: boolean) {
 		const cell = findCell(id);
@@ -2427,10 +2468,8 @@
 			else delete cellar.export;
 			cell.metadata = { ...(cell.metadata ?? {}), cellar };
 		}
-		if ((await settleCellEdits()).includes('failed'))
-			onNotice?.(
-				'A cell edit could not be saved, so the .py module may not include it. Fix the edit and export again.'
-			);
+		if ((await settleCellEdits(moduleSourceIds(exported ? [id] : []))).includes('failed'))
+			onNotice?.(unsavedExportEditNotice('proceeding'));
 		await fetch(`/api/cells/${id}`, {
 			method: 'PATCH',
 			headers: { 'content-type': 'application/json' },
@@ -2848,16 +2887,16 @@
 	}
 
 	async function commitExportTarget(raw: string, next: string | null, keepalive = false): Promise<TargetCommit> {
-		// Naming the module's file REGENERATES it, so this takes the same wait as the
-		// export button and the per-cell mark: tabbing (or clicking) into this input
-		// blurs the editor, whose flushed edit is still on the wire. NOT on the unload
-		// flush - the page is going away, so awaiting anything there loses the write
-		// `keepalive` exists to deliver. A target that did not land is the user's
-		// setting and is still stored; the unsaved edit is reported instead.
-		if (!keepalive && (await settleCellEdits()).includes('failed'))
-			onNotice?.(
-				'A cell edit could not be saved, so the .py module may not include it. Fix the edit and export again.'
-			);
+		// Naming the module's file REGENERATES it from the cells marked right now, so
+		// this takes the same wait as the export button and the per-cell mark: tabbing
+		// (or clicking) into this input blurs the editor, whose flushed edit is still
+		// on the wire. NOT on the unload flush - the page is going away, so awaiting
+		// anything there loses the write `keepalive` exists to deliver - and not on a
+		// CLEAR, which names no module, so no source is read and there is nothing a
+		// failed edit could affect. A target that did not land is the user's setting
+		// and is still stored; the unsaved edit is reported instead.
+		if (!keepalive && next != null && (await settleCellEdits(moduleSourceIds())).includes('failed'))
+			onNotice?.(unsavedExportEditNotice('proceeding'));
 		const res = await fetch('/api/notebooks/export-py', {
 			method: 'POST',
 			headers: { 'content-type': 'application/json' },
@@ -3109,7 +3148,9 @@
 	 * can be waited on is the promise that PATCH is riding. An edit that did NOT land
 	 * aborts WITH a message rather than exporting a module the notebook has moved
 	 * past - a silent abort would be a dead button, and a silent export would be the
-	 * confident-looking lie this wait exists to remove.
+	 * confident-looking lie this wait exists to remove. Scoped to the cells this
+	 * export really READS (`moduleSourceIds`), so an unrelated cell's failed autosave
+	 * refuses nothing and the message never claims a mismatch nobody measured.
 	 *
 	 * THAT ABORT IS SCOPED TO A WRITE STILL IN FLIGHT, exactly as the target commit's
 	 * is one paragraph above: `editCell` drops an entry the microtask after its PATCH
@@ -3130,14 +3171,16 @@
 		// pending edit is on the wire fire-and-forget, and the export reads what the
 		// server holds. Awaited, not flushed - `Cell.svelte`'s blur handler already
 		// ran `flushEdit` and advanced `savedSource`, so a second flush is a no-op;
-		// the promise to wait for is the one that PATCH is already riding.
-		if ((await settleCellEdits()).includes('failed')) {
+		// the promise to wait for is the one that PATCH is already riding. Scoped to
+		// the cells this export will actually READ, so an unrelated cell's failed
+		// autosave can never refuse an export whose module would have matched.
+		if ((await settleCellEdits(moduleSourceIds())).includes('failed')) {
 			// Aborting SILENTLY would make the button a dead control, and exporting on
 			// would write the module from the source the server still holds and report
 			// success over it - the confident-looking lie this whole wait exists to
 			// remove. The notice channel is single and nonce-keyed, so an export result
 			// posted afterwards would replace this reason: say it, and stop.
-			onNotice?.('Export skipped: a cell edit could not be saved, so the module would not match the notebook.');
+			onNotice?.(unsavedExportEditNotice('skipped'));
 			return null;
 		}
 		try {

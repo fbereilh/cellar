@@ -817,6 +817,29 @@ async function holdSourcePatches(page: Page, ms = 1500): Promise<() => number> {
 	return () => held;
 }
 
+/**
+ * The same body-based discrimination as `holdSourcePatches`, but the source write
+ * FAILS. Held open first, so the export finds it still in flight rather than
+ * already settled and dropped from `cellEditCommits`.
+ */
+async function failSourcePatches(page: Page, ms = 1500): Promise<void> {
+	await page.route('**/api/cells/**', async (route) => {
+		const req = route.request();
+		if (req.method() !== 'PATCH') return route.fallback();
+		let body: Record<string, unknown> | null = null;
+		try {
+			body = req.postDataJSON();
+		} catch {
+			body = null;
+		}
+		if (!body || typeof body.source !== 'string') return route.fallback();
+		await new Promise((r) => setTimeout(r, ms));
+		// A held handler can still be asleep when the test unroutes at the end, and
+		// Playwright then rejects the abort - which is bookkeeping, not a finding.
+		await route.abort().catch(() => {});
+	});
+}
+
 /** Summon a cell's editor and replace its whole source, leaving the edit UNFLUSHED. */
 async function retypeCell(page: Page, cell: Locator, source: string): Promise<void> {
 	await cell.click();
@@ -906,5 +929,66 @@ test('naming the target waits for the edit it raced, so the module holds the new
 		.toBe(true);
 	expect(heldCount()).toBeGreaterThan(0);
 	expect(readFileSync(modulePath, 'utf8')).not.toContain('def before():');
+	await page.unroute('**/api/cells/**');
+});
+
+test('an unsaved edit refuses the export only when that cell is IN the module', async ({
+	page,
+	request
+}) => {
+	// The wait has to be TRUE, not merely safe. Waiting on every in-flight edit
+	// refused an export over an UNMARKED cell's failed autosave - a module that
+	// would have matched the notebook exactly - under a sentence saying it would
+	// not. Both directions are pinned here: the unmarked cell must let the export
+	// through, and the MARKED one must still stop it.
+	const nb = await makeNotebook(request, 'export-scope.ipynb');
+	const markedId = await firstCellId(request, nb);
+	const modulePath = join(workspace, 'lib', 'scope.py');
+
+	const added = await request.post(`${baseURL}/api/cells`, {
+		data: { afterId: markedId, cellType: 'code', source: 'def loose():\n    return 0', nb }
+	});
+	expect(added.ok(), await added.text()).toBeTruthy();
+
+	const target = await request.post(`${baseURL}/api/notebooks/export-py`, {
+		data: { op: 'set-target', target: 'lib/scope.py', path: nb }
+	});
+	expect(target.ok(), await target.text()).toBeTruthy();
+	// Only the FIRST cell is in the module; the second is an ordinary cell.
+	const marked = await request.patch(`${baseURL}/api/cells/${markedId}`, {
+		data: { source: 'def kept():\n    return 1', export: true, nb }
+	});
+	expect(marked.ok(), await marked.text()).toBeTruthy();
+	await expect.poll(() => existsSync(modulePath)).toBe(true);
+	expect(readFileSync(modulePath, 'utf8')).toContain('def kept():');
+	expect(readFileSync(modulePath, 'utf8')).not.toContain('def loose():');
+
+	await page.goto(`${baseURL}/?ws=${encodeURIComponent(workspace)}`);
+	await page.locator(`[data-testid="tree-file"][data-path="${nb}"]`).click();
+	const cells = page.locator('[data-testid="cell"]:visible');
+	await expect(cells).toHaveCount(2);
+	const notice = page.getByTestId('app-notice');
+	const feedback = page.locator('[data-testid="export-feedback"]:visible');
+
+	// ONE handler for both directions: unrouting between them races a held handler
+	// still asleep, which leaves the second direction's PATCH unfailed.
+	await failSourcePatches(page);
+
+	// DIRECTION 1 - the UNMARKED cell. Its source is not in the module, so a write
+	// that never lands changes nothing about what the export would produce. The
+	// feedback is the proof the export really RAN rather than being skipped.
+	await retypeCell(page, cells.nth(1), 'def loose():\n    return 99');
+	await page.locator('[data-testid="export-run"]:visible').click();
+	await expect(feedback).toContainText('Exported 1 cell');
+	await expect(notice).toHaveCount(0);
+	expect(readFileSync(modulePath, 'utf8')).toContain('def kept():');
+
+	// DIRECTION 2 - the MARKED cell, the case the wait exists for. Unchanged by the
+	// narrowing: the export still refuses, and still says why.
+	await retypeCell(page, cells.nth(0), 'def kept():\n    return 42');
+	await page.locator('[data-testid="export-run"]:visible').click();
+	await expect(notice).toBeVisible();
+	await expect(notice).toContainText('could not be saved');
+	expect(readFileSync(modulePath, 'utf8')).not.toContain('return 42');
 	await page.unroute('**/api/cells/**');
 });
