@@ -1317,6 +1317,12 @@ function exportBaseDir(doc: NotebookDoc, base: ExportBase): string {
  * A no-op also covers re-picking the current base. Refusals are typed
  * (`InvalidExportTargetError`) exactly like the setter's, and the same
  * `persist`-throw distinction applies.
+ *
+ * It deliberately does NOT regenerate the module, unlike its sibling
+ * `setExportTarget` - which is why it is not a fourth entry in
+ * `regenerateExportModule`'s list of explicit callers: re-expression changes only
+ * how the path is SPELLED - the same marked cells, the same resolved file - so it
+ * moves nothing an export would read or write.
  */
 export function setExportBase(base: string, nb?: string | null, originId?: string | null): ExportTargetState {
 	const doc = docFor(nb);
