@@ -189,6 +189,32 @@ cells, so a marked cell calling an `exporti` helper yields a module that raises
 it is a real limit. The clobber guard in `export-py.ts` (refusing to overwrite a file that
 does not start with Cellar's header) is what stops it damaging an existing nbdev module.
 
+### 5.0 Opening an ESTABLISHED nbdev repo writes nothing, and that is an outcome
+
+Reading `#| export` as a mark changed what happens on a save in nbdev's own repositories,
+and the consequence is worth stating because it is the feature's primary use case. Before,
+such a notebook had a `#|default_exp` TARGET but zero marked cells, so `exportNotebookToPy`
+returned `no-cells` and never reached the write. Now the marks are real, so every save
+reaches it - and the module already on disk carries **nbdev's** header, not Cellar's, so the
+clobber guard declines.
+
+The guard itself is unchanged: **Cellar never overwrites a file it did not generate.** What
+changed is how that refusal is REPORTED. It is a first-class not-written outcome
+(`ExportResult.reason === 'foreign-module'`) rather than a throw, because `autoExportPy`
+runs on every persist: as an error it set `doc.lastExportError` permanently, on a channel
+only MCP's `moduleFailure` reads, so a human saw every affordance reading healthy while the
+module was never regenerated. As an outcome, no error is recorded, the manual Export button
+still says why nothing was written, and MCP's `module.reason` names the same cause and the
+same two remedies (point the target at a path Cellar owns, or remove that file). An EMPTY
+file at the target is still overwritten, and a file that cannot be READ is still an error -
+neither was verified as foreign.
+
+The steady state is therefore: Cellar reads such a notebook correctly (the marks, the
+target under `lib_path`) and writes nothing into the library, which is the safe direction.
+Regenerating nbdev's own modules is not in this slice. **Export-on-every-save is the deeper
+problem here** - the refusal is re-derived on each persist rather than once - and is filed
+as its own change; nothing about the persist/auto-export cadence was touched.
+
 ### 5.1 Known cosmetic divergence: the directive line survives into the module
 
 nbdev STRIPS directives from an exported cell's source (`remove_directives`); Cellar emits

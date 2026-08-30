@@ -138,6 +138,38 @@ describe('nbdevLibPath reads nbdev\'s own rule', () => {
 		pyproject('[project]\nname = "pkg"\n[tool.nbdev]\nlib_path = ["a", "b"]\n');
 		expect(nbdev.nbdevLibPath(WS)).toMatchObject({ ok: false });
 	});
+
+	it('refuses a [project] it cannot read as a plain table, rather than degenerating', () => {
+		// The name fallback has to follow the SAME refuse-never-degrade rule as
+		// `[tool.nbdev]` above. An inline table and dotted keys are both legal TOML that
+		// a table-header lookup does not match, and degenerating there answers "the
+		// config directory" for a project nbdev writes into `<dir>/pkg` - the
+		// wrong-root write this resolution exists to fix, reported `ok:true`.
+		// Both spellings must sit at TOP LEVEL: a dotted key written after a table
+		// header belongs to THAT table, so `[tool.nbdev]` + `project.name` is
+		// `tool.nbdev.project.name` and is correctly not a `[project]` at all.
+		for (const spelling of ['project = { name = "pkg" }\n[tool.nbdev]\n', 'project.name = "pkg"\n[tool.nbdev]\nnbs_path = "nbs"\n']) {
+			pyproject(spelling);
+			const r = nbdev.nbdevLibPath(WS);
+			expect(r, spelling).toMatchObject({ ok: false });
+			expect((r as { reason: string }).reason, spelling).toMatch(/project is not a plain table/);
+		}
+
+		// ...and a directive target is then UNRESOLVABLE rather than resolving into a
+		// directory nobody chose.
+		pyproject('project = { name = "pkg" }\n[tool.nbdev]\n');
+		directiveNb('core');
+		expect(nbmod.exportTargetInfo(NB)).toMatchObject({ ok: false, source: 'default_exp' });
+		expect(existsSync(join(ROOT, 'core.py'))).toBe(false);
+		expect(existsSync(join(WS, 'core.py'))).toBe(false);
+	});
+
+	it('still degenerates to the config directory when [project] is genuinely absent', () => {
+		// nbdev's own rule, and the half that must NOT become a refusal: "no name" is a
+		// fact Cellar can read, unlike "a name in a shape it cannot read".
+		pyproject('[tool.nbdev]\nnbs_path = "nbs"\n');
+		expect(nbdev.nbdevLibPath(WS)).toMatchObject({ ok: true, libPath: ROOT });
+	});
 });
 
 describe('a directive target resolves under lib_path', () => {

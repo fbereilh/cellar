@@ -998,11 +998,9 @@ export type SetCellExportRefusal = 'no-such-cell' | 'not-code' | 'export-directi
  * put in the 409 body by the PATCH route, and is preferred over any client
  * derivation. MCP's `set_cell_export` carries the same fact under the same name.
  */
-export interface SetCellExportResult {
-	ok: boolean;
-	reason?: SetCellExportRefusal;
-	alsoFlagged?: boolean;
-}
+export type SetCellExportResult =
+	| { ok: true }
+	| { ok: false; reason: SetCellExportRefusal; alsoFlagged?: boolean };
 
 /**
  * Mark (or unmark) a code cell for nbdev-style export in the allowlisted `cellar`
@@ -1024,7 +1022,7 @@ export function setCellExport(
 	exported: boolean,
 	nb?: string | null,
 	originId?: string | null
-): { ok: true } | { ok: false; reason: SetCellExportRefusal; alsoFlagged?: boolean } {
+): SetCellExportResult {
 	const doc = docFor(nb);
 	const cell = find(doc, id);
 	if (!cell) return { ok: false, reason: 'no-such-cell' };

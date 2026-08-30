@@ -366,9 +366,28 @@ function libPathFrom(path: string): NbdevLibPath | 'skip' {
 			};
 		return { ok: true, libPath: resolve(dir, value.trim()), configPath: path };
 	}
-	// nbdev's fallback: the project name with `-` folded to `_`. An absent or empty
-	// name degenerates to the config directory itself, which is what nbdev does.
+	// nbdev's fallback: the project name with `-` folded to `_`. A genuinely ABSENT
+	// `[project]`, or one with no name, degenerates to the config directory itself,
+	// which is what nbdev does.
+	//
+	// A `[project]` Cellar cannot read as a plain table is a different thing and is
+	// REFUSED, exactly as `[tool.nbdev]` above is: an inline table
+	// (`project = { name = "pkg" }`) or dotted keys (`project.name = "pkg"`) are both
+	// legal TOML that `findTable` does not match, so degenerating there would silently
+	// answer "the config directory" for a project nbdev writes into `<dir>/pkg` - the
+	// wrong-root write this whole resolution exists to fix, reached through the
+	// fallback and reported `ok:true`. Unresolvable is the honest answer; the explicit
+	// `export_target` escape hatch never consults any of this.
 	const project = findTable(doc, PROJECT_TABLE);
+	if (!project) {
+		const line = otherFormLine(doc, PROJECT_TABLE);
+		if (line !== null)
+			return {
+				ok: false,
+				configPath: path,
+				reason: `it sets no lib_path, and its ${PROJECT_TABLE.join('.')} is not a plain table (line ${line + 1})`
+			};
+	}
 	const nameAssigned = project ? readAssignment(doc, project, 'name') : null;
 	const name = nameAssigned ? parseTomlString(nameAssigned.value) : null;
 	if (nameAssigned && name === null)

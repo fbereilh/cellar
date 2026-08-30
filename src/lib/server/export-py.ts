@@ -47,8 +47,16 @@ export interface ExportResult {
 	target: string | null;
 	/** number of cells exported. */
 	count: number;
-	/** why nothing was written, when `written` is false. */
-	reason?: 'no-target' | 'no-cells' | 'unchanged';
+	/**
+	 * why nothing was written, when `written` is false.
+	 *
+	 * `foreign-module` is the clobber guard declining: a file Cellar did not generate
+	 * already occupies the target, so there is nothing it may legitimately write. It
+	 * is an OUTCOME rather than an error because it is the STEADY STATE of an
+	 * established nbdev repo - the library module carries nbdev's own header, and
+	 * every save would otherwise raise and leave `lastExportError` set forever.
+	 */
+	reason?: 'no-target' | 'no-cells' | 'unchanged' | 'foreign-module';
 	/**
 	 * Constructs in the marked cells that make the generated module uncompilable
 	 * (`$lib/exportHazard`). Empty on every ordinary export, and empty for
@@ -56,7 +64,9 @@ export interface ExportResult {
 	 *
 	 * Carried on `unchanged` too, and that is the point rather than an edge case:
 	 * the broken module is still ON DISK, so a re-export that writes nothing must
-	 * not report the plain success the first one was corrected out of.
+	 * not report the plain success the first one was corrected out of. Empty for
+	 * `foreign-module` for the `no-cells` reason: the file at the target is not one
+	 * Cellar wrote, so nothing on disk describes these marks.
 	 *
 	 * A POSITIVE finding, never a compile verdict - the class is wider than what
 	 * is detected. `$lib/exportHazard`'s header states the measured boundary; no
@@ -644,10 +654,15 @@ export function exportNotebookToPy(doc: NotebookDoc): ExportResult {
 			throw new Error(
 				`refusing to overwrite ${target}: it exists but could not be read, so it cannot be verified as a Cellar-generated module`
 			);
-		if (!isGeneratedModule(existing) && existing.trim() !== '')
-			throw new Error(
-				`refusing to overwrite ${target}: it is not a Cellar-generated module (it does not begin with "${HEADER}") - point the export target at a path Cellar owns, or delete that file`
-			);
+		// The clobber guard, UNCHANGED in what it refuses: Cellar never overwrites a
+		// file it did not generate. Only the REPORTING changed - this is a
+		// not-written OUTCOME rather than a throw, because it is the ordinary state
+		// of an established nbdev repo (the module carries nbdev's own header), and
+		// `autoExportPy` runs on every save: as an error it left `lastExportError`
+		// permanently set on a notebook nothing was wrong with, on a channel no human
+		// surface reads.
+		if (isForeignModuleText(existing))
+			return { written: false, target, count: exported.length, reason: 'foreign-module', hazards: [] };
 	}
 	mkdirSync(dirname(abs), { recursive: true });
 	writeFileSync(abs, text);
@@ -679,6 +694,30 @@ export function generatedModuleExists(target: string): boolean {
 	} catch {
 		return false;
 	}
+}
+
+/**
+ * Does a file Cellar did NOT generate occupy this workspace-relative target?
+ *
+ * The reporting half of the clobber guard, so the write site's refusal and every
+ * caller that has to EXPLAIN it read one rule rather than two that can drift. An
+ * EMPTY file is not foreign - the write site overwrites it (pre-creating the module
+ * with `touch` is an ordinary workflow), so saying otherwise would explain a refusal
+ * that never happened. A file we cannot READ is not foreign either: it was not
+ * verified as anything, and that case is still an error at the write site.
+ */
+export function foreignModuleAt(target: string): boolean {
+	try {
+		const existing = safeRead(resolveInWorkspace(target));
+		return existing !== null && isForeignModuleText(existing);
+	} catch {
+		return false;
+	}
+}
+
+/** Is this file text something OTHER than a module Cellar generated? */
+function isForeignModuleText(text: string): boolean {
+	return text.trim() !== '' && !isGeneratedModule(text);
 }
 
 /**

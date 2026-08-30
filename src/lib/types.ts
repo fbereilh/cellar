@@ -89,7 +89,7 @@ export interface ExportPyResult {
 	written: boolean;
 	target: string | null;
 	count: number;
-	reason?: 'no-target' | 'no-cells' | 'unchanged';
+	reason?: 'no-target' | 'no-cells' | 'unchanged' | 'foreign-module';
 	/**
 	 * Constructs in the marked cells that make the generated module uncompilable
 	 * (`$lib/exportHazard`). Present and non-empty means the module was written and
