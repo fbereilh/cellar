@@ -265,13 +265,16 @@ export function docExportHazards(
 	const exported = doc.cells.filter((c: Cell) => isExportCell(c)).map((c) => c.source);
 	if (!exported.length) return [];
 	const hazards = exportHazards(exported);
-	// The foreign-module question is asked LAST in code and FIRST in meaning: a
-	// hazard sentence claims the module WAS written and will not import, and over a
-	// write the clobber guard declined that is simply false. Ordering it here is what
-	// keeps the export bar and MCP's `moduleHazard` (which reads this same function
-	// through `exportHazardsFor`) from describing one document differently - the
-	// drift the shared-rule convention exists to prevent. `exportNotebookToPy`
-	// already zeroes its own hazards on that branch, for the same reason.
+	// The foreign-module question is asked LAST in code and FIRST in meaning: over a
+	// target the clobber guard declines there is no module of ours and never will be,
+	// so a hazard sentence describes a file that cannot exist - MCP's `moduleHazard`
+	// says outright that `<target>` WAS written, and the export bar's own claim about
+	// the module these marks describe is equally beside the point when no export can
+	// land. Ordering it here is what keeps that bar and `moduleHazard` (which reads
+	// this same function through `exportHazardsFor`) from describing one document
+	// differently - the drift the shared-rule convention exists to prevent.
+	// `exportNotebookToPy` already zeroes its own hazards on that branch, for the
+	// same reason.
 	//
 	// Asked only once there IS a hazard to suppress, so the file read costs nothing
 	// on the ordinary `getNotebook` / persist path.
@@ -730,10 +733,11 @@ export function exportNotebookToPy(doc: NotebookDoc): ExportResult {
 		// The clobber guard, UNCHANGED in what it refuses: Cellar never overwrites a
 		// file it did not generate. Only the REPORTING changed - this is a
 		// not-written OUTCOME rather than a throw, because it is the ordinary state
-		// of an established nbdev repo (the module carries nbdev's own header), and
-		// `autoExportPy` runs on every save: as an error it left `lastExportError`
-		// permanently set on a notebook nothing was wrong with, on a channel no human
-		// surface reads.
+		// of an established nbdev repo (the module carries nbdev's own header, and
+		// reading `#| export` means every notebook there HAS marks, so every export
+		// reaches this branch): as an error it answered the button with a failure and
+		// left `lastExportError` set on the two best-effort callers - a channel no
+		// human surface reads - for a notebook nothing was wrong with.
 		if (isForeignModuleText(existing))
 			return { written: false, target, count: exported.length, reason: 'foreign-module', hazards: [] };
 	}

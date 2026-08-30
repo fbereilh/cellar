@@ -133,8 +133,9 @@ test('clicking it explains rather than silently doing nothing, and touches no so
 
 test('the module really contains the directive-marked cell, and not the plain one', async ({ page }) => {
 	await openNotebook(page);
-	// Nudge a save so auto-on-save regenerates the module for this workspace.
-	await cellEl(page, PLAIN).getByTestId('toggle-agent-hidden').click();
+	// The module is written by an EXPLICIT action and never by a save, so ask for
+	// one: the "Export to .py" button is the plainest of the three.
+	await page.getByTestId('export-run').click();
 
 	const modulePath = join(workspace, 'lib', 'mod.py');
 	await expect(async () => {

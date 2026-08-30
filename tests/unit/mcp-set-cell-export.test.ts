@@ -630,9 +630,10 @@ describe('a regeneration that FAILED is reported, never read as a success', () =
 		expect(reason).not.toMatch(/edit a marked cell/);
 
 		// This is an OUTCOME, not an error: it is the steady state of an established
-		// nbdev repo, whose module carries nbdev's own header, and `autoExportPy` runs
-		// on EVERY save - as a throw it left a permanent record on a channel no human
-		// surface reads while every affordance still read healthy.
+		// nbdev repo, whose module carries nbdev's own header, and every notebook there
+		// HAS marks (the `#| export` directive is one), so every export reaches it - as
+		// a throw it answered the button with a failure and left a record on the two
+		// best-effort callers' channel, which no human surface reads.
 		expect(nbmod.lastExportError(target)).toBe(null);
 		expect(nbmod.exportPy(target)).toMatchObject({
 			written: false,
@@ -936,9 +937,9 @@ describe('a regeneration that FAILED is reported, never read as a success', () =
 		expect(nbmod.lastExportError(target)).toBe(null);
 
 		// The target is repointed under a path whose parent is a FILE, so the write
-		// itself fails (ENOTDIR - the shape `autoExportPy`'s own comment names, beside
-		// EACCES and ENOSPC). Deliberately NOT the clobber guard, which is a refusal
-		// rather than a failure and records nothing by design.
+		// itself fails (ENOTDIR - the shape `regenerateExportModule`'s own comment
+		// names, beside EACCES and ENOSPC). Deliberately NOT the clobber guard, which is
+		// a refusal rather than a failure and records nothing by design.
 		writeFileSync(join(WS, 'blocker'), 'not a directory\n');
 		svc.setExportTarget('blocker/records.py', target);
 		expect(() => nbmod.exportPy(target)).toThrow();

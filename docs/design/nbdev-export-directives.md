@@ -235,37 +235,42 @@ does not start with Cellar's header) is what stops it damaging an existing nbdev
 
 ### 5.0 Opening an ESTABLISHED nbdev repo writes nothing, and that is an outcome
 
-Reading `#| export` as a mark changed what happens on a save in nbdev's own repositories,
-and the consequence is worth stating because it is the feature's primary use case. Before,
-such a notebook had a `#|default_exp` TARGET but zero marked cells, so `exportNotebookToPy`
-returned `no-cells` and never reached the write. Now the marks are real, so every save
-reaches it - and the module already on disk carries **nbdev's** header, not Cellar's, so the
-clobber guard declines.
+Reading `#| export` as a mark changed what happens on an export in nbdev's own
+repositories, and the consequence is worth stating because it is the feature's primary use
+case. Before, such a notebook had a `#|default_exp` TARGET but zero marked cells, so
+`exportNotebookToPy` returned `no-cells` and never reached the write. Now the marks are
+real, so every export reaches it - and the module already on disk carries **nbdev's**
+header, not Cellar's, so the clobber guard declines.
 
 The guard itself is unchanged: **Cellar never overwrites a file it did not generate.** What
 changed is how that refusal is REPORTED. It is a first-class not-written outcome
-(`ExportResult.reason === 'foreign-module'`) rather than a throw, because `autoExportPy`
-runs on every persist: as an error it set `doc.lastExportError` permanently, on a channel
-only MCP's `moduleFailure` reads, so a human saw every affordance reading healthy while the
-module was never regenerated. As an outcome, no error is recorded, the manual Export button
-still says why nothing was written, and MCP's `module.reason` - on BOTH export write tools,
-through one shared helper, since either can trigger the regeneration - names the same cause and the
-same two remedies (point the target at a path Cellar owns, or remove that file). An EMPTY
-file at the target is still overwritten, and a file that cannot be READ is still an error -
-neither was verified as foreign.
+(`ExportResult.reason === 'foreign-module'`) rather than a throw, because the refusal is the
+STEADY STATE of such a repository rather than a fault: every export reaches it, so as an
+error it answered the Export button with a failure and set `doc.lastExportError` on the two
+BEST-EFFORT explicit callers (`setExportTarget`, `setCellExports`) - a channel only MCP's
+`moduleFailure` reads, so an agent saw a fault and a human saw nothing at all. As an
+outcome, no error is recorded, the manual Export button still says why nothing was written,
+and MCP's `module.reason` - on BOTH export write tools, through one shared helper, since
+either can trigger the regeneration - names the same cause and the same two remedies (point
+the target at a path Cellar owns, or remove that file). An EMPTY file at the target is still
+overwritten, and a file that cannot be READ is still an error - neither was verified as
+foreign.
 
-A hazard may not speak over it either. `ExportResult.hazards` says the module WAS written
-and will not import, which is false over a write the guard declined - so the foreign-module
-question is asked BEFORE the hazard, and the precedence is expressed ONCE, in
+A hazard may not speak over it either. It describes the module these marks make - and MCP's
+`moduleHazard` says outright that the target WAS written - so over a write the guard
+declined it describes a file that does not and will not exist. The foreign-module
+question is therefore asked BEFORE the hazard, and the precedence is expressed ONCE, in
 `docExportHazards`, which the export bar (through `exportTargetView`) and MCP's
 `moduleHazard` (through `exportHazardsFor`) both read. It costs a file read only once there
 IS a hazard to suppress, so the ordinary `getNotebook` / persist path is untouched.
 
 The steady state is therefore: Cellar reads such a notebook correctly (the marks, the
 target under `lib_path`) and writes nothing into the library, which is the safe direction.
-Regenerating nbdev's own modules is not in this slice. **Export-on-every-save is the deeper
-problem here** - the refusal is re-derived on each persist rather than once - and is filed
-as its own change; nothing about the persist/auto-export cadence was touched.
+Regenerating nbdev's own modules is not in this slice. Export-on-every-save was the deeper
+problem this refusal used to expose; it was filed as its own change and has since landed
+(the module is written by an explicit action and never by a save), so the refusal is now
+reached only when someone ASKS for an export - which is exactly the caller that can be told
+about it. Nothing here changed that cadence.
 
 ### 5.1 Known cosmetic divergence: the directive line survives into the module
 
