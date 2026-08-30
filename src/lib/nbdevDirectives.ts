@@ -97,22 +97,74 @@ export function nbdevDirective(source: string | null | undefined, name: string):
 		// Trim only the line terminator; leading whitespace is part of the patterns.
 		const line = source.slice(at, end > at && source[end - 1] === '\r' ? end - 1 : end);
 		at = end + 1;
-		if (PREFIX.test(line)) {
-			const rest = line.replace(PREFIX, '').trim();
-			const m = rest === '' ? null : NAME_VALUE.exec(rest);
-			// A bare `#|` parses to no directive at all yet still belongs to the leading
-			// block (it matched the prefix), so it must not end the walk.
-			if (m && m[1] === name) found = m[2] === 'true' ? '' : m[2];
-			continue;
-		}
-		// A cell magic or a blank line stays inside the block; anything else ends it.
-		if (CELL_MAGIC.test(line) || line.trim() === '') {
-			if (nl === -1) break;
-			continue;
-		}
-		break;
+		const d = directiveOn(line);
+		if (d) {
+			if (d.name === name) found = d.value;
+		} else if (!staysInBlock(line)) break;
+		if (nl === -1) break;
 	}
 	return found;
+}
+
+/**
+ * The value of the FIRST `#| <name>` line that sits OUTSIDE this source's leading
+ * directive block, or null when there is none. A BARE one reports `''`, exactly as
+ * `nbdevDirective` does.
+ *
+ * The REPORTING half of the leading-block rule, and it is deliberately not a
+ * loosening of it: what nbdev ignores, Cellar ignores. But `#| default_exp core`
+ * written after a line of code, after a plain comment, or inside a triple-quoted
+ * string LOOKS like a working target, and Cellar's own scan used to honour it - so
+ * resolving to nothing and saying nothing leaves a previously generated module
+ * quietly going stale. This is what lets the caller NAME the ignored line instead
+ * (`storedExportTarget` in `server/export-py.ts`).
+ *
+ * Cost: only the caller's no-target fallback runs this, and only for a cell that
+ * already passed its `includes('default_exp')` guard AND yielded no usable
+ * directive - i.e. exactly the suspicious cell. It never touches the ordinary
+ * resolve path, where `nbdevDirective` still answers most cells from line 1.
+ */
+export function nbdevDirectiveOutsideBlock(
+	source: string | null | undefined,
+	name: string
+): string | null {
+	if (!source) return null;
+	let inBlock = true;
+	let at = 0;
+	const len = source.length;
+	while (at <= len) {
+		const nl = source.indexOf('\n', at);
+		const end = nl === -1 ? len : nl;
+		const line = source.slice(at, end > at && source[end - 1] === '\r' ? end - 1 : end);
+		at = end + 1;
+		const d = directiveOn(line);
+		if (d) {
+			if (!inBlock && d.name === name) return d.value;
+		} else if (inBlock && !staysInBlock(line)) inBlock = false;
+		if (nl === -1) break;
+	}
+	return null;
+}
+
+/**
+ * The directive a single line carries, or null when the line is not a `#|` line at
+ * all. A BARE `#|` reports a null NAME: it names no directive yet still belongs to
+ * the leading block (it matched the prefix), so it must not end a walk.
+ *
+ * The line-level RULE lives here so both walks above read one copy of it - the
+ * loops differ only in what they do with the answer.
+ */
+function directiveOn(line: string): { name: string | null; value: string } | null {
+	if (!PREFIX.test(line)) return null;
+	const rest = line.replace(PREFIX, '').trim();
+	const m = rest === '' ? null : NAME_VALUE.exec(rest);
+	if (!m) return { name: null, value: '' };
+	return { name: m[1], value: m[2] === 'true' ? '' : m[2] };
+}
+
+/** Does a NON-directive line stay inside the leading block? (a cell magic, or blank) */
+function staysInBlock(line: string): boolean {
+	return CELL_MAGIC.test(line) || line.trim() === '';
 }
 
 /** Is `name` present as a BARE directive (no value)? */

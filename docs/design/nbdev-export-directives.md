@@ -62,6 +62,19 @@ thing; names are **case-sensitive**; and a repeated name is **LAST**-wins (nbdev
 dict over the block, so a later line overwrites an earlier one - the obvious first-wins
 guess is wrong, and the differential is what caught it).
 
+**The narrowing is REPORTED, not silent.** The rule stays nbdev's - what nbdev ignores,
+Cellar ignores - but a notebook whose `#|default_exp` sat after code (which the old `/m`
+regex honoured) used to generate a committed module and now generates none, and with no
+target AND no error the export bar reads exactly like a notebook that never configured one
+while the module on disk quietly goes stale. So when nothing at all resolves and a
+`#|default_exp` line exists OUTSIDE its cell's leading block, that is reported through the
+EXISTING `exportResolveError` channel (`nbdevDirectiveOutsideBlock` +
+`misplacedDefaultExpError`), naming the line, that nbdev ignores it there too, and both ways
+out. No new surface, and no leniency in the RULE: the detection runs ONLY on the no-target
+fallback, behind the same `includes('default_exp')` guard, and only for a cell that already
+yielded no usable directive - so a notebook that resolves normally, and the far commoner one
+with no export configured at all, pay nothing.
+
 ---
 
 ## 3. The mark: which source wins, and why the question has no answer to argue about
@@ -209,6 +222,13 @@ through one shared helper, since either can trigger the regeneration - names the
 same two remedies (point the target at a path Cellar owns, or remove that file). An EMPTY
 file at the target is still overwritten, and a file that cannot be READ is still an error -
 neither was verified as foreign.
+
+A hazard may not speak over it either. `ExportResult.hazards` says the module WAS written
+and will not import, which is false over a write the guard declined - so the foreign-module
+question is asked BEFORE the hazard, and the precedence is expressed ONCE, in
+`docExportHazards`, which the export bar (through `exportTargetView`) and MCP's
+`moduleHazard` (through `exportHazardsFor`) both read. It costs a file read only once there
+IS a hazard to suppress, so the ordinary `getNotebook` / persist path is untouched.
 
 The steady state is therefore: Cellar reads such a notebook correctly (the marks, the
 target under `lib_path`) and writes nothing into the library, which is the safe direction.

@@ -118,8 +118,71 @@ describe('resolveExportTarget', () => {
 		// ...and a `#|default_exp` sitting AFTER code is not a directive to nbdev, so
 		// it must not be one here either. Honouring it was the "half-speaks nbdev"
 		// defect: a target resolved from text nbdev ignores, written to a file nbdev
-		// would never write (scout report section 5.2).
+		// would never write (scout report section 5.2). It resolves to NO module -
+		// but it is reported, not dropped in silence (below).
 		const afterCode = doc({ cells: [{ id: 'a', cell_type: 'code', source: `${source}#|default_exp lib.cheap` }] });
-		expect(resolveExportTarget(afterCode)).toBeNull();
+		expect(resolveExportTarget(afterCode)).toMatchObject({ ok: false, source: 'default_exp' });
+	});
+});
+
+/**
+ * A `#|default_exp` line nbdev IGNORES must not vanish silently.
+ *
+ * The rule is unchanged and stays nbdev's (leading block only) - the previous scan
+ * was a `/m` regex over the whole source and DID honour such a line, so a notebook
+ * that used to generate a committed module now generates none. With no target and
+ * no error the export bar reads exactly like a notebook that never configured one,
+ * while the module on disk quietly goes stale, so the ignored line is reported
+ * through the SAME `exportResolveError` an unresolvable target already uses.
+ */
+describe('a `#|default_exp` outside the leading block is REPORTED, not silently dropped', () => {
+	const doc = (over: Partial<NotebookDoc>): NotebookDoc => ({ path: '/ws/n.ipynb', cells: [], ...over });
+	const misplaced = (src: string) => resolveExportTarget(doc({ cells: [{ id: 'a', cell_type: 'code', source: src }] }));
+
+	for (const [src, why] of [
+		['x = 1\n#|default_exp core', 'after code'],
+		['# a note\n#| default_exp core', 'after a plain comment'],
+		["s = '''\n#| default_exp core\n'''", 'inside a triple-quoted string']
+	] as Array<[string, string]>)
+		it(`names the cause for a directive ${why}`, () => {
+			const info = misplaced(src);
+			expect(info).toMatchObject({ ok: false, source: 'default_exp' });
+			const error = (info as { error: string }).error;
+			// The three things a user can act on: WHICH line, that nbdev ignores it there
+			// too (so "fix Cellar" is not the answer), and both ways out.
+			expect(error).toContain('core');
+			expect(error).toContain('LEADING directive block');
+			expect(error).toContain('nbdev ignores');
+			expect(error).toMatch(/top of its cell/);
+			expect(error).toMatch(/explicit export target/);
+		});
+
+	it('says nothing for a directive nbdev really does read', () => {
+		expect(misplaced('#| default_exp core\nx = 1')).toMatchObject({ ok: true, target: 'core.py' });
+	});
+
+	it('says nothing for a notebook that merely mentions the word', () => {
+		expect(misplaced('default_exp = 3\nprint(default_exp)')).toBeNull();
+		expect(misplaced('x = 1\n# a note about default_exp')).toBeNull();
+	});
+
+	it('never speaks over a target that DOES resolve, wherever the stray line sits', () => {
+		// A real target elsewhere in the notebook wins: the report exists only for the
+		// case where nothing at all resolved.
+		const d = doc({
+			cells: [
+				{ id: 'a', cell_type: 'code', source: 'x = 1\n#|default_exp stray' },
+				{ id: 'b', cell_type: 'code', source: '#|default_exp real\ny = 2' }
+			]
+		});
+		expect(resolveExportTarget(d)).toMatchObject({ ok: true, target: 'real.py' });
+	});
+
+	it('is outranked by an explicit notebook-level target', () => {
+		const d = doc({
+			metadata: { cellar: { export_target: 'utils.py' } },
+			cells: [{ id: 'a', cell_type: 'code', source: 'x = 1\n#|default_exp stray' }]
+		});
+		expect(resolveExportTarget(d)).toMatchObject({ ok: true, source: 'metadata', target: 'utils.py' });
 	});
 });

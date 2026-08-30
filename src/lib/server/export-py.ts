@@ -27,7 +27,7 @@ import { resolveInWorkspace, workspaceRoot } from './fstree';
 import { gitRootOf } from './git';
 import { logicalLines, stripComments, splitSimpleStatements } from './imports';
 import { isExportCell } from '../exportRole';
-import { nbdevDirective } from '../nbdevDirectives';
+import { nbdevDirective, nbdevDirectiveOutsideBlock } from '../nbdevDirectives';
 import { nbdevLibPath } from './nbdev';
 import { isExportBase, type ExportBase } from '../exportTarget';
 import { futureImportJoinedHazard, type ExportHazard } from '../exportHazard';
@@ -264,7 +264,20 @@ export function docExportHazards(
 	if (!resolved) return [];
 	const exported = doc.cells.filter((c: Cell) => isExportCell(c)).map((c) => c.source);
 	if (!exported.length) return [];
-	return exportHazards(exported);
+	const hazards = exportHazards(exported);
+	// The foreign-module question is asked LAST in code and FIRST in meaning: a
+	// hazard sentence claims the module WAS written and will not import, and over a
+	// write the clobber guard declined that is simply false. Ordering it here is what
+	// keeps the export bar and MCP's `moduleHazard` (which reads this same function
+	// through `exportHazardsFor`) from describing one document differently - the
+	// drift the shared-rule convention exists to prevent. `exportNotebookToPy`
+	// already zeroes its own hazards on that branch, for the same reason.
+	//
+	// Asked only once there IS a hazard to suppress, so the file read costs nothing
+	// on the ordinary `getNotebook` / persist path.
+	if (!hazards.length) return [];
+	if (resolved.ok && foreignModuleAt(resolved.target)) return [];
+	return hazards;
 }
 
 /**
@@ -400,6 +413,13 @@ function storedExportTarget(
 		const base = typeof rawBase === 'string' && rawBase.trim() ? rawBase.trim() : 'workspace';
 		return { path: explicit.trim(), base, source: 'metadata' };
 	}
+	// The value of a `#|default_exp` line this document carries that nbdev IGNORES
+	// (it sits outside its cell's leading directive block). Recorded lazily, INSIDE
+	// the loop that is already here, so the ordinary paths - a target that resolves,
+	// and the far commoner notebook with no export configured at all - pay nothing
+	// for it: it is read only for a cell that already passed the `includes` guard
+	// AND produced no usable directive.
+	let ignored: string | null = null;
 	for (const c of doc.cells) {
 		if (c.cell_type !== 'code' || !c.source.includes('default_exp')) continue;
 		// The scanner reports the RAW remainder of the directive line, because that is
@@ -408,12 +428,41 @@ function storedExportTarget(
 		// rather than in the shared scanner - unbounded, `#| default_exp core # note`
 		// resolved to a file literally called `core # note.py`.
 		const mod = nbdevDirective(c.source, 'default_exp')?.trim().split(/\s+/)[0];
-		if (!mod) continue;
+		if (!mod) {
+			if (ignored === null) ignored = nbdevDirectiveOutsideBlock(c.source, 'default_exp');
+			continue;
+		}
 		// nbdev writes a dotted module path (`pkg.utils`); map it to a file path.
 		const rel = mod.endsWith('.py') ? mod : mod.replace(/\./g, '/') + '.py';
 		return { ...directiveBase(rel), source: 'default_exp' };
 	}
+	// Nothing resolved, and the notebook holds a `#|default_exp` line nbdev ignores.
+	// The RULE is untouched (it stays ignored); what changes is that the drop stops
+	// being SILENT - see `misplacedDefaultExpError`.
+	if (ignored !== null)
+		return { path: '', base: 'workspace', source: 'default_exp', error: misplacedDefaultExpError(ignored) };
 	return null;
+}
+
+/**
+ * Why a `#|default_exp` line this notebook carries generates no module.
+ *
+ * Reading it would be the "half-speaks nbdev" defect (a target resolved from text
+ * nbdev ignores, written to a file nbdev would never write), so the leading-block
+ * rule stands. But the previous scan was a `/m` regex over the whole source and DID
+ * honour such a line, so a notebook that used to generate a committed module now
+ * generates none - and with no error and no target the export bar reads exactly
+ * like a notebook that never configured one, while the module on disk quietly goes
+ * stale. So the ignored line is reported through the EXISTING `exportResolveError`
+ * channel: same field, same surfaces, no new UI.
+ *
+ * It names the CAUSE (the line is not in its cell's leading directive block), that
+ * nbdev ignores it there too (so "fixing" Cellar is not the answer), and both ways
+ * out.
+ */
+function misplacedDefaultExpError(value: string): string {
+	const mod = value.trim().split(/\s+/)[0];
+	return `#|default_exp${mod ? ` ${mod}` : ''} is not in its cell's LEADING directive block - it sits after code, after a plain comment, or inside a string, and nbdev ignores a directive there, so Cellar does too: no module is being generated. Move the line to the very top of its cell (above any code or plain comment), or set an explicit export target instead.`;
 }
 
 /**

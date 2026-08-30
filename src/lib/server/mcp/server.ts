@@ -390,25 +390,24 @@ Follow this house style:
 
    EXPORT TARGET is the notebook's nbdev-style module: the .py file the cells
    marked for export are written to (its #|default_exp). Its stored path is
-   measured from a BASE - workspace (what a notebook storing none is measured
-   from), notebook (the notebook's own folder), or git (its enclosing repo). get_notebook_map's display block reports
+   measured from a BASE - workspace (the default), notebook (its own folder), or
+   git (its enclosing repo). get_notebook_map's display block reports
    export_target = the RESOLVED workspace-relative file, plus export_base and
    export_path (the stored spelling) whenever the base is not workspace, and each
    marked cell as export:true. export_target is null BOTH when unset and when a
-   configured target cannot resolve - export_target_error carries the reason and
-   is what tells those two apart. To build a module: set_export_target(path, base)
-   names the file (path:null clears it) and set_cell_export(ids, export:true|false)
-   marks/unmarks the PYTHON code cells that go in it (markdown/SQL are refused).
-   Pass a path back in the base it was reported under, never the resolved one; an
-   omitted base keeps the notebook's current one.
-   Both persist in metadata, and THOSE TWO CALLS are what rewrite the module
-   (while a target is set AND a cell stays marked). Editing or running a cell does
-   NOT: the module is written only by an explicit export action, so after changing
-   a marked cell's source call set_export_target with the SAME path and base to
-   rewrite it - that call always regenerates, where re-marking an already-marked
-   cell changes nothing and so writes nothing. Unmark the last marked cell and the
-   old file stays as it was. No cell source changes, so never hand-write an
-   #|export comment.
+   configured target cannot resolve; export_target_error tells those apart. To
+   build a module: set_export_target(path, base) names the file (path:null clears
+   it) and set_cell_export(ids, export:true|false) marks/unmarks the PYTHON code
+   cells that go in it (markdown/SQL are refused). Pass a path back in the base it
+   was reported under, never the resolved one; an omitted base keeps the current
+   one. Both persist in metadata, and THOSE TWO CALLS are what rewrite the module
+   (while a target is set AND a cell stays marked); editing or running one does
+   NOT, so after changing a marked cell's source call set_export_target with the
+   SAME path and base to rewrite it - that call always regenerates, where
+   re-marking an already-marked cell writes nothing. Unmark the last marked cell
+   and the old file stays as it was. Never hand-write an #|export line: nbdev's
+   directive ALSO marks the cell, and set_cell_export then cannot unmark it - only
+   deleting that line can.
 
 6. DECLARE YOUR WORKING NOTEBOOK FIRST. Your read/write/run tools target YOUR
    session's working notebook — not whichever tab the user happens to be looking

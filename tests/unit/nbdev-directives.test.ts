@@ -25,7 +25,11 @@ import { describe, it, expect } from 'vitest';
 import { execFileSync } from 'node:child_process';
 import { readFileSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
-import { nbdevDirective, hasBareNbdevDirective } from '../../src/lib/nbdevDirectives';
+import {
+	nbdevDirective,
+	hasBareNbdevDirective,
+	nbdevDirectiveOutsideBlock
+} from '../../src/lib/nbdevDirectives';
 
 /** Every case below was run through real nbdev; the comment records its verdict. */
 const RECOGNIZED: Array<[string, string]> = [
@@ -121,6 +125,71 @@ describe('the leading block bounds the cost', () => {
 	it('still reads a block that legitimately runs long', () => {
 		const many = '#| hide\n'.repeat(50) + '#| export\nx = 1\n';
 		expect(hasBareNbdevDirective(many, 'export')).toBe(true);
+	});
+});
+
+/**
+ * The REPORTING half of the leading-block rule.
+ *
+ * The rule itself is NOT loosened - what nbdev ignores, Cellar ignores - but a
+ * `#| default_exp core` written after code, after a plain comment, or inside a
+ * string LOOKS like a working target, and Cellar's own pre-fix scan honoured it.
+ * So the ignored line has to be FINDABLE, or the drop is silent and a previously
+ * generated module goes stale with nothing saying why (`export-py.ts` is what
+ * turns this into the user-facing message).
+ */
+describe('a directive OUTSIDE the leading block is findable, so the drop is not silent', () => {
+	// The three shapes that carry a REAL `export` directive nbdev ignores for its
+	// POSITION. The rest of NOT_RECOGNIZED is refused for its NAME instead
+	// (`exporti`, `EXPORT`), and those must report nothing here either - there is
+	// no misplaced `export` line in them at all.
+	const MISPLACED: Array<[string, string]> = [
+		['x = 1\n#| export\ndef a(): pass', 'after code'],
+		['# a note\n#| export\ndef a(): pass', 'after a PLAIN comment'],
+		["s = '''\n#| export\n'''\ndef a(): pass", 'inside a triple-quoted string']
+	];
+	for (const [source, why] of MISPLACED)
+		it(`finds the ignored export: ${why}`, () => {
+			// The very source the scanner correctly refuses is the one this must see.
+			expect(nbdevDirective(source, 'export')).toBeNull();
+			expect(nbdevDirectiveOutsideBlock(source, 'export')).toBe('');
+		});
+
+	it('reports nothing for a directive refused for its NAME rather than its place', () => {
+		const misplacedSources = new Set(MISPLACED.map(([src]) => src));
+		for (const [source, why] of NOT_RECOGNIZED) {
+			if (misplacedSources.has(source)) continue;
+			expect(nbdevDirectiveOutsideBlock(source, 'export'), why).toBeNull();
+		}
+	});
+
+	it('reports the ignored directive VALUE, so a caller can name the module', () => {
+		expect(nbdevDirectiveOutsideBlock('x = 1\n#| default_exp core', 'default_exp')).toBe('core');
+		expect(nbdevDirectiveOutsideBlock('# a note\n#|default_exp pkg.utils', 'default_exp')).toBe('pkg.utils');
+		expect(nbdevDirectiveOutsideBlock("s = '''\n#| default_exp core\n'''", 'default_exp')).toBe('core');
+	});
+
+	it('finds NOTHING for a directive that IS in the leading block', () => {
+		// The two answers are complements: reporting an in-block directive here would
+		// make the message claim a line is misplaced when nbdev reads it perfectly.
+		for (const [source] of RECOGNIZED) expect(nbdevDirectiveOutsideBlock(source, 'export')).toBeNull();
+		expect(nbdevDirectiveOutsideBlock('#| default_exp core\nx = 1', 'default_exp')).toBeNull();
+		// A BARE `#| default_exp` with no module IS in the block - it names no module,
+		// which is a different complaint, and must not be reported as misplaced.
+		expect(nbdevDirectiveOutsideBlock('#| default_exp\nx = 1', 'default_exp')).toBeNull();
+	});
+
+	it('finds nothing where there is no directive at all, however the word appears', () => {
+		expect(nbdevDirectiveOutsideBlock('default_exp = 3\nprint(default_exp)', 'default_exp')).toBeNull();
+		expect(nbdevDirectiveOutsideBlock('x = 1\n# a note about default_exp', 'default_exp')).toBeNull();
+		expect(nbdevDirectiveOutsideBlock('x = 1\n#| hide', 'default_exp')).toBeNull();
+		expect(nbdevDirectiveOutsideBlock(null, 'default_exp')).toBeNull();
+		expect(nbdevDirectiveOutsideBlock(undefined, 'default_exp')).toBeNull();
+	});
+
+	it('reads the FIRST occurrence once out of the block, and handles CRLF', () => {
+		expect(nbdevDirectiveOutsideBlock('x = 1\n#| default_exp a\n#| default_exp b', 'default_exp')).toBe('a');
+		expect(nbdevDirectiveOutsideBlock('x = 1\r\n#| default_exp a\r\n', 'default_exp')).toBe('a');
 	});
 });
 

@@ -1141,16 +1141,45 @@ describe('the tool registration', () => {
 		expect(desc![1].length).toBeLessThan(700);
 	});
 
-	it('keeps INSTRUCTIONS clause 5 free of the unconditional regeneration claim', () => {
-		const src = readFileSync(new URL('../../src/lib/server/mcp/server.ts', import.meta.url), 'utf8');
-		const clause = src.slice(src.indexOf('EXPORT TARGET is the notebook'), src.indexOf('6. DECLARE YOUR WORKING NOTEBOOK'));
+	it('states the export doctrine in the instructions the server really delivers', async () => {
+		// INSTRUCTIONS is delivered once at connect, BEFORE any tool schema, so it is
+		// the generated interface an agent is billed for and acts on. Read it off the
+		// SHIPPED factory through a real client rather than out of the source file.
+		const server = srv.createCellarMcpServer();
+		const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+		(serverTransport as { sessionId?: string }).sessionId = 'wire-instructions';
+		const client = new Client({ name: 'test-agent', version: '0.0.0' });
+		await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+
+		// The clause is hard-wrapped, so read it as the prose it is.
+		const instructions = (client.getInstructions() ?? '').replace(/\s+/g, ' ');
+		const clause = instructions.slice(
+			instructions.indexOf('EXPORT TARGET is the notebook'),
+			instructions.indexOf('6. DECLARE YOUR WORKING NOTEBOOK')
+		);
 		expect(clause).toBeTruthy();
 
-		// INSTRUCTIONS is delivered once at connect, BEFORE any tool schema, so an
-		// unconditional promise here contradicts the descriptions it frames - the very
-		// claim both of them had to drop.
-		expect(clause).not.toMatch(/regenerate the\s+module immediately/);
+		// An unconditional promise here contradicts the descriptions it frames - the
+		// very claim both of them had to drop.
+		expect(clause).not.toMatch(/regenerate the module immediately/);
 		expect(clause).toMatch(/stays? marked/);
-		expect(clause).toMatch(/set_cell_export/);
+		expect(clause).toContain('set_cell_export');
+
+		// ...and the consequence an agent can CREATE by editing source: nbdev's own
+		// `#|export` line marks the cell too, and marking-stays-metadata-only means
+		// set_cell_export can then never unmark it. The old wording ("no cell source
+		// changes, so never hand-write an #|export comment") gave the advice without
+		// the reason, so an agent that hand-wrote one anyway had no way to recover.
+		expect(clause).toContain('#|export');
+		expect(clause).toMatch(/ALSO marks the cell/);
+		expect(clause).toMatch(/cannot unmark it/);
+		expect(clause).toMatch(/deleting that line/);
+
+		// The honesty correction is paid for by CUTTING words, never by growing the
+		// string every session is billed for. The ceiling is the clause AS IT STOOD
+		// before this change (1572 chars, once explicit-export landed its own
+		// correction), so the directive sentence has to come in under what it joined -
+		// which it does, by tightening the surrounding prose rather than appending.
+		expect(clause.length).toBeLessThanOrEqual(1500);
 	});
 });
