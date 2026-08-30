@@ -401,9 +401,14 @@ Follow this house style:
    marks/unmarks the PYTHON code cells that go in it (markdown/SQL are refused).
    Pass a path back in the base it was reported under, never the resolved one; an
    omitted base keeps the notebook's current one.
-   Both persist in metadata; the module is rewritten while a target is set AND a
-   cell stays marked - unmark the last one and the old file stays as it was. No
-   cell source changes, so never hand-write an #|export comment.
+   Both persist in metadata, and THOSE TWO CALLS are what rewrite the module
+   (while a target is set AND a cell stays marked). Editing or running a cell does
+   NOT: the module is written only by an explicit export action, so after changing
+   a marked cell's source call set_export_target with the SAME path and base to
+   rewrite it - that call always regenerates, where re-marking an already-marked
+   cell changes nothing and so writes nothing. Unmark the last marked cell and the
+   old file stays as it was. No cell source changes, so never hand-write an
+   #|export comment.
 
 6. DECLARE YOUR WORKING NOTEBOOK FIRST. Your read/write/run tools target YOUR
    session's working notebook — not whichever tab the user happens to be looking

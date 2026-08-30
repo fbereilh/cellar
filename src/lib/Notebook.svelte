@@ -118,9 +118,11 @@
 		 *  nothing on every save, and silence would read as configured-and-working. */
 		exportResolveError?: string | null;
 		/** Constructs in the MARKED cells that make the generated module uncompilable
-		 *  (`$lib/exportHazard`). Rendered as a standing warning: the module IS written,
-		 *  so the export cannot report plain success, and the auto-on-save path has no
-		 *  other surface to say it on. Empty on every ordinary notebook.
+		 *  (`$lib/exportHazard`). A fact about the MARKS, not about any file on disk,
+		 *  so it is honest whether or not an export has run: it says the module these
+		 *  cells describe will not import. Rendered as a standing warning so the user
+		 *  learns it BEFORE pressing Export, and so an export that does run cannot
+		 *  report plain success. Empty on every ordinary notebook.
 		 *
 		 *  A POSITIVE finding, never a compile verdict - the detected class is narrower
 		 *  than "a module that fails `compile`" - so the copy names the construct it
@@ -995,9 +997,11 @@
 		{#if showExportBar}
 			<!-- nbdev-style export: pick the BASE the path is measured from, name the
 			     target `.py` module, export on demand. Always present (directly below
-			     the code-root bar) so a target can be set BEFORE any cell is marked;
-			     the module also regenerates automatically on save while a cell stays
-			     marked. Root-bar-neutral styling: standing chrome, not a call to
+			     the code-root bar) so a target can be set BEFORE any cell is marked.
+			     The module is written ONLY by an explicit export action - this button,
+			     or naming the target / marking a cell - never by an ordinary save, so
+			     an edit to a marked cell leaves the module as it was until one of
+			     those. Root-bar-neutral styling: standing chrome, not a call to
 			     action. -->
 			<div
 				class="mb-4 flex flex-wrap items-center gap-2 rounded-box border border-base-300 bg-base-100 px-3 py-2 text-sm"
@@ -1050,10 +1054,13 @@
 						{exportResolveError}
 					</span>
 				{:else if exportHazards.length}
-					<!-- The module WAS written and will not import. Ranked above the
-					     code-root warning: that one says the kernel cannot reach the
-					     module, this says nothing can. Below `exportResolveError`,
-					     which means no module was written at all. -->
+					<!-- The module these marks describe will not import - said in the
+					     future tense on purpose, since under explicit export there may
+					     be no such file yet (the shared wording in `$lib/exportHazard`
+					     already reads that way). Ranked above the code-root warning:
+					     that one says the kernel cannot reach the module, this says
+					     nothing can. Below `exportResolveError`, which means no module
+					     can be written at all. -->
 					<span class="flex items-center gap-1 text-xs text-base-content/70" data-testid="export-hazard">
 						<svg class="h-3.5 w-3.5 shrink-0 text-warning" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3" /><path d="M12 9v4" /><path d="M12 17h.01" /></svg>
 						{exportHazards[0].message}

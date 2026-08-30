@@ -241,9 +241,10 @@
 	// (`$lib/exportHazard`). Server-derived like the three fields above - the rule
 	// needs the Python line tokenizer, which is server-only - seeded on load and
 	// kept live by the `notebook:export-hazards` event, which the server publishes
-	// only when the set CHANGES. That push is what gives the auto-on-save export a
-	// UI home: the module regenerates on every save, so a hazard appears the moment
-	// a cell is marked or edited into one, nowhere near the manual export button.
+	// only when the set CHANGES. A hazard is a fact about the marked CELLS, so a
+	// SAVE is what creates one (editing a marked cell, or marking a cell that
+	// already holds one) even though a save no longer exports; the push is what
+	// lets the bar warn BEFORE the user presses Export.
 	let exportHazards = $state<ExportHazard[]>([]);
 	let exportBaseBusy = $state(false);
 	// Code root: the workspace-relative directory THIS notebook's kernel runs in and

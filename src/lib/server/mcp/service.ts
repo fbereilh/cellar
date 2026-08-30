@@ -1830,8 +1830,9 @@ export function setReportView(enabled: boolean, nb?: string | null) {
  * MCP `set_export_target`. The notebook-level nbdev-style `#|default_exp` target:
  * the `.py` module the cells marked `cellar.export` are written to. Setting it
  * (or clearing it with null/'') persists in the allowlisted `cellar` namespace so
- * it round-trips through clean-on-save, and `persist` regenerates the module as a
- * side effect (auto-on-save) exactly like the UI's target input. Returns the
+ * it round-trips through clean-on-save, and the call regenerates the module -
+ * naming the module's file is one of the three EXPLICIT export actions, exactly
+ * like the UI's target input, which shares this doc-layer setter. Returns the
  * resulting `export_target` (the RESOLVED workspace-relative path, or null when
  * cleared); `get_notebook_map`'s `display` block reports the same value.
  *
@@ -1850,7 +1851,7 @@ export function setReportView(enabled: boolean, nb?: string | null) {
  *
  * A `.py` TEXT notebook is refused through the SAME `isPyTextNotebook` predicate
  * as its pair `setCellExport`, and that symmetry is the point: such a document is
- * written through jupytext, which stores no cellar metadata, and `autoExportPy`
+ * written through jupytext, which stores no cellar metadata, and the export
  * skips it entirely — so a target set here survives neither a reload nor a
  * regeneration. Accepting it while the other half refuses would leave an agent
  * following the export flow holding a target it was told is set, for a module
@@ -1858,8 +1859,8 @@ export function setReportView(enabled: boolean, nb?: string | null) {
  *
  * A path that ESCAPES the workspace is refused (`invalid`) rather than stored:
  * `setExportTargetDoc` validates through the exporter's own `resolveInWorkspace`,
- * because `autoExportPy` is best-effort, so such a target would otherwise sit in
- * the metadata generating nothing on every later save while this call reported it
+ * because the regeneration is best-effort, so such a target would otherwise sit in
+ * the metadata generating nothing on every later export while this call reported it
  * set. A path that is not a `.py` module is refused the same way and for a sharper
  * reason: the exporter WRITES to it, so an ordinary source file named here would be
  * overwritten the moment a cell is marked. Only a refusal of the PATH is reported as
@@ -1920,8 +1921,8 @@ export function setExportTarget(
  * on addressing: every ref resolves (and every marked cell is checked to BE a
  * code cell) before anything is written, so a bad handle - or a markdown cell -
  * in the fifth slot cannot leave the first four rewritten. Duplicates collapse,
- * and `setCellExports` makes the whole batch ONE document write, which matters
- * doubly here because `persist` regenerates the `.py` on every write.
+ * and `setCellExports` makes the whole batch ONE document write AND ONE module
+ * regeneration, rather than one of each per cell.
  *
  * Only a PYTHON code cell can be marked, tested with `canExportCell`
  * (`isExportCell`'s own eligibility half, shared with the doc-layer setter so the
@@ -2084,20 +2085,22 @@ function exportTargetFields(nb?: string | null): ExportTargetFields {
 
 /**
  * The generated module is NOT on disk as this notebook's marks describe it: the
- * last export attempt threw. `autoExportPy` is best-effort by design (a bad target
- * must not cost the user their notebook save), so a target whose parent is a file,
- * an EACCES or an ENOSPC left the module unwritten while the result claimed nothing
- * at all - and since `module` is CONDITIONAL, its absence is precisely what says the
- * module was regenerated, with no MCP export tool through which the agent could ever
- * learn otherwise.
+ * last export attempt threw. The regeneration these two tools drive is best-effort
+ * by design (a bad target must not cost the user the notebook write the same call
+ * just made), so a target whose parent is a file, an EACCES or an ENOSPC left the
+ * module unwritten while the result claimed nothing at all - and since `module` is
+ * CONDITIONAL, its absence is precisely what says the module was regenerated, with
+ * no MCP export tool through which the agent could ever learn otherwise.
  *
  * A STATE, not an attribution: `lastExportError` is doc state refreshed by every
- * persist, and an idempotent call (every cell already at the requested value) skips
- * the persist entirely, so the failure it reports may belong to an earlier write. The
- * agent-facing `reason` is worded for exactly that - it says what is on disk, never
- * that this call caused it.
+ * EXPLICIT export, and an idempotent call (every cell already at the requested
+ * value) neither persists nor regenerates, so the failure it reports may belong to
+ * an earlier one. The agent-facing `reason` is worded for exactly that - it says
+ * what is on disk, never that this call caused it. Since an ordinary save no longer
+ * exports, the record now describes the last time the module was actually asked
+ * for, which is strictly more useful here than the last keystroke was.
  *
- * Read back from the doc, i.e. from the attempt the persist ACTUALLY made, rather
+ * Read back from the doc, i.e. from the attempt the call ACTUALLY made, rather
  * than by re-running the export here - that would be a second export path, and a
  * second chance to disagree with the first.
  *
@@ -2218,7 +2221,7 @@ function moduleWarning(target: string, where: ExportTargetFields, wrote: boolean
 			return {
 				module: {
 					regenerated: false as const,
-					reason: `no Cellar-generated module is on disk at ${exportTarget} and this call wrote none (the addressed cells already carried the requested value) - edit a marked cell, or re-call set_export_target with ${setExportTargetArgs(where)}, to write it`,
+					reason: `no Cellar-generated module is on disk at ${exportTarget} and this call wrote none (the addressed cells already carried the requested value) - re-call set_export_target with ${setExportTargetArgs(where)} to write it (that call always regenerates; editing a cell does not)`,
 					warning: undefined
 				}
 			};

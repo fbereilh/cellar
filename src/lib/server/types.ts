@@ -149,9 +149,11 @@ export interface NotebookDoc {
 	metadata?: NotebookMetadata;
 	jpFormat?: string;
 	/**
-	 * Runtime-only (never serialized): why the last auto-export of the nbdev-style
-	 * `.py` module threw, or null when it wrote / had nothing to write. See
-	 * `notebook.ts`'s `autoExportPy` - best-effort must not mean silent.
+	 * Runtime-only (never serialized): why the last EXPLICIT export of the
+	 * nbdev-style `.py` module threw, or null when it wrote / had nothing to write.
+	 * See `notebook.ts`'s `regenerateExportModule` - best-effort must not mean
+	 * silent. Only the explicit export paths write it (an ordinary save does not
+	 * export), so it describes the last time the module was actually asked for.
 	 */
 	lastExportError?: string | null;
 	/**
