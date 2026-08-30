@@ -225,6 +225,14 @@
 	 * differently; where one palette leaves a tag unstyled its value is that
 	 * palette's plain foreground, i.e. exactly what the tag inherits today. */
 	--cellar-cm-tok-comment: light-dark(#636972, #7d8799);
+	/* nbdev/Quarto `#|` DIRECTIVE comments (`#| default_exp training`). The Python
+	 * grammar calls these plain comments, so the distinction is drawn by an extra
+	 * class both render paths add (see `directiveComment.ts`) rather than by a tag.
+	 * A deep pink/magenta: the one hue neighbourhood no other token occupies (light
+	 * hue 326 sits 25deg off `tok-keyword`'s purple and well clear of `tok-name`'s
+	 * brick red; dark hue 324 likewise). Measured on the editor surfaces at 6.9:1
+	 * (light, on #f4f6f9) and 6.1:1 (dark, on #282c34), so both clear WCAG AA. */
+	--cellar-cm-tok-directive: light-dark(#a8005f, #e88fc4);
 	--cellar-cm-tok-meta: light-dark(#a626a4, #7d8799);
 	--cellar-cm-tok-annotation: light-dark(#755d0e, #e5c07b);
 	--cellar-cm-tok-keyword: light-dark(#a626a4, #c678dd);
@@ -266,6 +274,35 @@
 	 * comments (which One Dark leaves upright). So the light editor reads as the
 	 * same design as the dark one, not a heavier pygments variant. */
 	--cellar-cm-tok-comment-style: italic;
+}
+
+/* An nbdev/Quarto `#|` directive comment, in BOTH code surfaces: the live
+ * CodeMirror editor (`.cm-content`, marked by `directiveComment.ts`'s decoration
+ * plugin) and the static no-editor render (`.cm-static-content`, marked by
+ * `staticHighlight.ts`) - one rule, so a directive cannot change appearance when
+ * the lazy editor is summoned. `font-style` is forced upright because the light
+ * scheme renders ordinary comments italic: an extra, colour-independent signal
+ * that this line is acted upon.
+ *
+ * THE THREE SELECTORS ARE NOT INTERCHANGEABLE, and the middle one is the
+ * load-bearing surprise. The two paths mark the range differently:
+ *
+ *   static: <span class="TOKEN cellar-directive">#| export</span>
+ *   editor: <span class="cellar-directive"><span class="TOKEN">#| export</span></span>
+ *
+ * CodeMirror's mark decoration WRAPS the highlight span rather than merging into
+ * it, so in the editor the comment token span is a CHILD - and a child's own
+ * `color` beats anything inherited from an ancestor, whatever the specificity. So
+ * the descendant selector is what actually colours the editor's directive; the
+ * bare `.cm-content .cellar-directive` covers the (reachable) case of a directive
+ * range CodeMirror did not split into a token span of its own. Two classes
+ * throughout, so this out-specifies the highlight style's own single generated
+ * class without depending on which stylesheet was inserted first. */
+.cm-content .cellar-directive,
+.cm-content .cellar-directive span,
+.cm-static-content .cellar-directive {
+	color: var(--cellar-cm-tok-directive);
+	font-style: normal;
 }
 
 /* Find-in-page in-place highlights (Search P4). The CSS Custom Highlight API

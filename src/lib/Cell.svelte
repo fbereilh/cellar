@@ -11,6 +11,7 @@
 	import { sql } from '@codemirror/lang-sql';
 	import { renderChatReply, renderMarkdown, renderOutputMarkdown } from '$lib/markdown';
 	import { EDITOR_THEME } from '$lib/editorTheme';
+	import { directiveCommentHighlight } from '$lib/directiveComment';
 	import StaticCode from '$lib/StaticCode.svelte';
 	import type { StaticLang } from '$lib/staticHighlight';
 	import DataFrameGrid from '$lib/DataFrameGrid.svelte';
@@ -1282,7 +1283,11 @@
 		if (cell.cell_type === 'markdown') return markdown();
 		if (isRaw) return [];
 		if (isChat) return markdown(); // a chat question is prose; markdown is its grammar
-		return isSql ? sql() : python(); // mojo: python(), per Mojo's own language_info
+		// Python-family cells (code and mojo) also get the nbdev/Quarto `#|` directive
+		// highlight, BESIDE the grammar rather than globally: `#|` is a directive in
+		// that ecosystem, so marking a `#` comment in SQL or markdown would invent a
+		// class those languages do not have. See `directiveComment.ts`.
+		return isSql ? sql() : [python(), directiveCommentHighlight]; // mojo: python(), per Mojo's own language_info
 	}
 	// The same grammar choice, for the static (no-editor) render. Kept in lockstep
 	// with `langFor` so the read-only view highlights like the editor it precedes -
