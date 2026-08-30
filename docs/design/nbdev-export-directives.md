@@ -204,7 +204,8 @@ changed is how that refusal is REPORTED. It is a first-class not-written outcome
 runs on every persist: as an error it set `doc.lastExportError` permanently, on a channel
 only MCP's `moduleFailure` reads, so a human saw every affordance reading healthy while the
 module was never regenerated. As an outcome, no error is recorded, the manual Export button
-still says why nothing was written, and MCP's `module.reason` names the same cause and the
+still says why nothing was written, and MCP's `module.reason` - on BOTH export write tools,
+through one shared helper, since either can trigger the regeneration - names the same cause and the
 same two remedies (point the target at a path Cellar owns, or remove that file). An EMPTY
 file at the target is still overwritten, and a file that cannot be READ is still an error -
 neither was verified as foreign.

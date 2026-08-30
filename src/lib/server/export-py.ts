@@ -65,8 +65,8 @@ export interface ExportResult {
 	 * Carried on `unchanged` too, and that is the point rather than an edge case:
 	 * the broken module is still ON DISK, so a re-export that writes nothing must
 	 * not report the plain success the first one was corrected out of. Empty for
-	 * `foreign-module` for the `no-cells` reason: the file at the target is not one
-	 * Cellar wrote, so nothing on disk describes these marks.
+	 * `foreign-module` for the SAME reason as `no-cells`: the file at the target is
+	 * not one Cellar wrote, so nothing on disk describes these marks.
 	 *
 	 * A POSITIVE finding, never a compile verdict - the class is wider than what
 	 * is detected. `$lib/exportHazard`'s header states the measured boundary; no
@@ -577,12 +577,19 @@ export function resolveExportTarget(doc: NotebookDoc): ResolvedExportTarget | nu
  * directive resolves straight to a path here without passing that setter, and a
  * `.py` path may perfectly well be a hand-written module. Every generated module
  * opens with `HEADER`, so testing the file already on disk for it rejects nothing
- * Cellar wrote. The refusal throws, which the manual button surfaces directly and
- * the two consequential callers record as `lastExportError` (never breaking the
- * notebook write). This is the case that made the export EXPLICIT in the first
- * place: in an established nbdev repository the target names a module nbdev
- * generated, so while every save regenerated, every save hit this refusal and
- * recorded it where no human surface reads it.
+ * Cellar wrote.
+ *
+ * The two shapes that guard refuses are DIFFERENT FACTS and are reported
+ * differently, which is the point rather than an inconsistency:
+ *
+ *   - a file PROVABLY not ours (it has content and does not open with `HEADER`)
+ *     returns `{written:false, reason:'foreign-module'}` and records NOTHING. It is
+ *     an outcome, not an error: it is the steady state of an established nbdev repo,
+ *     whose module carries nbdev's own header, so there is nothing Cellar could
+ *     legitimately write there and no export ever will.
+ *   - a file that cannot be READ was verified as nothing at all, so it still THROWS
+ *     - the manual button surfaces that directly and the two consequential callers
+ *     record it as `lastExportError` (never breaking the notebook write).
  *
  * An EMPTY file (zero bytes, or whitespace only) is overwritten, not refused: the
  * guard exists to protect CONTENT, and there is none. Pre-creating the module
