@@ -401,8 +401,13 @@ export type ResolvedExportTarget =
  * (`dataframeHtml.ts`'s `/dataframe/i` pre-check, same reason): this is the ONE
  * resolution rule the exporter AND the agent map read, and the map short-circuits
  * only when a notebook-level target IS set — so the COMMON case, a notebook with
- * no export configured at all, would otherwise run a multiline regex over every
- * code cell's full source on the most frequently called agent read tool.
+ * no export configured at all, would otherwise run the shared scanner over every
+ * code cell on the most frequently called agent read tool.
+ *
+ * The guard belongs HERE and deliberately NOT inside the scanner, which carries
+ * none: this caller sweeps EVERY cell before it may conclude "no target", so a
+ * cheap per-cell reject pays for itself. `nbdevDirectives.ts`'s header has the
+ * measurement and the other half of that reasoning.
  */
 function storedExportTarget(
 	doc: NotebookDoc

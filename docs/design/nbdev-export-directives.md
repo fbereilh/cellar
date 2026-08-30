@@ -133,6 +133,17 @@ every surface says so rather than reporting a change the notebook did not take:
   needs - which line to remove - would be unreachable. Clicking declines on the shell's
   notice line. Same live-control-that-explains-itself stance the Databricks card takes.
 
+**The remedy is CONDITIONAL, because "remove that line" is not always true.** A cell can
+carry BOTH marks (mark it in Cellar, then let the directive arrive on its source - an agent
+edit, a pull, a hand edit). `setCellExports` skips a directive-owned cell in BOTH
+directions, so in that state the flag cannot be cleared either and removing the line alone
+still leaves the cell exported. The condition lives ONCE, in `exportRole.ts`'s
+`exportMarkedTwice`, and the three surfaces that carry the sentence each branch on it in
+their own voice. The server hands the answer to the client ON the refusal (`alsoFlagged`)
+rather than letting it re-derive one: a tab only sends the call because it believed the cell
+was not directive-owned, so the source it would inspect is the stale copy that made it
+wrong.
+
 Clearing the metadata half instead would leave the cell exported with the toggle bouncing
 straight back to ON. MARKING a directive-marked cell is an honest no-op: it is already
 exported, so the call is satisfied and nothing is written.
