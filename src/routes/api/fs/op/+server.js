@@ -7,6 +7,7 @@ import {
 	copyEntry
 } from '$lib/server/fstree';
 import { dropDocs, rekeyDocs } from '$lib/server/notebook';
+import { blankNotebookText, isIpynbPath } from '$lib/server/ipynb';
 import { shutdownKernelsUnder } from '$lib/server/kernel';
 import { invalidateGitStatusCache } from '$lib/server/git';
 import { unwatchUnder } from '$lib/server/fileWatch';
@@ -33,7 +34,23 @@ export async function POST({ request }) {
 	try {
 		switch (op) {
 			case 'create':
-				return json({ ok: true, ...createEntry(body.parent ?? '', body.name, body.kind) });
+				// A new `.ipynb` must be a VALID notebook the moment it exists. A
+				// zero-byte file is not one - not to Cellar (`readNotebook` used to
+				// answer the explorer's own "New file" with `Unexpected end of JSON
+				// input`) and not to any other tool that would open it. The choice is
+				// made from the name `createEntry` NORMALISES, never from `body.name`,
+				// so a typed `"notes.ipynb "` cannot create `notes.ipynb` blank.
+				//
+				// It sits here beside its siblings - `delete` drops the live doc and
+				// its kernel, `rename`/`move` rekey them - because this route is where
+				// a file op meets its notebook consequences; `fstree` stays
+				// notebook-agnostic and keeps the one copy of the path/name guards.
+				return json({
+					ok: true,
+					...createEntry(body.parent ?? '', body.name, body.kind, (name) =>
+						isIpynbPath(name) ? blankNotebookText() : ''
+					)
+				});
 			case 'rename': {
 				const res = renameEntry(body.path, body.name);
 				// This guard and the one in `move` answer the same question the neighbouring

@@ -241,8 +241,28 @@ function dedupeDest(destAbs: string): string {
 	}
 }
 
-/** Create an empty file (or an empty folder) inside a workspace directory. */
-export function createEntry(parentRel: string, name: string, kind: 'file' | 'dir'): FsOpPathResult {
+/**
+ * Create a file (or an empty folder) inside a workspace directory. A file starts
+ * empty unless the caller says otherwise - see `initialContents`.
+ */
+export function createEntry(
+	parentRel: string,
+	name: string,
+	kind: 'file' | 'dir',
+	/**
+	 * The bytes a brand-new FILE starts as, chosen from the name that will really
+	 * land on disk. A plain file starts empty (the default); a `.ipynb` must start
+	 * as a VALID notebook, which is why this is a FUNCTION OF THE NORMALISED NAME
+	 * rather than a plain string: `assertSimpleName` trims, so a caller deciding
+	 * from its own raw input would answer about `"notes.ipynb "` while the file
+	 * created is `notes.ipynb`, and mint exactly the blank notebook this exists to
+	 * prevent. `fstree` itself stays notebook-agnostic - the path/name guards and
+	 * the collision check stay the one copy here, and WHAT a kind of file starts as
+	 * is the caller's (see `POST /api/fs/op`, where a file op's notebook
+	 * consequences already live).
+	 */
+	initialContents: (cleanName: string) => string = () => ''
+): FsOpPathResult {
 	const cleanName = assertSimpleName(name);
 	// Resolve the parent (may be '' for the workspace root) and the target.
 	const parentAbs = resolveInWorkspace(parentRel);
@@ -253,7 +273,7 @@ export function createEntry(parentRel: string, name: string, kind: 'file' | 'dir
 	if (kind === 'dir') {
 		mkdirSync(abs);
 	} else {
-		writeFileSync(abs, '', 'utf8');
+		writeFileSync(abs, initialContents(cleanName), 'utf8');
 	}
 	return { path: toRel(abs) };
 }

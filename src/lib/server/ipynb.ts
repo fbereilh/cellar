@@ -9,7 +9,8 @@
  * produces a byte-identical file (no git diff).
  */
 import { readFileSync, existsSync, mkdirSync } from 'node:fs';
-import { dirname, resolve } from 'node:path';
+import { randomUUID } from 'node:crypto';
+import { dirname, extname, resolve } from 'node:path';
 import { cleanNotebook, stripRuntimeMeta } from './clean';
 import { atomicWriteFileSync } from './atomic-write';
 import { serializeWriteSync } from './write-lock';
@@ -263,9 +264,69 @@ export function stringify(nb: unknown): string {
 	return out.join('') + '\n';
 }
 
+/**
+ * True for a path Cellar treats as an `.ipynb` notebook, matching the rule the
+ * browser routes tab kinds by (`/\.ipynb$/i` in `+page.svelte`) so the two
+ * surfaces cannot disagree about which new file has to be a valid notebook.
+ */
+export function isIpynbPath(path: string): boolean {
+	return extname(path).toLowerCase() === '.ipynb';
+}
+
+/**
+ * What a notebook that has never held anything CONTAINS: nbformat 4.5 with one
+ * empty code cell (never zero cells - a notebook always keeps somewhere to type,
+ * which is the same invariant `deleteCells` refuses to break).
+ *
+ * ONE definition, TWO consumers, and that is the point: `blankNotebookText` is
+ * what the file explorer writes when a user creates `foo.ipynb`, and the blank-file
+ * branch of `readNotebook` below is what an already-blank one OPENS as. Split into
+ * two answers they would drift, and the second is what repairs a file the first
+ * never wrote (a `touch`, a rename of an empty file, a copy of one, or an `.ipynb`
+ * created by an older Cellar - see `readNotebook`).
+ *
+ * It goes through `serialize`, so the shape/key order is exactly what every other
+ * Cellar write produces - a fresh notebook is byte-identical to the same notebook
+ * re-saved, modulo its cell id.
+ */
+export function blankNotebook(): NbNotebook {
+	return serialize({ cells: [{ id: randomUUID(), cell_type: 'code', source: '', outputs: [] }] });
+}
+
+/** `blankNotebook()` as the bytes to write for a brand-new `.ipynb` file. */
+export function blankNotebookText(): string {
+	return stringify(blankNotebook());
+}
+
+/**
+ * Read a notebook from disk. `null` means the file does not exist.
+ *
+ * A BLANK file (no bytes, or only whitespace) reads as `blankNotebook()` rather
+ * than throwing. `JSON.parse('')` raises `Unexpected end of JSON input`, so a
+ * zero-byte `.ipynb` - which the file explorer's "New file" used to mint, and
+ * which a `touch`, a rename or a copy of an empty file still can - dead-ended at
+ * "Could not open x.ipynb: Unexpected end of JSON input" with no way back from
+ * inside Cellar. Leniency here MASKS NOTHING: the file holds no bytes, so there
+ * is nothing to lose and nothing a stricter reader could have preserved. Opening
+ * it writes nothing either (`loadDoc` never persists), so the file stays as it is
+ * until the user actually edits it.
+ *
+ * That is the whole of the leniency, deliberately. Bytes that are PRESENT but do
+ * not parse are a hard error, because something IS there: opening such a file as
+ * an empty notebook and then persisting over it would destroy it. The message
+ * keeps the parser's own detail (its position is the useful part) and names the
+ * cause, since the caller - the notebook route, the MCP tool - already names the
+ * file.
+ */
 export function readNotebook(path: string): NbNotebook | null {
 	if (!existsSync(path)) return null;
-	return JSON.parse(readFileSync(path, 'utf8')) as NbNotebook;
+	const text = readFileSync(path, 'utf8');
+	if (text.trim() === '') return blankNotebook();
+	try {
+		return JSON.parse(text) as NbNotebook;
+	} catch (err) {
+		throw new Error(`not valid JSON (${(err as Error)?.message ?? String(err)})`);
+	}
 }
 
 /**
