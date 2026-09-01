@@ -9,12 +9,13 @@
  * produces a byte-identical file (no git diff).
  */
 import { readFileSync, existsSync, mkdirSync } from 'node:fs';
-import { dirname, resolve } from 'node:path';
+import { randomUUID } from 'node:crypto';
+import { dirname, extname, resolve } from 'node:path';
 import { cleanNotebook, stripRuntimeMeta } from './clean';
 import { atomicWriteFileSync } from './atomic-write';
 import { serializeWriteSync } from './write-lock';
 import { invalidateGitStatusCache } from './git';
-import type { Cell, NotebookDoc, NotebookMetadata, NbNotebook } from './types';
+import type { Cell, NotebookDoc, NotebookMetadata, NbNotebook, NotebookReadFailure } from './types';
 
 const NBFORMAT = 4;
 const NBFORMAT_MINOR = 5;
@@ -263,9 +264,131 @@ export function stringify(nb: unknown): string {
 	return out.join('') + '\n';
 }
 
+/**
+ * True for a path Cellar treats as an `.ipynb` notebook, matching the rule the
+ * browser routes tab kinds by (`/\.ipynb$/i` in `+page.svelte`) so the two
+ * surfaces cannot disagree about which new file has to be a valid notebook.
+ */
+export function isIpynbPath(path: string): boolean {
+	return extname(path).toLowerCase() === '.ipynb';
+}
+
+/**
+ * What a brand-new `.ipynb` FILE is written as: nbformat 4.5 with one empty code
+ * cell (never zero cells - a notebook always keeps somewhere to type, which is the
+ * same invariant `deleteCells` refuses to break).
+ *
+ * This is the WRITER's answer and nothing else - `blankNotebookText` is what the
+ * file explorer writes when a user creates `foo.ipynb`. `readNotebook` below does
+ * NOT mirror it: a file that is already blank on disk is REFUSED, not opened as
+ * this (see there for why).
+ *
+ * It goes through `serialize`, so the shape/key order is exactly what every other
+ * Cellar write produces - a fresh notebook is byte-identical to the same notebook
+ * re-saved, modulo its cell id.
+ */
+export function blankNotebook(): NbNotebook {
+	return serialize({ cells: [{ id: randomUUID(), cell_type: 'code', source: '', outputs: [] }] });
+}
+
+/** `blankNotebook()` as the bytes to write for a brand-new `.ipynb` file. */
+export function blankNotebookText(): string {
+	return stringify(blankNotebook());
+}
+
+/** A file holds nothing a notebook could be built from: no non-whitespace bytes. */
+function isBlankText(text: string): boolean {
+	return text.trim() === '';
+}
+
+/**
+ * Every refusal `readNotebook` raises, carrying WHICH one as `reason`. Callers
+ * branch on that field and never on the message text (the `InvalidExportTargetError`
+ * rule): the SSR guidance hangs real consequences off it - only `empty` may advise
+ * deleting the file - and a message match would silently mis-route them on a reword.
+ */
+export class NotebookReadError extends Error {
+	readonly reason: NotebookReadFailure;
+	constructor(reason: NotebookReadFailure, message: string) {
+		super(message);
+		this.name = 'NotebookReadError';
+		this.reason = reason;
+	}
+}
+
+/**
+ * Read a notebook from disk. `null` means the file does not exist.
+ *
+ * STRICT, deliberately - this reader never infers a notebook from bytes that are
+ * not one, and there are three distinct refusals because they are three distinct
+ * facts. A BLANK file (no bytes, or whitespace only) says so and names the
+ * repair; bytes that are PRESENT but do not parse keep the parser's own detail;
+ * and a file that could not be READ at all names the errno.
+ *
+ * Every refusal is a `NotebookReadError` carrying its `reason`, because the
+ * guidance a surface hangs off it is not cosmetic: only `empty` may advise
+ * DELETING the file. A blank one holds nothing, while an `unparseable` one holds
+ * the user's own bytes - the very bytes this reader refuses to overwrite - so
+ * advising a delete there would destroy by hand exactly what refusing protects.
+ * Told apart by the FIELD, never by matching the message.
+ *
+ * NO REFUSAL HERE CARRIES A PATH, and that is a property of this reader rather
+ * than of anything downstream. Every caller already prefixes the file (the
+ * notebook route's "Could not open <path>:", the MCP tool the agent named it in),
+ * and these messages reach a browser - so an absolute server path in one leaks
+ * the machine's layout into the interface. The two authored refusals never had
+ * one; the READ is the door it came through, because Node names the file it
+ * failed to open (`EACCES: permission denied, open '/Users/…'`), so the read is
+ * wrapped and re-raised as its errno alone. Fixing it HERE rather than stripping
+ * paths downstream is what keeps a corrupt notebook's own parser detail intact -
+ * that snippet is the file's CONTENT, and a path-stripper run over it eats
+ * exactly the token that identifies the corruption.
+ *
+ * WHY A BLANK FILE IS REFUSED RATHER THAN OPENED AS AN EMPTY NOTEBOOK. Reading it
+ * leniently would buy exactly one thing: repairing an `.ipynb` that is already
+ * blank on disk (a `touch`, a rename or a copy of an empty file, or one an older
+ * Cellar left behind). It was tried, and its cost was measured twice over. First,
+ * "no bytes, so nothing to lose" is true of a genuinely empty file and FALSE of a
+ * MOMENTARILY empty one: a non-atomic external writer (nbdev's `fastcore/nbio.py`
+ * opens with 'w') truncates before it writes, and this repo has measured a 0-byte
+ * read in exactly that window (see `fileWatch.ts`'s header, which is why its
+ * settle debounce exists) - so a real notebook was cached as a blank document and
+ * the next save overwrote it. Guarding that at the first write then cost a
+ * PERMANENT LOCKOUT (`loadDoc` caches the blank-inferred document and never
+ * re-reads, so the refusal's advised reload could not work and every later save
+ * refused for the life of the process) plus a refusal that is invisible on its
+ * likeliest paths (an autosave PATCH is deliberately swallowed by the client, and
+ * in the run route the throw closes the NDJSON stream with no `run:end` and no
+ * `lastRun` stamp). Every fix needed another fix, in the notebook WRITE path,
+ * which is the user's PRIMARY data - while the repair it bought is now one
+ * delete-and-recreate away, because creating a notebook works. So the reader
+ * stays strict: refuse, never degrade.
+ */
 export function readNotebook(path: string): NbNotebook | null {
 	if (!existsSync(path)) return null;
-	return JSON.parse(readFileSync(path, 'utf8')) as NbNotebook;
+	let text: string;
+	try {
+		text = readFileSync(path, 'utf8');
+	} catch (err) {
+		const code = (err as NodeJS.ErrnoException)?.code;
+		throw new NotebookReadError(
+			'unreadable',
+			`the file could not be read${code ? ` (${code})` : ''}`
+		);
+	}
+	if (isBlankText(text))
+		throw new NotebookReadError(
+			'empty',
+			'the file is empty, so there is no notebook to open - delete it and create it again from the file explorer'
+		);
+	try {
+		return JSON.parse(text) as NbNotebook;
+	} catch (err) {
+		throw new NotebookReadError(
+			'unparseable',
+			`not valid JSON (${(err as Error)?.message ?? String(err)})`
+		);
+	}
 }
 
 /**

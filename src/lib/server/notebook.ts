@@ -21,7 +21,7 @@
 import { dirname, join, resolve, isAbsolute, relative, sep } from 'node:path';
 import { existsSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
-import { readNotebook, deserialize, writeNotebook, serialize, stringify } from './ipynb';
+import { readNotebook, NotebookReadError, deserialize, writeNotebook, serialize, stringify } from './ipynb';
 import { isPyPath, readPyNotebook, writePyNotebook } from './jupytext';
 import { publish } from './events';
 import { cancelRun } from './run-queue';
@@ -55,6 +55,7 @@ import type {
 	LogicalCellType,
 	LastRun,
 	NotebookDoc,
+	NotebookReadFailure,
 	NotebookView
 } from './types';
 
@@ -452,7 +453,15 @@ function emit(doc: NotebookDoc, type: string, extra: Record<string, unknown>, or
 
 /** Serializable view of a notebook for the browser. */
 export function getNotebook(nb?: string | null): NotebookView {
-	const doc = docFor(nb);
+	return notebookView(docFor(nb));
+}
+
+/**
+ * The browser-facing projection of an ALREADY-RESOLVED document. Split out of
+ * `getNotebook` so a view can be built for a document that is deliberately not in
+ * the `docs` map - see `readDefaultNotebook`, whose stand-in must stay unwritable.
+ */
+function notebookView(doc: NotebookDoc): NotebookView {
 	const t = doc.metadata?.cellar?.export_target;
 	return {
 		workspace: workspace(),
@@ -560,10 +569,56 @@ export function notebookIpynb(nb?: string | null): { path: string; name: string;
 /**
  * Serializable view of the canonical default notebook (`notebook.ipynb`),
  * regardless of the current active pointer. SSR seeds the shell (notebook tab,
- * path/name) from this, so it must never follow `activePath`.
+ * path/name) from this, so it must never follow `activePath` - it reaches it
+ * through `readDefaultNotebook` below, which is what keeps an unreadable
+ * `notebook.ipynb` from taking the whole page down. This one still THROWS.
  */
 export function getDefaultNotebook(): NotebookView {
 	return getNotebook(canonicalPath());
+}
+
+/**
+ * The canonical notebook for SSR, or a stand-in plus the reason it could not be
+ * read - it NEVER throws.
+ *
+ * The shell's `load()` seeds itself from the canonical notebook, so an unreadable
+ * `notebook.ipynb` (blank, or corrupt) took the whole page down rather than one
+ * tab: the user never reached the file explorer that the reader's own refusal
+ * names as the repair, and a production build sanitises a load error into a
+ * generic page, so they were not even told why. Every other risky call in that
+ * `load()` is already best-effort for exactly this reason.
+ *
+ * The stand-in is DISPLAY-ONLY and is deliberately never put in the `docs` map:
+ * every mutation path reaches `docFor` -> `loadDoc`, which still reads the file
+ * and still throws, so no write can ever land on top of bytes Cellar could not
+ * read. That matters most for a CORRUPT notebook, where overwriting would be real
+ * data loss.
+ */
+export function readDefaultNotebook(): {
+	notebook: NotebookView;
+	error: string | null;
+	errorReason: NotebookReadFailure | null;
+} {
+	try {
+		return { notebook: getDefaultNotebook(), error: null, errorReason: null };
+	} catch (err) {
+		const abs = canonicalPath();
+		// Forwarded verbatim: `readNotebook` owns the rule that none of its refusals
+		// carries a server path, so there is nothing to strip here - and stripping
+		// would eat a corrupt notebook's own parser detail, which is the file's
+		// CONTENT rather than a path. The fallback only keeps the field TRUTHY,
+		// since its truthiness is the signal that the notebook could not be read.
+		//
+		// `errorReason` rides alongside so the shell branches its guidance on WHICH
+		// refusal this was rather than on the message - only `empty` may advise
+		// deleting the file. Anything that is not a `NotebookReadError` reports no
+		// reason at all, which the shell reads as the non-destructive default.
+		return {
+			notebook: notebookView({ path: abs, cells: [], metadata: undefined }),
+			error: String((err as Error)?.message ?? err) || 'the file could not be read',
+			errorReason: err instanceof NotebookReadError ? err.reason : null
+		};
+	}
 }
 
 /**

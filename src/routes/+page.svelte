@@ -23,7 +23,7 @@
 	import { toWorkspaceRel } from '$lib/workspacePath';
 	import { createNoticeChannel } from '$lib/notice.svelte';
 	import type { PageData } from './$types';
-	import type { Cell } from '$lib/server/types';
+	import type { Cell, NotebookReadFailure } from '$lib/server/types';
 	import type {
 		UICell,
 		FoldRegistryHandle,
@@ -104,6 +104,29 @@
 	// foreign-run gate below, so the two cannot drift; a path it cannot derive
 	// falls back to the bare name here.
 	const canonicalNotebookRel = toWorkspaceRel(workspace, notebookPath) ?? notebookName;
+
+	// Why the canonical notebook could not be read, else null. SSR seeds the shell
+	// from that notebook, so an unreadable one used to take the whole page down -
+	// see `readDefaultNotebook`. It renders instead, but the empty state must not
+	// then imply there is simply no notebook: the file explorer beside it is the
+	// remedy, and the user has to be told which file to act on and why.
+	//
+	// A one-shot fact from the SSR payload, deliberately not re-probed: the only
+	// read that could answer runs through `loadDoc`, which serves a CACHED document
+	// and materialises a starter one for this very path, so it cannot observe the
+	// file - and on a delete it would resurrect the entry `dropDocs` just cleared.
+	// The message names a reload instead, which makes the remedy it advises
+	// complete and keeps it true for as long as it is on screen.
+	const canonicalNotebookError: string | null = data.notebookError ?? null;
+
+	// WHICH refusal it was, so the guidance below is DERIVED from the failure. Only
+	// `empty` may advise deleting the file: a blank one holds nothing, while an
+	// `unparseable` one holds the user's own bytes - the very bytes the strict
+	// reader refuses to overwrite - so telling them to delete it would destroy by
+	// hand exactly what refusing protects. Anything unrecognised (an absent reason,
+	// an older payload) falls through to the non-destructive branch by
+	// construction, since only the exact `empty` match reaches the delete advice.
+	const canonicalNotebookErrorReason: NotebookReadFailure | null = data.notebookErrorReason ?? null;
 
 	// Live cells per open notebook (path → the notebook's reactive cell array),
 	// reported up by each LiveNotebook so the sidebar (outline / search) can read
@@ -1921,9 +1944,49 @@
 				<!-- Empty state: no tab open (first-ever open, or all tabs closed). -->
 				<div class="flex h-full flex-col items-center justify-center gap-4 text-center" data-testid="empty-state">
 					<div class="text-5xl opacity-30">🍷</div>
-					<div class="text-sm text-base-content/50">No notebook open</div>
-					<p class="max-w-xs text-xs text-base-content/40">Open a file from the sidebar, or create a notebook for this workspace.</p>
-					<button class="btn btn-sm btn-primary" onclick={newNotebook} data-testid="empty-open-notebook">New notebook</button>
+					{#if canonicalNotebookError}
+						<!--
+							No "New notebook" button here: `newNotebook` always targets the CANONICAL
+							path and `createNotebook` opens an existing file rather than overwriting
+							it, so over a blank or corrupt `notebook.ipynb` it can only throw. The
+							remedy is the explorer, and the reload is what makes it complete - this
+							reason is a one-shot SSR fact (see above), so nothing here re-reads the
+							file.
+
+							The guidance below is DERIVED from the reason, and the split is a
+							data-safety rule rather than copy: only `empty` may advise deleting or
+							recreating this file, because it holds nothing. The other two hold the
+							user's own bytes - the very bytes the reader refuses to overwrite - so
+							they name a way forward that leaves the file alone (a DIFFERENT name via
+							the explorer's New file) and send the repair itself outside Cellar.
+						-->
+						<div class="text-sm text-error" data-testid="canonical-notebook-error">
+							Could not open <code class="font-mono">{canonicalNotebookRel}</code>: {canonicalNotebookError}
+						</div>
+						<p class="max-w-xs text-xs text-base-content/40" data-testid="canonical-notebook-guidance">
+							{#if canonicalNotebookErrorReason === 'empty'}
+								Open another notebook from the sidebar, or delete this file there, create it
+								again, and reload the page.
+							{:else if canonicalNotebookErrorReason === 'unparseable'}
+								This file has content Cellar cannot parse, so it is left untouched. To work
+								now, make a notebook under a different name with the file explorer's New
+								file. To get this one back, repair or restore it outside Cellar (a text
+								editor, or <code class="font-mono">git checkout</code>), then reload the
+								page.
+							{:else if canonicalNotebookErrorReason === 'unreadable'}
+								Cellar could not read this file at all. To work now, make a notebook under a
+								different name with the file explorer's New file. To get this one back, fix
+								access to it, then reload the page.
+							{:else}
+								To work now, make a notebook under a different name with the file explorer's
+								New file. To get this one back, repair it, then reload the page.
+							{/if}
+						</p>
+					{:else}
+						<div class="text-sm text-base-content/50">No notebook open</div>
+						<p class="max-w-xs text-xs text-base-content/40">Open a file from the sidebar, or create a notebook for this workspace.</p>
+						<button class="btn btn-sm btn-primary" onclick={newNotebook} data-testid="empty-open-notebook">New notebook</button>
+					{/if}
 				</div>
 			{/if}
 		</main>
