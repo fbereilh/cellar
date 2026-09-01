@@ -109,7 +109,7 @@ describe('(B) a deleted cell fails legibly', () => {
 	});
 
 	it('a UI action that threads NO originId is still the USER, not an agent', async () => {
-		// The navbar "Consolidate imports" sweep: POST /api/notebooks/imports runs with
+		// The toolbar "Consolidate imports" sweep: POST /api/notebooks/imports runs with
 		// actor:'user' but deliberately threads no originId, and imports-cell.ts deletes
 		// each emptied cell with `deleteCell(id, abs)` outside any MCP session. So the
 		// tombstone carries origin == null AND by == null. Attribution must turn on the

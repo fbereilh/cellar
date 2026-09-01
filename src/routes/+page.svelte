@@ -1014,19 +1014,53 @@
 	// top and run it. The server does the whole sweep and broadcasts the resulting
 	// `cell:*` events with NO originId, so this tab renders it exactly as any other
 	// tab does - there is nothing to apply locally.
-	let consolidating = $state(false);
+	// Per-notebook in-flight state, keyed by notebook path (the `actingPaths` idiom
+	// the Kernels sidebar uses): the handler is bound per notebook, so the busy flag
+	// has to be too - a single boolean disabled every OTHER notebook's button and
+	// showed it a spinner for a sweep that was not its own.
+	let consolidatingPaths = $state<Set<string>>(new Set());
 
-	async function consolidateImports() {
-		if (!activeNotebookPath || consolidating) return;
-		consolidating = true;
+	// Takes the notebook it acts on, so each notebook's own toolbar button sweeps its
+	// OWN notebook rather than whichever tab happens to be focused (the binding
+	// `onInterruptKernel` already uses). The palette twin passes nothing and so still
+	// means "the active notebook".
+	async function consolidateImports(path: string | null = activeNotebookPath) {
+		if (!path || consolidatingPaths.has(path)) return;
+		consolidatingPaths = new Set(consolidatingPaths).add(path);
 		try {
-			await fetch('/api/notebooks/imports', {
+			const res = await fetch('/api/notebooks/imports', {
 				method: 'POST',
 				headers: { 'content-type': 'application/json' },
-				body: JSON.stringify({ path: activeNotebookPath })
+				body: JSON.stringify({ path })
 			});
-		} catch {}
-		consolidating = false;
+			// A REFUSAL the server ANSWERED: the route rethrows every
+			// `consolidateImports` error as a 400 carrying its own message, so this
+			// may say the sweep failed. It names the notebook because the button is
+			// bound per notebook and this line is shell-wide - the sweep may belong to
+			// a tab the user has since left - and it says nothing about WHICH cells
+			// moved, which this side never learns. The server's reason is carried with
+			// any absolute path stripped out (`loadDoc` throws one).
+			if (!res.ok) {
+				const body = await res.json().catch(() => null);
+				const reason =
+					typeof body?.message === 'string' ? reasonWithoutServerPath(body.message) : '';
+				showNotice(`Consolidate imports failed for ${path}${reason ? `: ${reason}` : ''}.`);
+			}
+		} catch (err) {
+			// NO VERDICT: a rejected fetch establishes nothing about whether the sweep
+			// ran - the reachable shape is the server persisting the whole sweep and
+			// the reply dying on the way back - so it may not assert failure. It says
+			// only that the outcome could not be confirmed, and that a retry is safe
+			// (the sweep is idempotent). The `noVerdict` stance `openKernelNotebook`
+			// takes, applied to the same shape.
+			showNotice(
+				`Could not confirm Consolidate imports for ${path}: Cellar did not answer (${(err as Error)?.message ?? err}). The sweep may or may not have been applied - running it again is safe.`
+			);
+		} finally {
+			const next = new Set(consolidatingPaths);
+			next.delete(path);
+			consolidatingPaths = next;
+		}
 	}
 
 	// ---- nbdev-style export to a .py module -----------------------------------
@@ -1735,8 +1769,7 @@
 		{tabRunState}
 		{sidebarOpen}
 		kernelInfo={displayKernel}
-		canConsolidateImports={!!activeNotebookPath}
-		{consolidating}
+		canExportPy={!!activeNotebookPath}
 		canSaveAsPy={!!activeNotebookPath}
 		canConvertToIpynb={activeNotebookIsPy}
 		{converting}
@@ -1754,7 +1787,6 @@
 		onPromoteTab={promoteTab}
 		onReorderTabs={reorderTabs}
 		onToggleSidebar={() => (sidebarOpen = !sidebarOpen)}
-		onConsolidateImports={consolidateImports}
 		onExportPy={exportPy}
 		onSaveAsPy={openSaveAsPy}
 		onConvertToIpynb={convertToIpynb}
@@ -1872,6 +1904,8 @@
 						onRunStart={onRunStart}
 						onRunEnd={onRunEnd}
 						onInterruptKernel={() => interruptKernel(canonicalNotebookRel)}
+						onConsolidateImports={() => consolidateImports(canonicalNotebookRel)}
+						consolidating={consolidatingPaths.has(canonicalNotebookRel)}
 						onBlame={handleBlame}
 						searchHighlight={searchHighlight}
 					/>
@@ -1906,6 +1940,8 @@
 						onRunStart={onRunStart}
 						onRunEnd={onRunEnd}
 						onInterruptKernel={() => interruptKernel(tab.path)}
+						onConsolidateImports={() => consolidateImports(tab.path)}
+						consolidating={consolidatingPaths.has(tab.path)}
 						onBlame={handleBlame}
 						searchHighlight={searchHighlight}
 					/>

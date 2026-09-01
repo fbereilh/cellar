@@ -12,7 +12,7 @@
  *
  * A human typing `import os` into cell 7 is left completely alone. Their cell is
  * their cell; yanking a line out from under a cursor is the one behavior this
- * feature must never have. Both entry points above are deliberate acts — a menu
+ * feature must never have. Both entry points above are deliberate acts — a toolbar
  * click, or an agent's write — and neither observes a human's keystrokes.
  *
  * When new imports land, the imports cell RUNS: an import the kernel has not

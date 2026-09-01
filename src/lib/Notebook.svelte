@@ -85,6 +85,14 @@
 		onClear: (id: string) => void;
 		/** Clear every cell's outputs — the same action as the palette's "Clear all outputs". */
 		onClearAll?: () => void;
+		/**
+		 * Sweep this notebook's module-level imports into its pinned imports cell and
+		 * run it — the same action as the palette's "Consolidate imports". The shell
+		 * owns the request (and the busy flag below); this bar only surfaces it.
+		 */
+		onConsolidateImports?: () => void;
+		/** True while a consolidate request is in flight, so it cannot be fired twice. */
+		consolidating?: boolean;
 		onDelete: (id: string) => void;
 		onMove: (id: string, dir: 'up' | 'down') => void;
 		onMoveToIndex?: (id: string, toIndex: number) => void;
@@ -231,6 +239,8 @@
 		onInterrupt,
 		onClear,
 		onClearAll,
+		onConsolidateImports,
+		consolidating = false,
 		onDelete,
 		onMove,
 		onMoveToIndex,
@@ -899,11 +909,18 @@
 		<!-- Notebook toolbar: the discoverable, top-of-notebook entry points for
 		     acting on the whole notebook. Each button triggers the SAME handler its
 		     command-palette twin does (`run-all` / `kernel-interrupt` /
-		     `clear-all-outputs`) — this bar surfaces those actions, it owns none of
-		     their logic. Run all enqueues every code cell through the same
-		     server-side FIFO run queue as any other run, so interrupting cancels
-		     the whole batch. -->
-		<div class="mb-4 flex items-center gap-2" data-testid="notebook-toolbar">
+		     `clear-all-outputs` / `consolidate-imports`) — this bar surfaces those
+		     actions, it owns none of their logic. Run all enqueues every code cell
+		     through the same server-side FIFO run queue as any other run, so
+		     interrupting cancels the whole batch.
+		     An action promoted to this bar leaves the navbar Options menu rather than
+		     appearing in both: Run all / Interrupt / Clear all outputs are toolbar +
+		     palette only, and Consolidate imports now follows them. The menu keeps
+		     what this bar does NOT carry (run stale/above/below, Export to .py, …).
+		     `flex-wrap` so a narrow window (or a wide sidebar) wraps the bar onto a
+		     second row instead of pushing buttons out of reach — the same rule the
+		     per-cell toolbar row follows. -->
+		<div class="mb-4 flex flex-wrap items-center gap-2" data-testid="notebook-toolbar">
 			<button
 				class="btn btn-ghost btn-sm gap-1.5 text-success"
 				onclick={() => onRunAll?.()}
@@ -944,6 +961,32 @@
 					<path d="m7 21-4.3-4.3a1 1 0 0 1 0-1.4l9.3-9.3a1 1 0 0 1 1.4 0l5.6 5.6a1 1 0 0 1 0 1.4L13 21" /><path d="M22 21H7" /><path d="m5 11 9 9" />
 				</svg>
 				Clear all outputs
+			</button>
+			<!-- Disabled only while a sweep is in flight, so it cannot be fired twice.
+			     There is no "nothing to consolidate" gate here and there was none on the
+			     menu item this replaces: the sweep is idempotent (a notebook with nothing
+			     to move rewrites nothing), so predicting emptiness would be a new claim,
+			     not the same button in a new place. -->
+			<button
+				class="btn btn-ghost btn-sm gap-1.5"
+				onclick={() => onConsolidateImports?.()}
+				disabled={consolidating}
+				title="Move every top-level import into one pinned cell at the top of the notebook, and run it"
+				aria-label="Consolidate imports"
+				data-testid="consolidate-imports"
+			>
+				{#if consolidating}
+					<span class="loading loading-spinner loading-xs"></span>
+				{:else}
+					<!-- Arrow UP into a line at the TOP: imports are gathered into the pinned
+					     cell at the top of the notebook. The menu item this replaces used the
+					     mirrored glyph (down onto a bottom line), which in this bar is the same
+					     picture as the "Export to" download arrow sitting directly below it —
+					     two adjacent affordances reading as one action. This way is both
+					     distinct and the right direction. -->
+					<svg class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 3h14" /><path d="M12 21V9" /><path d="m7 14 5-5 5 5" /></svg>
+				{/if}
+				Consolidate imports
 			</button>
 		</div>
 		{#if showRootBar}
