@@ -19,29 +19,10 @@
  * form this UI speaks) never does. A message left empty by that removal is
  * reported as nothing rather than as a stray fragment - the caller decides what to
  * say when there is no reason left worth showing.
- *
- * A path is not always introduced by a SPACE, and the commonest source of these
- * messages is the one that proves it: Node quotes it (`EACCES: permission denied,
- * open '/Users/<name>/ws/notebook.ipynb'`), so a whitespace-only boundary matched
- * nothing and forwarded the whole path verbatim. The boundary therefore includes
- * the usual openers, and the token runs to whitespace OR the matching closer so
- * the quotes go with what they wrap.
  */
 
-/** Characters an absolute path may be introduced by, besides the start of the string. */
-const OPENERS = "\\s'\"`([{<";
-/**
- * Characters an absolute path may be terminated by, besides whitespace. Quotes
- * ONLY: a bracket is far commoner INSIDE a path (`report(2).ipynb`) than around
- * one, and stopping there would leave the tail of the path on screen.
- */
-const CLOSERS = "'\"`";
-
-/** An absolute POSIX path, a UNC path, or a Windows drive path, with any quoting. */
-const ABSOLUTE_PATH = new RegExp(
-	`(?:^|[${OPENERS}])(?:[A-Za-z]:)?[\\\\/][^\\s${CLOSERS}]*[${CLOSERS}]?`,
-	'g'
-);
+/** An absolute POSIX path, a UNC path, or a Windows drive path. */
+const ABSOLUTE_PATH = /(?:^|\s)(?:[A-Za-z]:)?[\\/][^\s]*/g;
 
 /**
  * `message` with every absolute filesystem path removed, tidied so it still reads

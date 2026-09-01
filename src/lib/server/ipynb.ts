@@ -305,11 +305,22 @@ function isBlankText(text: string): boolean {
  * Read a notebook from disk. `null` means the file does not exist.
  *
  * STRICT, deliberately - this reader never infers a notebook from bytes that are
- * not one, and there are two distinct refusals because they are two distinct
+ * not one, and there are three distinct refusals because they are three distinct
  * facts. A BLANK file (no bytes, or whitespace only) says so and names the
- * repair; bytes that are PRESENT but do not parse keep the parser's own detail.
- * Neither message repeats the file name: every caller already prefixes it (the
- * notebook route's "Could not open <path>:", the MCP tool the agent named it in).
+ * repair; bytes that are PRESENT but do not parse keep the parser's own detail;
+ * and a file that could not be READ at all names the errno.
+ *
+ * NO REFUSAL HERE CARRIES A PATH, and that is a property of this reader rather
+ * than of anything downstream. Every caller already prefixes the file (the
+ * notebook route's "Could not open <path>:", the MCP tool the agent named it in),
+ * and these messages reach a browser - so an absolute server path in one leaks
+ * the machine's layout into the interface. The two authored refusals never had
+ * one; the READ is the door it came through, because Node names the file it
+ * failed to open (`EACCES: permission denied, open '/Users/…'`), so the read is
+ * wrapped and re-raised as its errno alone. Fixing it HERE rather than stripping
+ * paths downstream is what keeps a corrupt notebook's own parser detail intact -
+ * that snippet is the file's CONTENT, and a path-stripper run over it eats
+ * exactly the token that identifies the corruption.
  *
  * WHY A BLANK FILE IS REFUSED RATHER THAN OPENED AS AN EMPTY NOTEBOOK. Reading it
  * leniently would buy exactly one thing: repairing an `.ipynb` that is already
@@ -333,7 +344,13 @@ function isBlankText(text: string): boolean {
  */
 export function readNotebook(path: string): NbNotebook | null {
 	if (!existsSync(path)) return null;
-	const text = readFileSync(path, 'utf8');
+	let text: string;
+	try {
+		text = readFileSync(path, 'utf8');
+	} catch (err) {
+		const code = (err as NodeJS.ErrnoException)?.code;
+		throw new Error(`the file could not be read${code ? ` (${code})` : ''}`);
+	}
 	if (isBlankText(text))
 		throw new Error(
 			'the file is empty, so there is no notebook to open - delete it and create it again from the file explorer'

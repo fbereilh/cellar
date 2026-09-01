@@ -94,36 +94,48 @@ describe('SSR renders the shell even when the canonical notebook cannot be read'
 const ROOT = typeof process.getuid === 'function' && process.getuid() === 0;
 
 describe(
-	ROOT ? 'the reason never leaks a server path (skipped: running as root ignores file modes)' : 'the reason never leaks a server path',
+	ROOT
+		? 'no refusal carries a server path (skipped: running as root ignores file modes)'
+		: 'no refusal carries a server path',
 	() => {
-		it.skipIf(ROOT)('an fs-level failure reports the cause without the absolute path', () => {
+		it.skipIf(ROOT)('an fs-level failure names the cause and no absolute path', () => {
 			const ws = workspace('');
 			const abs = join(ws, 'notebook.ipynb');
-			// `readNotebook` reads the file OUTSIDE its parse try, so this throws Node's
-			// own `EACCES: permission denied, open '<abs>'` - the shape that used to be
-			// printed verbatim on the page.
+			// Node names the file it could not open (`EACCES: permission denied, open
+			// '<abs>'`), so `readNotebook` re-raises the errno alone.
 			chmodSync(abs, 0o000);
 			try {
 				const data = load();
 				expect(data.notebookError).toBeTruthy();
 				expect(data.notebookError).not.toContain(ws);
-				expect(data.notebookError).not.toMatch(/(^|\s)\//);
-				// Stripped, not silenced: the cause still reads as something.
-				expect(data.notebookError).toMatch(/EACCES|permission/i);
+				expect(data.notebookError).not.toMatch(/[\\/]/);
+				// Stripped of the path, not silenced: the cause still reads as something.
+				expect(data.notebookError).toMatch(/could not be read/i);
+				expect(data.notebookError).toMatch(/EACCES/);
 			} finally {
 				chmodSync(abs, 0o644);
 			}
 		});
 
-		it('the two refusals it is written for pass through completely unchanged', () => {
+		it("a corrupt notebook keeps its parser detail, slashes and all", () => {
+			// The natural fixture: a renamed `.js` file. Its parser detail is the
+			// file's own CONTENT, so nothing may edit it on the way to the page - a
+			// path-stripper run over this eats the very token naming the corruption.
+			workspace('// hello\nconst x = 1;\n');
+			const reason = load().notebookError as string;
+			expect(reason).toMatch(/^not valid JSON \(.+\)$/s);
+			expect(reason).toContain('/');
+			expect(reason).toContain('// hello');
+		});
+
+		it('the two authored refusals pass through completely unchanged', () => {
 			workspace('');
 			expect(load().notebookError).toBe(
 				'the file is empty, so there is no notebook to open - delete it and create it again from the file explorer'
 			);
 
 			workspace('{"cells": [oops');
-			const corrupt = load().notebookError;
-			expect(corrupt).toMatch(/^not valid JSON \(.+\)$/s);
+			expect(load().notebookError).toMatch(/^not valid JSON \(.+\)$/s);
 		});
 	}
 );
