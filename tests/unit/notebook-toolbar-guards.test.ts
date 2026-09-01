@@ -1,5 +1,5 @@
 /**
- * Source guards for the notebook toolbar's three whole-notebook actions.
+ * Source guards for the notebook toolbar's four whole-notebook actions.
  *
  * WHAT THESE PROVE, AND WHAT THEY DO NOT. vitest runs without the SvelteKit
  * plugin (see `vitest.config.ts`), so `Notebook.svelte` cannot be mounted here —
@@ -25,7 +25,9 @@ import { join } from 'node:path';
 const NOTEBOOK = readFileSync(join(process.cwd(), 'src/lib/Notebook.svelte'), 'utf8');
 const LIVE = readFileSync(join(process.cwd(), 'src/lib/LiveNotebook.svelte'), 'utf8');
 
-const TOOLBAR_ACTIONS = ['run-all', 'interrupt-all', 'clear-all-outputs'];
+const TOOLBAR_ACTIONS = ['run-all', 'interrupt-all', 'clear-all-outputs', 'consolidate-imports'];
+
+const NAVBAR = readFileSync(join(process.cwd(), 'src/lib/Navbar.svelte'), 'utf8');
 
 /** The `<button …>` element whose `data-testid` is `id`. */
 function buttonWith(testid: string): string {
@@ -112,7 +114,7 @@ function registeredApiProps(): string[] {
 }
 
 describe('notebook toolbar: the three whole-notebook actions', () => {
-	it('renders Run all, Interrupt and Clear all outputs together', () => {
+	it('renders Run all, Interrupt, Clear all outputs and Consolidate imports together', () => {
 		for (const id of TOOLBAR_ACTIONS) {
 			expect(TOOLBAR, `${id} is not in the toolbar`).toContain(`data-testid="${id}"`);
 		}
@@ -141,5 +143,36 @@ describe('LiveNotebook wiring', () => {
 
 	it('passes the existing kernel interrupt in as onInterrupt', () => {
 		expect(LIVE).toContain('onInterrupt={onInterruptKernel}');
+	});
+
+	// The shell owns the consolidate request (it is a fetch, not notebook state), so
+	// LiveNotebook only forwards it — the same shape as onInterruptKernel. Both the
+	// handler and its busy flag have to reach the toolbar, since the flag is what
+	// stops a second click.
+	it('forwards the shell`s consolidate handler and its busy flag to the toolbar', () => {
+		expect(LIVE).toContain('onConsolidateImports={onConsolidateImports}');
+		expect(LIVE).toContain('consolidating={consolidating}');
+	});
+});
+
+/**
+ * An action promoted to the toolbar LEAVES the navbar Options menu rather than
+ * living in both: Run all / Interrupt / Clear all outputs have always been toolbar
+ * + palette only, and Consolidate imports now follows them. The palette twin is
+ * unaffected either way — this is about the two POINTED surfaces not carrying the
+ * same button one click apart.
+ */
+describe('one pointed surface per action', () => {
+	it('keeps every toolbar action out of the navbar Options menu', () => {
+		for (const id of TOOLBAR_ACTIONS) {
+			expect(NAVBAR, `${id} is in BOTH the toolbar and the Options menu`).not.toContain(
+				`data-testid="${id}"`
+			);
+		}
+	});
+
+	it('still offers Consolidate imports from the command palette', () => {
+		const commands = readFileSync(join(process.cwd(), 'src/lib/commands.ts'), 'utf8');
+		expect(commands).toContain("'consolidate-imports'");
 	});
 });

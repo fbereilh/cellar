@@ -356,7 +356,7 @@ function ago(ms: number): string {
  *   - `by` is null => the user, or Cellar acting on their behalf through a REST
  *     route, which reads as the user either way. Keying this off `origin` instead
  *     is the misattribution this module exists to prevent: a UI action does not
- *     always carry an `originId` (the navbar "Consolidate imports" sweep deletes
+ *     always carry an `originId` (the toolbar "Consolidate imports" sweep deletes
  *     emptied cells through a route that deliberately threads none), so it reported
  *     a human's own click as "an agent deleted it" - worse than the generic message
  *     it replaces, since another agent's action reads to the model as not its

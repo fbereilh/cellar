@@ -117,6 +117,13 @@
 		onRunEnd?: () => void;
 		/** Interrupt this notebook's kernel (same handler the Kernels sidebar uses). */
 		onInterruptKernel?: () => void;
+		/**
+		 * Consolidate THIS notebook's imports (the shell owns the request, and binds
+		 * it to this notebook's path the way `onInterruptKernel` is bound).
+		 */
+		onConsolidateImports?: () => void;
+		/** True while a consolidate request is in flight — the toolbar's busy state. */
+		consolidating?: boolean;
 		/** (path, record|null): the focused cell's git blame, for the shell footer. */
 		onBlame?: (path: string, record: BlameLine | null) => void;
 		/**
@@ -204,6 +211,8 @@
 		onRunStart,
 		onRunEnd,
 		onInterruptKernel,
+		onConsolidateImports,
+		consolidating = false,
 		onBlame,
 		searchHighlight = null
 	}: Props = $props();
@@ -4534,6 +4543,8 @@
 			onInterrupt={onInterruptKernel}
 			onClear={clearCell}
 			onClearAll={clearAll}
+			onConsolidateImports={onConsolidateImports}
+			consolidating={consolidating}
 			onDelete={deleteCell}
 			onMove={moveCell}
 			onMoveToIndex={moveCellToIndex}

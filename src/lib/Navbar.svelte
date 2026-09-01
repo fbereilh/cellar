@@ -24,8 +24,7 @@
 		tabRunState?: Record<string, 'running' | 'queued'>;
 		sidebarOpen: boolean;
 		kernelInfo: KernelInfo | null;
-		canConsolidateImports?: boolean;
-		consolidating?: boolean;
+		canExportPy?: boolean;
 		canSaveAsPy?: boolean;
 		canConvertToIpynb?: boolean;
 		converting?: boolean;
@@ -60,7 +59,6 @@
 		 */
 		onReorderTabs?: (id: string, insertAt: number) => void;
 		onToggleSidebar: () => void;
-		onConsolidateImports: () => void;
 		onExportPy: () => void;
 		onSaveAsPy: () => void;
 		onConvertToIpynb: () => void;
@@ -85,8 +83,7 @@
 		tabRunState = {},
 		sidebarOpen,
 		kernelInfo,
-		canConsolidateImports = false, // a notebook is active, so the sweep has a target
-		consolidating = false,
+		canExportPy = false, // a notebook is active, so the export has a target
 		canSaveAsPy = false, // a notebook is active → it can be exported to a .py
 		canConvertToIpynb = false, // the active notebook is a .py → it can be run into an .ipynb
 		converting = false,
@@ -104,7 +101,6 @@
 		onPromoteTab,
 		onReorderTabs,
 		onToggleSidebar,
-		onConsolidateImports,
 		onExportPy,
 		onSaveAsPy,
 		onConvertToIpynb,
@@ -509,23 +505,8 @@
 				</li>
 				<li>
 					<button
-						onclick={onConsolidateImports}
-						disabled={!canConsolidateImports || consolidating}
-						title="Move every top-level import into one pinned cell at the top of the notebook, and run it"
-						data-testid="consolidate-imports"
-					>
-						{#if consolidating}
-							<span class="loading loading-spinner loading-xs"></span>
-						{:else}
-							<svg class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v12" /><path d="m7 10 5 5 5-5" /><path d="M5 21h14" /></svg>
-						{/if}
-						Consolidate imports
-					</button>
-				</li>
-				<li>
-					<button
 						onclick={onExportPy}
-						disabled={!canConsolidateImports}
+						disabled={!canExportPy}
 						title="Write the cells marked for export to the notebook's .py module (nbdev-style). Mark cells and set the target from the bar at the top of the notebook."
 						data-testid="export-py-menu"
 					>
