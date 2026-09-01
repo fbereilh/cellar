@@ -76,27 +76,97 @@ export interface ExportResult {
 }
 
 /**
+ * fastcore's method-attaching decorators, by the EXACT head name of the decorator
+ * expression - the two `fastcore.basics` exports (`patch`, `patch_to`) that bind a
+ * function onto a CLASS rather than into the module.
+ *
+ * Why they must be skipped is a fact about what `@patch` LEAVES BEHIND, not a
+ * style preference: `patch` returns `glb.get(f.__name__, ...)` - the module-level
+ * binding that name ALREADY had, or **None** - so after `@patch def make(self: C)`
+ * the module global `make` is `None`. Listing it in `__all__` therefore does not
+ * merely add noise; `from module import *` binds `make = None` in the caller's
+ * namespace while the real method lives on `C`. Measured against the real fastcore.
+ *
+ * WHAT IS MATCHED, and what deliberately is not (over-matching would silently drop
+ * a legitimate export from someone's own code, which is worse than the bug):
+ *   - `@patch` and `@patch(...)`, `@patch_to(...)` - matched.
+ *   - `@patchwork`, `@patched`, `@patch_all` - NOT matched. This is an exact-name
+ *     set, deliberately NARROWER than nbdev's own rule, which is a PREFIX test
+ *     (`decor_id(d).startswith('patch')`, `nbdev/maker.py`). The prefix catches
+ *     both fastcore decorators, which is all it exists for, and this set catches
+ *     the same two by name - so the two agree on every real case while a
+ *     user-authored `@patchwork` keeps its export here and loses it under nbdev.
+ *   - `@p` from `from fastcore.basics import patch as p`, and a namespaced
+ *     `@fc.patch` - NOT matched, exactly as nbdev does not match them
+ *     (`decor_id` reads a bare `Name`'s `id` or a `Call`'s `func.id`, so an alias
+ *     yields the alias and an `Attribute` yields `''`). Recovering those needs
+ *     import resolution this scanner does not do, and guessing at a dotted tail
+ *     would re-open the over-match this set is narrow to avoid. Such a function
+ *     keeps its (harmless-but-wrong) `__all__` entry - the pre-existing behaviour.
+ *
+ * nbdev's `patch` prefix is the ONLY decorator filter in its whole vocabulary
+ * (`maker.py` for `__all__`, `doclinks.py` for the docs index; verified against
+ * nbdev 3.3.13). `@delegates`, `@docs`, `@call_parse` and friends define ordinary
+ * module-level names and are correctly left alone.
+ */
+const METHOD_ATTACHING_DECORATORS = new Set(['patch', 'patch_to']);
+
+/**
+ * The head name of a decorator logical line (`@patch` -> `patch`,
+ * `@patch_to(C)` -> `patch_to`, `@fc.patch` -> `fc.patch`), or null when the line
+ * is not a decorator. The DOTTED name is returned whole so a namespaced decorator
+ * simply misses the exact-name set above rather than matching on its tail.
+ */
+function decoratorName(head: string): string | null {
+	const m = head.match(/^@\s*([A-Za-z_][\w.]*)/);
+	return m ? m[1] : null;
+}
+
+/**
  * Best-effort top-level names for `__all__`, from a single cell's source:
  * top-level `def`/`class` and simple top-level assignments (`X = …`,
  * `X: T = …`, `A, B = …`). Names starting with `_` are omitted (nbdev/Python
  * convention: private). Order is preserved; the caller dedupes across cells.
  *
+ * A `def`/`class` carrying a method-attaching decorator (`METHOD_ATTACHING_DECORATORS`)
+ * is SKIPPED - it is a method on some class, not module-level API. Only its `__all__`
+ * membership is dropped: `generateModule` writes the cell's source verbatim, so the
+ * method still exists and still attaches.
+ *
  * Uses the imports tokenizer's `logicalLines` so `=`/`def`/`class` inside a
- * string or a nested (indented) scope are never mistaken for a definition.
+ * string or a nested (indented) scope are never mistaken for a definition - and so a
+ * `@patch` inside a triple-quoted string is never mistaken for a decorator either.
  * Known limits (documented, acceptable for a best-effort `__all__`): augmented
  * assignments (`X += …`), `del`, and dynamically-created names are invisible.
  */
 export function topLevelNames(source: string): string[] {
 	const names: string[] = [];
+	// Decorators are their own logical lines and STACK, so the flag accumulates
+	// across a run of them and is consumed by the `def`/`class` they belong to.
+	let patched = false;
 	for (const line of logicalLines(source)) {
 		if (line.indent !== 0) continue; // only module-level statements define exports
 		const head = line.raw.replace(/^\s+/, '');
+		// A blank or comment-only line is LEGAL between a decorator and its `def`
+		// (verified against CPython), so it must not break the run.
+		if (!stripComments(head).trim()) continue;
+		const dec = decoratorName(head);
+		if (dec) {
+			if (METHOD_ATTACHING_DECORATORS.has(dec)) patched = true;
+			continue;
+		}
 		// def / class (including `async def`)
 		const dc = head.match(/^(?:async\s+)?(?:def|class)\s+([A-Za-z_]\w*)/);
 		if (dc) {
-			names.push(dc[1]);
+			const skip = patched;
+			patched = false;
+			if (!skip) names.push(dc[1]);
 			continue;
 		}
+		// Any other statement ends the decorator run (unreachable in valid Python -
+		// a decorator must be followed by a `def`/`class` - so this is only a guard
+		// against a mid-edit cell leaking the flag onto a later definition).
+		patched = false;
 		// annotated single assignment: `NAME: T = …`
 		const ann = head.match(/^([A-Za-z_]\w*)\s*:\s*[^=]+=(?!=)/);
 		if (ann) {
