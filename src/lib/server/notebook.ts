@@ -452,7 +452,15 @@ function emit(doc: NotebookDoc, type: string, extra: Record<string, unknown>, or
 
 /** Serializable view of a notebook for the browser. */
 export function getNotebook(nb?: string | null): NotebookView {
-	const doc = docFor(nb);
+	return notebookView(docFor(nb));
+}
+
+/**
+ * The browser-facing projection of an ALREADY-RESOLVED document. Split out of
+ * `getNotebook` so a view can be built for a document that is deliberately not in
+ * the `docs` map - see `readDefaultNotebook`, whose stand-in must stay unwritable.
+ */
+function notebookView(doc: NotebookDoc): NotebookView {
 	const t = doc.metadata?.cellar?.export_target;
 	return {
 		workspace: workspace(),
@@ -564,6 +572,35 @@ export function notebookIpynb(nb?: string | null): { path: string; name: string;
  */
 export function getDefaultNotebook(): NotebookView {
 	return getNotebook(canonicalPath());
+}
+
+/**
+ * The canonical notebook for SSR, or a stand-in plus the reason it could not be
+ * read - it NEVER throws.
+ *
+ * The shell's `load()` seeds itself from the canonical notebook, so an unreadable
+ * `notebook.ipynb` (blank, or corrupt) took the whole page down rather than one
+ * tab: the user never reached the file explorer that the reader's own refusal
+ * names as the repair, and a production build sanitises a load error into a
+ * generic page, so they were not even told why. Every other risky call in that
+ * `load()` is already best-effort for exactly this reason.
+ *
+ * The stand-in is DISPLAY-ONLY and is deliberately never put in the `docs` map:
+ * every mutation path reaches `docFor` -> `loadDoc`, which still reads the file
+ * and still throws, so no write can ever land on top of bytes Cellar could not
+ * read. That matters most for a CORRUPT notebook, where overwriting would be real
+ * data loss.
+ */
+export function readDefaultNotebook(): { notebook: NotebookView; error: string | null } {
+	try {
+		return { notebook: getDefaultNotebook(), error: null };
+	} catch (err) {
+		const abs = canonicalPath();
+		return {
+			notebook: notebookView({ path: abs, cells: [], metadata: undefined }),
+			error: String((err as Error)?.message ?? err)
+		};
+	}
 }
 
 /**

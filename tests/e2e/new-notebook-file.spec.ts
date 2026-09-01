@@ -111,3 +111,54 @@ test.describe(runtimeAvailable() ? 'new .ipynb from the file explorer' : `new .i
 		expect(statSync(abs).size).toBe(0);
 	});
 });
+
+/**
+ * The CANONICAL notebook is the one file whose unreadability used to take the whole
+ * shell down: SSR seeds itself from it, so a blank `notebook.ipynb` threw during
+ * `load()` and the user never reached the file explorer the refusal names as the
+ * repair (and, in a production build, was not even shown the reason). It must cost
+ * one tab's worth of information, not the page - so this boots its OWN workspace,
+ * blank before the first request, because the canonical document is materialised in
+ * memory on the first load and would otherwise already be cached.
+ */
+test.describe(
+	runtimeAvailable() ? 'a blank canonical notebook.ipynb' : `blank canonical notebook (skipped: ${REASON})`,
+	() => {
+		test.skip(!runtimeAvailable(), REASON);
+
+		let ws: string;
+		let proc: ChildProcess;
+		let url: string;
+
+		test.beforeAll(async () => {
+			ws = mkdtempSync(join(tmpdir(), 'cellar-blank-canonical-'));
+			writeFileSync(join(ws, 'notebook.ipynb'), '');
+			({ proc, url } = await bootCellar(ws));
+		});
+		test.afterAll(() => proc && killCellar(proc));
+
+		test('renders the shell, says why, and leaves the explorer usable', async ({ page }) => {
+			await page.goto(url);
+
+			// The shell rendered at all - the regression is that this page 500s.
+			const reason = page.getByTestId('canonical-notebook-error');
+			await expect(reason).toBeVisible();
+			await expect(reason).toContainText(/file is empty/i);
+			await expect(reason).not.toContainText(/JSON input/i);
+
+			// And the remedy the message names is actually reachable: the explorer
+			// works, so the file can be deleted and created again.
+			await openSidebarSection(page, 'files', 'files-body');
+			await expect(page.getByTestId('tree-file').filter({ hasText: 'notebook.ipynb' })).toBeVisible();
+			await page.getByTestId('files-new-file').click();
+			const field = page.getByTestId('tree-entry-field');
+			await expect(field).toBeVisible();
+			await field.fill('fresh.ipynb');
+			await field.press('Enter');
+			await expect(page.getByTestId('tree-file').filter({ hasText: 'fresh.ipynb' })).toBeVisible();
+
+			// The unreadable file is left exactly as it was.
+			expect(statSync(join(ws, 'notebook.ipynb')).size).toBe(0);
+		});
+	}
+);

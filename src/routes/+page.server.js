@@ -1,4 +1,4 @@
-import { getDefaultNotebook } from '$lib/server/notebook';
+import { readDefaultNotebook } from '$lib/server/notebook';
 import { workspaceRoot } from '$lib/server/fstree';
 import { harnessState, isHarnessAllowed, mcpJsonHarnessNames, mcpConfigDisabled } from '$lib/server/harness.js';
 import { getUiState } from '$lib/server/ui-state';
@@ -56,8 +56,17 @@ export function load() {
 	// running value in the demoted raw-endpoint disclosure.
 	const mcpPort = Number(process.env.CELLAR_MCP_PORT || 39587);
 	const claude = detectMcpConfig();
+	// The canonical notebook, or a display-only stand-in plus the reason it could
+	// not be read. Best-effort like every other call here: an unreadable
+	// `notebook.ipynb` must cost one tab, not the whole shell - otherwise the file
+	// explorer the reader's refusal names as the repair is unreachable.
+	const canonical = readDefaultNotebook();
 	return {
-		notebook: getDefaultNotebook(),
+		notebook: canonical.notebook,
+		// Why the canonical notebook could not be read (the same message the notebook
+		// route returns), else null. Carried rather than swallowed: an empty shell
+		// over a broken file would imply there is simply no notebook.
+		notebookError: canonical.error,
 		// Soft cap on live kernels: past this the Kernels sidebar shows a
 		// high-memory warning (warn-only, never blocks a run). Each kernel is a full
 		// Python process (100s of MB with pandas/pyspark). Tunable via

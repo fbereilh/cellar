@@ -105,6 +105,13 @@
 	// falls back to the bare name here.
 	const canonicalNotebookRel = toWorkspaceRel(workspace, notebookPath) ?? notebookName;
 
+	// Why the canonical notebook could not be read, else null. SSR seeds the shell
+	// from that notebook, so an unreadable one used to take the whole page down -
+	// see `readDefaultNotebook`. It renders instead, but the empty state must not
+	// then imply there is simply no notebook: the file explorer beside it is the
+	// remedy, and the user has to be told which file to act on and why.
+	const canonicalNotebookError: string | null = data.notebookError ?? null;
+
 	// Live cells per open notebook (path → the notebook's reactive cell array),
 	// reported up by each LiveNotebook so the sidebar (outline / search) can read
 	// whichever notebook is active. Seeded with the default notebook's SSR cells
@@ -1921,9 +1928,18 @@
 				<!-- Empty state: no tab open (first-ever open, or all tabs closed). -->
 				<div class="flex h-full flex-col items-center justify-center gap-4 text-center" data-testid="empty-state">
 					<div class="text-5xl opacity-30">🍷</div>
-					<div class="text-sm text-base-content/50">No notebook open</div>
-					<p class="max-w-xs text-xs text-base-content/40">Open a file from the sidebar, or create a notebook for this workspace.</p>
-					<button class="btn btn-sm btn-primary" onclick={newNotebook} data-testid="empty-open-notebook">New notebook</button>
+					{#if canonicalNotebookError}
+						<div class="text-sm text-error" data-testid="canonical-notebook-error">
+							Could not open <code class="font-mono">{canonicalNotebookRel}</code>: {canonicalNotebookError}
+						</div>
+						<p class="max-w-xs text-xs text-base-content/40">
+							Open another notebook from the sidebar, or delete this file there and create it again.
+						</p>
+					{:else}
+						<div class="text-sm text-base-content/50">No notebook open</div>
+						<p class="max-w-xs text-xs text-base-content/40">Open a file from the sidebar, or create a notebook for this workspace.</p>
+						<button class="btn btn-sm btn-primary" onclick={newNotebook} data-testid="empty-open-notebook">New notebook</button>
+					{/if}
 				</div>
 			{/if}
 		</main>
