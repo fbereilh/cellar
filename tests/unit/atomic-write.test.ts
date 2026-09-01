@@ -160,7 +160,7 @@ describe('writeNotebook (atomic + serialized)', () => {
 	it('round-trips: write then read back equals the cleaned doc', () => {
 		const p = join(dir, 'nb.ipynb');
 		writeNotebook(p, { path: p, cells: [cell('a', 'x = 1'), cell('b', 'y = 2')] });
-		const back = readNotebook(p)?.nb;
+		const back = readNotebook(p);
 		expect(back?.nbformat).toBe(4);
 		expect(back?.cells.map((c) => c.id)).toEqual(['a', 'b']);
 		// Deterministic clean-on-save: execution_count nulled.
@@ -172,7 +172,7 @@ describe('writeNotebook (atomic + serialized)', () => {
 		const p = join(dir, 'nb.ipynb');
 		writeNotebook(p, { path: p, cells: [cell('a', 'first = 1')] });
 		writeNotebook(p, { path: p, cells: [cell('a', 'second = 2')] });
-		const back = readNotebook(p)?.nb;
+		const back = readNotebook(p);
 		expect(back).toBeTruthy();
 		expect(back?.cells).toHaveLength(1);
 		expect(back?.cells[0].source).toContain('second = 2');
@@ -185,8 +185,8 @@ describe('writeNotebook (atomic + serialized)', () => {
 		const p2 = join(dir, 'two.ipynb');
 		writeNotebook(p1, { path: p1, cells: [cell('a', 'a = 1')] });
 		writeNotebook(p2, { path: p2, cells: [cell('b', 'b = 2')] });
-		expect(readNotebook(p1)?.nb.cells[0].id).toBe('a');
-		expect(readNotebook(p2)?.nb.cells[0].id).toBe('b');
+		expect(readNotebook(p1)?.cells[0].id).toBe('a');
+		expect(readNotebook(p2)?.cells[0].id).toBe('b');
 		expect(tempFiles(dir)).toEqual([]);
 	});
 
@@ -207,7 +207,7 @@ describe('writeNotebook (atomic + serialized)', () => {
 		}
 
 		expect(readFileSync(p, 'utf8')).toBe(original);
-		expect(readNotebook(p)?.nb.cells[0].source).toContain('kept = 1');
+		expect(readNotebook(p)?.cells[0].source).toContain('kept = 1');
 		expect(tempFiles(sub)).toEqual([]);
 	});
 });

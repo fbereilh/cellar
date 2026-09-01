@@ -1,6 +1,6 @@
 /**
  * A NEW `.ipynb` is a VALID notebook the moment it exists — and an already-BLANK
- * one still opens.
+ * one refuses to open, with a message that says what to do about it.
  *
  * The reported bug: creating `analysis.ipynb` through the file explorer produced a
  * ZERO-BYTE file (`createEntry` writes `''` for every file kind), and opening it
@@ -9,13 +9,12 @@
  * create went through `createNotebook` instead and wrote a real skeleton, which is
  * why one route worked and the other did not.
  *
- * Two halves, and the tests below keep them apart because they answer different
- * questions:
- *   - the WRITER (`POST /api/fs/op` + `createEntry`) makes the file valid for
- *     every tool, not just Cellar;
- *   - the READER (`readNotebook`) opens a blank file as a blank notebook, which is
- *     what repairs a file the writer never wrote — a `touch`, a rename or a copy of
- *     an empty file, or an `.ipynb` an older Cellar already left on disk.
+ * The fix is the WRITER (`POST /api/fs/op` + `createEntry`), which makes the file
+ * valid for every tool and not just Cellar. The READER stays STRICT: a file that
+ * is already blank on disk is refused rather than inferred into an empty notebook
+ * (see `readNotebook` for the measured cost of the leniency that was tried), so
+ * the second half of these tests pins that refusal on every route that can still
+ * produce a blank `.ipynb` — a `touch`, a rename, a copy — and pins the repair.
  *
  * Driven against a real scratch workspace on the real filesystem: the whole
  * question is what lands on disk and whether it can be read back.
@@ -131,110 +130,64 @@ describe('the file explorer creates a usable notebook', () => {
 	});
 });
 
-describe('an already-blank .ipynb opens rather than dead-ending', () => {
-	it('reads a zero-byte file as a blank notebook', () => {
-		const abs = join(WS, 'touched.ipynb');
-		writeFileSync(abs, '');
-		const view = nbmod.getNotebook('touched.ipynb');
-		expect(view.cells).toHaveLength(1);
-		expect(view.cells[0].source).toBe('');
+describe('an already-blank .ipynb refuses, and names the repair', () => {
+	// The reader is deliberately strict. Opening a blank file as an empty notebook
+	// was tried and withdrawn: it can only ever repair a file that is genuinely
+	// empty, while a file caught MID-WRITE by a non-atomic external writer looks
+	// identical and would be silently overwritten by the next save. Refusing costs
+	// one delete-and-recreate, which the explorer now does correctly.
+	const REPAIR = /file is empty[\s\S]*create it again from the file explorer/i;
+
+	it('refuses a zero-byte file with the empty-file message, not a raw parser error', () => {
+		writeFileSync(join(WS, 'touched.ipynb'), '');
+		// The bug's own symptom was `Unexpected end of JSON input` reaching the user.
+		expect(() => nbmod.getNotebook('touched.ipynb')).toThrow(REPAIR);
+		expect(() => nbmod.getNotebook('touched.ipynb')).not.toThrow(/JSON input/i);
 	});
 
 	it('treats a whitespace-only file the same (it holds no more than the empty one)', () => {
 		writeFileSync(join(WS, 'blankish.ipynb'), '\n  \n\t\n');
-		expect(nbmod.getNotebook('blankish.ipynb').cells).toHaveLength(1);
+		expect(() => nbmod.getNotebook('blankish.ipynb')).toThrow(REPAIR);
 	});
 
-	it('does NOT write the file on open — Cellar still drops no uninvited bytes', () => {
-		const abs = join(WS, 'untouched-on-open.ipynb');
-		writeFileSync(abs, '');
-		nbmod.getNotebook('untouched-on-open.ipynb');
-		// `loadDoc` never persists; the file stays exactly as it was until a real edit.
-		expect(statSync(abs).size).toBe(0);
-	});
-
-	it('covers the OTHER blank-file routes: a rename and a copy of an empty file', async () => {
-		writeFileSync(join(WS, 'empty-src.txt'), '');
-		await op({ op: 'rename', path: 'empty-src.txt', name: 'renamed.ipynb' });
-		expect(nbmod.getNotebook('renamed.ipynb').cells).toHaveLength(1);
-
-		mkdirSync(join(WS, 'dest'));
-		await op({ op: 'copy', path: 'renamed.ipynb', dest: 'dest' });
-		expect(nbmod.getNotebook('dest/renamed.ipynb').cells).toHaveLength(1);
-	});
-});
-
-describe('a blank file that was only MOMENTARILY blank is never overwritten', () => {
-	// The blank-file leniency rests on "no bytes, so nothing to lose". That is true
-	// of a genuinely empty file and false of one caught MID-WRITE: a non-atomic
-	// external writer (nbdev's `fastcore/nbio.py` opens with 'w') truncates before
-	// it writes, and this repo has measured a 0-byte read in exactly that window
-	// (`fileWatch.ts`'s header). Read there, a real notebook would be cached as a
-	// blank document and the next save would overwrite it.
-	const REAL = JSON.stringify(
-		{
-			cells: [{ cell_type: 'code', id: 'precious', metadata: {}, source: ['treasure = 1'], outputs: [], execution_count: null }],
-			metadata: {},
-			nbformat: 4,
-			nbformat_minor: 5
-		},
-		null,
-		1
-	);
-
-	it('refuses the first save when the file gained content after it was opened blank', () => {
-		const abs = join(WS, 'mid-write.ipynb');
-		writeFileSync(abs, ''); // the truncation window
-
-		const view = nbmod.getNotebook('mid-write.ipynb');
-		expect(view.cells).toHaveLength(1);
-
-		// The external writer finishes.
-		writeFileSync(abs, REAL);
-
-		// Any mutation persists; this one must REFUSE rather than overwrite.
-		expect(() => nbmod.setSource(view.cells[0].id, 'x = 1', 'mid-write.ipynb')).toThrow(
-			/opened as an empty notebook but now has content/i
-		);
-		// The headline assertion: the user's bytes are untouched.
-		expect(readFileSync(abs, 'utf8')).toBe(REAL);
-	});
-
-	it('the refusal names the notebook workspace-relative, never an absolute server path', () => {
-		const abs = join(WS, 'named.ipynb');
-		writeFileSync(abs, '');
-		const view = nbmod.getNotebook('named.ipynb');
-		writeFileSync(abs, REAL);
+	it('does not repeat the file name — every caller already prefixes it', () => {
+		writeFileSync(join(WS, 'named-blank.ipynb'), '');
 		let msg = '';
 		try {
-			nbmod.setSource(view.cells[0].id, 'x = 1', 'named.ipynb');
+			nbmod.getNotebook('named-blank.ipynb');
 		} catch (err) {
 			msg = String((err as Error).message);
 		}
-		expect(msg).toContain('named.ipynb');
+		expect(msg).toMatch(REPAIR);
+		expect(msg).not.toMatch(/named-blank/);
+		// And no absolute server path leaks either.
 		expect(msg).not.toContain(WS);
 	});
 
-	it('a genuinely blank file still saves — and the guard does not fire twice', () => {
-		const abs = join(WS, 'really-blank.ipynb');
-		writeFileSync(abs, '');
-		const view = nbmod.getNotebook('really-blank.ipynb');
+	it('refuses the OTHER blank-file routes the same way: a rename and a copy', async () => {
+		writeFileSync(join(WS, 'empty-src.txt'), '');
+		await op({ op: 'rename', path: 'empty-src.txt', name: 'renamed.ipynb' });
+		expect(() => nbmod.getNotebook('renamed.ipynb')).toThrow(REPAIR);
 
-		nbmod.setSource(view.cells[0].id, 'first = 1', 'really-blank.ipynb');
-		expect(readFileSync(abs, 'utf8')).toContain('first = 1');
-
-		// The document now has bytes of its own on disk, so a SECOND save must not
-		// be refused by its own first write.
-		nbmod.setSource(view.cells[0].id, 'second = 2', 'really-blank.ipynb');
-		expect(readFileSync(abs, 'utf8')).toContain('second = 2');
+		mkdirSync(join(WS, 'dest'));
+		await op({ op: 'copy', path: 'renamed.ipynb', dest: 'dest' });
+		expect(() => nbmod.getNotebook('dest/renamed.ipynb')).toThrow(REPAIR);
 	});
 
-	it('a notebook read from real bytes is never guarded (an ordinary save is unaffected)', () => {
-		const abs = join(WS, 'ordinary.ipynb');
-		writeFileSync(abs, REAL);
-		const view = nbmod.getNotebook('ordinary.ipynb');
-		nbmod.setSource(view.cells[0].id, 'edited = 1', 'ordinary.ipynb');
-		expect(readFileSync(abs, 'utf8')).toContain('edited = 1');
+	it('leaves the file exactly as it was — a refusal writes nothing', () => {
+		const abs = join(WS, 'untouched-on-refusal.ipynb');
+		writeFileSync(abs, '');
+		expect(() => nbmod.getNotebook('untouched-on-refusal.ipynb')).toThrow();
+		expect(statSync(abs).size).toBe(0);
+	});
+
+	it('and the repair really works: delete it, create it again, and it opens', async () => {
+		writeFileSync(join(WS, 'repairable.ipynb'), '');
+		expect(() => nbmod.getNotebook('repairable.ipynb')).toThrow(REPAIR);
+
+		expect((await op({ op: 'delete', path: 'repairable.ipynb' })).status).toBe(200);
+		expect((await op({ op: 'create', parent: '', name: 'repairable.ipynb', kind: 'file' })).status).toBe(200);
+		expect(nbmod.getNotebook('repairable.ipynb').cells).toHaveLength(1);
 	});
 });
 
@@ -273,13 +226,15 @@ describe('a genuinely corrupt notebook still refuses, and says why', () => {
 	});
 });
 
-describe('blankNotebook is ONE definition with two consumers', () => {
-	it('the bytes the explorer writes are what a blank file reads as', () => {
-		const written = JSON.parse(ipynb.blankNotebookText());
-		const read = ipynb.blankNotebook();
-		// Everything but the freshly minted cell id.
-		written.cells[0].id = read.cells[0].id = 'x';
-		expect(written).toEqual(read);
+describe('the blank-notebook writer', () => {
+	it('mints a fresh cell id each time — two new notebooks are not the same cell', () => {
+		const a = ipynb.blankNotebook();
+		const b = ipynb.blankNotebook();
+		expect(a.cells[0].id).not.toBe(b.cells[0].id);
+		// Everything else is identical: one shape, one definition.
+		a.cells[0].id = b.cells[0].id = 'x';
+		expect(a).toEqual(b);
+		expect(JSON.parse(ipynb.blankNotebookText()).cells).toHaveLength(1);
 	});
 
 	it('isIpynbPath matches the browser tab rule', () => {

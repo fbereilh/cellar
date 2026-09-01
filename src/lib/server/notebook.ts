@@ -21,7 +21,7 @@
 import { dirname, join, resolve, isAbsolute, relative, sep } from 'node:path';
 import { existsSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
-import { readNotebook, notebookFileHasContent, deserialize, writeNotebook, serialize, stringify } from './ipynb';
+import { readNotebook, deserialize, writeNotebook, serialize, stringify } from './ipynb';
 import { isPyPath, readPyNotebook, writePyNotebook } from './jupytext';
 import { publish } from './events';
 import { cancelRun } from './run-queue';
@@ -218,39 +218,9 @@ function setImportBindings(
  * (see `publishExportDerived`).
  */
 function persist(doc: NotebookDoc): void {
-	assertBlankOriginStillBlank(doc);
 	if (doc.jpFormat) writePyNotebook(doc.path, doc.cells, doc.jpFormat);
 	else writeNotebook(doc.path, doc);
-	// Only the FIRST write is guarded: once these bytes are on disk the document is
-	// no longer standing in for a file nobody authored, and an ordinary keystroke
-	// autosave must not re-read the file every time. Cleared AFTER the write, so a
-	// write that threw leaves the guard armed for the next attempt.
-	doc.bornBlank = false;
 	publishExportDerived(doc);
-}
-
-/**
- * Refuse the first write of a document that was materialised from a BLANK file
- * when that file has since gained content.
- *
- * The blank-file leniency in `readNotebook` rests on "the file holds no bytes, so
- * there is nothing to lose". That is true of a genuinely empty file and false of
- * a MOMENTARILY empty one: a non-atomic external writer truncates before it
- * writes, and a read landing in that window caches a blank document over a real
- * notebook. Guessing at the timing (an mtime settle, a delayed re-read) can only
- * narrow that window; checking at the moment of harm CLOSES it, because by the
- * time a save is attempted the writer has either finished - so the file has
- * content and this refuses - or it has not, and there is still nothing to lose.
- *
- * A refusal is the pre-fix behaviour restored exactly where it was load-bearing:
- * visible, and with the user's bytes untouched.
- */
-function assertBlankOriginStillBlank(doc: NotebookDoc): void {
-	if (!doc.bornBlank) return; // the overwhelming majority: no read, no cost
-	if (!notebookFileHasContent(doc.path)) return;
-	throw new Error(
-		`${relative(workspace(), doc.path)} was opened as an empty notebook but now has content on disk - nothing was written. Reload it to see what the file holds.`
-	);
 }
 
 /**
@@ -419,13 +389,9 @@ function loadDoc(abs: string): NotebookDoc {
 	}
 	const raw = readNotebook(abs);
 	if (raw) {
-		const parsed = deserialize(raw.nb);
+		const parsed = deserialize(raw);
 		enforceUniqueIds(parsed.cells);
 		doc = { path: abs, cells: parsed.cells, metadata: parsed.metadata };
-		// The file held NO bytes, so this document stands in for nothing that was
-		// ever authored - which a later save must not take as licence to overwrite
-		// whatever is there by then. See `persist`.
-		if (raw.blank) doc.bornBlank = true;
 		docs.set(abs, doc);
 	} else if (abs === canonicalPath()) {
 		doc = { path: abs, cells: [starterCell()], metadata: undefined };

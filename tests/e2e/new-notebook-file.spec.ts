@@ -13,10 +13,12 @@
  * really reaching the route, and the tab really rendering a notebook rather than
  * a load error.
  *
- * The second test covers the other half of the fix: a blank `.ipynb` that Cellar
- * did NOT write (a `touch`, a rename or a copy of an empty file, or one an older
- * Cellar left behind) opens as a blank notebook instead of dead-ending, with no
- * bytes written until the user actually edits it.
+ * The second test covers the reader, which stays STRICT: a blank `.ipynb` that
+ * Cellar did NOT write (a `touch`, a rename or a copy of an empty file, or one an
+ * older Cellar left behind) is REFUSED - but with a message that says what it is
+ * and what to do about it, rather than the raw `Unexpected end of JSON input` this
+ * bug was reported as. It is still the end-user path, just with the strict
+ * outcome; `readNotebook` records why the leniency that was tried is not there.
  */
 import { test, expect, type Page } from '@playwright/test';
 import { mkdtempSync, readFileSync, statSync, writeFileSync } from 'node:fs';
@@ -89,8 +91,10 @@ test.describe(runtimeAvailable() ? 'new .ipynb from the file explorer' : `new .i
 		await expect(cells.first()).toContainText('42', { timeout: 60_000 });
 	});
 
-	test('a blank .ipynb Cellar did not write still opens', async ({ page }) => {
-		// The repair half: `touch blank.ipynb` (or a rename/copy of an empty file).
+	test('a blank .ipynb Cellar did not write says what is wrong with it', async ({ page }) => {
+		// `touch blank.ipynb` (or a rename/copy of an empty file). The reader refuses
+		// it - see `readNotebook` - but the message a user reads has to be the
+		// actionable one, not the raw parser error this bug was reported as.
 		const abs = join(ws, 'blank.ipynb');
 		writeFileSync(abs, '');
 
@@ -99,9 +103,11 @@ test.describe(runtimeAvailable() ? 'new .ipynb from the file explorer' : `new .i
 		await openSidebarSection(page, 'files', 'files-body');
 		await openFromTree(page, 'blank.ipynb');
 
-		await expect(pane(page).getByTestId('cell')).toHaveCount(1);
-		await expect(page.getByTestId('notebook-load-error')).toHaveCount(0);
-		// Opening writes nothing - Cellar still leaves an unedited file exactly as it was.
+		const err = page.getByTestId('notebook-load-error');
+		await expect(err).toContainText(/file is empty/i);
+		await expect(err).toContainText(/create it again from the file explorer/i);
+		await expect(err).not.toContainText(/JSON input/i);
+		// A refusal writes nothing - Cellar still leaves the file exactly as it was.
 		expect(statSync(abs).size).toBe(0);
 	});
 });

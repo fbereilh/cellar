@@ -274,16 +274,14 @@ export function isIpynbPath(path: string): boolean {
 }
 
 /**
- * What a notebook that has never held anything CONTAINS: nbformat 4.5 with one
- * empty code cell (never zero cells - a notebook always keeps somewhere to type,
- * which is the same invariant `deleteCells` refuses to break).
+ * What a brand-new `.ipynb` FILE is written as: nbformat 4.5 with one empty code
+ * cell (never zero cells - a notebook always keeps somewhere to type, which is the
+ * same invariant `deleteCells` refuses to break).
  *
- * ONE definition, TWO consumers, and that is the point: `blankNotebookText` is
- * what the file explorer writes when a user creates `foo.ipynb`, and the blank-file
- * branch of `readNotebook` below is what an already-blank one OPENS as. Split into
- * two answers they would drift, and the second is what repairs a file the first
- * never wrote (a `touch`, a rename of an empty file, a copy of one, or an `.ipynb`
- * created by an older Cellar - see `readNotebook`).
+ * This is the WRITER's answer and nothing else - `blankNotebookText` is what the
+ * file explorer writes when a user creates `foo.ipynb`. `readNotebook` below does
+ * NOT mirror it: a file that is already blank on disk is REFUSED, not opened as
+ * this (see there for why).
  *
  * It goes through `serialize`, so the shape/key order is exactly what every other
  * Cellar write produces - a fresh notebook is byte-identical to the same notebook
@@ -304,64 +302,44 @@ function isBlankText(text: string): boolean {
 }
 
 /**
- * True when `path` exists and holds at least one non-whitespace byte.
- *
- * Asks the same question as `readNotebook`'s blank branch, and deliberately does
- * NOT parse: its caller is `persist`'s transient-truncation guard, which must be
- * able to tell "something is there now" from "still nothing" even when what is
- * there is half-written and would not parse.
- */
-export function notebookFileHasContent(path: string): boolean {
-	if (!existsSync(path)) return false;
-	return !isBlankText(readFileSync(path, 'utf8'));
-}
-
-/** What `readNotebook` found: the notebook, and whether it was inferred from a BLANK file. */
-export interface NotebookRead {
-	nb: NbNotebook;
-	/**
-	 * The file held no non-whitespace bytes, so `nb` is `blankNotebook()` - a
-	 * document standing in for nothing, not one read off disk. The caller must
-	 * carry this to `NotebookDoc.bornBlank`; see `readNotebook` for why.
-	 */
-	blank: boolean;
-}
-
-/**
  * Read a notebook from disk. `null` means the file does not exist.
  *
- * A BLANK file (no bytes, or only whitespace) reads as `blankNotebook()` rather
- * than throwing. `JSON.parse('')` raises `Unexpected end of JSON input`, so a
- * zero-byte `.ipynb` - which the file explorer's "New file" used to mint, and
- * which a `touch`, a rename or a copy of an empty file still can - dead-ended at
- * "Could not open x.ipynb: Unexpected end of JSON input" with no way back from
- * inside Cellar. Opening it writes nothing either (`loadDoc` never persists), so
- * the file stays as it is until the user actually edits it.
+ * STRICT, deliberately - this reader never infers a notebook from bytes that are
+ * not one, and there are two distinct refusals because they are two distinct
+ * facts. A BLANK file (no bytes, or whitespace only) says so and names the
+ * repair; bytes that are PRESENT but do not parse keep the parser's own detail.
+ * Neither message repeats the file name: every caller already prefixes it (the
+ * notebook route's "Could not open <path>:", the MCP tool the agent named it in).
  *
- * WHAT THAT LENIENCY COSTS, AND WHERE IT IS PAID. "No bytes, so nothing to lose"
- * is true of a file that is genuinely empty and FALSE of one that is MOMENTARILY
- * empty: a non-atomic external writer (nbdev's `fastcore/nbio.py` opens with 'w')
- * truncates before it writes, and this repo has MEASURED a 0-byte read in exactly
- * that window (see `fileWatch.ts`'s header, which is why its settle debounce
- * exists). Read there, a real notebook would be cached as a blank document and
- * the next save would overwrite it - where the old parse error was at least
- * VISIBLE. So `blank` is reported to the caller rather than swallowed, and the
- * race is closed at the moment of harm - the first WRITE, in `notebook.ts`'s
- * `persist`, which refuses when the file has since gained content. A time-based
- * settle here would only narrow that window, never close it.
- *
- * Bytes that are PRESENT but do not parse stay a hard error, because something IS
- * there: opening such a file as an empty notebook and then persisting over it
- * would destroy it. The message keeps the parser's own detail and names the
- * cause, since the caller - the notebook route, the MCP tool - already names the
- * file.
+ * WHY A BLANK FILE IS REFUSED RATHER THAN OPENED AS AN EMPTY NOTEBOOK. Reading it
+ * leniently would buy exactly one thing: repairing an `.ipynb` that is already
+ * blank on disk (a `touch`, a rename or a copy of an empty file, or one an older
+ * Cellar left behind). It was tried, and its cost was measured twice over. First,
+ * "no bytes, so nothing to lose" is true of a genuinely empty file and FALSE of a
+ * MOMENTARILY empty one: a non-atomic external writer (nbdev's `fastcore/nbio.py`
+ * opens with 'w') truncates before it writes, and this repo has measured a 0-byte
+ * read in exactly that window (see `fileWatch.ts`'s header, which is why its
+ * settle debounce exists) - so a real notebook was cached as a blank document and
+ * the next save overwrote it. Guarding that at the first write then cost a
+ * PERMANENT LOCKOUT (`loadDoc` caches the blank-inferred document and never
+ * re-reads, so the refusal's advised reload could not work and every later save
+ * refused for the life of the process) plus a refusal that is invisible on its
+ * likeliest paths (an autosave PATCH is deliberately swallowed by the client, and
+ * in the run route the throw closes the NDJSON stream with no `run:end` and no
+ * `lastRun` stamp). Every fix needed another fix, in the notebook WRITE path,
+ * which is the user's PRIMARY data - while the repair it bought is now one
+ * delete-and-recreate away, because creating a notebook works. So the reader
+ * stays strict: refuse, never degrade.
  */
-export function readNotebook(path: string): NotebookRead | null {
+export function readNotebook(path: string): NbNotebook | null {
 	if (!existsSync(path)) return null;
 	const text = readFileSync(path, 'utf8');
-	if (isBlankText(text)) return { nb: blankNotebook(), blank: true };
+	if (isBlankText(text))
+		throw new Error(
+			'the file is empty, so there is no notebook to open - delete it and create it again from the file explorer'
+		);
 	try {
-		return { nb: JSON.parse(text) as NbNotebook, blank: false };
+		return JSON.parse(text) as NbNotebook;
 	} catch (err) {
 		throw new Error(`not valid JSON (${(err as Error)?.message ?? String(err)})`);
 	}

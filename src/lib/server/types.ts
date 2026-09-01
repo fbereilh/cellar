@@ -157,15 +157,6 @@ export interface NotebookDoc {
 	 */
 	lastExportError?: string | null;
 	/**
-	 * Runtime-only (never serialized): this document was materialised from a file
-	 * that held NO bytes, so its emptiness was INFERRED from disk rather than
-	 * authored. `notebook.ts`'s `persist` reads it once, to refuse the first write
-	 * when the file has since gained content - the transient-truncation guard; see
-	 * `ipynb.ts`'s `readNotebook` for the race it closes. Cleared by the first
-	 * successful write, so an ordinary autosave never pays for it.
-	 */
-	bornBlank?: boolean;
-	/**
 	 * Runtime-only (never serialized): the DERIVED export state last BROADCAST for
 	 * this doc - the target's resolution (or the reason it cannot resolve) and the
 	 * compile hazards the marks describe - joined into one comparison key. Held
