@@ -164,6 +164,80 @@ describe('an already-blank .ipynb opens rather than dead-ending', () => {
 	});
 });
 
+describe('a blank file that was only MOMENTARILY blank is never overwritten', () => {
+	// The blank-file leniency rests on "no bytes, so nothing to lose". That is true
+	// of a genuinely empty file and false of one caught MID-WRITE: a non-atomic
+	// external writer (nbdev's `fastcore/nbio.py` opens with 'w') truncates before
+	// it writes, and this repo has measured a 0-byte read in exactly that window
+	// (`fileWatch.ts`'s header). Read there, a real notebook would be cached as a
+	// blank document and the next save would overwrite it.
+	const REAL = JSON.stringify(
+		{
+			cells: [{ cell_type: 'code', id: 'precious', metadata: {}, source: ['treasure = 1'], outputs: [], execution_count: null }],
+			metadata: {},
+			nbformat: 4,
+			nbformat_minor: 5
+		},
+		null,
+		1
+	);
+
+	it('refuses the first save when the file gained content after it was opened blank', () => {
+		const abs = join(WS, 'mid-write.ipynb');
+		writeFileSync(abs, ''); // the truncation window
+
+		const view = nbmod.getNotebook('mid-write.ipynb');
+		expect(view.cells).toHaveLength(1);
+
+		// The external writer finishes.
+		writeFileSync(abs, REAL);
+
+		// Any mutation persists; this one must REFUSE rather than overwrite.
+		expect(() => nbmod.setSource(view.cells[0].id, 'x = 1', 'mid-write.ipynb')).toThrow(
+			/opened as an empty notebook but now has content/i
+		);
+		// The headline assertion: the user's bytes are untouched.
+		expect(readFileSync(abs, 'utf8')).toBe(REAL);
+	});
+
+	it('the refusal names the notebook workspace-relative, never an absolute server path', () => {
+		const abs = join(WS, 'named.ipynb');
+		writeFileSync(abs, '');
+		const view = nbmod.getNotebook('named.ipynb');
+		writeFileSync(abs, REAL);
+		let msg = '';
+		try {
+			nbmod.setSource(view.cells[0].id, 'x = 1', 'named.ipynb');
+		} catch (err) {
+			msg = String((err as Error).message);
+		}
+		expect(msg).toContain('named.ipynb');
+		expect(msg).not.toContain(WS);
+	});
+
+	it('a genuinely blank file still saves — and the guard does not fire twice', () => {
+		const abs = join(WS, 'really-blank.ipynb');
+		writeFileSync(abs, '');
+		const view = nbmod.getNotebook('really-blank.ipynb');
+
+		nbmod.setSource(view.cells[0].id, 'first = 1', 'really-blank.ipynb');
+		expect(readFileSync(abs, 'utf8')).toContain('first = 1');
+
+		// The document now has bytes of its own on disk, so a SECOND save must not
+		// be refused by its own first write.
+		nbmod.setSource(view.cells[0].id, 'second = 2', 'really-blank.ipynb');
+		expect(readFileSync(abs, 'utf8')).toContain('second = 2');
+	});
+
+	it('a notebook read from real bytes is never guarded (an ordinary save is unaffected)', () => {
+		const abs = join(WS, 'ordinary.ipynb');
+		writeFileSync(abs, REAL);
+		const view = nbmod.getNotebook('ordinary.ipynb');
+		nbmod.setSource(view.cells[0].id, 'edited = 1', 'ordinary.ipynb');
+		expect(readFileSync(abs, 'utf8')).toContain('edited = 1');
+	});
+});
+
 describe('a genuinely corrupt notebook still refuses, and says why', () => {
 	it('refuses bytes that are PRESENT but do not parse', () => {
 		// The leniency above is scoped to a file holding NOTHING: there is nothing to
@@ -173,7 +247,7 @@ describe('a genuinely corrupt notebook still refuses, and says why', () => {
 		expect(() => nbmod.getNotebook('corrupt.ipynb')).toThrow(/not valid JSON/i);
 	});
 
-	it('keeps the parser\'s own detail — the position is the useful part', () => {
+	it("keeps the parser's own detail, without pinning V8's wording", () => {
 		writeFileSync(join(WS, 'corrupt2.ipynb'), '{ nope }');
 		let msg = '';
 		try {
@@ -181,8 +255,13 @@ describe('a genuinely corrupt notebook still refuses, and says why', () => {
 		} catch (err) {
 			msg = String((err as Error).message);
 		}
-		expect(msg).toMatch(/not valid JSON/i);
-		expect(msg).toMatch(/position/i);
+		// The contract is the WRAPPER plus a non-empty inner detail. Asserting V8's
+		// own phrasing (its "position N" clause) would couple this to an unstable
+		// implementation detail: that wording has already changed across V8
+		// versions, and CI pins a different Node than local dev runs.
+		const inner = /^not valid JSON \((.+)\)$/s.exec(msg);
+		expect(inner, `unexpected message shape: ${msg}`).not.toBeNull();
+		expect(inner![1].trim().length).toBeGreaterThan(0);
 		// It does NOT repeat the file name: every caller (the notebook route's
 		// `Could not open <path>:` prefix, the MCP tool the agent named it in)
 		// already has it, and repeating it reads as a stutter.

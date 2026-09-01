@@ -298,6 +298,35 @@ export function blankNotebookText(): string {
 	return stringify(blankNotebook());
 }
 
+/** A file holds nothing a notebook could be built from: no non-whitespace bytes. */
+function isBlankText(text: string): boolean {
+	return text.trim() === '';
+}
+
+/**
+ * True when `path` exists and holds at least one non-whitespace byte.
+ *
+ * Asks the same question as `readNotebook`'s blank branch, and deliberately does
+ * NOT parse: its caller is `persist`'s transient-truncation guard, which must be
+ * able to tell "something is there now" from "still nothing" even when what is
+ * there is half-written and would not parse.
+ */
+export function notebookFileHasContent(path: string): boolean {
+	if (!existsSync(path)) return false;
+	return !isBlankText(readFileSync(path, 'utf8'));
+}
+
+/** What `readNotebook` found: the notebook, and whether it was inferred from a BLANK file. */
+export interface NotebookRead {
+	nb: NbNotebook;
+	/**
+	 * The file held no non-whitespace bytes, so `nb` is `blankNotebook()` - a
+	 * document standing in for nothing, not one read off disk. The caller must
+	 * carry this to `NotebookDoc.bornBlank`; see `readNotebook` for why.
+	 */
+	blank: boolean;
+}
+
 /**
  * Read a notebook from disk. `null` means the file does not exist.
  *
@@ -306,24 +335,33 @@ export function blankNotebookText(): string {
  * zero-byte `.ipynb` - which the file explorer's "New file" used to mint, and
  * which a `touch`, a rename or a copy of an empty file still can - dead-ended at
  * "Could not open x.ipynb: Unexpected end of JSON input" with no way back from
- * inside Cellar. Leniency here MASKS NOTHING: the file holds no bytes, so there
- * is nothing to lose and nothing a stricter reader could have preserved. Opening
- * it writes nothing either (`loadDoc` never persists), so the file stays as it is
- * until the user actually edits it.
+ * inside Cellar. Opening it writes nothing either (`loadDoc` never persists), so
+ * the file stays as it is until the user actually edits it.
  *
- * That is the whole of the leniency, deliberately. Bytes that are PRESENT but do
- * not parse are a hard error, because something IS there: opening such a file as
- * an empty notebook and then persisting over it would destroy it. The message
- * keeps the parser's own detail (its position is the useful part) and names the
+ * WHAT THAT LENIENCY COSTS, AND WHERE IT IS PAID. "No bytes, so nothing to lose"
+ * is true of a file that is genuinely empty and FALSE of one that is MOMENTARILY
+ * empty: a non-atomic external writer (nbdev's `fastcore/nbio.py` opens with 'w')
+ * truncates before it writes, and this repo has MEASURED a 0-byte read in exactly
+ * that window (see `fileWatch.ts`'s header, which is why its settle debounce
+ * exists). Read there, a real notebook would be cached as a blank document and
+ * the next save would overwrite it - where the old parse error was at least
+ * VISIBLE. So `blank` is reported to the caller rather than swallowed, and the
+ * race is closed at the moment of harm - the first WRITE, in `notebook.ts`'s
+ * `persist`, which refuses when the file has since gained content. A time-based
+ * settle here would only narrow that window, never close it.
+ *
+ * Bytes that are PRESENT but do not parse stay a hard error, because something IS
+ * there: opening such a file as an empty notebook and then persisting over it
+ * would destroy it. The message keeps the parser's own detail and names the
  * cause, since the caller - the notebook route, the MCP tool - already names the
  * file.
  */
-export function readNotebook(path: string): NbNotebook | null {
+export function readNotebook(path: string): NotebookRead | null {
 	if (!existsSync(path)) return null;
 	const text = readFileSync(path, 'utf8');
-	if (text.trim() === '') return blankNotebook();
+	if (isBlankText(text)) return { nb: blankNotebook(), blank: true };
 	try {
-		return JSON.parse(text) as NbNotebook;
+		return { nb: JSON.parse(text) as NbNotebook, blank: false };
 	} catch (err) {
 		throw new Error(`not valid JSON (${(err as Error)?.message ?? String(err)})`);
 	}
