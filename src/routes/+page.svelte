@@ -30,7 +30,8 @@
 		NumberingRegistryHandle,
 		NotebookApiHandle,
 		FileTabApiHandle,
-		NotebookRef
+		NotebookRef,
+		FsChange
 	} from '$lib/types';
 	import type { SearchCache } from '$lib/search';
 	import type { SearchHighlightState } from '$lib/searchHighlight';
@@ -66,11 +67,6 @@
 		seq: number;
 	}
 	/** A tab-impacting workspace change reported up from the sidebar file tree. */
-	interface FsChange {
-		type: 'rename' | 'move' | 'delete';
-		from?: string;
-		path: string;
-	}
 	/** A kernel-namespace variable row (from the inspector probe). */
 	interface VariableInfo {
 		name: string;
@@ -110,7 +106,12 @@
 	// see `readDefaultNotebook`. It renders instead, but the empty state must not
 	// then imply there is simply no notebook: the file explorer beside it is the
 	// remedy, and the user has to be told which file to act on and why.
-	const canonicalNotebookError: string | null = data.notebookError ?? null;
+	//
+	// It is a fact about a READ, so it is re-asked rather than left as the SSR
+	// snapshot: the message names a repair the user then performs in the explorer,
+	// and a message that survives its own remedy reads as the advice not having
+	// worked. See `recheckCanonicalNotebook`.
+	let canonicalNotebookError = $state<string | null>(data.notebookError ?? null);
 
 	// Live cells per open notebook (path → the notebook's reactive cell array),
 	// reported up by each LiveNotebook so the sidebar (outline / search) can read
@@ -722,6 +723,17 @@
 		if (!tabs.some((t) => t.id === activeTabId)) activeTabId = id;
 	}
 
+	// A route answers a VERDICT about a notebook only as its own `error(400, …)`
+	// shape - a JSON body carrying a string `message`. Anything else (a proxy
+	// 502/503, an HTML error page, a 404 from a mismatched route) never reached the
+	// handler, so it says nothing at all and the caller must claim nothing. One
+	// helper for every caller, so a later one cannot re-derive the rule differently.
+	async function verdictReason(r: Response): Promise<string | null> {
+		if (r.status !== 400) return null;
+		const body = await r.json().catch(() => null);
+		return typeof body?.message === 'string' ? body.message : null;
+	}
+
 	// A Kernels-sidebar card's row action: show me the notebook this kernel belongs
 	// to. It routes to `openFilePermanent`, the SAME path the file tree's
 	// double-click uses, rather than a second open implementation - so an already
@@ -762,17 +774,6 @@
 		const noVerdict = (why: string) => showNotice(`Could not open ${path}: ${why}.`);
 		const unreachable = (err: unknown) =>
 			noVerdict(`could not reach Cellar (${(err as Error)?.message ?? err})`);
-		// Both pre-flight routes answer a verdict ONLY as their own `error(400, …)`
-		// shape - a JSON body carrying a string `message`. Anything else (a proxy
-		// 502/503, an HTML error page, a 404 from a mismatched route) never reached
-		// the handler, so it says nothing about the notebook. One helper for both,
-		// so a third pre-flight cannot re-derive the rule differently.
-		const verdictReason = async (r: Response): Promise<string | null> => {
-			if (r.status !== 400) return null;
-			const body = await r.json().catch(() => null);
-			return typeof body?.message === 'string' ? body.message : null;
-		};
-
 		// THE CANONICAL NOTEBOOK IS THE ONE PATH WHERE "loadable" IS TOO BROAD.
 		// `loadDoc` MATERIALISES a starter document for it when the file is missing
 		// (that is what lets an empty workspace render a shell at all), so the load
@@ -841,6 +842,39 @@
 		openFilePermanent(canonicalNotebookRel);
 	}
 
+	/** True when a file op touched the canonical notebook itself (either end of a move). */
+	function touchesCanonicalNotebook(...paths: (string | null | undefined)[]): boolean {
+		return paths.some((p) => p === canonicalNotebookRel);
+	}
+
+	// Re-ask the server whether the canonical notebook reads, and set or clear the
+	// message from what it now says. Never clears optimistically: only a read that
+	// SUCCEEDS clears, a read that fails REPLACES the reason (blank -> corrupt is a
+	// different fact), and a request that landed no verdict of this route's own
+	// shape changes nothing - the stance every other pre-flight here takes.
+	//
+	// Deliberately not `invalidateAll()`: re-running the SSR `load()` would re-seed
+	// uiState, userSettings, the nbdev notice and the MCP panel facts as a side
+	// effect of a file operation.
+	async function recheckCanonicalNotebook() {
+		let res: Response;
+		try {
+			res = await fetch(`/api/notebooks?path=${encodeURIComponent(canonicalNotebookRel)}`);
+		} catch {
+			return;
+		}
+		if (res.ok) {
+			canonicalNotebookError = null;
+			return;
+		}
+		const reason = await verdictReason(res);
+		if (reason === null) return;
+		// The path goes, the reason stays - the same treatment the SSR read gives its
+		// own throw. Nothing showable left means nothing learned, so nothing changes.
+		const shown = reasonWithoutServerPath(reason);
+		if (shown) canonicalNotebookError = shown;
+	}
+
 	// Explicitly create (or open) the workspace's default notebook. On a fresh
 	// workspace the file isn't on disk yet (startup never writes one); this POST
 	// materializes it, then opens its live tab. If it already exists it is opened
@@ -856,6 +890,7 @@
 		} catch {}
 		openNotebook();
 		fsRefreshSignal++; // a new file on disk → refresh the tree + git decorations
+		recheckCanonicalNotebook();
 	}
 
 	function closeTab(id: string) {
@@ -888,6 +923,10 @@
 		return null;
 	}
 	function handleFsChange(change: FsChange) {
+		// A create/delete/rename/move of the canonical notebook itself is exactly the
+		// remedy the empty state's message names, so re-ask whether it reads now.
+		// Scoped to that one path: every other file op leaves the answer unchanged.
+		if (touchesCanonicalNotebook(change.path, change.from)) recheckCanonicalNotebook();
 		if (change.type === 'delete') {
 			const gone = tabs.filter((t) => t.path === change.path || t.path.startsWith(change.path + '/'));
 			for (const t of gone) closeTab(t.id);
@@ -1553,6 +1592,8 @@
 			// .ipynb, so the tree + git decorations are stale exactly as they are after
 			// our own create — every new-file path here bumps this for the same reason.
 			fsRefreshSignal++; // a new file on disk → refresh the tree + git decorations
+			// An agent (or another tab) may have just created the canonical notebook.
+			if (touchesCanonicalNotebook(ev.relPath as string)) recheckCanonicalNotebook();
 			// focus:false is an AGENT declaring its working notebook — surface it as an
 			// available tab, but never yank the user off the tab they are on. A human's
 			// own open/create (focus:true, or the field absent on older events) focuses.

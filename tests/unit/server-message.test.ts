@@ -48,17 +48,38 @@ describe('reasonWithoutServerPath', () => {
 		expect(reasonWithoutServerPath('   ')).toBe('');
 	});
 
+	it('strips a QUOTED path - the shape every Node fs error uses', () => {
+		// `readFileSync` on an unreadable notebook throws exactly this, and it reaches
+		// a user-facing surface through both the SSR canonical read and the notebook
+		// route. The quote is why a whitespace-only boundary missed it.
+		expect(reasonWithoutServerPath(`EACCES: permission denied, open '/Users/me/ws/notebook.ipynb'`)).toBe(
+			'EACCES: permission denied, open'
+		);
+		expect(reasonWithoutServerPath('ELOOP: too many symbolic links, open "/var/ws/notebook.ipynb"')).toBe(
+			'ELOOP: too many symbolic links, open'
+		);
+	});
+
+	it('a path holding brackets still goes whole', () => {
+		// Brackets terminate nothing, so the tail of the path cannot survive.
+		expect(reasonWithoutServerPath("open '/Users/me/report(2)/nb.ipynb'")).toBe('open');
+		expect(reasonWithoutServerPath('read /var/a[1]/b.ipynb here')).toBe('read here');
+	});
+
 	it('never returns a string containing an absolute path, for any of the above', () => {
 		const cases = [
 			'notebook not found: /a/b/c.ipynb',
 			'x /a y /b z',
 			'C:\\x\\y',
 			'\\\\srv\\s\\f',
-			'/only/a/path'
+			'/only/a/path',
+			`EACCES: permission denied, open '/a/b/c.ipynb'`,
+			'ELOOP: too many symbolic links, open "/a/b/c.ipynb"',
+			"open '/a/b(2)/c.ipynb'"
 		];
 		for (const c of cases) {
 			const out = reasonWithoutServerPath(c);
-			expect(out, c).not.toMatch(/(?:^|\s)(?:[A-Za-z]:)?[\\/]/);
+			expect(out, c).not.toMatch(/(?:^|[\s'"`([{<])(?:[A-Za-z]:)?[\\/]/);
 		}
 	});
 });

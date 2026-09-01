@@ -160,5 +160,37 @@ test.describe(
 			// The unreadable file is left exactly as it was.
 			expect(statSync(join(ws, 'notebook.ipynb')).size).toBe(0);
 		});
+
+		test('walking the advised remedy clears the message and leaves a usable notebook', async ({ page }) => {
+			await page.goto(url);
+			const reason = page.getByTestId('canonical-notebook-error');
+			await expect(reason).toBeVisible();
+
+			await openSidebarSection(page, 'files', 'files-body');
+			const row = page.getByTestId('tree-file').filter({ hasText: 'notebook.ipynb' });
+			await expect(row).toBeVisible();
+
+			// The remedy the message names, performed exactly as it reads: delete the
+			// file from the explorer, then create it again there.
+			await row.click({ button: 'right' });
+			await page.getByTestId('ctx-delete').click();
+			await page.getByTestId('delete-confirm').click();
+			await expect(row).toHaveCount(0);
+
+			await page.getByTestId('files-new-file').click();
+			const field = page.getByTestId('tree-entry-field');
+			await expect(field).toBeVisible();
+			await field.fill('notebook.ipynb');
+			await field.press('Enter');
+			await expect(row).toBeVisible();
+
+			// The advice worked, so it must stop being shown - without a reload.
+			await expect(reason).toHaveCount(0);
+
+			// And what is there now is a real notebook, not a second broken one.
+			await row.dblclick();
+			await expect(page.locator('[role=tabpanel]:not(.hidden)').getByTestId('cell')).toHaveCount(1);
+			await expect(page.getByTestId('notebook-load-error')).toHaveCount(0);
+		});
 	}
 );

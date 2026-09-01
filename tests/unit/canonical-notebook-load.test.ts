@@ -14,7 +14,7 @@
  * Cellar could not read — which for a CORRUPT notebook would be real data loss.
  */
 import { describe, it, expect, beforeAll, beforeEach } from 'vitest';
-import { mkdtempSync, writeFileSync, readFileSync, mkdirSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, readFileSync, mkdirSync, chmodSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -90,6 +90,43 @@ describe('SSR renders the shell even when the canonical notebook cannot be read'
 		expect(data.mcp.url).toMatch(/^http:\/\/127\.0\.0\.1:\d+\/mcp$/);
 	});
 });
+
+const ROOT = typeof process.getuid === 'function' && process.getuid() === 0;
+
+describe(
+	ROOT ? 'the reason never leaks a server path (skipped: running as root ignores file modes)' : 'the reason never leaks a server path',
+	() => {
+		it.skipIf(ROOT)('an fs-level failure reports the cause without the absolute path', () => {
+			const ws = workspace('');
+			const abs = join(ws, 'notebook.ipynb');
+			// `readNotebook` reads the file OUTSIDE its parse try, so this throws Node's
+			// own `EACCES: permission denied, open '<abs>'` - the shape that used to be
+			// printed verbatim on the page.
+			chmodSync(abs, 0o000);
+			try {
+				const data = load();
+				expect(data.notebookError).toBeTruthy();
+				expect(data.notebookError).not.toContain(ws);
+				expect(data.notebookError).not.toMatch(/(^|\s)\//);
+				// Stripped, not silenced: the cause still reads as something.
+				expect(data.notebookError).toMatch(/EACCES|permission/i);
+			} finally {
+				chmodSync(abs, 0o644);
+			}
+		});
+
+		it('the two refusals it is written for pass through completely unchanged', () => {
+			workspace('');
+			expect(load().notebookError).toBe(
+				'the file is empty, so there is no notebook to open - delete it and create it again from the file explorer'
+			);
+
+			workspace('{"cells": [oops');
+			const corrupt = load().notebookError;
+			expect(corrupt).toMatch(/^not valid JSON \(.+\)$/s);
+		});
+	}
+);
 
 describe('the ordinary cases are unchanged', () => {
 	it('a healthy notebook.ipynb loads its cells and reports no error', () => {

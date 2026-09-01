@@ -13,6 +13,21 @@ import type { ExportHazard } from './exportHazard';
 import type { Match } from '$lib/search';
 import type { SelectionGesture } from '$lib/cellSelection';
 
+/**
+ * A file-management op in the sidebar tree that changed the workspace, reported
+ * up so the shell can keep open tabs consistent (and re-ask anything that is a
+ * fact about a particular path). `from` is set only where something MOVED.
+ *
+ * ONE definition, deliberately: the Sidebar emits it and the shell consumes it,
+ * and two structurally-identical copies let a new `type` member be added on one
+ * side while the other silently keeps ignoring it.
+ */
+export interface FsChange {
+	type: 'create' | 'rename' | 'move' | 'delete';
+	from?: string;
+	path: string;
+}
+
 /** Jupyter-style modal keyboard mode for the notebook. */
 export type KeyMode = 'command' | 'edit';
 

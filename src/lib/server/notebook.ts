@@ -45,6 +45,7 @@ import { isLogicalCellType, isPyUnsupportedType, languageTagFor, logicalCellType
 import { foldImportChange, pruneImportBindings } from './importBindings';
 import { stripRuntimeMeta } from './clean';
 import { normalizeRootPath, textNotebookRootError } from '../notebookRoot';
+import { reasonWithoutServerPath } from '../serverMessage';
 import type {
 	Cell,
 	CellView,
@@ -596,9 +597,17 @@ export function readDefaultNotebook(): { notebook: NotebookView; error: string |
 		return { notebook: getDefaultNotebook(), error: null };
 	} catch (err) {
 		const abs = canonicalPath();
+		// The two refusals this is written for carry no path, but `readNotebook`
+		// reads the file OUTSIDE its parse try, so anything `readFileSync` raises
+		// (EACCES on a mode-000 file, ELOOP on a symlink loop) names the absolute
+		// path - which this renders on the page. Same rule, same helper, as the
+		// stale-kernel-card refusal: the PATH goes, the REASON stays. The fallback
+		// is what keeps the field TRUTHY, since its truthiness is the signal that
+		// the notebook could not be read at all.
+		const reason = reasonWithoutServerPath(String((err as Error)?.message ?? err));
 		return {
 			notebook: notebookView({ path: abs, cells: [], metadata: undefined }),
-			error: String((err as Error)?.message ?? err)
+			error: reason || 'the file could not be read'
 		};
 	}
 }

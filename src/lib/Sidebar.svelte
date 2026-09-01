@@ -28,7 +28,7 @@
 	import type { KernelInfo, KernelCard } from '$lib/kernelBadge';
 	import type { NbdevState } from '$lib/nbdev';
 	import type { CellarFileOps, FileClipboard, NewEntry, FileDescriptor } from '$lib/fileOps';
-	import type { NotebookRef } from '$lib/types';
+	import type { FsChange, NotebookRef } from '$lib/types';
 
 	/** A file/dir/root descriptor the context menu + selection act on. */
 	type MenuNode = { type: 'file' | 'dir' | 'root'; path: string; name?: string; children?: TreeNode[] };
@@ -56,12 +56,6 @@
 		projectRepairPaused?: boolean;
 	}
 	/** A tab-impacting file-system change reported up to the shell. */
-	interface FsChange {
-		type: 'rename' | 'move' | 'delete';
-		from?: string;
-		path: string;
-	}
-
 	interface Props {
 		cells: Cell[];
 		/**
@@ -538,7 +532,8 @@
 		const entry = newEntry;
 		newEntry = null;
 		if (!entry) return;
-		await runOp({ op: 'create', parent: entry.parentPath, name, kind: entry.kind });
+		const res = await runOp({ op: 'create', parent: entry.parentPath, name, kind: entry.kind });
+		if (res?.path) onFsChange?.({ type: 'create', path: res.path });
 	}
 
 	function startRename(node: MenuNode) {
@@ -573,6 +568,10 @@
 		if (res && op === 'move' && res.path) {
 			onFsChange?.({ type: 'move', from, path: res.path });
 			clipboard = null; // a cut is consumed; a copy stays for repeat pastes
+		} else if (res?.path && op === 'copy') {
+			// A copy lands a NEW file, so it is a create as far as anything watching a
+			// particular path is concerned; no tab remapping, nothing moved.
+			onFsChange?.({ type: 'create', path: res.path });
 		}
 	}
 
