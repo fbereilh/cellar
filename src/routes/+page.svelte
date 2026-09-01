@@ -1010,20 +1010,29 @@
 				headers: { 'content-type': 'application/json' },
 				body: JSON.stringify({ path })
 			});
-			// The route rethrows every `consolidateImports` refusal as a 400 carrying
-			// its own message, so say THAT and nothing else - a sweep touches many
-			// cells and this side never learns which of them moved, so claiming what
-			// did or did not change would be a claim nothing here observed.
+			// A REFUSAL the server ANSWERED: the route rethrows every
+			// `consolidateImports` error as a 400 carrying its own message, so this
+			// may say the sweep failed. It names the notebook because the button is
+			// bound per notebook and this line is shell-wide - the sweep may belong to
+			// a tab the user has since left - and it says nothing about WHICH cells
+			// moved, which this side never learns. The server's reason is carried with
+			// any absolute path stripped out (`loadDoc` throws one).
 			if (!res.ok) {
 				const body = await res.json().catch(() => null);
-				const why = typeof body?.message === 'string' && body.message ? `: ${body.message}` : '';
-				showNotice(`Consolidate imports failed${why}`);
+				const reason =
+					typeof body?.message === 'string' ? reasonWithoutServerPath(body.message) : '';
+				showNotice(`Consolidate imports failed for ${path}${reason ? `: ${reason}` : ''}.`);
 			}
 		} catch (err) {
-			// A rejected fetch landed no verdict we can read - the server was
-			// unreachable, or the reply never arrived. Still reported: a promoted
-			// toolbar button that silently does nothing reads as a dead control.
-			showNotice(`Consolidate imports failed: ${(err as Error)?.message ?? err}`);
+			// NO VERDICT: a rejected fetch establishes nothing about whether the sweep
+			// ran - the reachable shape is the server persisting the whole sweep and
+			// the reply dying on the way back - so it may not assert failure. It says
+			// only that the outcome could not be confirmed, and that a retry is safe
+			// (the sweep is idempotent). The `noVerdict` stance `openKernelNotebook`
+			// takes, applied to the same shape.
+			showNotice(
+				`Could not confirm Consolidate imports for ${path}: Cellar did not answer (${(err as Error)?.message ?? err}). The sweep may or may not have been applied - running it again is safe.`
+			);
 		} finally {
 			const next = new Set(consolidatingPaths);
 			next.delete(path);

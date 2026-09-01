@@ -23,8 +23,10 @@ import { tabPanelDomId } from '../../src/lib/tabIds';
  *    and shows a spinner (the request is held open so that state is observable
  *    rather than raced) — and that busy state is per NOTEBOOK, so a second
  *    notebook stays clickable and sweeps concurrently;
- *  - a sweep that FAILS says so on the shell's transient notice line and leaves
- *    the button clickable again, rather than dying silently;
+ *  - a sweep the server REFUSED says so on the shell's transient notice line,
+ *    names the notebook and the server's reason, and leaves the button clickable
+ *    again — while one whose reply never ARRIVED claims no outcome at all, since
+ *    the sweep may well have been applied before the connection died;
  *  - the toolbar keeps every button reachable at a narrow window — one row at
  *    ordinary widths, wrapping rather than overflowing below that, and never a
  *    horizontal page scrollbar.
@@ -48,6 +50,7 @@ const NB = {
 	sweep: 'sweep.ipynb',
 	busy: 'busy.ipynb',
 	failed: 'failed.ipynb',
+	unreachable: 'unreachable.ipynb',
 	layout: 'layout.ipynb',
 	other: 'other.ipynb',
 	peerA: 'peer-a.ipynb',
@@ -212,15 +215,21 @@ test('a sweep in flight disables the button, so it cannot be fired twice', async
 	await expect(button).toBeDisabled();
 	await expect(button.locator('.loading-spinner')).toBeVisible();
 
-	// A second click while it is disabled reaches nothing.
+	// A second click while it is disabled reaches nothing. `calls` is incremented in
+	// the route handler — in the DRIVER, a round trip after the click — so reading it
+	// synchronously here would pass even if the guard had regressed and a POST were
+	// on the wire. It is read at a SETTLED point instead: the handler counts before
+	// it awaits `held`, so any stray request is counted the moment Playwright
+	// intercepts it, which is long before the released one completes a full round
+	// trip, writes the notebook and re-enables the button.
 	await button.click({ force: true }).catch(() => {});
-	expect(calls, 'a second request was sent while one was in flight').toBe(1);
 
 	release!();
 	await expect(button).toBeEnabled({ timeout: 30_000 });
 	await expect
 		.poll(() => importsCellSource(NB.busy), { timeout: 30_000 })
 		.toContain('import');
+	expect(calls, 'a second request was sent while one was in flight').toBe(1);
 });
 
 test('a failed sweep says so and leaves the button clickable', async ({ page }) => {
@@ -239,9 +248,13 @@ test('a failed sweep says so and leaves the button clickable', async ({ page }) 
 	const button = consolidateButtonFor(page, NB.failed);
 	await button.click();
 
-	await expect(page.getByTestId('app-notice')).toContainText('no imports cell could be created', {
-		timeout: 30_000
-	});
+	const notice = page.getByTestId('app-notice');
+	// The server ANSWERED, so this branch may claim failure — and it names both the
+	// notebook (the button is per notebook while this line is shell-wide) and the
+	// server's own reason.
+	await expect(notice).toContainText('no imports cell could be created', { timeout: 30_000 });
+	await expect(notice).toContainText('Consolidate imports failed');
+	await expect(notice).toContainText(NB.failed);
 	// The per-path busy entry is released on the failure path too, so the notebook
 	// is clickable again rather than stranded disabled.
 	await expect(button).toBeEnabled({ timeout: 30_000 });
@@ -258,6 +271,27 @@ test('a failed sweep says so and leaves the button clickable', async ({ page }) 
 	});
 	await button.click();
 	await expect.poll(() => retries, { timeout: 30_000 }).toBe(1);
+});
+
+test('a sweep whose reply never arrives claims no outcome', async ({ page }) => {
+	await openNotebook(page, NB.unreachable);
+
+	// A rejected fetch is the NO-VERDICT case, not a refusal: the reachable shape is
+	// the server persisting the whole sweep and the reply dying on the way back, so
+	// this branch must not assert that the sweep failed.
+	await page.route('**/api/notebooks/imports', (route) => route.abort('connectionfailed'));
+
+	const button = consolidateButtonFor(page, NB.unreachable);
+	await button.click();
+
+	const notice = page.getByTestId('app-notice');
+	await expect(notice).toContainText('Could not confirm', { timeout: 30_000 });
+	await expect(notice).toContainText(NB.unreachable);
+	await expect(notice).toContainText('may or may not have been applied');
+	// Pinned APART from the refusal branch above, which is the whole point: an
+	// unread reply may not be reported as a failure.
+	await expect(notice).not.toContainText('Consolidate imports failed');
+	await expect(button).toBeEnabled({ timeout: 30_000 });
 });
 
 test('each notebook`s button names ITS OWN notebook, not the focused tab', async ({ page }) => {
