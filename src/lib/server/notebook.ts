@@ -569,7 +569,9 @@ export function notebookIpynb(nb?: string | null): { path: string; name: string;
 /**
  * Serializable view of the canonical default notebook (`notebook.ipynb`),
  * regardless of the current active pointer. SSR seeds the shell (notebook tab,
- * path/name) from this, so it must never follow `activePath`.
+ * path/name) from this, so it must never follow `activePath` - it reaches it
+ * through `readDefaultNotebook` below, which is what keeps an unreadable
+ * `notebook.ipynb` from taking the whole page down. This one still THROWS.
  */
 export function getDefaultNotebook(): NotebookView {
 	return getNotebook(canonicalPath());
