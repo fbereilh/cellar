@@ -1,26 +1,42 @@
 /**
  * Source guards for the notebook toolbar's four whole-notebook actions.
  *
- * WHAT THESE PROVE, AND WHAT THEY DO NOT. vitest runs without the SvelteKit
- * plugin (see `vitest.config.ts`), so `Notebook.svelte` cannot be mounted here —
- * these read the component source, so they can only witness that the wiring is
- * DECLARED, never that it behaves. The behavioural proof (the buttons render,
- * gate on real state, and really interrupt a batch / clear every cell's outputs
- * on disk) is `tests/e2e/toolbar-interrupt-clear-all.spec.ts`, against a real
- * kernel. These stay in the unit suite only because e2e runs in neither CI nor
- * the no-mistakes gate, so without them the two invariants below could regress
- * and merge green.
+ * WHAT THESE PROVE, AND WHAT THEY DO NOT — read this before adding one. vitest
+ * runs without the SvelteKit plugin (see `vitest.config.ts`), so no Svelte
+ * component can be MOUNTED here: every assertion below over `Notebook.svelte`,
+ * `LiveNotebook.svelte` or `Navbar.svelte` reads that component's source and can
+ * therefore witness only that the wiring is DECLARED. None of them proves the
+ * declaration behaves, and each would survive dead markup and break on a
+ * behaviour-preserving rename. They are kept — rather than deleted as the
+ * anti-pattern they resemble — for one reason: Playwright e2e runs in NEITHER
+ * CI nor the no-mistakes gate, so without them these three invariants could
+ * regress and merge green with no CI-visible coverage at all.
  *
- * Deliberately narrow: only what raw source text can honestly carry and what
- * survives a behaviour-preserving refactor — the controls exist and are
- * labelled, and the clear-all button reaches the SAME function the palette's
- * `clear-all-outputs` command does. Assertions on exact expressions (a
- * `$derived` line, an `onclick` body) belong to the e2e, not here: they break on
- * a rename and pass on dead code.
+ * The BEHAVIOURAL proof of each is a named e2e, against a real kernel:
+ *  - the buttons render, gate on real state, and really interrupt a batch /
+ *    clear every cell's outputs on disk — `tests/e2e/toolbar-interrupt-clear-all.spec.ts`;
+ *  - Consolidate imports really sweeps, names ITS OWN notebook, and its busy
+ *    state is per notebook — `tests/e2e/toolbar-consolidate-imports.spec.ts`.
  *
- * The ONE exception is the palette check at the foot of this file: `commands.ts`
- * carries no Svelte dependency, so `buildCommands` is built and invoked for real
- * rather than read.
+ * THE CONTRACT EACH GUARD STANDS ON, stated so a future edit knows what it may
+ * loosen and what it may not:
+ *  - "the four controls are IN the toolbar": scoped to the toolbar's own
+ *    balanced element (`elementBlock`), never the whole file, so a control that
+ *    moved out of the bar fails rather than passing on a mention elsewhere;
+ *  - "clear-all reaches the palette's own `clearAll`": the name has to be a real
+ *    PROPERTY of the object handed to `onRegisterApi` (`registeredApiProps`),
+ *    not merely a substring of the file;
+ *  - "one pointed surface per action": an ABSENCE over the whole of
+ *    `Navbar.svelte`, which is the strong direction — no spelling of the testid
+ *    anywhere in that file passes.
+ * The remaining forwarding assertions are raw substring matches over Svelte
+ * markup. They stay that way deliberately: making them semantic means parsing a
+ * component's attribute list, i.e. inventing machinery this runner exists to
+ * avoid, for a claim the e2e above already proves properly.
+ *
+ * The ONE assertion here that is genuinely EXECUTED is the palette check at the
+ * foot of the file: `commands.ts` carries no Svelte dependency, so
+ * `buildCommands` is built and invoked for real rather than read.
  */
 import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
@@ -119,7 +135,7 @@ function registeredApiProps(): string[] {
 	return propertyNames(balanced(args, brace, '{', '}'));
 }
 
-describe('notebook toolbar: the three whole-notebook actions', () => {
+describe('notebook toolbar: the four whole-notebook actions', () => {
 	it('renders Run all, Interrupt, Clear all outputs and Consolidate imports together', () => {
 		for (const id of TOOLBAR_ACTIONS) {
 			expect(TOOLBAR, `${id} is not in the toolbar`).toContain(`data-testid="${id}"`);

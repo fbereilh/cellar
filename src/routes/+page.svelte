@@ -1005,12 +1005,25 @@
 		if (!path || consolidatingPaths.has(path)) return;
 		consolidatingPaths = new Set(consolidatingPaths).add(path);
 		try {
-			await fetch('/api/notebooks/imports', {
+			const res = await fetch('/api/notebooks/imports', {
 				method: 'POST',
 				headers: { 'content-type': 'application/json' },
 				body: JSON.stringify({ path })
 			});
-		} catch {
+			// The route rethrows every `consolidateImports` refusal as a 400 carrying
+			// its own message, so say THAT and nothing else - a sweep touches many
+			// cells and this side never learns which of them moved, so claiming what
+			// did or did not change would be a claim nothing here observed.
+			if (!res.ok) {
+				const body = await res.json().catch(() => null);
+				const why = typeof body?.message === 'string' && body.message ? `: ${body.message}` : '';
+				showNotice(`Consolidate imports failed${why}`);
+			}
+		} catch (err) {
+			// A rejected fetch landed no verdict we can read - the server was
+			// unreachable, or the reply never arrived. Still reported: a promoted
+			// toolbar button that silently does nothing reads as a dead control.
+			showNotice(`Consolidate imports failed: ${(err as Error)?.message ?? err}`);
 		} finally {
 			const next = new Set(consolidatingPaths);
 			next.delete(path);
