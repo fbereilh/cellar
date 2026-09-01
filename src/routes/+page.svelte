@@ -23,7 +23,7 @@
 	import { toWorkspaceRel } from '$lib/workspacePath';
 	import { createNoticeChannel } from '$lib/notice.svelte';
 	import type { PageData } from './$types';
-	import type { Cell } from '$lib/server/types';
+	import type { Cell, NotebookReadFailure } from '$lib/server/types';
 	import type {
 		UICell,
 		FoldRegistryHandle,
@@ -118,6 +118,15 @@
 	// The message names a reload instead, which makes the remedy it advises
 	// complete and keeps it true for as long as it is on screen.
 	const canonicalNotebookError: string | null = data.notebookError ?? null;
+
+	// WHICH refusal it was, so the guidance below is DERIVED from the failure. Only
+	// `empty` may advise deleting the file: a blank one holds nothing, while an
+	// `unparseable` one holds the user's own bytes - the very bytes the strict
+	// reader refuses to overwrite - so telling them to delete it would destroy by
+	// hand exactly what refusing protects. Anything unrecognised (an absent reason,
+	// an older payload) falls through to the non-destructive branch by
+	// construction, since only the exact `empty` match reaches the delete advice.
+	const canonicalNotebookErrorReason: NotebookReadFailure | null = data.notebookErrorReason ?? null;
 
 	// Live cells per open notebook (path → the notebook's reactive cell array),
 	// reported up by each LiveNotebook so the sidebar (outline / search) can read
@@ -1946,8 +1955,22 @@
 						<div class="text-sm text-error" data-testid="canonical-notebook-error">
 							Could not open <code class="font-mono">{canonicalNotebookRel}</code>: {canonicalNotebookError}
 						</div>
-						<p class="max-w-xs text-xs text-base-content/40">
-							Open another notebook from the sidebar, or delete this file there, create it again, and reload the page.
+						<p class="max-w-xs text-xs text-base-content/40" data-testid="canonical-notebook-guidance">
+							{#if canonicalNotebookErrorReason === 'empty'}
+								Open another notebook from the sidebar, or delete this file there, create it
+								again, and reload the page.
+							{:else if canonicalNotebookErrorReason === 'unparseable'}
+								This file has content Cellar cannot parse, so it is left untouched. Open
+								another notebook from the sidebar, repair or restore it outside Cellar (a
+								text editor, or <code class="font-mono">git checkout</code>), then reload
+								the page.
+							{:else if canonicalNotebookErrorReason === 'unreadable'}
+								Cellar could not read this file at all. Open another notebook from the
+								sidebar, fix access to it, then reload the page.
+							{:else}
+								Open another notebook from the sidebar, or repair this file, then reload the
+								page.
+							{/if}
 						</p>
 					{:else}
 						<div class="text-sm text-base-content/50">No notebook open</div>

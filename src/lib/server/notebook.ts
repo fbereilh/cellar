@@ -21,7 +21,7 @@
 import { dirname, join, resolve, isAbsolute, relative, sep } from 'node:path';
 import { existsSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
-import { readNotebook, deserialize, writeNotebook, serialize, stringify } from './ipynb';
+import { readNotebook, NotebookReadError, deserialize, writeNotebook, serialize, stringify } from './ipynb';
 import { isPyPath, readPyNotebook, writePyNotebook } from './jupytext';
 import { publish } from './events';
 import { cancelRun } from './run-queue';
@@ -55,6 +55,7 @@ import type {
 	LogicalCellType,
 	LastRun,
 	NotebookDoc,
+	NotebookReadFailure,
 	NotebookView
 } from './types';
 
@@ -591,9 +592,13 @@ export function getDefaultNotebook(): NotebookView {
  * read. That matters most for a CORRUPT notebook, where overwriting would be real
  * data loss.
  */
-export function readDefaultNotebook(): { notebook: NotebookView; error: string | null } {
+export function readDefaultNotebook(): {
+	notebook: NotebookView;
+	error: string | null;
+	errorReason: NotebookReadFailure | null;
+} {
 	try {
-		return { notebook: getDefaultNotebook(), error: null };
+		return { notebook: getDefaultNotebook(), error: null, errorReason: null };
 	} catch (err) {
 		const abs = canonicalPath();
 		// Forwarded verbatim: `readNotebook` owns the rule that none of its refusals
@@ -601,9 +606,15 @@ export function readDefaultNotebook(): { notebook: NotebookView; error: string |
 		// would eat a corrupt notebook's own parser detail, which is the file's
 		// CONTENT rather than a path. The fallback only keeps the field TRUTHY,
 		// since its truthiness is the signal that the notebook could not be read.
+		//
+		// `errorReason` rides alongside so the shell branches its guidance on WHICH
+		// refusal this was rather than on the message - only `empty` may advise
+		// deleting the file. Anything that is not a `NotebookReadError` reports no
+		// reason at all, which the shell reads as the non-destructive default.
 		return {
 			notebook: notebookView({ path: abs, cells: [], metadata: undefined }),
-			error: String((err as Error)?.message ?? err) || 'the file could not be read'
+			error: String((err as Error)?.message ?? err) || 'the file could not be read',
+			errorReason: err instanceof NotebookReadError ? err.reason : null
 		};
 	}
 }

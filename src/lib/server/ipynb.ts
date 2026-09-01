@@ -15,7 +15,7 @@ import { cleanNotebook, stripRuntimeMeta } from './clean';
 import { atomicWriteFileSync } from './atomic-write';
 import { serializeWriteSync } from './write-lock';
 import { invalidateGitStatusCache } from './git';
-import type { Cell, NotebookDoc, NotebookMetadata, NbNotebook } from './types';
+import type { Cell, NotebookDoc, NotebookMetadata, NbNotebook, NotebookReadFailure } from './types';
 
 const NBFORMAT = 4;
 const NBFORMAT_MINOR = 5;
@@ -310,6 +310,13 @@ function isBlankText(text: string): boolean {
  * repair; bytes that are PRESENT but do not parse keep the parser's own detail;
  * and a file that could not be READ at all names the errno.
  *
+ * Every refusal is a `NotebookReadError` carrying its `reason`, because the
+ * guidance a surface hangs off it is not cosmetic: only `empty` may advise
+ * DELETING the file. A blank one holds nothing, while an `unparseable` one holds
+ * the user's own bytes - the very bytes this reader refuses to overwrite - so
+ * advising a delete there would destroy by hand exactly what refusing protects.
+ * Told apart by the FIELD, never by matching the message.
+ *
  * NO REFUSAL HERE CARRIES A PATH, and that is a property of this reader rather
  * than of anything downstream. Every caller already prefixes the file (the
  * notebook route's "Could not open <path>:", the MCP tool the agent named it in),
@@ -342,6 +349,15 @@ function isBlankText(text: string): boolean {
  * delete-and-recreate away, because creating a notebook works. So the reader
  * stays strict: refuse, never degrade.
  */
+export class NotebookReadError extends Error {
+	readonly reason: NotebookReadFailure;
+	constructor(reason: NotebookReadFailure, message: string) {
+		super(message);
+		this.name = 'NotebookReadError';
+		this.reason = reason;
+	}
+}
+
 export function readNotebook(path: string): NbNotebook | null {
 	if (!existsSync(path)) return null;
 	let text: string;
@@ -349,16 +365,23 @@ export function readNotebook(path: string): NbNotebook | null {
 		text = readFileSync(path, 'utf8');
 	} catch (err) {
 		const code = (err as NodeJS.ErrnoException)?.code;
-		throw new Error(`the file could not be read${code ? ` (${code})` : ''}`);
+		throw new NotebookReadError(
+			'unreadable',
+			`the file could not be read${code ? ` (${code})` : ''}`
+		);
 	}
 	if (isBlankText(text))
-		throw new Error(
+		throw new NotebookReadError(
+			'empty',
 			'the file is empty, so there is no notebook to open - delete it and create it again from the file explorer'
 		);
 	try {
 		return JSON.parse(text) as NbNotebook;
 	} catch (err) {
-		throw new Error(`not valid JSON (${(err as Error)?.message ?? String(err)})`);
+		throw new NotebookReadError(
+			'unparseable',
+			`not valid JSON (${(err as Error)?.message ?? String(err)})`
+		);
 	}
 }
 

@@ -66,6 +66,9 @@ describe('SSR renders the shell even when the canonical notebook cannot be read'
 		const data = load();
 		expect(data.notebookError).toMatch(/file is empty/i);
 		expect(data.notebookError).toMatch(/create it again from the file explorer/i);
+		// The discriminator the shell branches its guidance on: this is the ONE
+		// reason that may be advised away, because the file holds nothing.
+		expect(data.notebookErrorReason).toBe('empty');
 		// The fields `+page.svelte` reads unconditionally must still be valid.
 		expect(data.notebook.workspace).toBe(ws);
 		expect(data.notebook.path).toBe(join(ws, 'notebook.ipynb'));
@@ -78,6 +81,8 @@ describe('SSR renders the shell even when the canonical notebook cannot be read'
 		expect(data.notebookError).toMatch(/^not valid JSON \(.+\)$/s);
 		// The two refusals stay distinguishable: this one is not the empty-file case.
 		expect(data.notebookError).not.toMatch(/file is empty/i);
+		// Bytes are PRESENT, so nothing downstream may advise deleting this file.
+		expect(data.notebookErrorReason).toBe('unparseable');
 		expect(Array.isArray(data.notebook.cells)).toBe(true);
 	});
 
@@ -112,6 +117,7 @@ describe(
 				// Stripped of the path, not silenced: the cause still reads as something.
 				expect(data.notebookError).toMatch(/could not be read/i);
 				expect(data.notebookError).toMatch(/EACCES/);
+				expect(data.notebookErrorReason).toBe('unreadable');
 			} finally {
 				chmodSync(abs, 0o644);
 			}
@@ -122,7 +128,9 @@ describe(
 			// file's own CONTENT, so nothing may edit it on the way to the page - a
 			// path-stripper run over this eats the very token naming the corruption.
 			workspace('// hello\nconst x = 1;\n');
-			const reason = load().notebookError as string;
+			const data = load();
+			expect(data.notebookErrorReason).toBe('unparseable');
+			const reason = data.notebookError as string;
 			expect(reason).toMatch(/^not valid JSON \(.+\)$/s);
 			expect(reason).toContain('/');
 			expect(reason).toContain('// hello');
@@ -145,6 +153,7 @@ describe('the ordinary cases are unchanged', () => {
 		workspace(HEALTHY);
 		const data = load();
 		expect(data.notebookError).toBeNull();
+		expect(data.notebookErrorReason).toBeNull();
 		expect(data.notebook.cells).toHaveLength(1);
 		expect(data.notebook.cells[0].source).toBe('kept = 1');
 	});
@@ -153,6 +162,7 @@ describe('the ordinary cases are unchanged', () => {
 		const ws = workspace();
 		const data = load();
 		expect(data.notebookError).toBeNull();
+		expect(data.notebookErrorReason).toBeNull();
 		expect(data.notebook.cells).toHaveLength(1);
 		expect(data.notebook.path).toBe(join(ws, 'notebook.ipynb'));
 		// Loading still writes nothing: Cellar drops no uninvited file.

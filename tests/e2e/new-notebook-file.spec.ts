@@ -159,6 +159,56 @@ test.describe(
 
 			// The unreadable file is left exactly as it was.
 			expect(statSync(join(ws, 'notebook.ipynb')).size).toBe(0);
+
+			// The delete advice belongs to THIS reason and only this one: the file
+			// holds nothing, so nothing can be lost by acting on it.
+			await expect(page.getByTestId('canonical-notebook-guidance')).toContainText(/delete this file/i);
+		});
+	}
+);
+
+/**
+ * The CORRUPT canonical notebook is the case where the guidance itself is the data
+ * hazard: those bytes are the user's, which is exactly why the strict reader
+ * refuses to overwrite them - so the shell must not turn round and tell them to
+ * delete the file. Cellar refusing to destroy it and then advising the user to
+ * destroy it are the same loss by another hand.
+ */
+test.describe(
+	runtimeAvailable() ? 'a corrupt canonical notebook.ipynb' : `corrupt canonical notebook (skipped: ${REASON})`,
+	() => {
+		test.skip(!runtimeAvailable(), REASON);
+
+		// A renamed `.js` file: present, plainly the user's content, and not JSON.
+		const CORRUPT = '// analysis notes\nconst kept = 1;\n';
+
+		let ws: string;
+		let proc: ChildProcess;
+		let url: string;
+
+		test.beforeAll(async () => {
+			ws = mkdtempSync(join(tmpdir(), 'cellar-corrupt-canonical-'));
+			writeFileSync(join(ws, 'notebook.ipynb'), CORRUPT);
+			({ proc, url } = await bootCellar(ws));
+		});
+		test.afterAll(() => proc && killCellar(proc));
+
+		test('never advises deleting it, and leaves the bytes alone', async ({ page }) => {
+			await page.goto(url);
+
+			const reason = page.getByTestId('canonical-notebook-error');
+			await expect(reason).toBeVisible();
+			await expect(reason).toContainText(/not valid JSON/i);
+
+			const guidance = page.getByTestId('canonical-notebook-guidance');
+			await expect(guidance).toBeVisible();
+			await expect(guidance).toContainText(/cannot parse/i);
+			// The headline assertion: no branch of this page may advise destroying it.
+			await expect(guidance).not.toContainText(/delete/i);
+			await expect(guidance).toContainText(/reload/i);
+
+			// And the claim that actually matters: the user's bytes are untouched.
+			expect(readFileSync(join(ws, 'notebook.ipynb'), 'utf8')).toBe(CORRUPT);
 		});
 	}
 );

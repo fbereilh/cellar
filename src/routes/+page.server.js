@@ -67,6 +67,11 @@ export function load() {
 		// route returns), else null. Carried rather than swallowed: an empty shell
 		// over a broken file would imply there is simply no notebook.
 		notebookError: canonical.error,
+		// WHICH refusal it was (`empty` | `unparseable` | `unreadable`), so the shell
+		// derives its guidance from the failure instead of printing one paragraph for
+		// all of them - only an EMPTY file may be advised away, since a corrupt one
+		// holds bytes the reader deliberately refuses to overwrite.
+		notebookErrorReason: canonical.errorReason,
 		// Soft cap on live kernels: past this the Kernels sidebar shows a
 		// high-memory warning (warn-only, never blocks a run). Each kernel is a full
 		// Python process (100s of MB with pandas/pyspark). Tunable via

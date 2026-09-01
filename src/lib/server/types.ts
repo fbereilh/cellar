@@ -172,6 +172,22 @@ export interface NotebookDoc {
 	lastExportDerivedKey?: string;
 }
 
+/**
+ * WHY `readNotebook` refused - the machine-readable half of its message, and the
+ * ONE vocabulary the browser branches its guidance on.
+ *
+ * `empty`       the file holds no non-whitespace bytes, so nothing is lost.
+ * `unparseable` bytes are PRESENT and are not JSON - the user's data.
+ * `unreadable`  the file could not be opened at all (the message names the errno).
+ *
+ * A discriminator rather than a message match, because the guidance that hangs off
+ * it is not cosmetic: only `empty` may advise DELETING the file, and telling a
+ * user to delete an `unparseable` notebook destroys exactly the bytes the strict
+ * reader refuses to overwrite. Callers must tell these apart by this field, never
+ * by matching the message (the `InvalidExportTargetError` rule).
+ */
+export type NotebookReadFailure = 'empty' | 'unparseable' | 'unreadable';
+
 /** Serializable notebook view for the browser (SSR + REST). */
 export interface NotebookView {
 	workspace: string;
