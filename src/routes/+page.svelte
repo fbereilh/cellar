@@ -1946,11 +1946,19 @@
 					<div class="text-5xl opacity-30">🍷</div>
 					{#if canonicalNotebookError}
 						<!--
-							No "New notebook" button here: `createNotebook` opens an existing file
-							rather than overwriting it, so over a blank or corrupt `notebook.ipynb`
-							it can only throw. The remedy is the explorer, and the reload is what
-							makes it complete - this reason is a one-shot SSR fact (see above), so
-							nothing on this page re-reads the file.
+							No "New notebook" button here: `newNotebook` always targets the CANONICAL
+							path and `createNotebook` opens an existing file rather than overwriting
+							it, so over a blank or corrupt `notebook.ipynb` it can only throw. The
+							remedy is the explorer, and the reload is what makes it complete - this
+							reason is a one-shot SSR fact (see above), so nothing here re-reads the
+							file.
+
+							The guidance below is DERIVED from the reason, and the split is a
+							data-safety rule rather than copy: only `empty` may advise deleting or
+							recreating this file, because it holds nothing. The other two hold the
+							user's own bytes - the very bytes the reader refuses to overwrite - so
+							they name a way forward that leaves the file alone (a DIFFERENT name via
+							the explorer's New file) and send the repair itself outside Cellar.
 						-->
 						<div class="text-sm text-error" data-testid="canonical-notebook-error">
 							Could not open <code class="font-mono">{canonicalNotebookRel}</code>: {canonicalNotebookError}
@@ -1960,16 +1968,18 @@
 								Open another notebook from the sidebar, or delete this file there, create it
 								again, and reload the page.
 							{:else if canonicalNotebookErrorReason === 'unparseable'}
-								This file has content Cellar cannot parse, so it is left untouched. Open
-								another notebook from the sidebar, repair or restore it outside Cellar (a
-								text editor, or <code class="font-mono">git checkout</code>), then reload
-								the page.
-							{:else if canonicalNotebookErrorReason === 'unreadable'}
-								Cellar could not read this file at all. Open another notebook from the
-								sidebar, fix access to it, then reload the page.
-							{:else}
-								Open another notebook from the sidebar, or repair this file, then reload the
+								This file has content Cellar cannot parse, so it is left untouched. To work
+								now, make a notebook under a different name with the file explorer's New
+								file. To get this one back, repair or restore it outside Cellar (a text
+								editor, or <code class="font-mono">git checkout</code>), then reload the
 								page.
+							{:else if canonicalNotebookErrorReason === 'unreadable'}
+								Cellar could not read this file at all. To work now, make a notebook under a
+								different name with the file explorer's New file. To get this one back, fix
+								access to it, then reload the page.
+							{:else}
+								To work now, make a notebook under a different name with the file explorer's
+								New file. To get this one back, repair it, then reload the page.
 							{/if}
 						</p>
 					{:else}

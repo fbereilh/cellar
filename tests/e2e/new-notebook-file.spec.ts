@@ -209,6 +209,22 @@ test.describe(
 
 			// And the claim that actually matters: the user's bytes are untouched.
 			expect(readFileSync(join(ws, 'notebook.ipynb'), 'utf8')).toBe(CORRUPT);
+
+			// The way forward it names has to WORK, and has to be safe: a notebook
+			// under a DIFFERENT name, made from the explorer, leaving this file alone.
+			await expect(guidance).toContainText(/different name/i);
+			await openSidebarSection(page, 'files', 'files-body');
+			await page.getByTestId('files-new-file').click();
+			const field = page.getByTestId('tree-entry-field');
+			await expect(field).toBeVisible();
+			await field.fill('scratch.ipynb');
+			await field.press('Enter');
+			await page.getByTestId('tree-file').filter({ hasText: 'scratch.ipynb' }).dblclick();
+
+			await expect(page.locator('[role=tabpanel]:not(.hidden)').getByTestId('cell')).toHaveCount(1);
+			await expect(page.getByTestId('notebook-load-error')).toHaveCount(0);
+			// Working around the damaged file must not have touched it.
+			expect(readFileSync(join(ws, 'notebook.ipynb'), 'utf8')).toBe(CORRUPT);
 		});
 	}
 );

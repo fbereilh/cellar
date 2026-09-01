@@ -302,6 +302,21 @@ function isBlankText(text: string): boolean {
 }
 
 /**
+ * Every refusal `readNotebook` raises, carrying WHICH one as `reason`. Callers
+ * branch on that field and never on the message text (the `InvalidExportTargetError`
+ * rule): the SSR guidance hangs real consequences off it - only `empty` may advise
+ * deleting the file - and a message match would silently mis-route them on a reword.
+ */
+export class NotebookReadError extends Error {
+	readonly reason: NotebookReadFailure;
+	constructor(reason: NotebookReadFailure, message: string) {
+		super(message);
+		this.name = 'NotebookReadError';
+		this.reason = reason;
+	}
+}
+
+/**
  * Read a notebook from disk. `null` means the file does not exist.
  *
  * STRICT, deliberately - this reader never infers a notebook from bytes that are
@@ -349,15 +364,6 @@ function isBlankText(text: string): boolean {
  * delete-and-recreate away, because creating a notebook works. So the reader
  * stays strict: refuse, never degrade.
  */
-export class NotebookReadError extends Error {
-	readonly reason: NotebookReadFailure;
-	constructor(reason: NotebookReadFailure, message: string) {
-		super(message);
-		this.name = 'NotebookReadError';
-		this.reason = reason;
-	}
-}
-
 export function readNotebook(path: string): NbNotebook | null {
 	if (!existsSync(path)) return null;
 	let text: string;
