@@ -4,6 +4,7 @@ import { mkdtempSync, writeFileSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { runtimeAvailable, bootCellar, killCellar } from './harness';
+import { tabPanelDomId } from '../../src/lib/tabIds';
 
 /**
  * E2E: "Consolidate imports" as a toolbar button.
@@ -15,10 +16,13 @@ import { runtimeAvailable, bootCellar, killCellar } from './harness';
  *  - the button renders in the toolbar beside "Clear all outputs", and clicking it
  *    really sweeps this notebook's imports into the pinned imports cell, asserted
  *    against the `.ipynb` ON DISK;
- *  - it acts on ITS OWN notebook, not on whichever tab is focused;
+ *  - it acts on ITS OWN notebook, not on whichever tab is focused — proven by the
+ *    notebook each POST NAMES, since a click on the active tab's own button is
+ *    consistent with either binding and so discriminates nothing;
  *  - it cannot be fired twice: while a sweep is in flight the button is disabled
  *    and shows a spinner (the request is held open so that state is observable
- *    rather than raced);
+ *    rather than raced) — and that busy state is per NOTEBOOK, so a second
+ *    notebook stays clickable and sweeps concurrently;
  *  - the toolbar keeps every button reachable at a narrow window — one row at
  *    ordinary widths, wrapping rather than overflowing below that, and never a
  *    horizontal page scrollbar.
@@ -34,7 +38,9 @@ const NB = {
 	sweep: 'sweep.ipynb',
 	busy: 'busy.ipynb',
 	layout: 'layout.ipynb',
-	other: 'other.ipynb'
+	other: 'other.ipynb',
+	peerA: 'peer-a.ipynb',
+	peerB: 'peer-b.ipynb'
 } as const;
 
 /** A notebook whose imports are scattered below ordinary code. */
@@ -62,6 +68,41 @@ function cellsOnDisk(file: string): DiskCell[] {
 function importsCellSource(file: string): string | null {
 	const cell = cellsOnDisk(file).find((c) => c.metadata?.cellar?.role === 'imports');
 	return cell ? cell.source.join('') : null;
+}
+
+/**
+ * The consolidate button belonging to `file`'s OWN pane — visible or not.
+ *
+ * Addressed through the pane's DOM id rather than by visibility, because that is
+ * what makes "acts on its own notebook" testable at all: the background pane is
+ * `display:none`, so its button is only reachable by name, and every notebook the
+ * tab session restores carries one of these too.
+ */
+function consolidateButtonFor(page: Page, file: string) {
+	return page.locator(`[id="${tabPanelDomId('file:' + file)}"]`).getByTestId('consolidate-imports');
+}
+
+/** Records the notebook each POST to the sweep route names, in order. */
+async function recordSweepTargets(page: Page, gate?: Promise<void>): Promise<string[]> {
+	const posted: string[] = [];
+	await page.route('**/api/notebooks/imports', async (route) => {
+		posted.push(JSON.parse(route.request().postData() ?? '{}').path);
+		if (gate) await gate;
+		await route.continue();
+	});
+	return posted;
+}
+
+/** Opens `files` as permanent tabs (double-click promotes out of the preview slot). */
+async function openBoth(page: Page, files: readonly string[]): Promise<void> {
+	await page.goto(baseURL);
+	for (const file of files) {
+		await page.getByTestId('tree-file').filter({ hasText: file }).first().dblclick();
+		await expect(page.getByTestId('notebook-toolbar').filter({ visible: true })).toHaveCount(1, {
+			timeout: 30_000
+		});
+		await expect(consolidateButtonFor(page, file)).toBeVisible({ timeout: 30_000 });
+	}
 }
 
 async function openNotebook(page: Page, file: string): Promise<void> {
@@ -134,29 +175,63 @@ test('a sweep in flight disables the button, so it cannot be fired twice', async
 		.toContain('import');
 });
 
-test('each notebook`s button acts on ITS OWN notebook', async ({ page }) => {
+test('each notebook`s button names ITS OWN notebook, not the focused tab', async ({ page }) => {
 	// TWO notebooks open at once (double-click promotes out of the shared preview
 	// slot, so both panes stay mounted) — which is what makes this a real test of
 	// the per-notebook binding rather than of "the one notebook that exists".
-	await page.goto(baseURL);
-	for (const file of [NB.other, NB.layout]) {
-		await page.getByTestId('tree-file').filter({ hasText: file }).first().dblclick();
-		await expect(page.getByTestId('notebook-toolbar').filter({ visible: true })).toHaveCount(1, {
-			timeout: 30_000
-		});
-	}
-	// Both notebooks are mounted, so there are two toolbars — only the active tab's
-	// is visible, and that is the one a user can click.
-	const buttons = page.getByTestId('consolidate-imports');
-	await expect.poll(async () => buttons.count(), { timeout: 30_000 }).toBeGreaterThan(1);
+	// `layout.ipynb` is opened last, so it is the ACTIVE tab.
+	await openBoth(page, [NB.other, NB.layout]);
+	const posted = await recordSweepTargets(page);
 
-	const visible = buttons.filter({ visible: true });
-	await expect(visible).toHaveCount(1);
-	await visible.click();
-
-	// `layout.ipynb` was opened last, so it is the active tab and the one that changes.
+	// The active tab's button names the active notebook — true either way, so this
+	// half discriminates nothing on its own; it is the control for the one below.
+	await consolidateButtonFor(page, NB.layout).click();
+	await expect.poll(() => posted, { timeout: 30_000 }).toEqual([NB.layout]);
 	await expect.poll(() => importsCellSource(NB.layout), { timeout: 30_000 }).toContain('import');
 	expect(importsCellSource(NB.other), 'the notebook the user was NOT looking at was swept too').toBeNull();
+
+	// THE DISCRIMINATING HALF: the BACKGROUND notebook's own button names ITS
+	// notebook. Bound to the shell's `activeNotebookPath` instead, this second
+	// request would name `layout.ipynb` again and `other.ipynb` would never change.
+	// Its pane is `display:none`, so the click is dispatched rather than pointed.
+	await consolidateButtonFor(page, NB.other).dispatchEvent('click');
+	await expect.poll(() => posted, { timeout: 30_000 }).toEqual([NB.layout, NB.other]);
+	await expect.poll(() => importsCellSource(NB.other), { timeout: 30_000 }).toContain('import');
+});
+
+test('the busy state is per notebook, so one sweep never disables another', async ({ page }) => {
+	// `peer-b.ipynb` is opened last, so it is the ACTIVE tab.
+	await openBoth(page, [NB.peerA, NB.peerB]);
+
+	// Hold every sweep open so the busy state is observable rather than raced.
+	let release: (() => void) | null = null;
+	const held = new Promise<void>((r) => (release = r));
+	const posted = await recordSweepTargets(page, held);
+
+	const active = consolidateButtonFor(page, NB.peerB);
+	const background = consolidateButtonFor(page, NB.peerA);
+
+	await active.click();
+	await expect(active).toBeDisabled();
+
+	// A second click on the SAME notebook still sends nothing.
+	await active.click({ force: true }).catch(() => {});
+	expect(posted, 'a second request was sent for a notebook already sweeping').toEqual([NB.peerB]);
+
+	// ...while the OTHER notebook is untouched: a shell-wide flag would disable it
+	// here for a sweep that is not its own.
+	expect(
+		await background.isDisabled(),
+		'a sweep disabled a notebook it was not for'
+	).toBe(false);
+	await background.dispatchEvent('click');
+	await expect.poll(() => posted, { timeout: 30_000 }).toEqual([NB.peerB, NB.peerA]);
+
+	release!();
+	await expect(active).toBeEnabled({ timeout: 30_000 });
+	for (const file of [NB.peerA, NB.peerB]) {
+		await expect.poll(() => importsCellSource(file), { timeout: 30_000 }).toContain('import');
+	}
 });
 
 test('the toolbar stays reachable as the window narrows', async ({ page }) => {

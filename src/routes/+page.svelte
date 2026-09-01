@@ -991,23 +991,31 @@
 	// top and run it. The server does the whole sweep and broadcasts the resulting
 	// `cell:*` events with NO originId, so this tab renders it exactly as any other
 	// tab does - there is nothing to apply locally.
-	let consolidating = $state(false);
+	// Per-notebook in-flight state, keyed by notebook path (the `actingPaths` idiom
+	// the Kernels sidebar uses): the handler is bound per notebook, so the busy flag
+	// has to be too - a single boolean disabled every OTHER notebook's button and
+	// showed it a spinner for a sweep that was not its own.
+	let consolidatingPaths = $state<Set<string>>(new Set());
 
 	// Takes the notebook it acts on, so each notebook's own toolbar button sweeps its
 	// OWN notebook rather than whichever tab happens to be focused (the binding
 	// `onInterruptKernel` already uses). The palette twin passes nothing and so still
 	// means "the active notebook".
 	async function consolidateImports(path: string | null = activeNotebookPath) {
-		if (!path || consolidating) return;
-		consolidating = true;
+		if (!path || consolidatingPaths.has(path)) return;
+		consolidatingPaths = new Set(consolidatingPaths).add(path);
 		try {
 			await fetch('/api/notebooks/imports', {
 				method: 'POST',
 				headers: { 'content-type': 'application/json' },
 				body: JSON.stringify({ path })
 			});
-		} catch {}
-		consolidating = false;
+		} catch {
+		} finally {
+			const next = new Set(consolidatingPaths);
+			next.delete(path);
+			consolidatingPaths = next;
+		}
 	}
 
 	// ---- nbdev-style export to a .py module -----------------------------------
@@ -1852,7 +1860,7 @@
 						onRunEnd={onRunEnd}
 						onInterruptKernel={() => interruptKernel(canonicalNotebookRel)}
 						onConsolidateImports={() => consolidateImports(canonicalNotebookRel)}
-						{consolidating}
+						consolidating={consolidatingPaths.has(canonicalNotebookRel)}
 						onBlame={handleBlame}
 						searchHighlight={searchHighlight}
 					/>
@@ -1888,7 +1896,7 @@
 						onRunEnd={onRunEnd}
 						onInterruptKernel={() => interruptKernel(tab.path)}
 						onConsolidateImports={() => consolidateImports(tab.path)}
-						{consolidating}
+						consolidating={consolidatingPaths.has(tab.path)}
 						onBlame={handleBlame}
 						searchHighlight={searchHighlight}
 					/>

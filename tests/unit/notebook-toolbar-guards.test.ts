@@ -17,10 +17,16 @@
  * `clear-all-outputs` command does. Assertions on exact expressions (a
  * `$derived` line, an `onclick` body) belong to the e2e, not here: they break on
  * a rename and pass on dead code.
+ *
+ * The ONE exception is the palette check at the foot of this file: `commands.ts`
+ * carries no Svelte dependency, so `buildCommands` is built and invoked for real
+ * rather than read.
  */
 import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { buildCommands } from '../../src/lib/commands';
+import type { AppCommandHandlers, NotebookCommandHandle } from '../../src/lib/commands';
 
 const NOTEBOOK = readFileSync(join(process.cwd(), 'src/lib/Notebook.svelte'), 'utf8');
 const LIVE = readFileSync(join(process.cwd(), 'src/lib/LiveNotebook.svelte'), 'utf8');
@@ -171,8 +177,26 @@ describe('one pointed surface per action', () => {
 		}
 	});
 
+	// `commands.ts` is plain TypeScript with no Svelte dependency, so unlike every
+	// guard above this one has a real executable interface: build the palette and
+	// invoke the entry.
 	it('still offers Consolidate imports from the command palette', () => {
-		const commands = readFileSync(join(process.cwd(), 'src/lib/commands.ts'), 'utf8');
-		expect(commands).toContain("'consolidate-imports'");
+		let ran = 0;
+		const app = { consolidateImports: () => ran++ } as unknown as AppCommandHandlers;
+		const notebook = { dispatch() {}, runAll() {}, clearAll() {} } as NotebookCommandHandle;
+
+		const cmd = buildCommands({ notebook, app }).find((c) => c.id === 'consolidate-imports');
+		expect(cmd, 'the palette no longer offers consolidate-imports').toBeDefined();
+		expect(cmd!.title).toBe('Consolidate imports');
+		expect(cmd!.disabled, 'enabled with a notebook').toBe(false);
+
+		cmd!.run();
+		expect(ran, 'the palette entry does not reach the shell handler').toBe(1);
+
+		// With no active notebook there is nothing to sweep, so the row is offered
+		// but disabled - the same gate the entry has always carried.
+		const none = buildCommands({ notebook: null, app }).find((c) => c.id === 'consolidate-imports');
+		expect(none, 'the entry vanishes with no notebook').toBeDefined();
+		expect(none!.disabled, 'enabled with no notebook').toBe(true);
 	});
 });
