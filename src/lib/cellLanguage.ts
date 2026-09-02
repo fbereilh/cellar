@@ -185,9 +185,10 @@ export function isPyUnsupportedType(cellType: unknown): cellType is PyUnsupporte
  * May a UI surface OFFER this logical type for a notebook of this format? The ONE
  * rule behind every create/convert control - the cell-type menu's `typeOptions`
  * filter, the add affordances' chat gate (`Notebook.svelte`'s bottom add row +
- * hover-between strip), and `LiveNotebook`'s optimistic `refuseUnsupportedType` -
- * so no control can ever offer a type the doc layer's `assertCanHoldType` is
- * about to refuse.
+ * hover-between strip), `LiveNotebook`'s optimistic `refuseUnsupportedType`, and
+ * the multi-cell PASTE (which asks it of each entry's LOGICAL type - see
+ * `$lib/cellClipboard`) - so no control can ever offer a type the doc layer's
+ * `assertCanHoldType` is about to refuse.
  *
  * It is a FUNCTION rather than the same expression written out per surface for
  * the reason this whole module exists: three inlined copies of
