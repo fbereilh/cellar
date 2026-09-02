@@ -7,19 +7,37 @@
  *
  *   - a MANUAL "Checkpoint now" action (trigger `manual`), and
  *   - an AUTOMATIC snapshot taken BEFORE an agent action (trigger `agent`), so an
- *     agent's mutation or run can be undone. Agent actions are frequent (a run_all
- *     is many run_cell calls; one agent turn fires several tools), so snapshotting
- *     before *every* action produces far too many checkpoints. The auto path
- *     THROTTLES BY COUNT: it snapshots on the first agent action for a notebook and
- *     then once every `CHECKPOINT_EVERY_N_ACTIONS` actions, skipping the ones in
- *     between. Each snapshot is taken BEFORE the action, so it captures the state
- *     just before that batch of up to N actions began — restoring it walks the
- *     notebook back to before the batch. A `CHECKPOINT_MAX_GAP_MS` time backstop
- *     also snapshots if it's been a long while since the last auto checkpoint, so a
- *     slow, sparse agent (fewer than N actions over a long session) still gets
- *     periodic backups. The count is the primary trigger; time is only a floor.
- *     The result is one "before agent action" checkpoint per batch, which is what
- *     "undo last agent action" restores to.
+ *     agent's mutation or run can be undone.
+ *
+ * THE AUTO PATH HAS TWO TIERS, and which tier an action takes is a statement about
+ * what that action DESTROYS — not about how important it is.
+ *
+ *   - RECOVERABLE actions (a run, an edit, an add, a move, a consolidate) go through
+ *     `autoCheckpointBeforeAgentAction`, which THROTTLES BY COUNT: it snapshots on
+ *     the first agent action for a notebook and then once every
+ *     `CHECKPOINT_EVERY_N_ACTIONS` actions, skipping the ones in between. Agent
+ *     actions are frequent (a run_all is many run_cell calls; one agent turn fires
+ *     several tools), so snapshotting before *every* one would mint far more
+ *     checkpoints than `MAX_PER_NOTEBOOK` can hold and evict the very state worth
+ *     going back to. Each snapshot is taken BEFORE the action, so it captures the
+ *     state just before that batch of up to N actions began — restoring it walks the
+ *     notebook back to before the batch. A `CHECKPOINT_MAX_GAP_MS` time backstop also
+ *     snapshots if it's been a long while since the last auto checkpoint, so a slow,
+ *     sparse agent still gets periodic backups. The count is the primary trigger;
+ *     time is only a floor. What makes the throttle SAFE here is that the state these
+ *     actions overwrite can be produced again: a run's outputs come back by re-running,
+ *     and an edit's previous source is recoverable from the batch snapshot.
+ *
+ *   - DESTRUCTIVE actions — the ones that DELETE saved outputs, which nothing but a
+ *     re-run can recreate and a re-run may be impossible (the kernel is gone, the
+ *     cluster is down, the query cost an hour) — go through
+ *     `checkpointBeforeDestructiveAgentAction`, which is NEVER throttled. Under the
+ *     old single-tier rule four out of every five `clear_outputs` calls were preceded
+ *     by NO snapshot at all, so "the agent wiped my results" had no undo behind it.
+ *     Today that is `clear_outputs`, `delete_cells`, and the `set_cell_type`
+ *     conversions that drop a code cell's outputs. A run is deliberately NOT in this
+ *     set: it is the highest-frequency action there is and re-running is its own
+ *     recovery.
  *
  * STORAGE mirrors `ui-state.js`: a single JSON file under the workspace's
  * `.cellar/` dir (already gitignored in full), keyed by workspace-relative
@@ -27,11 +45,32 @@
  * diff. The in-memory `cache` is the source of truth once loaded; disk writes are
  * debounced and flushed synchronously on process exit.
  *
+ * OUTPUTS ARE STORED OUT-OF-BAND, one file per checkpoint at
+ * `.cellar/checkpoints/<id>.json`, and the index above holds only sources +
+ * metadata. That split is what makes undo after a clear actually work. Inline,
+ * every snapshot's outputs sat in the single index file, which is held in memory
+ * and re-serialized on EVERY write — so a per-snapshot `MAX_SNAPSHOT_BYTES` cap had
+ * to drop them, and it dropped them for exactly the output-heavy notebook
+ * `clear_outputs` exists to shed weight from. Out-of-band there is no such cap:
+ * the sidecar is written ONCE, read only on restore, and deleted on eviction, so
+ * the repeated-write path got CHEAPER at the same time as the guarantee got real.
+ *
  * BOUNDING. History is capped at `MAX_PER_NOTEBOOK` snapshots per notebook (FIFO
- * eviction). Outputs are INCLUDED (so a restore reproduces the rendered result),
- * but a single snapshot is capped at `MAX_SNAPSHOT_BYTES`: past that, its outputs
- * are dropped (source + metadata are always kept) and it is flagged
- * `outputsTruncated`, so one image-heavy notebook can never blow up the store.
+ * eviction, which deletes the evicted snapshot's sidecar with it). Sidecars are
+ * bounded in total by `outputBudgetBytes()` across the workspace (256 MB, or
+ * `CELLAR_CHECKPOINT_OUTPUT_BUDGET_BYTES`), and
+ * the eviction rule is NEWEST-WINS: the snapshot just taken always keeps its
+ * outputs, and older sidecars are shed until the store is under budget. That
+ * inversion is the guarantee — "the destructive action you just took is undoable"
+ * is a promise about the newest snapshot, while an old checkpoint losing its
+ * outputs is a degradation of history, not a broken promise. A shed snapshot is
+ * flagged `outputsTruncated` and still restores its sources.
+ *
+ * THE ONE REMAINING CASE where outputs cannot be preserved is a sidecar that could
+ * not be WRITTEN (a full disk, an unwritable `.cellar/`, a payload past the JS
+ * string limit). That is an error rather than a policy, so it is flagged
+ * `outputsTruncated` with the cause on `outputsError`, and the destructive tools
+ * REFUSE before destroying anything rather than reporting the loss afterwards.
  *
  * This module depends on `notebook.js` (read the live cells to snapshot, replace
  * the live cells to restore) but nothing in `notebook.js` depends on it — the
@@ -39,7 +78,7 @@
  * unambiguously knows an *agent* is about to act.
  */
 
-import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync } from 'node:fs';
 import { join, dirname, relative, isAbsolute } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { workspaceRoot } from '$lib/server/fstree';
@@ -57,8 +96,23 @@ export interface Checkpoint {
 	trigger: CheckpointTrigger;
 	label: string;
 	cellCount: number;
-	/** Set when outputs were dropped to keep the snapshot under the size cap. */
+	/**
+	 * Set when this snapshot holds NO outputs — either its sidecar was shed to keep
+	 * the store under `outputBudgetBytes()`, or writing it failed. Sources
+	 * and metadata are always kept, so such a checkpoint still restores.
+	 */
 	outputsTruncated?: boolean;
+	/** Why the outputs are missing, when the sidecar could not be written or read. */
+	outputsError?: string;
+	/** True while `.cellar/checkpoints/<id>.json` holds this snapshot's outputs. */
+	outputsStored?: boolean;
+	/** Serialized size of that sidecar, for the store-wide budget. */
+	outputBytes?: number;
+	/**
+	 * Sources + metadata. `outputs` is EMPTY here whenever `outputsStored` is set —
+	 * the outputs live in the sidecar. A checkpoint written by an older Cellar has
+	 * neither flag and carries its outputs inline; `snapshotCells` reads both shapes.
+	 */
 	cells: CellView[];
 }
 
@@ -70,6 +124,8 @@ export interface CheckpointMeta {
 	label: string;
 	cellCount: number;
 	outputsTruncated: boolean;
+	/** Why the outputs are missing; present only alongside `outputsTruncated`. */
+	outputsError?: string;
 }
 
 /** The outcome of a restore / undo. */
@@ -82,8 +138,16 @@ export interface RestoreResult {
 const WRITE_DEBOUNCE_MS = 250;
 /** Max checkpoints retained per notebook (oldest evicted first). */
 const MAX_PER_NOTEBOOK = 25;
-/** A snapshot larger than this (serialized) drops its outputs to stay bounded. */
-const MAX_SNAPSHOT_BYTES = 2 * 1024 * 1024;
+/**
+ * Total on-disk budget for output sidecars across the whole workspace. Past it the
+ * OLDEST sidecars are shed (see NEWEST-WINS above), never the one just written — so
+ * a destructive action's own undo is never the thing traded away. Overridable so a
+ * test can drive the eviction without writing hundreds of megabytes.
+ */
+function outputBudgetBytes(): number {
+	const raw = Number(process.env.CELLAR_CHECKPOINT_OUTPUT_BUDGET_BYTES);
+	return Number.isFinite(raw) && raw > 0 ? raw : 256 * 1024 * 1024;
+}
 /**
  * Auto-checkpoint throttle: take one automatic snapshot per this many agent
  * actions (plus the very first). The captain may retune this single constant.
@@ -111,6 +175,91 @@ function storePath(): string {
 	return join(workspaceRoot(), '.cellar', 'checkpoints.json');
 }
 
+/** Directory holding one outputs sidecar per checkpoint. */
+function outputsDir(): string {
+	return join(workspaceRoot(), '.cellar', 'checkpoints');
+}
+
+function outputsPath(id: string): string {
+	return join(outputsDir(), `${id}.json`);
+}
+
+/** The message a failed sidecar write / read reports as `outputsError`. */
+function outputsErrorText(e: unknown): string {
+	const code = (e as { code?: string } | null)?.code;
+	// A raw message can carry an absolute server path; the errno (or the error's
+	// name for a RangeError from an over-long JSON string) says enough.
+	return code || (e instanceof Error ? e.name : 'unknown error');
+}
+
+/**
+ * Drop a checkpoint's outputs: delete its sidecar and record that it no longer
+ * holds them. The checkpoint itself survives and still restores its sources — this
+ * is the budget's eviction step, not a deletion.
+ */
+function shedOutputs(cp: Checkpoint, reason: string): void {
+	if (cp.outputsStored) {
+		try {
+			rmSync(outputsPath(cp.id), { force: true });
+		} catch {}
+	}
+	cp.outputsStored = false;
+	delete cp.outputBytes;
+	cp.outputsTruncated = true;
+	cp.outputsError = reason;
+}
+
+/**
+ * Keep the sidecar store under `outputBudgetBytes()` by shedding the
+ * OLDEST sidecars first. `keepId` — the snapshot just taken — is never shed even
+ * when it alone exceeds the budget: it is the one whose outputs a destructive
+ * action's undo depends on, and the next checkpoint's own budget pass ages it out
+ * once it is no longer the newest.
+ */
+function enforceOutputBudget(store: Record<string, Checkpoint[]>, keepId: string): void {
+	const stored: Checkpoint[] = [];
+	let total = 0;
+	for (const list of Object.values(store)) {
+		for (const cp of list) {
+			if (!cp.outputsStored) continue;
+			stored.push(cp);
+			total += cp.outputBytes ?? 0;
+		}
+	}
+	const budget = outputBudgetBytes();
+	if (total <= budget) return;
+	stored.sort((a, b) => a.at - b.at);
+	for (const cp of stored) {
+		if (total <= budget) break;
+		if (cp.id === keepId) continue;
+		total -= cp.outputBytes ?? 0;
+		shedOutputs(cp, 'shed to keep the checkpoint store under its size budget');
+	}
+}
+
+/**
+ * Delete sidecars no checkpoint refers to any more — a crash between the sidecar
+ * write and the debounced index write, or a hand-deleted `checkpoints.json`. Runs
+ * once, from the single `ensureLoaded` miss, so it costs one readdir per process.
+ *
+ * STATED LIMIT: a SECOND Cellar instance in the same workspace (`cellar --new`,
+ * which the per-folder instance lock otherwise prevents) can sweep a sidecar the
+ * first has written but not yet flushed into its index. It degrades honestly rather
+ * than silently — the later restore finds the file gone, sheds the entry and reports
+ * `outputsTruncated` — and it is the same last-writer-wins hazard `checkpoints.json`
+ * itself already carries between two instances.
+ */
+function sweepOrphanOutputs(store: Record<string, Checkpoint[]>): void {
+	try {
+		const live = new Set<string>();
+		for (const list of Object.values(store)) for (const cp of list) if (cp.outputsStored) live.add(cp.id);
+		for (const name of readdirSync(outputsDir())) {
+			if (!name.endsWith('.json')) continue;
+			if (!live.has(name.slice(0, -'.json'.length))) rmSync(join(outputsDir(), name), { force: true });
+		}
+	} catch {}
+}
+
 /** Workspace-relative key for a notebook path (absolute, relative, or nullish → active). */
 function keyFor(nb?: string | null): string {
 	const abs = resolveNotebookPath(nb); // canonical absolute id
@@ -135,6 +284,7 @@ function ensureLoaded(): Record<string, Checkpoint[]> {
 	} catch {
 		cache = {};
 	}
+	sweepOrphanOutputs(cache);
 	return cache;
 }
 
@@ -146,7 +296,8 @@ function metaOf(cp: Checkpoint): CheckpointMeta {
 		trigger: cp.trigger,
 		label: cp.label,
 		cellCount: cp.cellCount,
-		outputsTruncated: !!cp.outputsTruncated
+		outputsTruncated: !!cp.outputsTruncated,
+		...(cp.outputsTruncated && cp.outputsError ? { outputsError: cp.outputsError } : {})
 	};
 }
 
@@ -167,12 +318,25 @@ export function createCheckpoint(
 ): CheckpointMeta {
 	const store = ensureLoaded();
 	const key = keyFor(nb);
-	// Deep-clone the live cells so later document mutations can't corrupt the stored
-	// snapshot. Runtime metadata (lastRun/editedAt/importBindings) rides along - it
-	// lives only in this ephemeral `.cellar` file, never the `.ipynb`, and restoring it
-	// keeps run-status AND staleness honest (the kernel-session epoch check still gates
+	const live = listCells(nb);
+	// The two halves are cloned SEPARATELY and never held at once: sources + metadata
+	// are cloned into the index entry (metadata is the only mutable part - id,
+	// cell_type and source are strings), while the outputs stay ALIASED to the live
+	// doc just long enough to be serialized straight into the sidecar. Cloning the
+	// whole cell first and then serializing it, as this used to, held two full copies
+	// of a multi-megabyte output set in memory to write one.
+	//
+	// Runtime metadata (lastRun/editedAt/importBindings) rides along - it lives only in
+	// this ephemeral `.cellar` file, never the `.ipynb`, and restoring it keeps
+	// run-status AND staleness honest (the kernel-session epoch check still gates
 	// ran_this_session; the import-change stamps still scope an imports-cell edit).
-	const cells = structuredClone(listCells(nb));
+	const cells: CellView[] = live.map((c) => ({
+		id: c.id,
+		cell_type: c.cell_type,
+		source: c.source,
+		outputs: [],
+		metadata: structuredClone(c.metadata ?? {})
+	}));
 	const cp: Checkpoint = {
 		id: randomUUID(),
 		at: Date.now(),
@@ -181,17 +345,79 @@ export function createCheckpoint(
 		cellCount: cells.length,
 		cells
 	};
-	// Bound a single snapshot: if it's too big, drop outputs (keep source + metadata).
-	if (JSON.stringify(cp).length > MAX_SNAPSHOT_BYTES) {
-		for (const c of cp.cells) c.outputs = [];
-		cp.outputsTruncated = true;
-	}
+	storeOutputs(cp, live);
 	const list = store[key] ?? (store[key] = []);
 	list.push(cp);
-	while (list.length > MAX_PER_NOTEBOOK) list.shift();
+	// FIFO eviction takes the evicted snapshot's sidecar with it, or `.cellar/` would
+	// accumulate a file per checkpoint the index no longer knows about.
+	while (list.length > MAX_PER_NOTEBOOK) {
+		const gone = list.shift();
+		if (gone?.outputsStored) {
+			try {
+				rmSync(outputsPath(gone.id), { force: true });
+			} catch {}
+		}
+	}
+	enforceOutputBudget(store, cp.id);
 	scheduleWrite();
 	publishGlobal({ type: 'checkpoints:changed', nb: resolveNotebookPath(nb) });
 	return metaOf(cp);
+}
+
+/**
+ * Write this snapshot's outputs to its sidecar, or record why it could not be done.
+ * A notebook with no outputs at all writes nothing and is NOT flagged truncated -
+ * there is nothing missing, so a destructive action on it has nothing to warn about.
+ *
+ * `live` is the live document's cell views, so the outputs are serialized without a
+ * second copy; the resulting string is the sidecar's exact bytes.
+ */
+function storeOutputs(cp: Checkpoint, live: CellView[]): void {
+	if (!live.some((c) => c.outputs?.length)) return;
+	try {
+		const json = JSON.stringify(live.map((c) => c.outputs ?? []));
+		mkdirSync(outputsDir(), { recursive: true });
+		writeFileSync(outputsPath(cp.id), json);
+		cp.outputsStored = true;
+		cp.outputBytes = Buffer.byteLength(json);
+	} catch (e) {
+		// A full disk, an unwritable `.cellar/`, or a payload past the JS string limit.
+		// Flagged rather than thrown: a source-only checkpoint is still worth keeping,
+		// and the destructive tools read this flag to refuse BEFORE destroying anything.
+		cp.outputsStored = false;
+		cp.outputsTruncated = true;
+		cp.outputsError = outputsErrorText(e);
+	}
+}
+
+/**
+ * A checkpoint's cells with their outputs re-attached from the sidecar. A snapshot
+ * written by an older Cellar carries them inline and is returned as-is.
+ *
+ * A sidecar that cannot be read is recorded on the stored entry (so the History
+ * panel and every later read stop claiming outputs that are gone) and the sources
+ * are still returned - restoring them beats refusing the restore outright.
+ */
+function snapshotCells(cp: Checkpoint): CellView[] {
+	if (!cp.outputsStored) return cp.cells;
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(readFileSync(outputsPath(cp.id), 'utf8'));
+	} catch (e) {
+		return withoutOutputs(cp, outputsErrorText(e));
+	}
+	// The payload is POSITIONAL - one outputs array per cell, in the snapshot's own
+	// order - so a length mismatch means it does not belong to these cells and must
+	// not be zipped onto them.
+	if (!Array.isArray(parsed) || parsed.length !== cp.cells.length) return withoutOutputs(cp, 'unexpected shape');
+	return cp.cells.map((c, i) => ({ ...c, outputs: (parsed[i] ?? []) as CellView['outputs'] }));
+}
+
+/** Record that a sidecar is unusable and fall back to the snapshot's sources. */
+function withoutOutputs(cp: Checkpoint, why: string): CellView[] {
+	shedOutputs(cp, `the stored outputs could not be read (${why})`);
+	scheduleWrite();
+	return cp.cells;
 }
 
 function defaultLabel(trigger: string): string {
@@ -230,6 +456,47 @@ export function autoCheckpointBeforeAgentAction(nb?: string | null): CheckpointM
 	return null;
 }
 
+/**
+ * Snapshot before a DESTRUCTIVE agent action - one that deletes saved outputs -
+ * and NEVER throttle it. Returns the checkpoint's metadata; the caller reads
+ * `outputsTruncated` to decide whether the action it is about to take is
+ * recoverable (see the tiers in the header).
+ *
+ * Deliberately does NOT touch the throttle counters, in either direction. Reading
+ * them would make a destructive action's snapshot depend on how many runs preceded
+ * it, which is the bug; writing them would let a destructive action grant or spend
+ * credit the recoverable tier is owed, so a refused call (which discards its
+ * checkpoint) would leave the counters describing a snapshot that no longer exists.
+ * The two tiers are independent mechanisms over one store.
+ */
+export function checkpointBeforeDestructiveAgentAction(nb?: string | null): CheckpointMeta {
+	return createCheckpoint(nb, { trigger: 'agent' });
+}
+
+/**
+ * Remove a checkpoint and its sidecar. The one caller is a destructive tool that
+ * took its pre-action snapshot, found it could not hold the outputs, and refused:
+ * a refused call must change nothing, and a leftover snapshot of an unchanged
+ * document would push the human's real undo target one step further out of reach
+ * (the same rule `removeCells` and `setType` state for their own refusals).
+ */
+export function discardCheckpoint(nb: string | null | undefined, id: string): void {
+	const store = ensureLoaded();
+	const key = keyFor(nb);
+	const list = store[key];
+	if (!list) return;
+	const i = list.findIndex((c) => c.id === id);
+	if (i < 0) return;
+	const [cp] = list.splice(i, 1);
+	if (cp.outputsStored) {
+		try {
+			rmSync(outputsPath(cp.id), { force: true });
+		} catch {}
+	}
+	scheduleWrite();
+	publishGlobal({ type: 'checkpoints:changed', nb: resolveNotebookPath(nb) });
+}
+
 /** Find a stored checkpoint (with its cells) by id, or null. */
 function findCheckpoint(key: string, id: string): Checkpoint | null {
 	const store = ensureLoaded();
@@ -246,10 +513,21 @@ export function restoreCheckpoint(nb: string | null | undefined, id: string, ori
 	const key = keyFor(nb);
 	const cp = findCheckpoint(key, id);
 	if (!cp) return { ok: false, error: 'not_found' };
+	// Read the sidecar FIRST. The pre-restore snapshot below runs the store-wide
+	// budget pass, which sheds the OLDEST sidecars and spares only the snapshot it
+	// just took - so `cp`, being older, is exactly what a tight budget would shed out
+	// from under this restore.
+	const cells = snapshotCells(cp);
+	// Read the meta HERE - after `snapshotCells`, which flags the entry when the
+	// sidecar could not be read, and BEFORE the pre-restore snapshot below, whose
+	// budget pass may shed this checkpoint's (already-read) sidecar. Either side of
+	// that window the result would describe something other than what this restore
+	// actually did: too optimistic before, too pessimistic after.
+	const restored = metaOf(cp);
 	// Capture the current (about-to-be-replaced) state so the user can walk it back.
 	createCheckpoint(nb, { trigger: 'restore' });
-	replaceCells(nb, cp.cells, originId);
-	return { ok: true, restored: metaOf(cp) };
+	replaceCells(nb, cells, originId);
+	return { ok: true, restored };
 }
 
 /**

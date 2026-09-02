@@ -154,19 +154,17 @@ describe('delete_cells removes many in one call', () => {
 	});
 
 	/**
-	 * A checkpoint is a snapshot of the state a mutation is about to leave behind,
-	 * so a batch the non-empty invariant REFUSES must not mint one: it would put an
-	 * entry carrying an 'agent' trigger in the human's History for a document that
-	 * never changed, and (the auto-checkpoint being throttled by an action COUNT)
-	 * it would spend the slot that the next real mutation should have had.
+	 * A checkpoint is a snapshot of the state a mutation is about to leave behind, so
+	 * a batch the non-empty invariant REFUSES must not mint one: it would put an entry
+	 * carrying an 'agent' trigger in the human's History for a document that never
+	 * changed, pushing the real undo target one step further out of reach.
 	 */
-	it('a REFUSED batch takes no checkpoint and spends no action slot', async () => {
+	it('a REFUSED batch takes no checkpoint, while the one that lands always takes one', async () => {
 		const { target, handles } = await makeNotebook('delete-refused.ipynb', 2);
 		const all = nbmod.listCells(target).map((c) => c.id);
-		// `makeNotebook`'s own add was this notebook's first agent action, so it
-		// already checkpointed and reset the throttle. Walk the counter to one action
-		// short of the next automatic snapshot, so a stray auto-checkpoint call is
-		// unmistakable rather than merely absent.
+		// Deliberately several actions deep, not at a checkpoint boundary: a delete
+		// destroys the cells' OUTPUTS, so it is on the never-throttled tier and its
+		// position in the agent's action sequence must not decide whether it snapshots.
 		for (let i = 0; i < 4; i++) await svc.editCell(handles[0], `a = ${i}`, { nb: target, routeImports: false });
 		const before = cp.listCheckpoints(target).length;
 
@@ -174,9 +172,30 @@ describe('delete_cells removes many in one call', () => {
 		expect(nbmod.listCells(target).map((c) => c.id)).toEqual(all); // nothing removed
 		expect(cp.listCheckpoints(target).length).toBe(before);
 
-		// …and the slot it did not spend is still there for the delete that lands.
+		// …and the delete that DOES land snapshots, right here mid-batch.
 		expect(svc.removeCells([handles[0]], target).ok).toBe(true);
 		expect(cp.listCheckpoints(target).length).toBe(before + 1);
+	});
+
+	it('undo after a delete brings the cells back WITH their outputs, past the old cap', async () => {
+		// The other output-destroying tool, and it had both halves of the same bug: the
+		// pre-delete snapshot was throttled away four times in five, and when one WAS
+		// taken an output-heavy notebook blew the inline 2 MB cap so the cells came back
+		// empty — a delete that reads as undone while the results are gone for good.
+		const { target, handles } = await makeNotebook('delete-undo.ipynb', 3);
+		const doomedId = svc.resolveRef(target, handles[1]);
+		const big = 'z'.repeat(3_000_000);
+		nbmod.setOutputs(doomedId, [{ output_type: 'stream', name: 'stdout', text: big }], target);
+		// Several actions deep, so the throttle would have skipped this one.
+		for (let i = 0; i < 3; i++) await svc.editCell(handles[0], `a = ${i}`, { nb: target, routeImports: false });
+
+		expect(svc.removeCells([handles[1]], target)).toMatchObject({ ok: true, count: 1 });
+		expect(nbmod.listCells(target).some((c) => c.id === doomedId)).toBe(false);
+
+		expect(cp.undoLastAgentAction(target).ok).toBe(true);
+		const back = nbmod.listCells(target).find((c) => c.id === doomedId);
+		expect(back, 'the deleted cell is back').toBeTruthy();
+		expect((back!.outputs?.[0] as { text?: string })?.text).toBe(big);
 	});
 
 	it('deletes NOTHING when any id is unknown — a typo cannot half-apply a batch', async () => {

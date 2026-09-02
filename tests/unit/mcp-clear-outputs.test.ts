@@ -20,7 +20,7 @@
  * the python dataflow subprocess.
  */
 import { describe, it, expect, beforeAll, vi } from 'vitest';
-import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -48,6 +48,7 @@ let svc: typeof import('../../src/lib/server/mcp/service');
 let nbmod: typeof import('../../src/lib/server/notebook');
 let events: typeof import('../../src/lib/server/events');
 let queue: typeof import('../../src/lib/server/run-queue');
+let cpmod: typeof import('../../src/lib/server/checkpoints');
 
 const abs = (rel: string) => nbmod.resolveNotebookPath(rel);
 
@@ -58,6 +59,7 @@ beforeAll(async () => {
 	nbmod = await import('../../src/lib/server/notebook');
 	events = await import('../../src/lib/server/events');
 	queue = await import('../../src/lib/server/run-queue');
+	cpmod = await import('../../src/lib/server/checkpoints');
 });
 
 /** One stream output, the shape a `print()` leaves behind. */
@@ -83,6 +85,43 @@ const withOutputs = (target: string) =>
 		.listCells(target)
 		.map((c, i) => (c.outputs?.length ? i : -1))
 		.filter((i) => i >= 0);
+
+/**
+ * A `chmod 0o500` directory does not stop root, so every refuse-before-destroying
+ * test below would pass VACUOUSLY there (no write failure ⇒ no refusal to observe ⇒
+ * the assertions never run against the path they exist for). Probe once and skip
+ * with the reason rather than assert something the environment cannot produce.
+ */
+const chmodBlocksWrites = (() => {
+	const probe = mkdtempSync(join(tmpdir(), 'cellar-chmod-probe-'));
+	try {
+		chmodSync(probe, 0o500);
+		writeFileSync(join(probe, 'x'), 'x');
+		return false; // the write went through: chmod is not enforced for us
+	} catch {
+		return true;
+	} finally {
+		try {
+			chmodSync(probe, 0o700);
+		} catch {}
+	}
+})();
+
+/**
+ * Run `fn` with the checkpoint sidecar directory unwritable - what a full disk or an
+ * unwritable `.cellar/` looks like from here. The first checkpoint is forced so the
+ * directory exists to be locked.
+ */
+function withUnwritableSidecars<T>(target: string, fn: () => T): T {
+	cpmod.createCheckpoint(target, { trigger: 'manual' });
+	const dir = join(WS, '.cellar', 'checkpoints');
+	chmodSync(dir, 0o500);
+	try {
+		return fn();
+	} finally {
+		chmodSync(dir, 0o700);
+	}
+}
 
 describe('clear_outputs clears the cells it is given', () => {
 	it('clears exactly the named cells and leaves every other output intact', async () => {
@@ -346,11 +385,13 @@ describe('the clear-all form never discloses a cell hidden from the agent', () =
 	});
 });
 
-describe('the result never claims an undo it cannot deliver', () => {
+describe('the pre-clear checkpoint really can give the outputs back', () => {
 	/**
 	 * A notebook built through the NOTEBOOK api, not the service - so no agent
-	 * action has been recorded for it and the clear below is its FIRST, which is
-	 * the one case the throttle always snapshots.
+	 * action has been recorded for it. It used to matter which was which: under the
+	 * old single-tier throttle only a notebook's FIRST agent action snapshotted, so
+	 * a clear anywhere else in the sequence took none. It no longer does, which is
+	 * the point of the position sweep below.
 	 */
 	function makeUntouchedNotebook(name: string, text: string): { target: string; ids: string[] } {
 		const target = abs(name);
@@ -364,58 +405,105 @@ describe('the result never claims an undo it cannot deliver', () => {
 		return { target, ids };
 	}
 
-	it('says nothing when the pre-clear checkpoint really does hold the outputs', () => {
+	it('says nothing when the checkpoint holds the outputs - which is now every ordinary clear', () => {
 		const { target } = makeUntouchedNotebook('undo-ok.ipynb', 'small\n');
-
-		// First agent action for this notebook ⇒ a checkpoint IS taken, and the
-		// snapshot is far under the size bound, so its outputs are stored. Undo works,
-		// so there is nothing to warn about and the agent pays no tokens for silence.
 		const r = svc.clearOutputs(undefined, target);
 		expect(r).toMatchObject({ ok: true, count: 2 });
+		// No `undo` field: the agent pays no tokens for a caveat that no longer applies.
 		expect(r).not.toHaveProperty('undo');
 	});
 
-	it('warns when the checkpoint was THROTTLED away, so undo lands on an earlier state', async () => {
-		// `makeNotebook` goes through the service, which spends this notebook's first
-		// agent action on the add - so the clear is folded into that batch and takes no
-		// snapshot of its own (auto-checkpoints are one per N actions).
-		const { target, handles } = await makeNotebook('undo-throttled.ipynb', 2);
+	it('checkpoints EVERY clear, wherever it falls in the agent action sequence', async () => {
+		// THE HEADLINE REGRESSION. `autoCheckpointBeforeAgentAction` snapshots on the
+		// first agent action and then once every N, so four out of five clears used to
+		// be preceded by NO snapshot at all - the position in the sequence decided
+		// whether the user's outputs were recoverable. A destructive action is never
+		// throttled now, so the position must not matter: run the clear at six
+		// consecutive positions and every one of them must be its own checkpoint.
+		const { target, handles } = await makeNotebook('undo-positions.ipynb', 8);
+		const agentsBefore = cpmod.listCheckpoints(target).filter((c) => c.trigger === 'agent').length;
 
-		const r = svc.clearOutputs([handles[0]], target);
-		expect(r).toMatchObject({ ok: true, count: 1 });
-		// The whole point: the agent is told the outputs it just destroyed are not
-		// coming back from undo, rather than being left to assume they are.
-		expect(r.ok && r.undo).toMatchObject({ outputs_recoverable: false });
-		expect(r.ok && r.undo?.reason).toMatch(/throttled/);
+		for (let i = 0; i < 6; i++) {
+			nbmod.setOutputs(svc.resolveRef(target, handles[i]), out(`o ${i}\n`), target);
+			const r = svc.clearOutputs([handles[i]], target);
+			expect(r, `clear at position ${i}`).toMatchObject({ ok: true, count: 1 });
+			expect(r, `clear at position ${i} claims no lost undo`).not.toHaveProperty('undo');
+		}
+
+		const agentsAfter = cpmod.listCheckpoints(target).filter((c) => c.trigger === 'agent').length;
+		// Six clears, six snapshots. Under the throttle this was one.
+		expect(agentsAfter - agentsBefore).toBe(6);
 	});
 
-	it('warns when the checkpoint was too big to keep outputs - this tool\'s own use case', () => {
+	it("restores outputs far past the old 2 MB snapshot cap - this tool's own use case", () => {
 		// An output-heavy notebook is exactly what `clear_outputs` exists for, and it
-		// is exactly what blows past the snapshot size bound: the checkpoint then keeps
-		// sources and DROPS every cell's outputs. The cleared document is persisted
-		// straight afterwards, so those outputs are gone for good - the one case where
-		// a cheerful "undoable" would have been a lie.
-		const { target } = makeUntouchedNotebook('undo-truncated.ipynb', `${'x'.repeat(1_600_000)}\n`);
+		// is exactly what used to blow the inline snapshot cap: the checkpoint kept
+		// sources and DROPPED every cell's outputs, then the cleared document was
+		// persisted, so they were gone for good. Outputs live in their own file now,
+		// so size is not what decides whether undo works.
+		const big = 'x'.repeat(1_600_000); // 2 cells => ~3.2 MB, over the old cap
+		const { target, ids } = makeUntouchedNotebook('undo-big.ipynb', `${big}\n`);
 
 		const r = svc.clearOutputs(undefined, target);
 		expect(r).toMatchObject({ ok: true, count: 2 });
-		expect(r.ok && r.undo).toMatchObject({ outputs_recoverable: false });
-		expect(r.ok && r.undo?.reason).toMatch(/too large/);
+		expect(r).not.toHaveProperty('undo');
+		expect(withOutputs(target)).toEqual([]);
+
+		expect(cpmod.undoLastAgentAction(target).ok).toBe(true);
+		// Byte-for-byte, not merely "some output came back".
+		const back = nbmod.listCells(target).filter((c) => ids.includes(c.id));
+		expect(back).toHaveLength(2);
+		for (const c of back) expect((c.outputs?.[0] as { text?: string })?.text).toBe(`${big}\n`);
 	});
 
-	it('keeps the tool DESCRIPTION honest about that limit', () => {
+	it.skipIf(!chmodBlocksWrites)('REFUSES before clearing when the checkpoint cannot store the outputs', () => {
+		// The one case left: the sidecar could not be written (a full disk, an
+		// unwritable `.cellar/`). Simulated by making the checkpoints directory
+		// unwritable, which is what the failure looks like from here. The rule under
+		// test is the ORDER - the refusal lands BEFORE anything is destroyed, so the
+		// user never discovers the loss at undo time.
+		const { target } = makeUntouchedNotebook('undo-refused.ipynb', 'keep me\n');
+		withUnwritableSidecars(target, () => {
+			const r = svc.clearOutputs(undefined, target);
+			expect(r).toMatchObject({ ok: false, refused: 'outputs_unrecoverable' });
+			expect(r.ok === false && 'reason' in r && r.reason).toMatch(/nothing was changed/i);
+			expect(r.ok === false && 'reason' in r && r.reason).toMatch(/allow_unrecoverable/);
+			// Nothing was destroyed, and no leftover checkpoint of an unchanged document.
+			expect(withOutputs(target)).toEqual([1, 2]);
+			expect(cpmod.listCheckpoints(target).filter((c) => c.trigger === 'agent')).toHaveLength(0);
+		});
+	});
+
+	it.skipIf(!chmodBlocksWrites)('proceeds and SAYS SO when the caller waives the guarantee', () => {
+		// `allow_unrecoverable` exists because clearing outputs is itself how a user
+		// frees a full disk, so a flat refusal would trap them. A knowing caller still
+		// gets the fact in its result.
+		const { target } = makeUntouchedNotebook('undo-waived.ipynb', 'gone\n');
+		withUnwritableSidecars(target, () => {
+			const r = svc.clearOutputs(undefined, target, { allowUnrecoverable: true });
+			expect(r).toMatchObject({ ok: true, count: 2 });
+			expect(r.ok && r.undo).toMatchObject({ outputs_recoverable: false });
+			expect(withOutputs(target)).toEqual([]);
+		});
+	});
+
+	it('keeps the tool DESCRIPTION matching what undo now guarantees', () => {
 		const src = readFileSync(new URL('../../src/lib/server/mcp/server.ts', import.meta.url), 'utf8');
 		const desc = src.slice(src.indexOf("registerTool('clear_outputs'"));
 		const line = desc.slice(0, desc.indexOf('\n'));
 
 		// A tool description is paid on every MCP session AND is the only thing most
-		// agents ever read, so an over-claim there does more damage than a wrong
-		// result field. This one promised "the whole batch is one undoable
-		// checkpoint" while both halves could fail; pin the correction so it cannot
-		// quietly regrow.
-		expect(line).not.toMatch(/undoable/);
-		expect(line).toMatch(/throttled/);
-		expect(line).toMatch(/undo may not/);
+		// agents ever read, so a WRONG claim there does more damage than a wrong result
+		// field. It used to over-claim ("one undoable checkpoint"); it was then
+		// corrected to under-claim ("throttled", "undo may not") because both halves
+		// really could fail. Both halves are fixed, so the caveats must go with them -
+		// an agent told undo may not work will not use undo.
+		expect(line).not.toMatch(/throttled/);
+		expect(line).not.toMatch(/undo may not/);
+		// ...and what replaces them is the guarantee plus its ONE exception, named.
+		expect(line).toMatch(/undo restores them/);
+		expect(line).toMatch(/REFUSED before clearing/);
+		expect(line).toMatch(/allow_unrecoverable/);
 
 		// ...and honest WITHOUT growing: the same string is billed on every MCP
 		// session, so a correction has to be paid for by cutting words elsewhere.
@@ -426,6 +514,90 @@ describe('the result never claims an undo it cannot deliver', () => {
 		const literal = line.match(/description: '((?:[^'\\]|\\.)*)'/)?.[1];
 		expect(literal, 'clear_outputs description is a single-quoted literal').toBeTruthy();
 		expect(literal!.replace(/\\(.)/g, '$1').length).toBeLessThan(700);
+	});
+});
+
+describe('set_cell_type is on the destructive tier exactly when it drops outputs', () => {
+	/**
+	 * `applyCellType` clears a cell's outputs whenever it leaves nbformat `code`, so
+	 * converting a code cell to markdown/raw is output-destroying and must take the
+	 * never-throttled snapshot - the same tier `clear_outputs` and `delete_cells` take.
+	 * Every other conversion changes no outputs and stays on the throttled tier, where
+	 * a run's or an edit's snapshot belongs; putting them all on the destructive tier
+	 * would mint a checkpoint per retype and evict the history worth going back to.
+	 */
+	async function retypeDeepInABatch(name: string, to: 'markdown' | 'sql') {
+		const { target, handles } = await makeNotebook(name, 3);
+		// Several actions deep, so the throttle would have skipped a snapshot here.
+		for (let i = 0; i < 3; i++) await svc.editCell(handles[0], `a = ${i}`, { nb: target, routeImports: false });
+		const before = cpmod.listCheckpoints(target).length;
+		const id = svc.resolveRef(target, handles[1]);
+		const r = svc.setType(handles[1], to, target);
+		expect(r).toMatchObject({ ok: true });
+		return { target, id, taken: cpmod.listCheckpoints(target).length - before };
+	}
+
+	it('snapshots a code→markdown conversion mid-batch, and undo returns the outputs', async () => {
+		const { target, id, taken } = await retypeDeepInABatch('retype-md.ipynb', 'markdown');
+		expect(taken, 'the conversion took its own checkpoint').toBe(1);
+		expect(nbmod.listCells(target).find((c) => c.id === id)?.outputs ?? []).toHaveLength(0);
+
+		expect(cpmod.undoLastAgentAction(target).ok).toBe(true);
+		const back = nbmod.listCells(target).find((c) => c.id === id);
+		expect(back?.cell_type).toBe('code');
+		expect((back?.outputs?.[0] as { text?: string })?.text).toBe('out 1\n');
+	});
+
+	it('leaves a conversion that keeps outputs on the throttled tier', async () => {
+		// sql is still nbformat `code`, so its outputs survive and nothing is destroyed.
+		const { target, id, taken } = await retypeDeepInABatch('retype-sql.ipynb', 'sql');
+		expect(taken, 'no destructive snapshot for a conversion that destroys nothing').toBe(0);
+		expect(nbmod.listCells(target).find((c) => c.id === id)?.outputs ?? []).toHaveLength(1);
+	});
+
+	/**
+	 * The tier alone is not the whole guarantee: a never-throttled snapshot that could
+	 * not KEEP the outputs still leaves undo a lie, so this conversion owes the same
+	 * refuse-before-destroying guard its two siblings take. Left out, `set_cell_type`
+	 * was the one output-destroying tool that could still destroy silently.
+	 */
+	it.skipIf(!chmodBlocksWrites)('REFUSES the conversion when the checkpoint cannot store the outputs', async () => {
+		const { target, handles } = await makeNotebook('retype-refused.ipynb', 2);
+		const id = svc.resolveRef(target, handles[1]);
+		withUnwritableSidecars(target, () => {
+			// Counted as a DELTA: building the notebook is itself agent work, so it has
+			// already minted checkpoints of its own.
+			const before = cpmod.listCheckpoints(target).length;
+			const r = svc.setType(handles[1], 'markdown', target);
+			expect(r).toMatchObject({ ok: false, refused: 'outputs_unrecoverable' });
+			expect(r.ok === false && 'reason' in r && r.reason).toMatch(/nothing was changed/i);
+			expect(r.ok === false && 'reason' in r && r.reason).toMatch(/allow_unrecoverable/);
+			// Nothing converted, nothing destroyed, no leftover snapshot of an unchanged doc.
+			const cell = nbmod.listCells(target).find((c) => c.id === id);
+			expect(cell?.cell_type).toBe('code');
+			expect(cell?.outputs ?? []).toHaveLength(1);
+			expect(cpmod.listCheckpoints(target).length - before, 'a refused call leaves no snapshot behind').toBe(0);
+		});
+	});
+
+	it.skipIf(!chmodBlocksWrites)('converts anyway when the caller waives the guarantee', async () => {
+		const { target, handles } = await makeNotebook('retype-waived.ipynb', 2);
+		const id = svc.resolveRef(target, handles[1]);
+		withUnwritableSidecars(target, () => {
+			expect(svc.setType(handles[1], 'markdown', target, { allowUnrecoverable: true })).toMatchObject({ ok: true });
+			expect(nbmod.listCells(target).find((c) => c.id === id)?.cell_type).toBe('markdown');
+		});
+	});
+
+	it('keeps the tool DESCRIPTION naming the guarantee and its exception', () => {
+		// The description is the only thing most agents ever read about this tool, and
+		// it already told them the conversion "drops that cell's outputs" - so it has to
+		// say what now happens to them, and that the call can be refused.
+		const src = readFileSync(new URL('../../src/lib/server/mcp/server.ts', import.meta.url), 'utf8');
+		const line = src.slice(src.indexOf("registerTool('set_cell_type'")).split('\n')[0];
+		expect(line).toMatch(/undo brings them back/);
+		expect(line).toMatch(/REFUSED before converting/);
+		expect(line).toMatch(/allow_unrecoverable/);
 	});
 });
 

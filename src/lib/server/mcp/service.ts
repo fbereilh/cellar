@@ -59,7 +59,7 @@ import { getNotebookStaleness, analyzeDataflow } from '../dataflow';
 import { STALE_STATE, staleIdsInOrder } from '../../staleness';
 import type { StalenessEntry, StalenessMap } from '../../staleness';
 import { resolveSymbol, resolveImpact } from '../../symbolGraph';
-import { isPyUnsupportedType, isSqlCell, isRawCell, isChatCell, languageTagFor, logicalCellType, textNotebookCellTypeError, textNotebookTypeMessage } from '../../cellLanguage';
+import { isPyUnsupportedType, isSqlCell, nbCellType, isRawCell, isChatCell, languageTagFor, logicalCellType, textNotebookCellTypeError, textNotebookTypeMessage } from '../../cellLanguage';
 import { isCodeHidden, hideInputExplicit } from '../../hideInput';
 import {
 	isExportCell,
@@ -75,7 +75,13 @@ import { isHiddenFromAgent } from '../../agentVisibility';
 import { computeHeadingNumbers, outlineHeadings } from '../../headings';
 import { buildImageBlocks, canInlineImage, imagePlaceholder, isInlinableImageMime, MAX_FULL_OUTPUT_IMAGE_BLOCKS } from './image';
 import type { ImageBlocks, ImageBlockPayload, ImageOutputRef, OmittedImage } from './image';
-import { autoCheckpointBeforeAgentAction, createCheckpoint, type CheckpointMeta } from '../checkpoints';
+import {
+	autoCheckpointBeforeAgentAction,
+	checkpointBeforeDestructiveAgentAction,
+	createCheckpoint,
+	discardCheckpoint,
+	type CheckpointMeta
+} from '../checkpoints';
 import { computeHandles, resolveCellId } from './cellHandle';
 import { forgetSessionActivity } from './userActivity';
 import type { CellView, CellOutput, NotebookView, SessionId, LogicalCellType, QueueState } from '../types';
@@ -1568,6 +1574,60 @@ export async function editCell(id: string, source: string, { routeImports: route
 }
 
 /**
+ * The refusal a destructive tool returns when its pre-action checkpoint could not
+ * keep the outputs it is about to destroy. Shared shape so `clear_outputs` and
+ * `delete_cells` refuse identically.
+ */
+export type UnrecoverableRefusal = {
+	ok: false;
+	refused: 'outputs_unrecoverable';
+	reason: string;
+};
+
+/**
+ * Take the pre-action snapshot for a DESTRUCTIVE agent tool - one that deletes
+ * saved outputs - and decide whether the tool may proceed.
+ *
+ * Two things separate this from `autoCheckpointBeforeAgentAction`, and both were
+ * bugs the user met as "the agent wiped my results and I cannot get them back":
+ *
+ *   - it is NEVER THROTTLED, so every such action is preceded by a snapshot rather
+ *     than four out of five being folded into a batch that predates the outputs, and
+ *   - it REFUSES BEFORE DESTROYING when that snapshot could not hold the outputs,
+ *     instead of reporting the loss afterwards. Since outputs are stored out-of-band
+ *     the only way that happens now is a sidecar that could not be written (a full
+ *     disk, an unwritable `.cellar/`), which is an error rather than a policy - so
+ *     the refusal names the cause and the `allow_unrecoverable` opt-in, which exists
+ *     because "clear the outputs" is itself how a user frees a full disk and a flat
+ *     refusal would trap them there.
+ *
+ * Its three callers are the three output-destroying tools - `clear_outputs`,
+ * `delete_cells` and the `set_cell_type` conversions that drop a code cell's
+ * outputs - so all three refuse identically rather than one of them destroying
+ * silently. A tool added later that deletes saved outputs belongs here too.
+ *
+ * A refused call changes NOTHING, so the checkpoint it just took is discarded: a
+ * leftover snapshot of an unchanged document would push the human's real undo target
+ * one step out of reach (`removeCells` and `setType` state the same rule for their
+ * own refusals).
+ */
+function destructiveCheckpoint(
+	nb: string,
+	allowUnrecoverable: boolean
+): { cp: CheckpointMeta } | UnrecoverableRefusal {
+	const cp = checkpointBeforeDestructiveAgentAction(nb);
+	if (cp.outputsTruncated && !allowUnrecoverable) {
+		discardCheckpoint(nb, cp.id);
+		return {
+			ok: false,
+			refused: 'outputs_unrecoverable',
+			reason: `nothing was changed: the pre-action checkpoint could not store this notebook's outputs (${cp.outputsError ?? 'unknown error'}), so undo could not bring them back. Free space or fix permissions on the workspace's .cellar directory, then retry - or pass allow_unrecoverable:true to destroy them knowingly.`
+		};
+	}
+	return { cp };
+}
+
+/**
  * MCP `delete_cells`: remove one or several cells in ONE call. A batch is not
  * sugar — an agent pivoting off a dead end deletes eight cells, and one call per
  * cell is eight round-trips, eight persists, and eight SSE fan-outs for what is
@@ -1581,12 +1641,17 @@ export async function editCell(id: string, source: string, { routeImports: route
  * as it was before the pivot rather than after seven eighths of it, and
  * `deleteCells` makes the removal ONE document write rather than one per cell.
  *
+ * That checkpoint is the DESTRUCTIVE, never-throttled one and it stores the
+ * deleted cells' outputs, so undo brings the cells back WITH their results - a
+ * delete destroys outputs just as surely as `clear_outputs` does. See
+ * `destructiveCheckpoint` for the tier split and for the one case it refuses.
+ *
  * `deleteCells` also refuses a batch that would empty the notebook, and that
  * refusal is reported as such: an agent told `{ok:true, count:N}` over a document
  * the server never changed would go on building against cells that are still
  * there. A refused batch takes NO checkpoint either - see below.
  */
-export function removeCells(ids: string[], nb?: string | null) {
+export function removeCells(ids: string[], nb?: string | null, { allowUnrecoverable = false }: { allowUnrecoverable?: boolean } = {}) {
 	const target = nb ?? getActiveNotebookPath();
 	const full: string[] = [];
 	const seen = new Set<string>();
@@ -1609,7 +1674,13 @@ export function removeCells(ids: string[], nb?: string | null) {
 	// Handles are prefixes of the CURRENT cell set, so read them before deleting.
 	const toHandle = handleFn(target);
 	const deleted = full.map(toHandle);
-	autoCheckpointBeforeAgentAction(target);
+	// Deleting a cell destroys its OUTPUTS as well as its source, so this takes the
+	// destructive (never-throttled) snapshot, not the throttled one - under the old
+	// rule a delete landing mid-batch was covered only by a snapshot taken up to N
+	// actions earlier, which brought the cells back carrying whatever outputs they
+	// had before that batch, or none at all if they were created inside it.
+	const guard = destructiveCheckpoint(target, allowUnrecoverable);
+	if ('refused' in guard) return guard;
 	const res = deleteCells(full, target);
 	if (!res.ok) return { ok: false as const, refused: res.reason };
 	return { ok: true as const, deleted, count: deleted.length };
@@ -1632,18 +1703,22 @@ export function removeCells(ids: string[], nb?: string | null) {
  * blank. Duplicates collapse, and `clearOutputsForCells` makes it ONE document
  * write.
  *
- * UNDO IS NOT GUARANTEED, and the result says so rather than implying otherwise.
- * The batch takes at most ONE pre-action checkpoint, but the shared checkpoint
- * rules mean it may capture nothing useful for THIS tool: the auto-checkpoint is
- * THROTTLED (`autoCheckpointBeforeAgentAction` returns null for an action folded
- * into the batch protected by an earlier snapshot), and a snapshot past
- * `MAX_SNAPSHOT_BYTES` keeps sources but DROPS every cell's outputs - which is
- * exactly the output-heavy notebook this tool exists to shed weight from. Since
- * the cleared document is then persisted, those outputs are gone for good. So the
- * checkpoint's own metadata is read back and, whenever it cannot restore what was
- * just cleared, the result carries `undo: {outputs_recoverable:false, reason}`.
- * Never assert more than was verified: an agent must not be told its clear is
- * reversible when it is not.
+ * UNDO IS GUARANTEED, which it was not: this is an output-DESTROYING tool, so it
+ * goes through `destructiveCheckpoint`, and both halves of that matter. The batch
+ * takes ONE pre-clear checkpoint and it is NEVER THROTTLED - under the shared
+ * `autoCheckpointBeforeAgentAction` rule four out of five clears were preceded by
+ * no snapshot at all, so where a clear happened to fall in the agent's action
+ * sequence decided whether the user's results were recoverable. And the snapshot
+ * really holds the outputs whatever their size, because they are stored
+ * out-of-band; the old inline `MAX_SNAPSHOT_BYTES` cap dropped them for exactly
+ * the output-heavy notebook this tool exists to shed weight from, and the cleared
+ * document was persisted straight afterwards, so they were gone for good.
+ *
+ * The ONE case left - a checkpoint sidecar that could not be WRITTEN - is REFUSED
+ * before anything is cleared rather than reported afterwards, so the user learns
+ * of it while the outputs are still there. `allow_unrecoverable:true` waives that
+ * and is then reported back on `undo`. Never assert more than was verified: an
+ * agent must not be told its clear is reversible when it is not.
  *
  * A cell with no outputs is a harmless no-op: it is neither cleared nor listed,
  * and a batch that would change nothing takes no checkpoint and writes nothing.
@@ -1669,7 +1744,11 @@ export function removeCells(ids: string[], nb?: string | null) {
  * from the agent, so echoing one back discloses nothing it did not already know,
  * which is why `delete_cells` reports them too.
  */
-export function clearOutputs(ids: string[] | null | undefined, nb?: string | null) {
+export function clearOutputs(
+	ids: string[] | null | undefined,
+	nb?: string | null,
+	{ allowUnrecoverable = false }: { allowUnrecoverable?: boolean } = {}
+) {
 	const target = nb ?? getActiveNotebookPath();
 	const clearAll = ids == null;
 	let full: string[];
@@ -1714,24 +1793,32 @@ export function clearOutputs(ids: string[] | null | undefined, nb?: string | nul
 	// Nothing to clear ⇒ no checkpoint and no write: a checkpoint for a no-op
 	// would push the human's real undo target one step further out of reach.
 	if (!withOutputs.length) return { ok: true as const, cleared: [], count: 0, ...skippedField };
-	const cp = autoCheckpointBeforeAgentAction(target);
+	const guard = destructiveCheckpoint(target, allowUnrecoverable);
+	if ('refused' in guard) return guard;
 	const cleared = clearOutputsForCells(withOutputs, target).filter(reportable).map(toHandle);
-	return { ok: true as const, cleared, count: cleared.length, ...skippedField, ...undoWarning(cp) };
+	return { ok: true as const, cleared, count: cleared.length, ...skippedField, ...undoWarning(guard.cp) };
 }
 
 /**
  * The honesty half of `clearOutputs`: report when the pre-clear checkpoint cannot
  * give the cleared outputs back. Present ONLY in that case, so an ordinary clear
- * pays no tokens for it. Reads what `autoCheckpointBeforeAgentAction` already
- * returns - it changes no checkpoint behavior, it only stops the result from
- * over-claiming.
+ * pays no tokens for it.
+ *
+ * It is now reachable ONLY through `allow_unrecoverable:true` - a caller that
+ * asked to proceed knowingly. Every other route to a checkpoint that cannot hold
+ * the outputs is refused BEFORE the clear (`destructiveCheckpoint`), which is the
+ * point: this used to be the whole mitigation, and reporting a loss after causing
+ * it is not a mitigation. It survives because a knowing caller still deserves the
+ * fact in its result rather than only in the refusal it waived.
  */
-function undoWarning(cp: CheckpointMeta | null) {
-	if (cp && !cp.outputsTruncated) return {};
-	const reason = cp
-		? 'the pre-clear checkpoint was too large to store outputs, so restoring it brings the cells back empty'
-		: 'no pre-clear checkpoint was due (they are throttled), so undo walks back to an earlier snapshot';
-	return { undo: { outputs_recoverable: false as const, reason } };
+function undoWarning(cp: CheckpointMeta) {
+	if (!cp.outputsTruncated) return {};
+	return {
+		undo: {
+			outputs_recoverable: false as const,
+			reason: `the pre-clear checkpoint could not store the outputs (${cp.outputsError ?? 'unknown error'}) and allow_unrecoverable was set, so undo brings these cells back empty`
+		}
+	};
 }
 
 /** Where a `move_cell` lands: beside another cell (a handle, like every other
@@ -1796,15 +1883,42 @@ export function moveCell(id: string, dest: MoveDest, nb?: string | null) {
  * conversion is unaffected on a `.py` notebook, and an `.ipynb` never reaches
  * the check.
  */
-export function setType(id: string, type: LogicalCellType, nb?: string | null) {
+export function setType(
+	id: string,
+	type: LogicalCellType,
+	nb?: string | null,
+	{ allowUnrecoverable = false }: { allowUnrecoverable?: boolean } = {}
+) {
 	const target = nb ?? getActiveNotebookPath();
 	id = asFullId(target, id);
 	if (!getCell(id, target)) return { ok: false as const, missing: true as const };
 	if (isPyUnsupportedType(type) && isPyTextNotebook(target))
 		return { ok: false as const, refused: textNotebookTypeMessage(type) };
-	autoCheckpointBeforeAgentAction(target);
+	// Converting a code cell to markdown/raw DROPS that cell's outputs (`applyCellType`),
+	// so this conversion is output-destroying and takes the never-throttled snapshot -
+	// AND the same refuse-before-destroying guard - as `clear_outputs` and
+	// `delete_cells`, for the same reason: an output this tool deletes is one nothing
+	// but a re-run can recreate, so it may not be destroyed behind a checkpoint that
+	// could not keep it. Every other conversion changes no outputs, so it stays on the
+	// throttled tier where a run's or an edit's snapshot belongs. Decided from the
+	// CURRENT cell, not from the requested type alone: converting a markdown cell
+	// (which holds none) destroys nothing whatever it becomes.
+	if (dropsOutputs(getCell(id, target), type)) {
+		const guard = destructiveCheckpoint(target, allowUnrecoverable);
+		if ('refused' in guard) return guard;
+	} else autoCheckpointBeforeAgentAction(target);
 	setCellType(id, type, target);
 	return { ok: true as const };
+}
+
+/**
+ * Would this conversion destroy saved outputs? Only a cell that HAS outputs and is
+ * leaving `code` for a type that cannot hold them - `applyCellType`'s own rule
+ * (`cell_type !== 'code'` ⇒ outputs cleared), read through `nbCellType` so the
+ * logical types that stay nbformat `code` (sql, mojo) are correctly not destructive.
+ */
+function dropsOutputs(cell: CellView | null, type: LogicalCellType): boolean {
+	return !!cell?.outputs?.length && cell.cell_type === 'code' && nbCellType(type) !== 'code';
 }
 
 export function setCellVisibility(id: string, hidden: boolean, nb?: string | null) {
