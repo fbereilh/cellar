@@ -652,7 +652,7 @@ describe('the wiring the browser ships (source guards - see the file header)', (
 	// say is that the rendered gate is that derived rather than a second, looser one.
 	it('export is gated on the export eligibility rule; hide-from-agent is ungated', () => {
 		expect(openGates(cell, 'data-testid="toggle-export"')).toEqual(['{#if canExport}']);
-		expect(cell).toContain('const canExport = $derived(canExportCell(cell));');
+		expect(cell).toContain('const canExport = $derived(canExportCell(cell, exportLanguage));');
 		expect(openGates(cell, 'data-testid="toggle-agent-hidden"')).toEqual([]);
 	});
 

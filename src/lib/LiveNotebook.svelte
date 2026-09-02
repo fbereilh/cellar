@@ -30,7 +30,14 @@
 		selectionAfterRemoval,
 		stepFromUnwalkableHead
 	} from '$lib/cellSelection';
-	import { exportCellCount, exportDirectiveOwnsCell, exportMarkedTwice, isExportCell } from '$lib/exportRole';
+	import {
+		exportCellCount,
+		exportDirectiveOwnsCell,
+		exportMarkedTwice,
+		exportTargetLanguage,
+		isExportCell
+	} from '$lib/exportRole';
+	import { mojoMainDroppedIds } from '$lib/mojoExport';
 	import { isExportBase } from '$lib/exportTarget';
 	import type { ExportHazard } from '$lib/exportHazard';
 	import type { ExportPyResult } from '$lib/types';
@@ -243,7 +250,6 @@
 	// count derives from the live cell flags. Rendered as an always-present section
 	// at the top of the notebook (Notebook.svelte), directly below the root bar.
 	let exportTarget = $state<string | null>(null);
-	const exportCount = $derived(exportCellCount(cells));
 	// The stored target's BASE (`$lib/exportTarget`: workspace / notebook / git;
 	// `workspace` = the absent-key legacy default) plus the server's resolution of
 	// the effective target - the workspace-relative file the module IS, or why a
@@ -256,6 +262,26 @@
 	let exportBase = $state<string>('workspace');
 	let exportResolved = $state<string | null>(null);
 	let exportResolveError = $state<string | null>(null);
+	// Which MODULE LANGUAGE this notebook's target names (`.py` -> python, `.mojo` ->
+	// mojo), which is what decides which cells are eligible for it. Read off the
+	// server's RESOLUTION where there is one and the stored form otherwise, so a
+	// target expressed under a non-workspace base still answers; `python` when no
+	// target is configured, the same legacy default the server applies, so the
+	// toggle on an unconfigured notebook behaves exactly as it always has.
+	const exportLanguage = $derived(exportTargetLanguage(exportResolved ?? exportTarget) ?? 'python');
+	const exportCount = $derived(exportCellCount(cells, exportLanguage));
+	/**
+	 * The cells whose top-level `def main()` the next `.mojo` export will DROP - a
+	 * Mojo module can define main only once, so the LAST exported cell that defines
+	 * one keeps it (`$lib/mojoExport`).
+	 *
+	 * Derived HERE, from the cells this tab already holds, rather than fetched: the
+	 * warning has to appear the moment a later cell gains a `main` and clear the
+	 * moment it loses one, and it is the SAME rule the exporter applies, so the
+	 * badge can never disagree with the file. Empty for any non-`.mojo` target, so
+	 * an ordinary notebook derives one `!== 'mojo'` comparison and stops.
+	 */
+	const mojoMainDropped = $derived(mojoMainDroppedIds(cells, exportLanguage));
 	// Constructs in the MARKED cells that make the generated module uncompilable
 	// (`$lib/exportHazard`). Server-derived like the three fields above - the rule
 	// needs the Python line tokenizer, which is server-only - seeded on load and
@@ -2345,7 +2371,7 @@
 	 */
 	function moduleSourceIds(addressed: readonly string[] = []): string[] {
 		const ids = new Set(addressed);
-		for (const c of cells) if (isExportCell(c)) ids.add(c.id);
+		for (const c of cells) if (isExportCell(c, exportLanguage)) ids.add(c.id);
 		return [...ids];
 	}
 
@@ -2575,8 +2601,8 @@
 		// refreshed for a MOUNTED cell whose remote edit is stashed behind the "changed
 		// on server" banner. In that window the directive is on the server's copy and
 		// not on ours, so the server's own refusal below is what keeps the promise.
-		if (!exported && exportDirectiveOwnsCell(cell)) {
-			onNotice?.(exportDirectiveNotice(exportMarkedTwice(cell)));
+		if (!exported && exportDirectiveOwnsCell(cell, exportLanguage)) {
+			onNotice?.(exportDirectiveNotice(exportMarkedTwice(cell, exportLanguage)));
 			return;
 		}
 		// Only whether THIS key was there, and what it held - never a snapshot of the
@@ -4604,6 +4630,8 @@
 			onSetExport={setExport}
 			exportTarget={exportTarget}
 			exportCount={exportCount}
+			{exportLanguage}
+			{mojoMainDropped}
 			onSetExportTarget={setExportTargetValue}
 			onExportPy={exportPy}
 			exportBase={exportBase}

@@ -26,11 +26,17 @@ import { dirname, basename, relative, resolve, sep } from 'node:path';
 import { resolveInWorkspace, workspaceRoot } from './fstree';
 import { gitRootOf } from './git';
 import { logicalLines, stripComments, splitSimpleStatements } from './imports';
-import { isExportCell } from '../exportRole';
+import { isExportCell, exportTargetLanguage, type ExportLanguage } from '../exportRole';
+import { mojoModuleSources, planMojoMains, stripMojoMagicHeader } from '../mojoExport';
 import { nbdevDirective, nbdevDirectiveOutsideBlock } from '../nbdevDirectives';
 import { nbdevLibPath } from './nbdev';
 import { isExportBase, type ExportBase } from '../exportTarget';
-import { futureImportJoinedHazard, type ExportHazard } from '../exportHazard';
+import {
+	futureImportJoinedHazard,
+	mojoMainDroppedHazard,
+	mojoMainKeptHazard,
+	type ExportHazard
+} from '../exportHazard';
 import type { Cell, NotebookDoc } from './types';
 
 /** The header stamped at the top of every generated module. */
@@ -313,6 +319,87 @@ export function exportHazards(sources: string[]): ExportHazard[] {
 	return liftFutureImports(sources).hazards;
 }
 
+/** The short handle a cell is named by, the same one its toolbar chip shows. */
+function cellHandle(cell: Cell): string {
+	return cell.id.slice(0, 8);
+}
+
+/**
+ * What a `.mojo` export's `main` handling costs, reported for the NOTEBOOK. Up to
+ * two findings, and they are separate facts rather than two views of one:
+ *
+ *   - `mojo-main-dropped` - code the export DISCARDED. Named cell by cell (by the
+ *     handle each toolbar chip shows, so a reader can find them), and only when a
+ *     block really was dropped. It is the notebook-level summary of a loss the
+ *     notebook ALSO marks on each affected cell.
+ *   - `mojo-main-kept` - the module RETAINS a `main`, so no Python cell can import
+ *     it (measured; see `mojoMainKeptHazardMessage`). Fires whenever a `main`
+ *     survives, INCLUDING when nothing was dropped: a single-`main` notebook loses
+ *     that capability just as completely, and it is the commonest shape there is.
+ *
+ * A module with NO `main` at all is a plain library and reports neither: nothing
+ * was lost and nothing is out of reach. That is a perfectly good outcome, not a
+ * finding.
+ *
+ * The plan is read off the STRIPPED sources, exactly as `mojoModuleSources` does,
+ * so the cells this names can never differ from the ones the file was written
+ * with - or from the ones the notebook badges. `$lib/mojoExport` owns the rule;
+ * this only decides who is named.
+ */
+export function mojoExportHazards(cells: readonly Cell[]): ExportHazard[] {
+	const { keep, dropped } = planMojoMains(cells.map((c) => stripMojoMagicHeader(c.source)));
+	if (keep === null) return [];
+	const kept = cellHandle(cells[keep]);
+	const out: ExportHazard[] = [];
+	// The DISCARD leads: it is about the user's own code, where the kept-main
+	// finding is about a capability the artifact does not have.
+	if (dropped.length) out.push(mojoMainDroppedHazard(dropped.map((i) => cellHandle(cells[i])), kept));
+	out.push(mojoMainKeptHazard(kept));
+	return out;
+}
+
+/**
+ * Every hazard a set of exported CELLS carries, for a module of this language -
+ * the one seam the exporter, the notebook view and the agent surface share, so
+ * none of them can describe the same module differently.
+ *
+ * The two languages have disjoint checks (`$lib/exportHazard`'s header says why
+ * they are different claims), so this is a branch rather than a union.
+ */
+export function hazardsFor(cells: readonly Cell[], lang: ExportLanguage): ExportHazard[] {
+	return lang === 'mojo' ? mojoExportHazards(cells) : exportHazards(cells.map((c) => c.source));
+}
+
+/**
+ * The module LANGUAGE a resolved target names, falling back to `python`.
+ *
+ * The fallback is the legacy question and can only be reached by a target no
+ * setter would accept: a hand-edited `export_target`, or one whose base does not
+ * resolve (where the stored form is the only spelling in hand). `setExportTarget`
+ * refuses anything but `.py`/`.mojo`, and a `#|default_exp` directive always names
+ * a `.py` module.
+ */
+function targetLanguage(info: ResolvedExportTarget): ExportLanguage {
+	return exportTargetLanguage(info.ok ? info.target : info.path) ?? 'python';
+}
+
+/**
+ * The module language a DOCUMENT's export target names - the one question every
+ * export-eligibility caller outside this file asks, so none of them re-derives it
+ * from a path.
+ *
+ * A notebook with NO target configured answers `python`: that is what every
+ * notebook meant before `.mojo` targets existed, so the per-cell toggle on an
+ * unconfigured notebook behaves exactly as it always has. The consequence is
+ * stated rather than hidden - a Mojo cell can only be MARKED once the notebook
+ * names a `.mojo` target, which is honest, since before that there is no module
+ * for the mark to describe.
+ */
+export function docExportLanguage(doc: NotebookDoc): ExportLanguage {
+	const info = resolveExportTarget(doc);
+	return info ? targetLanguage(info) : 'python';
+}
+
 /**
  * A DOCUMENT's compile hazards: what the module its marks describe would carry.
  *
@@ -332,9 +419,10 @@ export function docExportHazards(
 	resolved: ResolvedExportTarget | null = resolveExportTarget(doc)
 ): ExportHazard[] {
 	if (!resolved) return [];
-	const exported = doc.cells.filter((c: Cell) => isExportCell(c)).map((c) => c.source);
+	const lang = targetLanguage(resolved);
+	const exported = doc.cells.filter((c: Cell) => isExportCell(c, lang));
 	if (!exported.length) return [];
-	const hazards = exportHazards(exported);
+	const hazards = hazardsFor(exported, lang);
 	// The foreign-module question is asked LAST in code and FIRST in meaning: over a
 	// target the clobber guard declines there is no module of ours and never will be,
 	// so a hazard sentence describes a file that cannot exist - MCP's `moduleHazard`
@@ -406,6 +494,40 @@ function spliceLines(src: string, cuts: Array<[number, number]>): string {
 }
 
 /**
+ * The `.mojo` module: the SAME header, blank-line joining, trailing newline and
+ * determinism as the Python one, minus the two things Mojo has no use for and
+ * plus the two transforms it needs.
+ *
+ * OMITTED, and each for its own reason rather than by a shared accident:
+ *
+ *   - `__all__`. Mojo has no such concept, and - measured - it is the ONE line of
+ *     Cellar's existing generator that a Mojo compiler rejects: `error:
+ *     expressions must not appear at file scope`. It is also WRONG for Mojo:
+ *     `topLevelNames` reads Python, so it misses `struct` and `comptime` and
+ *     includes `main`. Omitting it loses nothing.
+ *   - the `__future__` hoist. `from __future__ import …` is Python syntax with no
+ *     Mojo equivalent, so there is nothing to lift and no ordering rule to obey.
+ *
+ * APPLIED: the `%%mojo` magic strip and the one-`main` rule, both owned by
+ * `$lib/mojoExport` so the notebook's per-cell badge is derived from exactly the
+ * rule that writes this file.
+ *
+ * Leading blank lines are dropped from each block as well as trailing ones -
+ * stripping a header or a `main` block can leave one, and the "single blank line
+ * between blocks, no incidental whitespace" contract is what makes a re-export
+ * byte-identical.
+ */
+function generateMojoModule(exportedSources: string[], sourceName: string): string {
+	const { sources } = mojoModuleSources(exportedSources);
+	const blocks: string[] = [`${HEADER}\n# Source notebook: ${sourceName}`];
+	for (const src of sources) {
+		const trimmed = src.replace(/^(?:[ \t]*\n)+/, '').replace(/\s+$/, '');
+		if (trimmed) blocks.push(trimmed);
+	}
+	return blocks.join('\n\n') + '\n';
+}
+
+/**
  * Build the full module text from the exported cells (already filtered + in
  * document order). Deterministic: a trailing newline, single blank line between
  * blocks, no incidental whitespace, so re-exporting identical content is a
@@ -415,7 +537,12 @@ function spliceLines(src: string, cuts: Array<[number, number]>): string {
  * `liftFutureImports`); a comment is the only thing Python allows before one, and
  * the header is comments, so the emitted order compiles.
  */
-export function generateModule(exportedSources: string[], sourceName: string): string {
+export function generateModule(
+	exportedSources: string[],
+	sourceName: string,
+	lang: ExportLanguage = 'python'
+): string {
+	if (lang === 'mojo') return generateMojoModule(exportedSources, sourceName);
 	const { future, body: bodySources } = liftFutureImports(exportedSources);
 	const allNames: string[] = [];
 	const seen = new Set<string>();
@@ -518,7 +645,10 @@ function storedExportTarget(
 	// The RULE is untouched (it stays ignored); what changes is that the drop stops
 	// being SILENT - see `misplacedDefaultExpError` for the harm, and for why the
 	// report needs a MARKED cell before it may speak.
-	if (ignored !== null && doc.cells.some((c: Cell) => isExportCell(c)))
+	// The Python question deliberately: this report is about an nbdev `#|default_exp`
+	// line, and nbdev's directive vocabulary is Python's. It is also the one caller
+	// with no target in scope - it IS the function that resolves one.
+	if (ignored !== null && doc.cells.some((c: Cell) => isExportCell(c, 'python')))
 		return { path: '', base: 'workspace', source: 'default_exp', error: misplacedDefaultExpError(ignored) };
 	return null;
 }
@@ -767,12 +897,17 @@ export function exportNotebookToPy(doc: NotebookDoc): ExportResult {
 	// cell marked there is nothing to write anywhere, so the honest answer is
 	// `no-cells` (reporting the stored form), not a throw about a path that was
 	// never going to be written.
-	const exported = doc.cells.filter((c: Cell) => isExportCell(c)).map((c) => c.source);
+	// The target's EXTENSION decides which cells may go in (`exportRole`'s
+	// `canExportCell`), so a `.mojo` target assembles the notebook's Mojo cells and a
+	// `.py` one its Python cells - one rule, both languages.
+	const lang = targetLanguage(info);
+	const exportedCells = doc.cells.filter((c: Cell) => isExportCell(c, lang));
+	const exported = exportedCells.map((c) => c.source);
 	if (!exported.length)
 		return { written: false, target: info.ok ? info.target : info.path, count: 0, reason: 'no-cells', hazards: [] };
-	// Computed once, from the sources this call is about to assemble, and attached
+	// Computed once, from the cells this call is about to assemble, and attached
 	// to whichever result it returns below.
-	const hazards = exportHazards(exported);
+	const hazards = hazardsFor(exportedCells, lang);
 	// A configured-but-unresolvable target (base `git` with no repository, a path
 	// resolving outside the workspace, an unknown base) is a real error the manual
 	// button surfaces and the consequential callers record - exactly where the old
@@ -788,7 +923,7 @@ export function exportNotebookToPy(doc: NotebookDoc): ExportResult {
 	// one helper (`$lib/server/fstree`), not here.
 	const abs = info.abs; // already passed `resolveInWorkspace`, whatever the base
 	const sourceName = basename(doc.path);
-	const text = generateModule(exported, sourceName);
+	const text = generateModule(exported, sourceName, lang);
 
 	if (existsSync(abs)) {
 		const existing = safeRead(abs);

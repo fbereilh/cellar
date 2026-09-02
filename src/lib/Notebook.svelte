@@ -11,7 +11,8 @@
 	import type { ExtractedCodeBlock } from '$lib/codeBlockExtract';
 	import type { WorkspaceRootOption } from '$lib/notebookRoot';
 	import { EXPORT_BASES, EXPORT_BASE_LABELS, exportImportWarning } from '$lib/exportTarget';
-	import type { ExportHazard } from '$lib/exportHazard';
+	import { hazardSummaryClause, type ExportHazard } from '$lib/exportHazard';
+	import type { ExportLanguage } from '$lib/exportRole';
 	import { reservedFailureHeight, failureDetail } from '$lib/cellRenderFailure';
 	import type { ExportPyResult } from '$lib/types';
 	import {
@@ -27,6 +28,7 @@
 	const EMPTY_PLAN: PlanItem[] = [];
 	const EMPTY_IDS: string[] = [];
 	const EMPTY_SELECTION: ReadonlySet<string> = new Set();
+	const EMPTY_MAIN_DROPPED: ReadonlySet<string> = new Set();
 
 	interface Props {
 		cells: UICell[];
@@ -104,8 +106,21 @@
 		onSetRole: (id: string, role: string | null) => void;
 		/** Mark this code cell for nbdev-style `.py` export, or unmark it. */
 		onSetExport?: (id: string, exported: boolean) => void;
-		/** The notebook's `.py` export target (module path), or null when unset. */
+		/** The notebook's export target (module path), or null when unset. */
 		exportTarget?: string | null;
+		/**
+		 * The MODULE LANGUAGE that target's extension names (`.py` -> python,
+		 * `.mojo` -> mojo; `python` when nothing is configured). It decides which
+		 * cells may be marked, so each Cell needs it to draw its export toggle.
+		 */
+		exportLanguage?: ExportLanguage;
+		/**
+		 * The cells whose top-level `def main()` a `.mojo` export will DROP, because a
+		 * later exported cell defines one too and a Mojo module can hold only one
+		 * (`$lib/mojoExport`). Always empty for a `.py` target. Read per cell rather
+		 * than pinned, like `selectedIds`.
+		 */
+		mojoMainDropped?: ReadonlySet<string>;
 		/** How many cells are currently marked for export. */
 		exportCount?: number;
 		/**
@@ -231,6 +246,8 @@
 		selectedIds = EMPTY_SELECTION,
 		keyMode = 'command',
 		staleness = {},
+		exportLanguage = 'python',
+		mojoMainDropped = EMPTY_MAIN_DROPPED,
 		hidden = new Set(),
 		foldedIds = new Set(),
 		hiddenSegs = new Map(),
@@ -638,6 +655,9 @@
 	// so the everyday case pays no chrome (the root bar's kernel-restart warning
 	// is the model: accurate, and only where it applies).
 	const importWarning = $derived(exportImportWarning(exportResolved, root));
+	// The button names the file it writes, so it has to track the target's language:
+	// "Export to .py" over a `.mojo` target names a file that will never exist.
+	const exportExtension = $derived(exportLanguage === 'mojo' ? '.mojo' : '.py');
 	// Whether the notebook has any runnable (code) cell — gates the "Run all" button.
 	const hasCodeCell = $derived(cells.some((c) => c.cell_type === 'code'));
 	// Whether THIS notebook's kernel is executing or has work waiting — gates
@@ -792,7 +812,7 @@
 		// carrying the server's own reason; a bare "Export failed." here would be a
 		// second, less informative surface for the same event.
 		if (!r) return;
-		if (r.reason === 'no-target') exportFeedback = 'Set a target .py path first.';
+		if (r.reason === 'no-target') exportFeedback = 'Set a target module path first (.py or .mojo).';
 		else if (r.reason === 'no-cells') exportFeedback = 'No cells are marked for export.';
 		// Nothing was written and that is deliberate, so the button may not read as a
 		// dead control: Cellar never overwrites a file it did not generate.
@@ -802,8 +822,14 @@
 		// success. The standing warning below already carries the full sentence
 		// (this reply and it come from one server-side rule), so the feedback says
 		// what happened and points at it rather than repeating it in the same bar.
+		// ...and WHICH warning is read off the hazard KINDS through the shared
+		// `hazardSummaryClause`, never assumed here: the kinds make different claims
+		// (`$lib/exportHazard`) - a `.py` module that will not import, a `.mojo` one
+		// that compiles precisely BECAUSE code was dropped from it, and one that keeps
+		// a main and so cannot be imported by a Python cell - and a `.mojo` export can
+		// carry two at once, so `hazards[0]` is not the question either.
 		else if (r.hazards?.length)
-			exportFeedback = `Wrote ${r.count} ${r.count === 1 ? 'cell' : 'cells'} → ${r.target}, but it will not import - see the warning.`;
+			exportFeedback = `Wrote ${r.count} ${r.count === 1 ? 'cell' : 'cells'} → ${r.target}, but ${hazardSummaryClause(r.hazards)} - see the warning.`;
 		else exportFeedback = `Exported ${r.count} ${r.count === 1 ? 'cell' : 'cells'} → ${r.target}`;
 	}
 </script>
@@ -1012,6 +1038,8 @@
 				onEdit={onEdit}
 				onSetType={onSetType}
 				onSetRole={onSetRole}
+				{exportLanguage}
+				mainDropped={mojoMainDropped.has(cell.id)}
 				onSetExport={onSetExport}
 				onSetScrolled={onSetScrolled}
 				{hideAllCode}
@@ -1227,7 +1255,7 @@
 					value={exportTarget ?? ''}
 					onchange={onExportTargetCommit}
 					data-testid="export-target-input"
-					aria-label="Export target .py module path"
+					aria-label="Export target module path"
 				/>
 				<span class="text-xs text-base-content/55" data-testid="export-count">
 					{exportCount} {exportCount === 1 ? 'cell' : 'cells'} marked
@@ -1238,7 +1266,7 @@
 					disabled={exporting}
 					data-testid="export-run"
 				>
-					{exporting ? 'Exporting…' : 'Export to .py'}
+					{exporting ? 'Exporting…' : `Export to ${exportExtension}`}
 				</button>
 				{#if exportResolveError}
 					<!-- A CONFIGURED target that resolves to no writable file: the module is
@@ -1250,17 +1278,27 @@
 						{exportResolveError}
 					</span>
 				{:else if exportHazards.length}
-					<!-- The module these marks describe will not import - said in the
-					     future tense on purpose, since under explicit export there may
-					     be no such file yet (the shared wording in `$lib/exportHazard`
-					     already reads that way). Ranked above the code-root warning:
-					     that one says the kernel cannot reach the module, this says
-					     nothing can. Below `exportResolveError`, which means no module
-					     can be written at all. -->
-					<span class="flex items-center gap-1 text-xs text-base-content/70" data-testid="export-hazard">
-						<svg class="h-3.5 w-3.5 shrink-0 text-warning" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3" /><path d="M12 9v4" /><path d="M12 17h.01" /></svg>
-						{exportHazards[0].message}
-					</span>
+					<!-- What the module these marks describe carries - said in the future
+					     tense on purpose, since under explicit export there may be no
+					     such file yet (the shared wording in `$lib/exportHazard` already
+					     reads that way). The MESSAGE is the shared one, never a sentence
+					     built here: the kinds make DIFFERENT claims (a `.py` module that
+					     will not import; a `.mojo` one that compiles because a `def
+					     main()` was dropped; one that keeps a main and so cannot be
+					     imported by a Python cell), and no single wording can make all
+					     three. EVERY hazard is rendered, not just the first: a `.mojo`
+					     export really can carry two at once, and one of them silently
+					     going unsaid is the reporting defect this channel exists to fix.
+					     Ranked above the code-root warning: that one says the kernel
+					     cannot reach the module, these say what the module itself is.
+					     Below `exportResolveError`, which means no module can be written
+					     at all. -->
+					{#each exportHazards as hazard (hazard.kind + hazard.statement)}
+						<span class="flex items-center gap-1 text-xs text-base-content/70" data-testid="export-hazard">
+							<svg class="h-3.5 w-3.5 shrink-0 text-warning" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3" /><path d="M12 9v4" /><path d="M12 17h.01" /></svg>
+							{hazard.message}
+						</span>
+					{/each}
 				{:else if importWarning}
 					<span class="flex items-center gap-1 text-xs text-base-content/70" data-testid="export-import-warning">
 						<svg class="h-3.5 w-3.5 shrink-0 text-warning" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3" /><path d="M12 9v4" /><path d="M12 17h.01" /></svg>

@@ -29,6 +29,7 @@ import {
 	setExportTarget as setExportTargetDoc,
 	InvalidExportTargetError,
 	setCellExports as setCellExportsDoc,
+	exportLanguageFor,
 	exportTargetInfo,
 	isPyTextNotebook,
 	lastExportError,
@@ -60,7 +61,15 @@ import type { StalenessEntry, StalenessMap } from '../../staleness';
 import { resolveSymbol, resolveImpact } from '../../symbolGraph';
 import { isPyUnsupportedType, isSqlCell, isRawCell, isChatCell, languageTagFor, logicalCellType, textNotebookCellTypeError, textNotebookTypeMessage } from '../../cellLanguage';
 import { isCodeHidden, hideInputExplicit } from '../../hideInput';
-import { isExportCell, canExportCell, exportCellCount, exportDirectiveOwnsCell, exportMarkedTwice } from '../../exportRole';
+import {
+	isExportCell,
+	canExportCell,
+	exportCellCount,
+	exportDirectiveOwnsCell,
+	exportLanguageOf,
+	exportMarkedTwice,
+	exportTargetLanguage
+} from '../../exportRole';
 import { isHiddenFromAgent } from '../../agentVisibility';
 import { computeHeadingNumbers, outlineHeadings } from '../../headings';
 import { buildImageBlocks, canInlineImage, imagePlaceholder, isInlinableImageMime, MAX_FULL_OUTPUT_IMAGE_BLOCKS } from './image';
@@ -921,6 +930,10 @@ export async function getNotebookMap(nb?: string | null) {
 	const stack: { node: MapSection; level: number }[] = [];
 	const toHandle = handleFn(nb);
 	const view = getNotebook(nb);
+	// Which module language this notebook's target names, so `export: true` marks the
+	// cells that really go into it - a Python cell under a `.mojo` target contributes
+	// nothing and must not be reported as exported.
+	const exportLang = exportLanguageFor(nb);
 	// The number each section renders with, so the agent reads the SAME heading the
 	// human does ("1. Setup", not "Setup") and can see the numbering is already
 	// being done for it - which is what stops it hardcoding a number into the source.
@@ -938,7 +951,7 @@ export async function getNotebookMap(nb?: string | null) {
 		// conditional shape as hideInputFields). This is the READ side of
 		// set_cell_export: it is what lets an agent see which cells the
 		// `display.export_target` module is built from before it changes them.
-		...(isExportCell(c) ? { export: true } : {}),
+		...(isExportCell(c, exportLang) ? { export: true } : {}),
 		...hideInputFields(c, view.hideAllCode)
 	});
 	for (const c of cells) {
@@ -1930,15 +1943,17 @@ export function setExportTarget(
  * and `setCellExports` makes the whole batch ONE document write AND ONE module
  * regeneration, rather than one of each per cell.
  *
- * Only a PYTHON code cell can be marked, tested with `canExportCell`
- * (`isExportCell`'s own eligibility half, shared with the doc-layer setter so the
- * two cannot drift) and never a bare nbformat `cell_type`: a SQL cell is
- * an nbformat `code` cell tagged `cellar.language`, so that test admits one and its
- * raw SQL is then concatenated into a generated module git tracks. That is
- * refused by id (`notCode`) rather than no-op'd, so an agent building a module is
- * never told a cell is in it when it is not. UNMARKING is allowed on any cell - it
- * asks for a state a non-Python cell is already in, and it is how a stale flag on
- * a hand-edited `.ipynb` is cleared.
+ * Only a code cell whose LANGUAGE matches the export target's can be marked,
+ * tested with `canExportCell` (`isExportCell`'s own eligibility half, shared with
+ * the doc-layer setter so the two cannot drift) and never a bare nbformat
+ * `cell_type`: a SQL cell is an nbformat `code` cell tagged `cellar.language`, so
+ * that test admits one and its raw SQL is then concatenated into a generated
+ * module git tracks. A `.mojo` target admits the notebook's Mojo cells and a `.py`
+ * target its Python ones - one rule, both languages. A mismatch is refused by id
+ * (`notCode`) rather than no-op'd, so an agent building a module is never told a
+ * cell is in it when it is not. UNMARKING is allowed on any cell - it asks for a
+ * state an ineligible cell is already in, and it is how a stale flag on a
+ * hand-edited `.ipynb` is cleared.
  *
  * A `.py` TEXT notebook (jupytext/Databricks source) is refused UP FRONT
  * (`refused:'py-notebook'`), like `exportPy`: it carries no cellar cell metadata,
@@ -1985,6 +2000,9 @@ export function setExportTarget(
 export function setCellExport(ids: string[], exported: boolean, nb?: string | null) {
 	const target = nb ?? getActiveNotebookPath();
 	if (isPyTextNotebook(target)) return { ok: false as const, refused: 'py-notebook' as const };
+	// Eligibility is a MATCH against the target's module language, not a fixed
+	// "is this Python" - see `exportRole`'s `canExportCell`.
+	const lang = exportLanguageFor(target);
 	const full: string[] = [];
 	const seen = new Set<string>();
 	for (const ref of ids) {
@@ -1993,7 +2011,16 @@ export function setCellExport(ids: string[], exported: boolean, nb?: string | nu
 		const cell = getCell(id, target);
 		if (!cell || isHidden(cell)) return { ok: false as const, missing: ref };
 		// Checked for the WHOLE batch before the first write - see all-or-nothing.
-		if (exported && !canExportCell(cell)) return { ok: false as const, notCode: ref };
+		// The refusal carries the LANGUAGE THIS CELL WOULD CONTRIBUTE, because the one
+		// eligibility test refuses two different facts and `server.ts` may not word one
+		// as the other: a markdown/SQL/raw cell contributes NO module source at all
+		// (`null` - the pre-existing refusal, and the common one), while a code cell
+		// with a language contributes source in the WRONG one. Reporting the first as a
+		// language mismatch asserts a comparison that was never made - a markdown cell
+		// does not "not match" Python, it has nothing to match with - and sends an agent
+		// looking for a target extension to change when no target could ever admit it.
+		if (exported && !canExportCell(cell, lang))
+			return { ok: false as const, notCode: ref, cellLanguage: exportLanguageOf(cell), targetLanguage: lang };
 		// A cell whose SOURCE carries nbdev's `#| export` cannot be UNMARKED here:
 		// Cellar never writes a directive, so clearing the metadata half would leave
 		// the cell exported while the result claimed it was not. Reported by name, and
@@ -2011,8 +2038,8 @@ export function setCellExport(ids: string[], exported: boolean, nb?: string | nu
 		// the export, so the tool's sentence may not promise that it does. Answered by
 		// the shared `exportMarkedTwice` rather than re-derived in `server.ts`, so the
 		// agent surface and the two human ones cannot say different things.
-		if (!exported && exportDirectiveOwnsCell(cell))
-			return { ok: false as const, exportDirective: ref, alsoFlagged: exportMarkedTwice(cell) };
+		if (!exported && exportDirectiveOwnsCell(cell, lang))
+			return { ok: false as const, exportDirective: ref, alsoFlagged: exportMarkedTwice(cell, lang) };
 		seen.add(id);
 		full.push(id);
 	}
@@ -2165,7 +2192,12 @@ function moduleFailure(target: string, exportTarget: string | null) {
  * about a write that never landed.
  */
 function moduleForeign(target: string, exportTarget: string | null) {
-	if (!exportTarget || !exportCellCount(listCells(target)) || !foreignModuleAt(exportTarget)) return {};
+	if (
+		!exportTarget ||
+		!exportCellCount(listCells(target), exportTargetLanguage(exportTarget) ?? 'python') ||
+		!foreignModuleAt(exportTarget)
+	)
+		return {};
 	return {
 		module: {
 			regenerated: false as const,
@@ -2214,7 +2246,10 @@ function moduleHazard(target: string, exportTarget: string | null) {
 		module: {
 			regenerated: true as const,
 			reason: undefined,
-			warning: `${exportTarget} was written, but ${hazards[0].message}`
+			// EVERY hazard, not just the first: a `.mojo` export can carry two at once
+			// (code dropped, and a kept `main` no Python cell can import), and they are
+			// different facts - reporting one would leave the other with no agent surface.
+			warning: `${exportTarget} was written, but ${hazards.map((h) => h.message).join(' Also: ')}`
 		}
 	};
 }
@@ -2290,7 +2325,7 @@ function moduleWarning(target: string, where: ExportTargetFields, wrote: boolean
 	const failed = moduleFailure(target, exportTarget);
 	if ('module' in failed) return failed;
 	if (!exportTarget) return {};
-	if (exportCellCount(listCells(target))) {
+	if (exportCellCount(listCells(target), exportTargetLanguage(exportTarget) ?? 'python')) {
 		// Asked FIRST, because every branch below describes a module a later export
 		// could write, and here none ever can: a file Cellar did not generate occupies
 		// the target, so the clobber guard declines it and re-calling `set_export_target`

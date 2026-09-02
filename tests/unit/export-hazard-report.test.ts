@@ -435,7 +435,12 @@ describe('the two Svelte halves - source SHAPE guards, not behaviour', () => {
 	it('the export bar markup carries the hazard arm, ordered below an unresolvable target', () => {
 		const src = read('lib/Notebook.svelte');
 		expect(src).toContain('data-testid="export-hazard"');
-		expect(src).toContain('exportHazards[0].message');
+		// EVERY hazard is rendered, not just the first: a `.mojo` export carries two at
+		// once (code dropped, and a kept `main` no Python cell can import), and they are
+		// DIFFERENT claims, so one of them silently going unsaid is the reporting defect
+		// this channel exists to fix.
+		expect(src).toMatch(/\{#each exportHazards as hazard[^}]*\}/);
+		expect(src).toContain('{hazard.message}');
 		// The warning chain shows ONE arm. `exportResolveError` means no module was
 		// written at all, so it outranks this; this outranks the code-root warning,
 		// which is about the kernel not reaching a module that is otherwise fine.

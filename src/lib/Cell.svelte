@@ -27,7 +27,14 @@
 	import WidgetOutput from '$lib/WidgetOutput.svelte';
 	import { foldKey, numberHeadingLine, splitHeadingSegments } from '$lib/headings';
 	import { isImportsCell } from '$lib/importsRole';
-	import { canExportCell, isExportCell, exportDirectiveOwnsCell, exportMarkedTwice } from '$lib/exportRole';
+	import {
+		canExportCell,
+		isExportCell,
+		exportDirectiveOwnsCell,
+		exportMarkedTwice,
+		type ExportLanguage
+	} from '$lib/exportRole';
+	import { MAIN_DROPPED_BADGE, MAIN_DROPPED_REASON } from '$lib/mojoExport';
 	import { isHiddenFromAgent } from '$lib/agentVisibility';
 	import { isPageOutput } from '$lib/pageOutput';
 	import { isCodeHidden } from '$lib/hideInput';
@@ -96,6 +103,20 @@
 		keyMode?: KeyMode;
 		/** Staleness verdict ($lib/staleness), or null. */
 		staleState?: StalenessEntry | null;
+		/**
+		 * The MODULE LANGUAGE the notebook's export target names (`$lib/exportRole`).
+		 * A cell is eligible for the export toggle only when its own language matches,
+		 * so this is what decides whether the toggle is drawn at all.
+		 */
+		exportLanguage?: ExportLanguage;
+		/**
+		 * This cell is marked for a `.mojo` export AND a LATER exported cell also
+		 * defines a top-level `def main()`, so this one's `main` will not be written
+		 * to the module (a Mojo module can hold one). Decided for the notebook in
+		 * `LiveNotebook` from the same rule the exporter applies; the cell only draws
+		 * the warning.
+		 */
+		mainDropped?: boolean;
 		dragging?: boolean;
 		/** Fold keys of every collapsed heading in the notebook. */
 		foldedIds?: Set<string>;
@@ -185,6 +206,8 @@
 		selected = false,
 		keyMode = 'command',
 		staleState = null,
+		exportLanguage = 'python',
+		mainDropped = false,
 		dragging = false,
 		foldedIds = new Set(),
 		segHidden = NO_SEGS_HIDDEN,
@@ -322,8 +345,8 @@
 	// is the strict test, so such a cell got a toggle whose `aria-pressed` could
 	// never move and whose setter always skipped it. An always-visible control that
 	// can never apply is worse than one behind a menu, so it is GATED, not disabled.
-	const canExport = $derived(canExportCell(cell));
-	const isExport = $derived(isExportCell(cell));
+	const canExport = $derived(canExportCell(cell, exportLanguage));
+	const isExport = $derived(isExportCell(cell, exportLanguage));
 	// Marked by nbdev's `#| export` in the cell's own SOURCE rather than by
 	// `metadata.cellar.export`. The toggle then shows ON (it IS exported - showing an
 	// unticked control over a cell the exporter writes is the lie this exists to
@@ -337,12 +360,12 @@
 	// every state (the state is `aria-pressed`'s job - a label that moves announces
 	// the same fact twice), and a browser exposes `title` as the accessible
 	// DESCRIPTION beside that name, which is exactly the right split for a reason.
-	const exportByDirective = $derived(exportDirectiveOwnsCell(cell));
+	const exportByDirective = $derived(exportDirectiveOwnsCell(cell, exportLanguage));
 	// ...and marked by Cellar's own flag AS WELL, in which case the title may not
 	// promise that removing the line stops the export: the flag would still mark it.
 	// The shared rule (`exportMarkedTwice`) is what keeps this tooltip, the shell's
 	// refusal notice and MCP's saying the same true thing about the same cell.
-	const exportMarkedBoth = $derived(exportMarkedTwice(cell));
+	const exportMarkedBoth = $derived(exportMarkedTwice(cell, exportLanguage));
 	// Withheld from every agent surface (`cellar.hidden_from_agent`, the shared
 	// predicate MCP filters every read through). Deliberately UNGATED: unlike export
 	// and hide-code this applies to every cell type - a markdown cell's prose is as
@@ -2314,6 +2337,29 @@
 					>
 						<svg class="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9" /><path d="M12 8v4" /><path d="M12 16h.01" /></svg>
 						not run
+					</span>
+				{/if}
+				{#if mainDropped}
+					<!-- A `.mojo` export drops every exported cell's top-level `def main()`
+					     but the LAST one's, because a Mojo module can define main only once
+					     ($lib/mojoExport). The user has to see that on the CELL, while
+					     editing - not only after opening the generated file - so this rides
+					     the same always-visible toolbar row the stale chip does, which is
+					     also the one thing a fully collapsed cell keeps on screen.
+
+					     Warning-hued ICON, `base-content` copy: `text-warning` as body text
+					     measures ~2:1 on the light card, so the hue carries the signal and
+					     the words stay readable (the Git panel's own rule). The visible text
+					     states WHAT, the title states WHY - the stale chip's split, and the
+					     one wording ($lib/mojoExport's MAIN_DROPPED_REASON) that the
+					     notebook-level hazard and any future surface also read. -->
+					<span
+						class="ml-2 inline-flex items-center gap-1 rounded bg-warning/15 px-1.5 py-0.5 text-[11px] font-medium text-base-content/80"
+						data-testid="main-dropped-badge"
+						title={MAIN_DROPPED_REASON}
+					>
+						<svg class="h-3 w-3 text-warning" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z" /><path d="M12 9v4" /><path d="M12 17h.01" /></svg>
+						{MAIN_DROPPED_BADGE}
 					</span>
 				{/if}
 			</div>

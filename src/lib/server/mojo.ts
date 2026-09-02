@@ -48,14 +48,18 @@
  * traceback. Detect-and-instruct: Cellar never installs `max` itself.
  */
 
-import { cellMagicName } from './magics';
+import { MOJO_MAGIC, MOJO_MAGIC_HEADER, hasMojoHeader } from '../cellMagic';
 import type { SessionId } from './types';
 
-/** The IPython cell magic a mojo cell compiles to. */
-export const MOJO_MAGIC = 'mojo';
-
-/** The header line `mojoToCellSource` prepends when the source has none. */
-export const MOJO_MAGIC_HEADER = `%%${MOJO_MAGIC}`;
+/**
+ * The `%%mojo` magic name, its header line, and the "does this source already
+ * open with it" test all live in the browser-safe `$lib/cellMagic`: the EXPORT
+ * eligibility rule (`exportRole.ts`, read by `Cell.svelte`) has to refuse a
+ * `%%mojo`-bodied cell for a `.py` target, and a browser module may not import
+ * `$lib/server`. Re-exported here so every existing importer of this module is
+ * unchanged and there is still ONE definition of what a `%%mojo` cell is.
+ */
+export { MOJO_MAGIC, MOJO_MAGIC_HEADER, hasMojoHeader };
 
 /** The pip/uv package that provides both `mojo` and the `mojo.notebook` magic. */
 export const MOJO_PACKAGE = 'max';
@@ -95,19 +99,6 @@ export function mojoToCellSource(mojoSource: string | null | undefined): string 
 	if (raw.trim() === '') return '';
 	if (hasMojoHeader(raw)) return raw;
 	return `${MOJO_MAGIC_HEADER}\n${raw}`;
-}
-
-/**
- * Does this source already open with a `%%mojo` header?
- *
- * Asked through `magics.ts`'s `cellMagicName` - the ONE owner of "which cell magic
- * does this cell open with", including IPython's rule that it must sit on the first
- * non-blank line. A local regex here would be a second copy of that rule, and it is
- * the same rule `normalizeForAnalysis` and `isCellMagicCell` key off, so the two
- * must not be able to disagree about what a `%%mojo` cell is.
- */
-export function hasMojoHeader(source: string | null | undefined): boolean {
-	return cellMagicName(source) === MOJO_MAGIC;
 }
 
 /**

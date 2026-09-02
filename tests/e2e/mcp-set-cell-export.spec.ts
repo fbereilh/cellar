@@ -189,18 +189,20 @@ test('an agent names a target, marks cells, and a real .py module appears - the 
 	expect(flagsOf(after)).toEqual(['imports', 'helper']);
 });
 
-test('only a PYTHON code cell can be marked - SQL, markdown and hidden cells are refused by id', async () => {
+test('only a cell matching the target language can be marked - SQL, markdown and hidden cells are refused by id', async () => {
 	// A SQL cell IS an nbformat code cell, so a cell_type test would admit one and
-	// concatenate raw SQL into a git-tracked .py. It is refused by NAME.
+	// concatenate raw SQL into a git-tracked .py. It is refused by NAME - and for the
+	// fact that was observed: a SQL/markdown cell contributes NO module source in any
+	// language, which is not the same refusal as a Mojo cell aimed at a `.py` target.
 	const sql = await call('set_cell_export', { ids: ['sqlcell'], export: true });
-	expect(sql.__error).toContain('cell sqlcell is not a Python code cell');
+	expect(sql.__error).toContain('cell sqlcell is not a code cell, so it has no module source to export');
 
 	const md = await call('set_cell_export', { ids: ['title'], export: true });
-	expect(md.__error).toContain('cell title is not a Python code cell');
+	expect(md.__error).toContain('cell title is not a code cell');
 
 	// All-or-nothing: a bad cell in the batch leaves the good one untouched.
 	const mixed = await call('set_cell_export', { ids: ['scratch', 'sqlcell'], export: true });
-	expect(mixed.__error).toContain('is not a Python code cell');
+	expect(mixed.__error).toContain('is not a code cell');
 	const map = await call('get_notebook_map', {});
 	expect(map.sections[0].children.filter((c: any) => c.export).map((c: any) => c.id)).toEqual(['imports', 'helper']);
 
