@@ -3,11 +3,14 @@
  * The DataFrame grid must key its rows by POSITION, never by the pandas index label.
  *
  * A pandas index is not guaranteed unique, so keying the row `{#each}` by the label
- * throws Svelte's `each_key_duplicate` during render. Nothing wraps a cell in an
- * error boundary, so that uncaught error takes down the whole notebook's render
- * tree: with windowing on the render loop dies the moment the offending cell scrolls
- * into the window (everything below it stays blank forever, in the same place every
- * time), and with "Render all cells" on it throws at load and NOTHING renders.
+ * throws Svelte's `each_key_duplicate` during render. At the time nothing wrapped a
+ * cell in an error boundary, so that uncaught error took down the whole notebook's
+ * render tree: with windowing on the render loop died the moment the offending cell
+ * scrolled into the window (everything below it stayed blank forever, in the same
+ * place every time), and with "Render all cells" on it threw at load and NOTHING
+ * rendered. `Notebook.svelte` now walls each row off in a `<svelte:boundary>`
+ * (`tests/unit/cell-render-boundary.test.ts`), which BOUNDS that blast radius to one
+ * cell - it does not make the key correct, which is what this file is about.
  *
  * Two halves, because either alone would be misleading:
  *   1. the PRECONDITION, through the real parser - ordinary pandas output really does

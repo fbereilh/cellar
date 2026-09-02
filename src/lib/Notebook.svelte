@@ -11,6 +11,7 @@
 	import type { WorkspaceRootOption } from '$lib/notebookRoot';
 	import { EXPORT_BASES, EXPORT_BASE_LABELS, exportImportWarning } from '$lib/exportTarget';
 	import type { ExportHazard } from '$lib/exportHazard';
+	import { reservedFailureHeight, failureDetail } from '$lib/cellRenderFailure';
 	import type { ExportPyResult } from '$lib/types';
 	import {
 		planWindow,
@@ -375,6 +376,72 @@
 		// scrollTop and the window never blanks.
 		heights.set(id, px);
 		if (virtualize) heightsVersion++;
+	}
+
+	// ---- Per-cell render error boundary --------------------------------------
+	// Cellar renders ARBITRARY kernel output, so a renderer that throws is a recurring
+	// failure class rather than a one-off (the duplicate-pandas-index bug fixed in
+	// `DataFrameGrid.svelte` was one instance). Svelte flushes the whole document in
+	// one pass and nothing else in `src/` mounts a boundary, so an uncaught throw in
+	// one cell used to take the ENTIRE notebook's render tree with it: with windowing
+	// on, everything below the offending cell stayed permanently blank and arrow-key
+	// navigation and the jump-to-running-cell spinner died with it; with "Render all
+	// cells" on it threw at load and NOTHING rendered. Wrapping each row in a
+	// `<svelte:boundary>` bounds the next unknown instance to ONE cell.
+	// Diagnosis: `data/cellar-virt-55cell-bugs-w7/report.md` §7b.
+
+	// The reserved height and the one-line cause are PURE rules and live in
+	// `$lib/cellRenderFailure` (which explains both): vitest runs without the
+	// SvelteKit plugin, so a rule kept here could not be executed by the only suite
+	// CI and the no-mistakes gate run. This is the wiring - the placeholder reserves
+	// `reservedFailureHeight` and then MEASURES ITSELF back into the same cache
+	// through the same `recordHeight`, so what the plan believes converges on what the
+	// DOM renders rather than being frozen at a height nothing occupies.
+	function renderFailureHeight(cell: UICell): number {
+		return reservedFailureHeight(cell, heights, !!cellCollapsed[cell.id]);
+	}
+
+	/**
+	 * Feed the placeholder's own box into the height cache, mirroring what `<Cell>`'s
+	 * card observer reports (`borderBoxSize`, so border-inclusive and identical to the
+	 * box a spacer must reproduce). Memoized per cell id so the attachment keeps a
+	 * stable identity across re-renders and never churns its observer.
+	 */
+	const failureMeasurers = new Map<string, (node: HTMLElement) => (() => void) | void>();
+	function measureRenderFailure(id: string) {
+		let attach = failureMeasurers.get(id);
+		if (!attach) {
+			attach = (node: HTMLElement) => {
+				const read = (px: number | undefined) => {
+					if (px && px > 0) recordHeight(id, Math.round(px));
+				};
+				if (typeof ResizeObserver === 'undefined') {
+					read(node.offsetHeight);
+					return;
+				}
+				const ro = new ResizeObserver((entries) => {
+					const box = entries[0]?.borderBoxSize?.[0];
+					read(box ? box.blockSize : node.offsetHeight);
+				});
+				ro.observe(node);
+				return () => ro.disconnect();
+			};
+			failureMeasurers.set(id, attach);
+		}
+		return attach;
+	}
+
+	/**
+	 * The failure is REPORTED, never swallowed. The boundary makes a broken renderer
+	 * survivable, which is exactly what risks making it invisible: the placeholder
+	 * shows only a one-line message (a stack has no business on the page), so without
+	 * this the stack that identifies the bug would be gone, and the existing E2E specs
+	 * that assert ZERO console errors - the assertion that actually catches a render
+	 * regression - would stop catching one. Logged, a future instance still degrades
+	 * gracefully for the user AND still fails the suite.
+	 */
+	function onCellRenderError(id: string, error: unknown) {
+		console.error(`[cellar] cell ${id} failed to render`, error);
 	}
 
 	// Scroll-pane metrics. Attached ONLY while windowing is on, so with the flag off
@@ -795,6 +862,43 @@
 	</div>
 {/snippet}
 
+<!-- What a cell that threw while rendering degrades to (see `renderFailureHeight`).
+     It carries `data-cell-id` so the row is still ADDRESSABLE: `ensureCellMounted`
+     resolves nodes by that attribute, so without it every jump path (the find bar,
+     the outline, follow-running, `j`/`k`) would silently no-op on this cell rather
+     than taking the user to it. It deliberately does NOT carry `data-testid="cell"`:
+     nothing here is a cell - there is no editor, no output, no run control - and
+     claiming otherwise would make every "the cells are there" assertion in the suite
+     pass over a notebook full of placeholders.
+     Contrast doctrine: the ERROR hue is on the icon, the copy stays `base-content`
+     (`text-error` body text measures ~2:1 on the light card). -->
+{#snippet cellRenderFailure(cell: UICell, error: unknown)}
+	{@const detail = failureDetail(error)}
+	<div
+		class="flex flex-col gap-1 rounded-lg border border-error/40 bg-(--cellar-surface-cell) p-3"
+		style="min-height: {renderFailureHeight(cell)}px"
+		data-testid="cell-render-error"
+		data-cell-id={cell.id}
+		data-cell-type={cell.cell_type}
+		{@attach measureRenderFailure(cell.id)}
+	>
+		<div class="flex items-center gap-1.5 text-sm font-medium text-base-content">
+			<svg class="h-4 w-4 shrink-0 text-error" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 9v4M12 17h.01M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0Z" /></svg>
+			Cellar could not render this cell
+			<!-- Same handle, same spelling as the cell toolbar's own chip, so the row is
+			     still identifiable by the id every other surface addresses it with. -->
+			<span class="ml-auto font-mono text-xs font-normal text-base-content/50">cell <span class="text-base-content/70">#{cell.id.slice(0, 8)}</span></span>
+		</div>
+		<p class="text-sm text-base-content/70">
+			The cell itself is unchanged and the rest of the notebook is unaffected. Clearing its
+			output or re-running it usually resolves it.
+		</p>
+		{#if detail}
+			<code class="font-mono text-xs break-all text-base-content/70" data-testid="cell-render-error-detail">{detail}</code>
+		{/if}
+	</div>
+{/snippet}
+
 <!-- One mounted cell row: the removed-seam above it, the `relative` wrapper, the
      per-cell git bar / hover-insert / drop indicator decorations, and the `<Cell>`.
      Shared by BOTH render paths so the flag-off output stays byte-identical: with
@@ -841,60 +945,70 @@
 				data-testid="cell-drop-indicator"
 			></div>
 		{/if}
-		<Cell
-			{cell}
-			index={i}
-			count={cells.length}
-			running={runningId === cell.id}
-			runStartedAt={runningId === cell.id ? runningSince : null}
-			queuedPosition={queued[cell.id] ?? null}
-			active={activeId === cell.id}
-			selected={selectedIds.has(cell.id)}
-			{keyMode}
-			staleState={staleness[cell.id] ?? null}
-			dragging={dragId === cell.id}
-			{foldedIds}
-			segHidden={hiddenSegs.get(cell.id) ?? NO_SEGS_HIDDEN}
-			foldCounts={hiddenCounts}
-			{headingNumbers}
-			onToggleFold={onToggleFold}
-			onRun={onRun}
-			onRunAdvance={onRunAdvance}
-			onRunAbove={onRunAbove}
-			onInterrupt={onInterrupt}
-			onClear={onClear}
-			onDelete={onDelete}
-			onMove={onMove}
-			onEdit={onEdit}
-			onSetType={onSetType}
-			onSetRole={onSetRole}
-			onSetExport={onSetExport}
-			onSetScrolled={onSetScrolled}
-			{hideAllCode}
-			{isPy}
-			onSetHideInput={onSetHideInput}
-			onSetHiddenFromAgent={onSetHiddenFromAgent}
-			editorCollapsed={editorCollapsed[cell.id]}
-			onSetEditorCollapsed={onSetEditorCollapsed}
-			cellCollapsed={!!cellCollapsed[cell.id]}
-			onSetCellCollapsed={onSetCellCollapsed}
-			rawEdit={rawEdits[cell.id] ?? false}
-			onSetRawEdit={onSetRawEdit}
-			onExtractCode={onExtractCode}
-			onActivate={onActivate}
-			{searchQuery}
-			{searchCaseSensitive}
-			{searchWholeWord}
-			{searchRegex}
-			searchHighlight={cellHighlights?.get(cell.id) ?? null}
-			onRegister={onRegister}
-			onEditorFocus={onEditorFocus}
-			onEditorBlur={onEditorBlur}
-			onInsertCell={onInsertCell}
-			onMeasure={recordHeight}
-			onDragStart={onDragStart}
-			onDragEnd={endDrag}
-		/>
+		<!-- Each row is walled off on its own: a cell that throws while rendering
+		     degrades to an inline placeholder while every other cell keeps working.
+		     Errors thrown OUTSIDE the render (an event handler, a `setTimeout`) are
+		     not caught by a boundary - this bounds render-time failures, which is the
+		     class that was fatal. -->
+		<svelte:boundary onerror={(error) => onCellRenderError(cell.id, error)}>
+			<Cell
+				{cell}
+				index={i}
+				count={cells.length}
+				running={runningId === cell.id}
+				runStartedAt={runningId === cell.id ? runningSince : null}
+				queuedPosition={queued[cell.id] ?? null}
+				active={activeId === cell.id}
+				selected={selectedIds.has(cell.id)}
+				{keyMode}
+				staleState={staleness[cell.id] ?? null}
+				dragging={dragId === cell.id}
+				{foldedIds}
+				segHidden={hiddenSegs.get(cell.id) ?? NO_SEGS_HIDDEN}
+				foldCounts={hiddenCounts}
+				{headingNumbers}
+				onToggleFold={onToggleFold}
+				onRun={onRun}
+				onRunAdvance={onRunAdvance}
+				onRunAbove={onRunAbove}
+				onInterrupt={onInterrupt}
+				onClear={onClear}
+				onDelete={onDelete}
+				onMove={onMove}
+				onEdit={onEdit}
+				onSetType={onSetType}
+				onSetRole={onSetRole}
+				onSetExport={onSetExport}
+				onSetScrolled={onSetScrolled}
+				{hideAllCode}
+				{isPy}
+				onSetHideInput={onSetHideInput}
+				onSetHiddenFromAgent={onSetHiddenFromAgent}
+				editorCollapsed={editorCollapsed[cell.id]}
+				onSetEditorCollapsed={onSetEditorCollapsed}
+				cellCollapsed={!!cellCollapsed[cell.id]}
+				onSetCellCollapsed={onSetCellCollapsed}
+				rawEdit={rawEdits[cell.id] ?? false}
+				onSetRawEdit={onSetRawEdit}
+				onExtractCode={onExtractCode}
+				onActivate={onActivate}
+				{searchQuery}
+				{searchCaseSensitive}
+				{searchWholeWord}
+				{searchRegex}
+				searchHighlight={cellHighlights?.get(cell.id) ?? null}
+				onRegister={onRegister}
+				onEditorFocus={onEditorFocus}
+				onEditorBlur={onEditorBlur}
+				onInsertCell={onInsertCell}
+				onMeasure={recordHeight}
+				onDragStart={onDragStart}
+				onDragEnd={endDrag}
+			/>
+			{#snippet failed(error)}
+				{@render cellRenderFailure(cell, error)}
+			{/snippet}
+		</svelte:boundary>
 	</div>
 {/snippet}
 
