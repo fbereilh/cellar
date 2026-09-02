@@ -1390,11 +1390,33 @@ function probe(request: ProbeRequest, timeoutMs = PROBE_TIMEOUT_MS, stdin?: stri
 				reject(new DatabricksError('error', `unparseable probe result: ${msg}`));
 			}
 		};
+		/**
+		 * Is a COMPLETE result already in hand?
+		 *
+		 * The script prints exactly one `SENTINEL`-prefixed line and TERMINATES it
+		 * with a newline, so a sentinel line with no newline after it is a payload
+		 * the pipe cut mid-JSON - a catalog/schema/table listing carries up to
+		 * `MAX_ROWS` rows and outruns a single 64 KB read routinely. Settling on that
+		 * parses a truncated line (`unparseable probe result`), which is the same
+		 * load-dependent false failure one door along, so only a terminated line may
+		 * take the fast path; anything else falls through to the bounded drain.
+		 */
+		const haveCompleteResult = () => {
+			const lines = stdout.split('\n');
+			const idx = lines.findIndex((l) => l.startsWith(SENTINEL));
+			return idx >= 0 && idx < lines.length - 1;
+		};
 		child.on('exit', (code, signal) => {
+			// The op timeout bounds how long the child may RUN, and it is gone; leaving
+			// it armed across the drain would let it SIGKILL an already-dead process and
+			// reject with a timeout that never happened, while `finish` then silently
+			// drops the result that had just drained. `PROBE_DRAIN_GRACE_MS` is the only
+			// bound the drain needs.
+			clearTimeout(timer);
 			// A result already in hand is complete - settle now, exactly as before.
-			if (stdout.split('\n').some((l) => l.startsWith(SENTINEL))) return finish(code, signal);
-			// Nothing yet: give the pipe its bounded moment to drain before calling a
-			// finished probe a crash.
+			if (haveCompleteResult()) return finish(code, signal);
+			// Nothing usable yet: give the pipe its bounded moment to drain before
+			// calling a finished probe a crash.
 			drainTimer = setTimeout(() => finish(code, signal), PROBE_DRAIN_GRACE_MS);
 		});
 		child.on('close', (code, signal) => finish(code, signal));

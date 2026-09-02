@@ -38,9 +38,19 @@ type Script = {
 	stderr?: string[];
 	/** Emit `exit` before any stdout is delivered (the race this file exists for). */
 	exitFirst?: boolean;
+	/**
+	 * How many stdout chunks land BEFORE `exit`; the rest arrive during the drain.
+	 * This is the >64 KB listing: the pipe hands over a first read that cuts the
+	 * sentinel line mid-JSON, and only the tail carries its terminating newline.
+	 */
+	chunksBeforeExit?: number;
 	/** Never emit `close` - a grandchild is still holding the pipe. */
 	holdOpen?: boolean;
 	exitCode?: number | null;
+	/** Fire `exit` this many ms into the run, instead of immediately. */
+	exitAtMs?: number;
+	/** Deliver stdout (and `close`) this many ms into the run. Requires `exitAtMs`. */
+	stdoutAtMs?: number;
 };
 
 /** The plan the next `spawn` should act out; `null` delegates to the real one. */
@@ -79,12 +89,35 @@ vi.mock('node:child_process', async (importOriginal) => {
 			};
 			// Two microtask hops so the caller's listeners are attached first.
 			queueMicrotask(() => {
-				if (plan.exitFirst) {
+				if (plan.exitAtMs !== undefined) {
+					// A scheduled run on the caller's clock: exit at one instant, output at
+					// another, so a test can put the op timeout between the two.
+					setTimeout(() => child.emit('exit', code, null), plan.exitAtMs);
+					setTimeout(
+						() => {
+							writeOut();
+							finish();
+						},
+						plan.stdoutAtMs ?? plan.exitAtMs
+					);
+				} else if (plan.exitFirst) {
 					// The OS-legal interleaving: the process is gone, its output is not
 					// yet readable. `close` follows only once the pipe drains.
 					child.emit('exit', code, null);
 					setTimeout(() => {
 						writeOut();
+						finish();
+					}, 5);
+				} else if (plan.chunksBeforeExit !== undefined) {
+					// A partial first read: the head of an oversized line is already
+					// readable when the process ends, its newline is not.
+					for (const chunk of plan.stdout.slice(0, plan.chunksBeforeExit)) out.write(chunk);
+					child.emit('exit', code, null);
+					setTimeout(() => {
+						for (const chunk of plan.stdout.slice(plan.chunksBeforeExit)) out.write(chunk);
+						for (const chunk of plan.stderr ?? []) err.write(chunk);
+						out.end();
+						err.end();
 						finish();
 					}, 5);
 				} else {
@@ -185,5 +218,54 @@ describe('a probe result is read once stdout has drained', () => {
 		await expect(
 			runProbe({ stdout: [], stderr: ['Traceback: boom\n'], exitFirst: true, exitCode: 1 })
 		).rejects.toThrow(/Traceback: boom/);
+	});
+
+	/**
+	 * A result in hand must be a COMPLETE one. A listing big enough to outrun a
+	 * single pipe read (a `catalogs`/`schemas`/`tables` reply carries up to
+	 * `MAX_ROWS` rows) hands over a first chunk that starts with the sentinel and is
+	 * cut mid-JSON, with the terminating newline arriving only afterwards - so a
+	 * fast path keyed on the PREFIX settles on a truncated line and reports
+	 * `unparseable probe result`, which is the same load-dependent false failure
+	 * this file exists to remove.
+	 */
+	it('waits for the newline when the pipe cuts the sentinel line mid-JSON', async () => {
+		const line = clusters(400);
+		const cut = Math.floor(line.length / 2);
+		expect(line.slice(0, cut).startsWith(SENTINEL)).toBe(true);
+		expect(line.slice(0, cut)).not.toContain('\n');
+		const result = await runProbe({
+			stdout: [line.slice(0, cut), line.slice(cut)],
+			chunksBeforeExit: 1
+		});
+		expect(result).toHaveLength(400);
+	});
+
+	/**
+	 * The op timeout bounds how long the child may RUN, and once `exit` has fired the
+	 * child is gone. Left armed across the drain it fires against a dead process,
+	 * SIGKILLs it and rejects with a timeout that never happened - after which
+	 * `finish` sees `killedByTimeout` and silently drops the result that had just
+	 * drained. `PROBE_DRAIN_GRACE_MS` is the only bound the drain needs.
+	 */
+	it('does not reject with a timeout when the child exits just before its deadline', async () => {
+		vi.useFakeTimers();
+		// Exit inside the op's window, output a beat after the deadline it no longer
+		// answers to, and still well inside the drain grace.
+		script.current = { stdout: [clusters(2)], exitAtMs: 44_500, stdoutAtMs: 45_500 };
+		try {
+			const pending = dbx.listClusters({ profile: 'pat' });
+			const outcome = pending.then(
+				(clusters) => ({ status: 'resolved' as const, clusters }),
+				(error: unknown) => ({ status: 'rejected' as const, error: String(error) })
+			);
+			await vi.advanceTimersByTimeAsync(60_000);
+			const settled = await outcome;
+			expect(settled).toMatchObject({ status: 'resolved' });
+			expect(settled.status === 'resolved' ? settled.clusters : []).toHaveLength(2);
+		} finally {
+			script.current = null;
+			vi.useRealTimers();
+		}
 	});
 });
