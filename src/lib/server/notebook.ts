@@ -1718,9 +1718,10 @@ const DURABLE_CELLAR_KEYS = [
  * Seed a newly created cell with `cellar` metadata a caller is RESTORING - the
  * undo stack re-inserting a deleted cell, which has to bring it back EXACTLY
  * (`language`, so a SQL cell does not come back as Python; `role`, `export`,
- * `hide_input`, `output_scrolled`, `hidden_from_agent`), and a paste carrying its
- * view choice. Seeding at creation is what keeps that ONE persist and ONE
- * `cell:added` event, rather than an add followed by a PATCH per key.
+ * `hide_input`, `output_scrolled`, `hidden_from_agent`), and a paste, which
+ * carries that same whole namespace through the same snapshot. Seeding at
+ * creation is what keeps that ONE persist and ONE `cell:added` event, rather
+ * than an add followed by a PATCH per key.
  *
  * The RUNTIME-only records are stripped first, through the same `stripRuntimeMeta`
  * the disk write uses, so this can never become a forgery route: `lastRun` is the
