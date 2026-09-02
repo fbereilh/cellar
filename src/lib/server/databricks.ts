@@ -256,6 +256,29 @@ const SENTINEL = '__CELLAR_DBX__';
 const PROBE_TIMEOUT_MS = 45_000;
 
 /**
+ * How long a probe that has already EXITED may be given for its stdout to drain.
+ *
+ * `exit` fires the moment the process ends, with the stdio pipes still open, so
+ * the result line the child already wrote can still be sitting unread - reading
+ * `stdout` there reports a perfectly good probe as
+ * `the Databricks probe crashed: python exited code=0`. Which of the two ready
+ * events libuv dispatches first is a scheduling detail, so the misreport is
+ * load-dependent: rare, silent, and unactionable for the user.
+ *
+ * `close` is the honest point (the process ended AND its stdio drained), but it
+ * may NEVER arrive: a grandchild that inherited the pipe keeps it open, which is
+ * exactly what the `login` op's browser launcher can leave behind. So the wait is
+ * bounded - a drained result resolves at once, and a genuinely empty one is still
+ * reported a moment later rather than never. It is deliberately far shorter than
+ * any op timeout: this is pipe drain, not work.
+ *
+ * `dataflow.ts`'s probe already reads its result on `close` for the same reason
+ * and says so; this is that rule applied to the one subprocess reader that had
+ * been left on `exit`.
+ */
+const PROBE_DRAIN_GRACE_MS = 2_000;
+
+/**
  * How long the interactive `login` subprocess may run: it opens the browser and
  * blocks on the localhost OAuth redirect, so it has to outlast a human signing
  * in (approve the app, pick an account, MFA). A kill here reads as "sign-in was
@@ -1295,13 +1318,34 @@ function probe(request: ProbeRequest, timeoutMs = PROBE_TIMEOUT_MS, stdin?: stri
 		// stdio is ['ignore','pipe','pipe'], so both streams exist at runtime.
 		child.stdout!.on('data', (d) => (stdout += d));
 		child.stderr!.on('data', (d) => (stderr += d));
+		// One settle, whichever path gets there first. The spawn itself failing
+		// (ENOENT/EACCES/E2BIG) emits `error` and then `close` but never `exit`, so
+		// without this the `close` would re-report that failure as an empty-stdout
+		// crash.
+		let settled = false;
 		child.on('error', (err) => {
 			clearTimeout(timer);
+			if (settled) return;
+			settled = true;
 			logError('databricks', `could not run probe (${request.op}): ${err.message}`);
 			reject(new DatabricksError('no_python', `could not run ${python}: ${err.message}`));
 		});
-		child.on('exit', (code, signal) => {
+		/**
+		 * Settle on DRAINED stdout, not on process exit.
+		 *
+		 * `close` is the only event that means "the process ended AND its stdio is
+		 * complete"; `exit` alone can leave the result line unread in the pipe (see
+		 * `PROBE_DRAIN_GRACE_MS`). So `exit` settles immediately only when the result
+		 * is already in hand, and otherwise hands over to `close` under a bounded
+		 * grace - which keeps a grandchild holding the pipe from turning a finished
+		 * probe into a hang.
+		 */
+		let drainTimer: ReturnType<typeof setTimeout> | undefined;
+		const finish = (code: number | null, signal: NodeJS.Signals | null) => {
 			clearTimeout(timer);
+			if (drainTimer) clearTimeout(drainTimer);
+			if (settled) return;
+			settled = true;
 			// The subprocess's raw stderr is exactly the underlying detail the friendly
 			// UI copy hides (a traceback, a TLS/connection error, an SDK deprecation),
 			// so surface it in the log panel even on an otherwise "ok" result.
@@ -1345,7 +1389,15 @@ function probe(request: ProbeRequest, timeoutMs = PROBE_TIMEOUT_MS, stdin?: stri
 				logError('databricks', `unparseable probe result (${request.op}): ${msg}`);
 				reject(new DatabricksError('error', `unparseable probe result: ${msg}`));
 			}
+		};
+		child.on('exit', (code, signal) => {
+			// A result already in hand is complete - settle now, exactly as before.
+			if (stdout.split('\n').some((l) => l.startsWith(SENTINEL))) return finish(code, signal);
+			// Nothing yet: give the pipe its bounded moment to drain before calling a
+			// finished probe a crash.
+			drainTimer = setTimeout(() => finish(code, signal), PROBE_DRAIN_GRACE_MS);
 		});
+		child.on('close', (code, signal) => finish(code, signal));
 	});
 }
 

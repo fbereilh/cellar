@@ -33,8 +33,16 @@ import { spawnSync } from 'node:child_process';
  * the cache filenames it must hit are derived INDEPENDENTLY here (mirroring
  * `credentials_provider.external_browser`) rather than by calling the code we test.
  * Those cases SKIP (loudly, with a reason) where no project venv carries the SDK -
- * a green run must never be mistakable for a verified purge. The honesty rules in
- * (5) need no SDK: they run against a stub interpreter, so they are always covered.
+ * a green run must never be mistakable for a verified purge.
+ *
+ * Everything else - the sign-in gate and the honesty rules in (5) - is about what
+ * `logout` REPORTS, not about the SDK, so it runs against a FAKE interpreter that
+ * never leaves this process: `spawn` is intercepted for those paths and answers
+ * with one canned sentinel line (see `fakeProbes`). Those assertions are pure
+ * logic, and a real subprocess only ever added ways for them to fail for reasons
+ * that have nothing to do with `logout` - which is exactly how this file went
+ * intermittently red in CI with `the Databricks probe crashed: python exited
+ * code=0`, a probe result that was written but not yet read.
  */
 
 const SENTINEL = '__CELLAR_DBX__';
@@ -49,6 +57,54 @@ const state = vi.hoisted(() => ({
 	hold: null as Promise<void> | null,
 	failDisconnect: false
 }));
+
+/**
+ * Fake interpreters, `<path> -> the exact stdout the probe should read`.
+ *
+ * `probe()` resolves its interpreter through `projectPython()`, which only checks
+ * that the path EXISTS - so a registered path is a MARKER file that is never
+ * executed, and the mocked `spawn` below answers for it in-process instead.
+ * Hoisted because a `vi.mock` factory is lifted above every import.
+ */
+const fakeProbes = vi.hoisted(() => new Map<string, string>());
+
+/**
+ * Answer for a registered fake interpreter without spawning anything; delegate
+ * every other command to the real `spawn` (the SDK cases below genuinely need it).
+ *
+ * The synthetic child delivers its stdout and only THEN emits `exit`/`close`, which
+ * is the ordering a drained pipe guarantees and a contended machine does not - so
+ * these tests assert `logout`'s reporting rather than the operating system's
+ * scheduling. The marker file is deliberately NOT executable: if this interception
+ * ever stopped applying, the probe would fail loudly instead of passing by luck.
+ */
+vi.mock('node:child_process', async (importOriginal) => {
+	const actual = await importOriginal<typeof import('node:child_process')>();
+	const { EventEmitter } = await import('node:events');
+	const { Readable } = await import('node:stream');
+	return {
+		...actual,
+		spawn: (command: string, args?: unknown, options?: unknown) => {
+			const canned = fakeProbes.get(command);
+			if (canned === undefined) {
+				return (actual.spawn as (...a: unknown[]) => unknown)(command, args, options);
+			}
+			const child = new EventEmitter() as InstanceType<typeof EventEmitter> & Record<string, unknown>;
+			const stdout = Readable.from([canned]);
+			child.stdout = stdout;
+			child.stderr = Readable.from([]);
+			child.stdin = null;
+			child.pid = 1;
+			child.killed = false;
+			child.kill = () => true;
+			stdout.once('end', () => {
+				child.emit('exit', 0, null);
+				child.emit('close', 0, null);
+			});
+			return child;
+		}
+	};
+});
 
 vi.mock('../../src/lib/server/kernel', () => ({
 	execute: async (_nb: string, code: string, onEvent: (e: unknown) => void) => {
@@ -78,12 +134,12 @@ let dbx: typeof import('../../src/lib/server/databricks');
 let home: string;
 let cfgPath: string;
 /**
- * Stub interpreters that answer every probe op with one canned sentinel line. They
+ * Fake interpreters that answer every probe op with one canned sentinel line. They
  * are what let the SIGN-IN and REPORTING halves of these tests run anywhere: `login`
  * is the only way into `signedInHosts`/`signedInProfiles` and the real thing opens a
  * browser, and the purge's honesty rules are about what the probe REPORTS, not about
  * the SDK. `stubPython` reports a token cleared; `stubPythonEmpty` reports the probe
- * running and finding nothing (the derivation-miss case). Written in `beforeAll`.
+ * running and finding nothing (the derivation-miss case). Registered in `beforeAll`.
  */
 let stubPython = '';
 let stubPythonEmpty = '';
@@ -116,10 +172,17 @@ const HOST_OTHER = 'https://keep-me.example.com';
 const HOST_PAT = 'https://pat-me.example.com';
 const HOST_BROWSER_PROFILE = 'https://prof-me.example.com';
 
-/** A tiny executable that prints one canned probe result, whatever it is asked. */
+/**
+ * Register a fake interpreter that answers every probe op with one canned result.
+ *
+ * The file it writes is a marker `projectPython()` can `existsSync`, nothing more:
+ * it is not executable and is never run, because `spawn` is intercepted for this
+ * path above.
+ */
 function writeStub(name: string, result: Record<string, unknown>): string {
 	const path = join(home, name);
-	writeFileSync(path, `#!/bin/sh\ncat <<'EOF'\n${SENTINEL}${JSON.stringify(result)}\nEOF\n`, { mode: 0o755 });
+	writeFileSync(path, 'cellar test marker - never executed\n', { mode: 0o644 });
+	fakeProbes.set(path, `${SENTINEL}${JSON.stringify(result)}\n`);
 	return path;
 }
 
