@@ -4,7 +4,7 @@
 	import { subscribeEvents, originId } from '$lib/events-client';
 	import { cellIdOfKey, computeFolding, computeHeadingNumbers, foldSignature, headerLevel, outlineHeadings, withHeadingLevel } from '$lib/headings';
 	import { notebookCellChanges, NO_CELL_CHANGES } from '$lib/gitdiff';
-	import { cellClipboard } from '$lib/cellClipboard';
+	import { cellClipboard, clipboardCellFrom, clipboardCellType } from '$lib/cellClipboard';
 	import { clampMoveIndex, isImportsCell, IMPORTS_ROLE } from '$lib/importsRole';
 	import {
 		isChatCell,
@@ -3310,43 +3310,32 @@
 		if (deletedCells.length > UNDO_LIMIT) deletedCells.shift();
 	}
 
-	/** A cell as the CLIPBOARD stores it: live source, no outputs. */
+	/**
+	 * A cell as the CLIPBOARD and the UNDO STACK store it: its live source (the
+	 * EDITOR's text, which the model's `source` lags by the autosave debounce) and
+	 * its WHOLE `cellar` namespace, never a named subset.
+	 *
+	 * ONE snapshot for both, deliberately - they were two shapes and they drifted,
+	 * which is the bug. Undo carried the namespace whole while the clipboard named
+	 * three fields, so cutting a SQL cell and pressing `z` brought back a SQL cell
+	 * while pasting the same cell produced Python, and with it went the nbdev
+	 * `export` mark, the report-view `hide_input` choice, the imports `role` and
+	 * `hidden_from_agent`. Bulk cut/copy turned that from a one-cell annoyance into
+	 * an N-cell one. The rule and the reasoning live in `$lib/cellClipboard`; what
+	 * the SERVER will accept from it is `seedCellar`'s allowlist, which also strips
+	 * the runtime-only records - so neither this file nor that one keeps a second,
+	 * drifting copy of either rule.
+	 */
 	function snapshotCell(cell: UICell): ClipboardCell {
-		return {
-			cell_type: cell.cell_type,
-			source: cellApis[cell.id]?.currentSource?.() ?? cell.source,
-			output_scrolled: cell.metadata?.cellar?.output_scrolled
-		};
+		return clipboardCellFrom(cell, cellApis[cell.id]?.currentSource?.() ?? cell.source);
 	}
 
-	/**
-	 * A cell as the UNDO STACK stores it: its document index, its live source, and
-	 * its WHOLE `cellar` namespace.
-	 *
-	 * Deliberately NOT the clipboard's shape. The clipboard carries only what a
-	 * cross-notebook paste should carry, but undo is the one path where a user
-	 * expects EXACT restoration - and the narrow shape drops `language`, so ten
-	 * deleted SQL cells came back as ten plain Python cells, along with the imports
-	 * `role`, the nbdev `export` flag and the `hide_input` report-view choice. Bulk
-	 * delete is what turned that from a one-cell annoyance into a ten-cell one.
-	 *
-	 * The namespace is copied whole and the SERVER strips the runtime-only records
-	 * from it (`seedCellar`), which is where that rule already lives - a second copy
-	 * of it here could drift from the one the disk write uses.
-	 */
-	interface DeletedCell {
+	/** The clipboard snapshot plus the pre-removal document index undo restores to. */
+	interface DeletedCell extends ClipboardCell {
 		index: number;
-		cell_type: CellType;
-		source: string;
-		cellar?: CellarNamespace;
 	}
 	function snapshotDeletedCell(cell: UICell, index: number): DeletedCell {
-		return {
-			index,
-			cell_type: cell.cell_type,
-			source: cellApis[cell.id]?.currentSource?.() ?? cell.source,
-			cellar: cell.metadata?.cellar ? { ...cell.metadata.cellar } : undefined
-		};
+		return { index, ...snapshotCell(cell) };
 	}
 
 	/** What an insert re-materializes: a cell's type, source and `cellar` metadata.
@@ -3400,15 +3389,6 @@
 		const created = await addCell(afterId ?? cells.at(-1)?.id, spec.cell_type, spec.source, spec.cellar);
 		if (!afterId && cells.length > 1) await moveCellToIndex(created.id, 0);
 		return created;
-	}
-
-	/** A clipboard entry as an insert: the view choice is the only metadata it carries. */
-	function pasteSpec(entry: ClipboardCell): InsertSpec {
-		return {
-			cell_type: entry.cell_type,
-			source: entry.source,
-			cellar: entry.output_scrolled === undefined ? undefined : { output_scrolled: entry.output_scrolled }
-		};
 	}
 
 	/**
@@ -3657,7 +3637,15 @@
 		// from an .ipynb can be pasted into a `.py` one, which cannot hold it. Refused
 		// for the WHOLE paste rather than by entry: pasting three of five cells and
 		// silently dropping the rest is the degrade this refusal exists to prevent.
-		if (isPy && entries.some((e) => e.cell_type === 'raw')) return noticeUnsupportedType('raw');
+		//
+		// Asked of the LOGICAL type through the shared `offersCellType`, never of
+		// `cell_type`: now that the entry carries `cellar.language`, a chat or mojo
+		// cell really does arrive as an nbformat `code` cell that the document cannot
+		// hold, and `assertCanHoldCell` refuses it server-side - so a `cell_type ===
+		// 'raw'` test would leave the user a thrown insert where every other surface
+		// gives a named notice.
+		const refusedType = entries.map(clipboardCellType).find((t) => !offersCellType(t, isPy));
+		if (refusedType) return noticeUnsupportedType(refusedType);
 		const i = cells.findIndex((c) => c.id === activeId);
 		// No selection (an empty notebook) → paste at the end.
 		let index = i < 0 ? cells.length : where === 'above' ? i : i + 1;
@@ -3667,7 +3655,7 @@
 		const inserted: string[] = [];
 		try {
 			for (const entry of entries) {
-				inserted.push((await insertCellAt(index, pasteSpec(entry))).id);
+				inserted.push((await insertCellAt(index, entry)).id);
 				index++;
 			}
 		} catch {

@@ -321,7 +321,14 @@ describe('the client half (source guards)', () => {
 		// return reads as a dead key.
 		expect(src).toMatch(/async function setType\(id: string, cellType: LogicalCellType\) \{\s*\n\s*if \(refuseUnsupportedType\(cellType\)\) return;/);
 		expect(src).toMatch(/if \(refuseUnsupportedType\(cellType\)\) return;\s*\n\s*\/\/ A cell already of the target type/);
-		expect(src).toMatch(/if \(isPy && entries\.some\(\(e\) => e\.cell_type === 'raw'\)\) return noticeUnsupportedType\('raw'\)/);
+		// The PASTE mirror asks the same shared rule, of the LOGICAL type: the
+		// clipboard entry carries `cellar.language`, so a chat or mojo cell arrives as
+		// an nbformat `code` cell this document cannot hold either, and a
+		// `cell_type === 'raw'` test would read it as plain `code` and leave the user
+		// a thrown insert where every other surface gives a named notice.
+		expect(src).toMatch(
+			/const refusedType = entries\.map\(clipboardCellType\)\.find\(\(t\) => !offersCellType\(t, isPy\)\);\s*\n\s*if \(refusedType\) return noticeUnsupportedType\(refusedType\);/
+		);
 		// And a refusal this tab did not predict is still surfaced + resynced: the
 		// route emits no `cell:type`, and this tab would echo-suppress it anyway.
 		// The type is resolved through the SHARED resolver (whose meaning is
