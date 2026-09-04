@@ -65,10 +65,12 @@ import type { OutputAccumulator } from '../output-accumulator';
 import type { CellOutput } from '../types';
 import { toolCallLine } from './tool-lines';
 import {
+	CHAT_LEARNING_MODE_KEY,
 	CHAT_MODEL_KEY,
 	CHAT_OTHER_NOTEBOOKS_KEY,
 	CHAT_WEB_SEARCH_KEY,
 	CHAT_WORKSPACE_READS_KEY,
+	chatLearningModeEnabled,
 	chatOtherNotebooksEnabled,
 	chatWebSearchEnabled,
 	chatWorkspaceReadsEnabled,
@@ -220,7 +222,9 @@ export async function executeChatRun({
 		// session in different directions (an outbound query channel vs. local file
 		// reach), so neither may arrive as a side effect of the other, while the
 		// other-notebooks key only ever NARROWS the read grant and is inert unless
-		// reads are already on.
+		// reads are already on. Learning mode rides the same read for consistency
+		// while being the one flag here that is NOT a capability: it widens nothing
+		// and only changes how the reply is written.
 		const settings = getUserSettings();
 		const res = await chatEngine().run({
 			prompt,
@@ -235,6 +239,12 @@ export async function executeChatRun({
 			// pipeline is keyed by, which is exactly what the deny rule needs.
 			notebookPath: nb,
 			otherNotebooks: chatOtherNotebooksEnabled(settings[CHAT_OTHER_NOTEBOOKS_KEY]),
+			// The one setting here that widens NOTHING: it appends a fixed teaching
+			// block to the frozen system prompt and leaves the argv's tool request,
+			// grant, denials and cwd byte-identical. Read at run time off the SAME
+			// store and through the same strict `=== true` gate as its neighbours, so
+			// an opt-out takes effect on the very next run.
+			learningMode: chatLearningModeEnabled(settings[CHAT_LEARNING_MODE_KEY]),
 			signal: ctrl.signal,
 			onDelta: (text) => {
 				if (!text) return;

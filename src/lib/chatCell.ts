@@ -76,6 +76,21 @@ export const CHAT_WORKSPACE_READS_KEY = 'cellar-chat-workspace-reads';
  */
 export const CHAT_OTHER_NOTEBOOKS_KEY = 'cellar-chat-other-notebooks';
 
+/**
+ * The user-settings key for LEARNING MODE - the teaching opt-in. Only a literal
+ * `true` turns it on (`chatLearningModeEnabled`), the same `=== true` gate as
+ * its neighbours: a fresh install, an upgraded install and any hand-edited junk
+ * in the untyped store all get today's plain answering voice.
+ *
+ * Its own key, and person-scoped like the model beside it, for the same reason:
+ * how someone wants to be TAUGHT follows the person across projects, not the
+ * project. It is the one chat setting that is not a CAPABILITY - it grants no
+ * tool, opens no path and sends nothing outward; it only appends a fixed block
+ * to the frozen system prompt (see `server/chat/claude-cli.ts`), so the argv,
+ * the grant, the denials and the init assertion are byte-identical either way.
+ */
+export const CHAT_LEARNING_MODE_KEY = 'cellar-chat-learning-mode';
+
 /** The model chat cells run when the user never chose one. */
 export const CHAT_MODEL_DEFAULT = 'sonnet';
 
@@ -138,6 +153,20 @@ export function chatWorkspaceReadsEnabled(value: unknown): boolean {
  * in.
  */
 export function chatOtherNotebooksEnabled(value: unknown): boolean {
+	return value === true;
+}
+
+/**
+ * Is LEARNING MODE on for chat runs? Only an explicit stored `true` counts - the
+ * same `=== true` gate as its neighbours, so an install that never opted in (and
+ * any junk a hand edit leaves in the untyped store) gets the unchanged prompt.
+ *
+ * Unlike its neighbours this is not a security gate: `true` widens no capability,
+ * it only changes how the reply is written. The strict read is kept anyway so
+ * every chat flag in this module reads the store the same way - one rule, not a
+ * per-key judgement about how much a wrong answer would cost.
+ */
+export function chatLearningModeEnabled(value: unknown): boolean {
 	return value === true;
 }
 

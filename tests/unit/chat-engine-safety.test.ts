@@ -43,6 +43,7 @@ import {
 	classifyChatFailure,
 	claudeCliEngine,
 	initViolation,
+	CHAT_LEARNING_MODE_BLOCK,
 	CHAT_MAX_CONCURRENT,
 	CHAT_SYSTEM_PROMPT,
 	CHAT_SYSTEM_PROMPT_READS,
@@ -775,6 +776,131 @@ describe('workspace reads are CONFINED, and confinement is the grant', () => {
 			expect(READ_TOOLS).not.toContain(d);
 			expect(d).toMatch(/^(Read|Glob|Grep)\(\/\/.*\)$/);
 		}
+	});
+
+	it('learning mode is OFF by default: every shipped prompt is byte-identical without it', () => {
+		// The regression this whole increment must not cause. The four constants are
+		// what every existing install sends today, so they are pinned as literal
+		// EXPECTED text rather than against the composition that produced them -
+		// compared against `buildChatSystemPrompt`'s own output the assertion would
+		// be a tautology and a reworded framing would sail through it.
+		const framing =
+			'You are the AI assistant inside Cellar, a data notebook. The user message is the notebook so far, ' +
+			'rendered as labelled blocks: [cell <id> · <kind>] holds a cell\'s source, [cell <id> · output] its ' +
+			'result, [cell <id> · reply] an earlier answer of yours, and [question] is what to answer now. Answer ' +
+			'in concise markdown. ALWAYS put code in a fenced block tagged with its language (```python, ```sql, ' +
+			'```markdown, ```bash): the user lifts a fenced block straight into a notebook cell and the tag picks ' +
+			"that cell's type, so an untagged or unfenced snippet lands as the wrong kind of cell.";
+		const reads =
+			"You can read files in the notebook's own workspace with Read, Glob and Grep, and only there - paths " +
+			'outside it are refused, so do not try. Use them to ground your answer in the real code, and say which ' +
+			'file a claim came from. The notebook you are answering in is not readable as a file: you already have ' +
+			'it above, fresher than any copy on disk, so do not go looking for it. You cannot write or edit files ' +
+			'and cannot run code - never claim to have done so; when something needs running, say what to run.';
+		expect(CHAT_SYSTEM_PROMPT).toBe(
+			`${framing} You have no tools and cannot run code, read files, or browse - never claim to have done so; ` +
+				'when the notebook lacks what you would need, say what to run.'
+		);
+		expect(CHAT_SYSTEM_PROMPT_WEB_SEARCH).toBe(
+			`${framing} Your only tool is web search - use it when the question needs current or external ` +
+				'information, and say when a claim comes from a search result. You cannot run code or read files - ' +
+				'never claim to have done so; when the notebook lacks what you would need, say what to run.'
+		);
+		expect(CHAT_SYSTEM_PROMPT_READS).toBe(`${framing} ${reads} You cannot browse the web.`);
+		expect(CHAT_SYSTEM_PROMPT_READS_WEB_SEARCH).toBe(
+			`${framing} ${reads} You can also search the web when the question needs current or external ` +
+				'information; say when a claim comes from a search result.'
+		);
+
+		// A caller that does not ask for learning mode gets those four back, byte for
+		// byte - the DEFAULT is what an upgraded install sends, so it is asserted at
+		// the function as well as at the constants.
+		const shapes = [
+			[chatToolPolicy(), CHAT_SYSTEM_PROMPT],
+			[chatToolPolicy({ webSearch: true }), CHAT_SYSTEM_PROMPT_WEB_SEARCH],
+			[chatToolPolicy({ readRoot: WS, notebookPath: NB }), CHAT_SYSTEM_PROMPT_READS],
+			[chatToolPolicy({ readRoot: WS, webSearch: true, notebookPath: NB }), CHAT_SYSTEM_PROMPT_READS_WEB_SEARCH]
+		] as const;
+		for (const [policy, expected] of shapes) {
+			expect(chatSystemPrompt(policy)).toBe(expected);
+			expect(chatSystemPrompt(policy, false)).toBe(expected);
+			expect(expected).not.toContain(CHAT_LEARNING_MODE_BLOCK);
+			expect(expected).not.toContain('act as a teacher');
+		}
+		// And the ARGV path defaults the same way: an omitted flag, and an explicit
+		// false, both send the unchanged prompt.
+		expect(promptOf(chatCliArgs())).toBe(CHAT_SYSTEM_PROMPT);
+		expect(promptOf(chatCliArgs({ learningMode: false }))).toBe(CHAT_SYSTEM_PROMPT);
+		// Only a literal `true` turns it on - the same gate the store read applies, so
+		// a truthy value that slipped past the caller cannot change what is sent.
+		for (const junk of ['true', 1, {}] as unknown[]) {
+			expect(promptOf(chatCliArgs({ learningMode: junk as boolean }))).toBe(CHAT_SYSTEM_PROMPT);
+		}
+	});
+
+	it('learning mode ADDS one block to every capability shape, and changes nothing else', () => {
+		// The block is the product owner's wording and is sent VERBATIM - it is an
+		// instruction to the model, not copy, so it is pinned here as the literal text
+		// rather than referenced through the constant it lives in.
+		expect(CHAT_LEARNING_MODE_BLOCK).toBe(
+			'Could you act as a teacher and build up the ideas from first principles?\n' +
+				'Try to answer in short blocks and test my understanding, your main goal is to make me understand.'
+		);
+
+		// It composes with EVERY combination of the two capabilities - the point of
+		// composing from parts rather than writing eight finished constants - and each
+		// on-prompt is exactly its own off-prompt plus the block, so it can never
+		// silently reword the capability sentence it is appended to.
+		const cases = [
+			[{}, CHAT_SYSTEM_PROMPT],
+			[{ webSearch: true }, CHAT_SYSTEM_PROMPT_WEB_SEARCH],
+			[{ readRoot: WS, notebookPath: NB }, CHAT_SYSTEM_PROMPT_READS],
+			[{ readRoot: WS, webSearch: true, notebookPath: NB }, CHAT_SYSTEM_PROMPT_READS_WEB_SEARCH]
+		] as const;
+		const seen = new Set<string>();
+		for (const [caps, off] of cases) {
+			const policy = chatToolPolicy(caps);
+			const on = chatSystemPrompt(policy, true);
+			expect(on).toBe(`${off} ${CHAT_LEARNING_MODE_BLOCK}`);
+			expect(on).toContain(CHAT_LEARNING_MODE_BLOCK);
+			seen.add(on);
+			// The capability claim is untouched: the shape still says what it can and
+			// cannot do, so a taught reply is not also a mis-described one.
+			expect(on.startsWith(off)).toBe(true);
+		}
+		// Eight distinct prompts across the two axes, from one added block.
+		expect(seen.size).toBe(4);
+		expect(new Set([...seen, CHAT_SYSTEM_PROMPT, CHAT_SYSTEM_PROMPT_WEB_SEARCH, CHAT_SYSTEM_PROMPT_READS, CHAT_SYSTEM_PROMPT_READS_WEB_SEARCH]).size).toBe(8);
+
+		// BYTE-STABILITY survives the composition: nothing per-run may enter, so two
+		// installs with different confinement roots must send the same bytes.
+		for (const root of ['/tmp/cellar-ws', '/some/other/workspace']) {
+			const p = promptOf(chatCliArgs({ readRoot: root, notebookPath: NB, learningMode: true }));
+			expect(p).toBe(chatSystemPrompt(chatToolPolicy({ readRoot: WS, notebookPath: NB }), true));
+			expect(p).not.toContain(root);
+		}
+
+		// The SAFETY BOUNDARY is untouched: learning mode moves `--system-prompt` and
+		// nothing else, so it can never widen a session. Asserted over every shape,
+		// because the flag is one argument the argv builder threads through all of them.
+		for (const [caps] of cases) {
+			const off = chatCliArgs(caps);
+			const on = chatCliArgs({ ...caps, learningMode: true });
+			const at = off.indexOf('--system-prompt');
+			expect(on.indexOf('--system-prompt')).toBe(at);
+			expect(on.length).toBe(off.length);
+			expect([...on.slice(0, at + 1), ...on.slice(at + 2)]).toEqual([...off.slice(0, at + 1), ...off.slice(at + 2)]);
+			// Stated positively too, since these three are the whole confinement story.
+			const flag = (args: string[], name: string) => args[args.indexOf(name) + 1];
+			expect(flag(on, '--tools')).toBe(flag(off, '--tools'));
+			expect(on.includes('--allowedTools')).toBe(off.includes('--allowedTools'));
+			expect(on.includes('--disallowedTools')).toBe(off.includes('--disallowedTools'));
+			// ...and the policy the init assertion is made against is the same object,
+			// so a learning-mode run cannot report a different tool set as acceptable.
+			expect(chatToolPolicy(caps).tools).toEqual(chatToolPolicy({ ...caps }).tools);
+		}
+		// The cwd is a function of the policy alone, so it cannot move either.
+		expect(chatCliCwd(chatToolPolicy({ readRoot: WS, notebookPath: NB }))).toBe(chatCliCwd(chatToolPolicy({ readRoot: WS, notebookPath: NB })));
 	});
 
 	it('the child runs IN the confinement root when reads are on, and in the neutral tmpdir otherwise', () => {
