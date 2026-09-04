@@ -52,6 +52,7 @@ import {
 	READ_TOOLS,
 	WEB_SEARCH_TOOL
 } from '../../src/lib/server/chat/claude-cli';
+import type { ChatCapabilities } from '../../src/lib/server/chat/claude-cli';
 import { CHAT_MODEL_DEFAULT, normalizeChatModel } from '../../src/lib/chatCell';
 import { chatFailureMarkdown } from '../../src/lib/server/chat/failure';
 import { chatChildEnv, isChatSensitiveEnv } from '../../src/lib/server/chat/env';
@@ -895,12 +896,21 @@ describe('workspace reads are CONFINED, and confinement is the grant', () => {
 			expect(flag(on, '--tools')).toBe(flag(off, '--tools'));
 			expect(on.includes('--allowedTools')).toBe(off.includes('--allowedTools'));
 			expect(on.includes('--disallowedTools')).toBe(off.includes('--disallowedTools'));
-			// ...and the policy the init assertion is made against is the same object,
-			// so a learning-mode run cannot report a different tool set as acceptable.
-			expect(chatToolPolicy(caps).tools).toEqual(chatToolPolicy({ ...caps }).tools);
+			// ...and the policy IGNORES the property outright: handed a `learningMode`
+			// the interface does not carry (hence the cast), it answers with the same
+			// tools, grants, denials, root and search verdict - so a future edit that
+			// routed the flag into the security seam fails here rather than silently
+			// changing what `system/init` is asserted against.
+			const policyOff = chatToolPolicy(caps);
+			const policyOn = chatToolPolicy({ ...caps, learningMode: true } as unknown as ChatCapabilities);
+			expect(policyOn.tools).toEqual(policyOff.tools);
+			expect(policyOn.grants).toEqual(policyOff.grants);
+			expect(policyOn.denials).toEqual(policyOff.denials);
+			expect(policyOn.readRoot).toBe(policyOff.readRoot);
+			expect(policyOn.webSearch).toBe(policyOff.webSearch);
+			// The cwd is a function of that policy alone, so it does not move either.
+			expect(chatCliCwd(policyOn)).toBe(chatCliCwd(policyOff));
 		}
-		// The cwd is a function of the policy alone, so it cannot move either.
-		expect(chatCliCwd(chatToolPolicy({ readRoot: WS, notebookPath: NB }))).toBe(chatCliCwd(chatToolPolicy({ readRoot: WS, notebookPath: NB })));
 	});
 
 	it('the child runs IN the confinement root when reads are on, and in the neutral tmpdir otherwise', () => {
