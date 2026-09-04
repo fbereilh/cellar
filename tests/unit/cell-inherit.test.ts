@@ -170,7 +170,7 @@ describe('SOURCE GUARD: every human insertion path resolves the type', () => {
 			/^addCell\(id, cell\.cell_type, source\.slice\(at\)/, // split: the SAME cell's second half
 			/^insertCellAt\(index, \{ cell_type: type, source: '' \}\)/, // insertCell, after resolving
 			/^insertCellAt\(cells\.length, \{ cell_type: 'code', source \}\)/, // the Databricks preview: literally Python
-			/^insertCellAt\(index, pasteSpec\(entry\)\)/,
+			/^insertCellAt\(index, entry\)/, // paste: the clipboard entry IS the spec (type + source + `cellar`)
 			/^insertCellAt\(group\[0\]\.index, group\[0\]\)/ // undo-delete restores the recorded type
 		];
 		for (const call of calls) {
