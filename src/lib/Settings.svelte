@@ -5,7 +5,7 @@
 	import { shortcuts, chordFromEvent, chordTokens, formatChord, typesACharacter, typingHazards, CATEGORIES, MODE_LABEL } from '$lib/shortcuts.svelte';
 	import type { VenvInfo } from '$lib/server/venv-bind';
 	import { getUserSettingFlag, getUserSettingText, setUserSetting, setUserSettingNow } from '$lib/userSettings';
-	import { CHAT_MODEL_KEY, CHAT_MODELS, CHAT_OTHER_NOTEBOOKS_KEY, CHAT_WEB_SEARCH_KEY, CHAT_WORKSPACE_READS_KEY, normalizeChatModel } from '$lib/chatCell';
+	import { CHAT_LEARNING_MODE_KEY, CHAT_MODEL_KEY, CHAT_MODELS, CHAT_OTHER_NOTEBOOKS_KEY, CHAT_WEB_SEARCH_KEY, CHAT_WORKSPACE_READS_KEY, normalizeChatModel } from '$lib/chatCell';
 	import { UPLOAD_PREFIX_DEFAULT_KEY, UPLOAD_POSTFIX_DEFAULT_KEY } from '$lib/uploadDefaults';
 	import {
 		UPLOAD_DATE_TOKENS,
@@ -239,6 +239,7 @@
 	let chatWebSearch = $state(false);
 	let chatWorkspaceReads = $state(false);
 	let chatOtherNotebooks = $state(false);
+	let chatLearningMode = $state(false);
 	let chatHydrated = false;
 	$effect(() => {
 		if (!open || chatHydrated) return;
@@ -247,6 +248,7 @@
 		chatWebSearch = getUserSettingFlag(CHAT_WEB_SEARCH_KEY);
 		chatWorkspaceReads = getUserSettingFlag(CHAT_WORKSPACE_READS_KEY);
 		chatOtherNotebooks = getUserSettingFlag(CHAT_OTHER_NOTEBOOKS_KEY);
+		chatLearningMode = getUserSettingFlag(CHAT_LEARNING_MODE_KEY);
 	});
 
 	// DETECT + REPORT (the `sdkDbutils` precedent): workspace reads fail CLOSED on a
@@ -360,6 +362,24 @@
 	function toggleChatOtherNotebooks() {
 		chatOtherNotebooks = !chatOtherNotebooks;
 		void setUserSettingNow(CHAT_OTHER_NOTEBOOKS_KEY, chatOtherNotebooks ? true : null);
+	}
+
+	// The one chat toggle that is not a CAPABILITY: it grants no tool, reaches no
+	// file and sends nothing outward - it only appends a fixed teaching block to
+	// the system prompt, so the tool request, the grant, the denials and the init
+	// assertion are byte-identical either way. Its own key and its own handler all
+	// the same, for the reason its neighbours have theirs: how someone wants to be
+	// taught must not arrive as a side effect of asking for a capability.
+	//
+	// Same `setUserSettingNow` rule too, though the argument here is legibility
+	// rather than security: the server re-reads this key when a chat cell RUNS, so
+	// a debounced write would let a run started right after the click reply in the
+	// voice the person just turned off.
+	function toggleChatLearningMode() {
+		chatLearningMode = !chatLearningMode;
+		// OFF deletes the key rather than storing `false`, like its neighbours:
+		// absent is the default, so an opted-out store matches a fresh one.
+		void setUserSettingNow(CHAT_LEARNING_MODE_KEY, chatLearningMode ? true : null);
 	}
 
 	// ---- Keyboard shortcuts --------------------------------------------------
@@ -709,8 +729,8 @@
 				<div class="divider my-1"></div>
 
 				<!-- Chat cells. Person-level like the upload defaults above: the model a
-				     reply bills and the two capability opt-ins follow the person across
-				     projects. Each toggle's copy states what turning it on actually
+				     reply bills, how it is written, and the capability opt-ins follow the
+				     person across projects. Each toggle's copy states what turning it on actually
 				     grants and what it costs - search only, queries derived from the
 				     notebook; reads confined to this workspace and read-only - because
 				     these are the controls deciding whether notebook-derived text can
@@ -735,6 +755,27 @@
 					<p class="mt-1 text-xs text-base-content/50">
 						The Claude model chat cells reply with. Applies from the next run; which models your
 						account can use depends on its subscription.
+					</p>
+					<!-- Learning mode sits with the MODEL rather than with the three
+					     capability toggles below it, and the grouping is the point: those
+					     three decide what a reply may reach, this one only decides how it
+					     is written. Placing it between them would also split the
+					     reads/other-notebooks pair, where the second narrows the first. -->
+					<label class="mt-3 flex cursor-pointer items-center justify-between gap-4">
+						<span class="text-sm font-medium">Learning mode</span>
+						<input
+							type="checkbox"
+							class="toggle toggle-primary toggle-sm"
+							checked={chatLearningMode}
+							onchange={toggleChatLearningMode}
+							data-testid="settings-chat-learning-mode"
+						/>
+					</label>
+					<p class="mt-1 text-xs text-base-content/50">
+						Off, a chat cell just answers the question. On, it teaches: replies build the idea up
+						from first principles, come in short blocks, and check your understanding as they go.
+						This changes only how the reply is written - it grants no new access, so a reply still
+						reaches exactly what the toggles below allow. Applies from the next run.
 					</p>
 					<label class="mt-3 flex cursor-pointer items-center justify-between gap-4">
 						<span class="text-sm font-medium">Allow web search</span>

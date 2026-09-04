@@ -798,25 +798,32 @@ export function chatToolPolicy(caps: ChatCapabilities = {}): ChatToolPolicy {
 }
 
 /**
- * The fixed system prompts, one per capability shape. Each is FROZEN
- * deliberately: the prompt is part of the cached prompt prefix (see
- * transcript.ts's byte-stability rule), so nothing time-varying or per-run may
- * be interpolated into any of them.
+ * The system prompt, COMPOSED FROM PARTS: shared framing, then the one
+ * capability sentence that is TRUE for what this run holds, then whichever
+ * answering-style blocks the person has opted into.
  *
- * FOUR variants rather than one templated string, because the prompt must be
- * TRUE for the capability the run actually has - the bare prompt's "you cannot
- * read files" is false for a reads-on run, and a model told it cannot read while
- * holding `Read` is a bad state - while a single interpolated prompt would make
- * byte-stability a property of the interpolation instead of the constants. Note
- * what the composition below is and is not: the shared framing is spread from a
- * module-scope array of LITERALS and joined once at module load, so each export
- * is a fixed string. No per-run value may ever enter - emphatically NOT the
- * confinement root, which differs per install and would make every run's prefix
- * a cache miss while leaking the path into the model's context.
+ * Composed rather than written out per combination, and the difference matters
+ * as soon as a second axis exists: four finished strings for `reads x search`
+ * become EIGHT the moment an orthogonal preference like learning mode is added,
+ * and sixteen after the next one - with every capability sentence copied into
+ * each, so a correction to one of them silently misses the others. Parts keep
+ * one copy of each claim and make an orthogonal block a single addition.
  *
- * Flipping a setting changes which frozen prefix is sent (one cache miss), which
- * is inherent to changing the capability; within a shape every run stays
- * byte-stable.
+ * What has NOT changed is why the capability half is per shape rather than
+ * templated: the prompt must be TRUE for what the run actually holds - the bare
+ * prompt's "you cannot read files" is false for a reads-on run, and a model told
+ * it cannot read while holding `Read` is a bad state.
+ *
+ * Nor has the byte-stability rule (see transcript.ts): the prompt is part of the
+ * cached prompt prefix, so nothing time-varying or per-run may enter. Every part
+ * here is a module-scope LITERAL and the composition is a pure function of
+ * (shape, settings), so within one shape and one setting every run sends the same
+ * bytes. Emphatically no per-run value - and NOT the confinement root, which
+ * differs per install and would make every run's prefix a cache miss while
+ * leaking the path into the model's context.
+ *
+ * Flipping a setting changes which composition is sent (one cache miss), which
+ * is inherent to changing it; nothing else moves.
  *
  * The fenced-code requirement lives in the SHARED framing rather than per shape,
  * because it is capability-INDEPENDENT: it is about the reply's FORMAT, and every
@@ -849,49 +856,128 @@ const READS_SENTENCE: readonly string[] = [
 	'so; when something needs running, say what to run.'
 ];
 
-export const CHAT_SYSTEM_PROMPT = [
-	...PROMPT_FRAMING,
-	'You have no tools and cannot run code, read files, or',
-	'browse - never claim to have done so; when the notebook lacks what you would',
-	'need, say what to run.'
-].join(' ');
-
-/** The search-on variant: same framing, capability sentence accurate for it. */
-export const CHAT_SYSTEM_PROMPT_WEB_SEARCH = [
-	...PROMPT_FRAMING,
-	'Your only tool is web search - use it when the question',
-	'needs current or external information, and say when a claim comes from a',
-	'search result. You cannot run code or read files - never claim to have done',
-	'so; when the notebook lacks what you would need, say what to run.'
-].join(' ');
-
-/** The reads-on variant: file reach, no search. */
-export const CHAT_SYSTEM_PROMPT_READS = [...PROMPT_FRAMING, ...READS_SENTENCE, 'You cannot browse the web.'].join(' ');
-
-/** Both capabilities. */
-export const CHAT_SYSTEM_PROMPT_READS_WEB_SEARCH = [
-	...PROMPT_FRAMING,
-	...READS_SENTENCE,
-	'You can also search the web when the question needs current or external',
-	'information; say when a claim comes from a search result.'
-].join(' ');
+/**
+ * The CAPABILITY sentence of each shape - the one part of the prompt that must be
+ * TRUE for what the run holds. Named parts rather than four finished strings,
+ * because the prompt is now COMPOSED (see `buildChatSystemPrompt`): a
+ * capability-independent block like learning mode is one addition here, not a
+ * doubling of the shapes.
+ */
+const CAPABILITY_BLOCKS = {
+	/** No tools at all - the only shape that may say so. */
+	bare: [
+		'You have no tools and cannot run code, read files, or',
+		'browse - never claim to have done so; when the notebook lacks what you would',
+		'need, say what to run.'
+	],
+	/** Search on: same framing, capability sentence accurate for it. */
+	search: [
+		'Your only tool is web search - use it when the question',
+		'needs current or external information, and say when a claim comes from a',
+		'search result. You cannot run code or read files - never claim to have done',
+		'so; when the notebook lacks what you would need, say what to run.'
+	],
+	/** Reads on: file reach, no search. */
+	reads: [...READS_SENTENCE, 'You cannot browse the web.'],
+	/** Both capabilities. */
+	readsSearch: [
+		...READS_SENTENCE,
+		'You can also search the web when the question needs current or external',
+		'information; say when a claim comes from a search result.'
+	]
+} as const satisfies Record<string, readonly string[]>;
 
 /**
- * Which frozen prompt a run sends - decided by the SAME policy that decides the
- * argv, so the prompt can never describe a capability shape the run does not
- * have.
+ * LEARNING MODE's block, appended verbatim when the person has opted in.
+ *
+ * The wording is the product owner's and is deliberately reproduced word for
+ * word - it is an instruction to the model, not copy to be tidied, so do not
+ * paraphrase it, re-punctuate it, or fold it into the framing above. It is ONE
+ * part carrying its own newline, so the two sentences reach the model on the two
+ * lines they were written on while everything else joins with a space.
+ *
+ * It is capability-INDEPENDENT, which is why it is a block rather than a fifth
+ * shape: it says how to ANSWER, and every shape's answer is read by the same
+ * person in the same notebook. Composed on rather than written out per shape, it
+ * costs one block instead of doubling the constants each time such a preference
+ * is added.
  */
-export function chatSystemPrompt(policy: ChatToolPolicy): string {
-	if (policy.readRoot && policy.webSearch) return CHAT_SYSTEM_PROMPT_READS_WEB_SEARCH;
-	if (policy.readRoot) return CHAT_SYSTEM_PROMPT_READS;
-	if (policy.webSearch) return CHAT_SYSTEM_PROMPT_WEB_SEARCH;
-	return CHAT_SYSTEM_PROMPT;
+export const CHAT_LEARNING_MODE_BLOCK = [
+	'Could you act as a teacher and build up the ideas from first principles?',
+	'Try to answer in short blocks and test my understanding, your main goal is to make me understand.'
+].join('\n');
+
+/**
+ * Compose one shape's prompt: the shared framing, that shape's capability
+ * sentence, then whichever answering-style blocks are on.
+ *
+ * Every part is a module-scope LITERAL, so the result is a pure function of
+ * (shape, learning mode) and nothing per-run can enter - which is what preserves
+ * the byte-stability rule the frozen constants had: the prompt is the cached
+ * prompt prefix, so within one shape and one setting every run sends the same
+ * bytes. Flipping learning mode changes which composition is sent (one cache
+ * miss), exactly as flipping a capability does, and is inherent to changing it.
+ */
+function buildChatSystemPrompt(capability: readonly string[], learningMode: boolean): string {
+	return [...PROMPT_FRAMING, ...capability, ...(learningMode ? [CHAT_LEARNING_MODE_BLOCK] : [])].join(' ');
+}
+
+/**
+ * The four capability shapes with every answering-style block OFF - i.e. exactly
+ * the strings this module has always sent. They stay EXPORTED and are what the
+ * unit suite pins byte-for-byte, so a change to the composition that moved any
+ * of them would fail rather than quietly reword what every existing install
+ * sends.
+ */
+export const CHAT_SYSTEM_PROMPT = buildChatSystemPrompt(CAPABILITY_BLOCKS.bare, false);
+
+/** The search-on variant: same framing, capability sentence accurate for it. */
+export const CHAT_SYSTEM_PROMPT_WEB_SEARCH = buildChatSystemPrompt(CAPABILITY_BLOCKS.search, false);
+
+/** The reads-on variant: file reach, no search. */
+export const CHAT_SYSTEM_PROMPT_READS = buildChatSystemPrompt(CAPABILITY_BLOCKS.reads, false);
+
+/** Both capabilities. */
+export const CHAT_SYSTEM_PROMPT_READS_WEB_SEARCH = buildChatSystemPrompt(CAPABILITY_BLOCKS.readsSearch, false);
+
+/** Which capability sentence a policy's shape takes. */
+function capabilityBlock(policy: ChatToolPolicy): readonly string[] {
+	if (policy.readRoot && policy.webSearch) return CAPABILITY_BLOCKS.readsSearch;
+	if (policy.readRoot) return CAPABILITY_BLOCKS.reads;
+	if (policy.webSearch) return CAPABILITY_BLOCKS.search;
+	return CAPABILITY_BLOCKS.bare;
+}
+
+/**
+ * The prompt a run sends. The capability half is decided by the SAME policy that
+ * decides the argv, so the prompt can never describe a capability shape the run
+ * does not have; `learningMode` is orthogonal to it - it grants nothing, so it is
+ * a separate argument rather than a field on the tool policy, and it composes
+ * with every one of the four shapes.
+ *
+ * Defaults OFF, so every caller that does not ask for it - and every existing
+ * test - gets the frozen constant above, byte for byte.
+ */
+export function chatSystemPrompt(policy: ChatToolPolicy, learningMode = false): string {
+	return buildChatSystemPrompt(capabilityBlock(policy), learningMode);
 }
 
 /** The per-run inputs `chatCliArgs` accepts (all optional = today's bare run). */
 export interface ChatCliOptions extends ChatCapabilities {
 	/** Untrusted: constrained through `normalizeChatModel` before touching argv. */
 	model?: unknown;
+	/**
+	 * LEARNING MODE: append the teaching block to the frozen system prompt. Only a
+	 * literal `true` turns it on, the same gate the store read applies.
+	 *
+	 * Deliberately NOT part of `ChatCapabilities`, which is the input to
+	 * `chatToolPolicy` and therefore the security seam: this grants no tool, opens
+	 * no path and changes no assertion - `--tools`, `--allowedTools`,
+	 * `--disallowedTools` and the cwd are byte-identical either way, and only
+	 * `--system-prompt` moves. Its home beside `model` is the honest one: a per-run
+	 * input that shapes argv without shaping the policy.
+	 */
+	learningMode?: boolean;
 	/**
 	 * The policy ALREADY derived for this run. The engine passes it so one run
 	 * derives exactly once: the policy reads the filesystem (`canonicalPath`), so
@@ -951,7 +1037,10 @@ export function chatCliArgs(opts: ChatCliOptions = {}): string[] {
 		'stream-json',
 		'--verbose',
 		'--system-prompt',
-		chatSystemPrompt(policy)
+		// The capability half comes from the policy the argv above was built from,
+		// so the prompt can never describe a shape this run does not have; learning
+		// mode composes onto whichever shape that is.
+		chatSystemPrompt(policy, opts.learningMode === true)
 	];
 }
 
@@ -1094,6 +1183,7 @@ function runOnce({
 	readRoot,
 	notebookPath,
 	otherNotebooks,
+	learningMode,
 	signal,
 	onDelta,
 	onToolCall
@@ -1121,7 +1211,7 @@ function runOnce({
 
 		let child: ChildProcess;
 		try {
-			child = spawn(CLAUDE_BIN, chatCliArgs({ model, policy }), {
+			child = spawn(CLAUDE_BIN, chatCliArgs({ model, policy, learningMode }), {
 				env: chatChildEnv(configDir),
 				cwd,
 				stdio: ['pipe', 'pipe', 'pipe']

@@ -4,7 +4,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { runtimeAvailable, bootCellar, killCellar } from './harness';
-import { CHAT_MODEL_KEY, CHAT_MODEL_DEFAULT, CHAT_OTHER_NOTEBOOKS_KEY, CHAT_WEB_SEARCH_KEY, CHAT_WORKSPACE_READS_KEY } from '../../src/lib/chatCell';
+import { CHAT_LEARNING_MODE_KEY, CHAT_MODEL_KEY, CHAT_MODEL_DEFAULT, CHAT_OTHER_NOTEBOOKS_KEY, CHAT_WEB_SEARCH_KEY, CHAT_WORKSPACE_READS_KEY } from '../../src/lib/chatCell';
 
 /**
  * E2E for the **Chat cells** section of the Settings pane - the human surface of
@@ -369,6 +369,18 @@ test('the other-notebooks opt-out reaches the server without waiting out the deb
  * Runs LAST: it creates and focuses a notebook, changing the workspace the
  * serial tests above share.
  */
+test('the learning-mode opt-out reaches the server without waiting out the debounce', async ({ page }) => {
+	// The fourth key on the same floor. Learning mode is the one chat setting that
+	// is NOT a capability - an opt-out sitting in a debounce window grants nothing -
+	// so the argument here is legibility rather than a grant: the server re-reads
+	// this key when a cell RUNS, so a run started right after the click would reply
+	// in the voice the person just turned off. The guarantee is a property of the
+	// HANDLER, and this toggle has its own, so the three beside it say nothing about
+	// it.
+	await page.goto(baseURL);
+	await assertOptOutBeatsDebounce(page, CHAT_LEARNING_MODE_KEY, 'settings-chat-learning-mode');
+});
+
 test('an un-patternable notebook name is REPORTED at the toggle, naming that notebook', async ({ page }) => {
 	await page.goto(baseURL);
 	await openSettings(page);

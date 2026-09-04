@@ -26,7 +26,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import type { ChatEngine, ChatEngineRunArgs } from '../../src/lib/server/chat/engine';
-import { CHAT_MODEL_DEFAULT, CHAT_MODEL_KEY, CHAT_OTHER_NOTEBOOKS_KEY, CHAT_WEB_SEARCH_KEY, CHAT_WORKSPACE_READS_KEY } from '../../src/lib/chatCell';
+import { CHAT_LEARNING_MODE_KEY, CHAT_MODEL_DEFAULT, CHAT_MODEL_KEY, CHAT_OTHER_NOTEBOOKS_KEY, CHAT_WEB_SEARCH_KEY, CHAT_WORKSPACE_READS_KEY } from '../../src/lib/chatCell';
 
 let WS: string;
 let nbmod: typeof import('../../src/lib/server/notebook');
@@ -62,7 +62,7 @@ afterEach(() => {
 	enginemod.__setChatEngineForTests(null);
 	activemod.__resetChatRuns();
 	// Undo whatever a threading test wrote, so key absence stays each test's default.
-	settingsmod.setUserSettings({ [CHAT_MODEL_KEY]: null, [CHAT_WEB_SEARCH_KEY]: null, [CHAT_WORKSPACE_READS_KEY]: null, [CHAT_OTHER_NOTEBOOKS_KEY]: null });
+	settingsmod.setUserSettings({ [CHAT_MODEL_KEY]: null, [CHAT_WEB_SEARCH_KEY]: null, [CHAT_WORKSPACE_READS_KEY]: null, [CHAT_OTHER_NOTEBOOKS_KEY]: null, [CHAT_LEARNING_MODE_KEY]: null });
 });
 
 /** A notebook: python cell / hidden cell / chat cell. */
@@ -570,6 +570,39 @@ describe('the engine capability settings are read from the user store and gated'
 		await runmod.executeCellRun({ nb, cellId: 'chatcell', actor: 'user', source: 'q' });
 		expect(args[0].readRoot ?? null).toBeNull();
 		expect(args[0].webSearch).toBe(false);
+	});
+
+	it('learning mode threads its own key, defaults off, and widens no capability', async () => {
+		// The ROUND TRIP this feature rests on: what the Settings pane writes into
+		// the person-scoped store is what a RUN reads back and hands the engine.
+		// Default OFF and a literal `true` the only thing that turns it on, so an
+		// upgraded install - and any junk a hand edit leaves in the untyped store -
+		// keeps today's answering voice.
+		const { nb } = makeNotebook('settings-learning.ipynb');
+		for (const [stored, expected] of [
+			[undefined, false],
+			['true', false],
+			[1, false],
+			[true, true]
+		] as const) {
+			settingsmod.setUserSettings({ [CHAT_LEARNING_MODE_KEY]: stored === undefined ? null : stored });
+			const { args } = capturingEngine();
+			const res = await runmod.executeCellRun({ nb, cellId: 'chatcell', actor: 'user', source: 'q' });
+			expect(res.status).toBe('ok');
+			expect(args[0].learningMode === true).toBe(expected);
+			// It is the one chat setting that is not a CAPABILITY: on or off, it hands
+			// the engine no tool and no file reach, so wanting to be taught can never
+			// be a way of asking for either.
+			expect(args[0].webSearch).toBe(false);
+			expect(args[0].readRoot ?? null).toBeNull();
+		}
+		// ...and neither capability drags it along in the other direction: a person
+		// who opted into search or reads did not thereby ask to be taught.
+		settingsmod.setUserSettings({ [CHAT_LEARNING_MODE_KEY]: null, [CHAT_WEB_SEARCH_KEY]: true, [CHAT_WORKSPACE_READS_KEY]: true });
+		const { args } = capturingEngine();
+		await runmod.executeCellRun({ nb, cellId: 'chatcell', actor: 'user', source: 'q' });
+		expect(args[0].learningMode === true).toBe(false);
+		expect(args[0].webSearch).toBe(true);
 	});
 
 	it('hand-edited junk is gated BEFORE the seam: unknown model falls back, truthy-not-true search stays off', async () => {

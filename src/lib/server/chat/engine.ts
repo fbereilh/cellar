@@ -63,6 +63,17 @@ export interface ChatEngineRunArgs {
 	 * Cellar's own `.cellar/` state stay denied either way.
 	 */
 	otherNotebooks?: boolean;
+	/**
+	 * LEARNING MODE: should the reply TEACH rather than simply answer? Absent/false
+	 * is the unchanged voice; `true` appends a fixed teaching block to the frozen
+	 * system prompt.
+	 *
+	 * The one flag on this seam that is not a capability: it grants no tool, reaches
+	 * no path and sends nothing outward, so an engine that ignored it would produce
+	 * a worse reply and never an unsafe one. It sits here rather than in the run
+	 * glue because the system prompt is the engine's to build.
+	 */
+	learningMode?: boolean;
 	/** Aborted by interrupt / kernel restart / shutdown; the engine must kill its work. */
 	signal: AbortSignal;
 	/** Streamed reply text, in order, as it is produced. */
