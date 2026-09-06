@@ -455,9 +455,11 @@ function readConfig(): { configPath: string; exists: boolean; error?: string; se
  * **The name is UNIQUE, and that is a correctness rule rather than tidiness.** Every
  * surface renders this list through a keyed `{#each … (name)}` - the picker, and the
  * default-profile notice's one command row per candidate - and a duplicate key
- * throws Svelte's `each_key_duplicate` DURING RENDER. Nothing in `src/` mounts a
- * `<svelte:boundary>`, so that throw takes down the whole page, not one card. It is
- * reachable from an ordinary hand-edited file: configparser's `SECTCRE` does NOT
+ * throws Svelte's `each_key_duplicate` DURING RENDER. The app's only
+ * `<svelte:boundary>` wraps a notebook CELL row (see `cellRenderFailure.ts`) while
+ * both of these render in the sidebar, so that throw takes down the whole page, not
+ * one card. It is reachable from an ordinary hand-edited file: configparser's
+ * `SECTCRE` does NOT
  * trim, so `[work]` and `[work ]` are two legal, distinct sections to the SDK, while
  * this reader trims and both arrive as `work`. Deduped HERE, where the list is
  * built, so every consumer inherits it rather than each keyed block defending

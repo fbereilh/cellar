@@ -153,9 +153,11 @@ export class OutputAccumulator {
 	 * buffer and its element indices, so (a) the next flush would restore the whole
 	 * pre-clear text into the live doc and `run:end` would persist it, undoing the
 	 * clear, and (b) the next element would be emitted at index N against a client
-	 * array the clear emptied, leaving a HOLE at 0 — which throws while rendering
-	 * and, with no error boundary anywhere in `src/`, takes the whole notebook's
-	 * render tree down. Resetting the indices too is what keeps the two in step.
+	 * array the clear emptied, leaving a HOLE at 0 — which throws while rendering.
+	 * The per-cell render boundary (`cellRenderFailure.ts`) now bounds that to the one
+	 * cell's placeholder, and before it, it took the whole notebook's render tree
+	 * down; either way the hole is a defect, not something the boundary licenses.
+	 * Resetting the indices too is what keeps the two in step.
 	 *
 	 * `outputs` is emptied IN PLACE: callers hold the reference (run.ts persists
 	 * `finish()`'s return, and each emit mirrors `outputs.slice()` into the doc).

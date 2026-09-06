@@ -419,9 +419,10 @@ test('the toolbar`s Interrupt does the same thing as its palette twin', async ({
 
 test('a mid-run Clear all drops the streaming cell`s output for good and keeps what follows', async ({ page }) => {
 	test.setTimeout(240_000);
-	// A hole in a cell's outputs throws while rendering and, with no error boundary
-	// anywhere in the app, takes the whole notebook's render tree down — so page
-	// errors are an assertion here, not diagnostics.
+	// A hole in a cell's outputs throws while rendering. NOTE the per-cell render
+	// boundary now CATCHES a cell render throw and reports it on the console instead,
+	// so this listener no longer sees that shape; it still catches a throw raised
+	// outside a cell's render, so page errors are an assertion here, not diagnostics.
 	const pageErrors: string[] = [];
 	page.on('pageerror', (e) => pageErrors.push(String(e)));
 

@@ -57,8 +57,9 @@ function getUserSetting<T>(key: string, fallback: T): T {
  * `/api/user-settings` accepts any JSON value, so a hand-edited
  * `~/.cellar/settings.json` (or a PUT) can put a number where a prefix belongs - and
  * the consumers hand it straight to `expandDateTokens`, whose `text.replace` then
- * throws inside a render-time `$derived`. Nothing in this app mounts a
- * `<svelte:boundary>`, so that throw does not cost one field: it takes the whole
+ * throws inside a render-time `$derived`. The app's only `<svelte:boundary>` wraps a
+ * notebook CELL row (see `cellRenderFailure.ts`) while these consumers render in the
+ * sidebar and in Settings, so that throw does not cost one field: it takes the whole
  * render tree with it. Degrading to "no affix" is both the safe reading and the
  * honest one - a value that is not text was never an affix.
  */
