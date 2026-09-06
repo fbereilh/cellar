@@ -113,7 +113,9 @@ specs.
   instead. A PR body is markdown, so only the backticked `` `@patch` `` is safe
   there; a bare one mentions and notifies exactly as a title does. A commit
   message is not markdown - GitHub autolinks it as plain text - so backticks
-  don't protect the body either: spell it out there too.
+  don't protect the body either: spell it out there too. A deliberate
+  `Closes #123` in a PR body is fine - that number is a real reference, which is
+  the whole point of the link.
 - **Don't hand-edit auto-generated files.** `CHANGELOG.md` is generated from the
   git history by [git-cliff](https://git-cliff.org) (run `make changelog` to
   regenerate; see below) - never edit it by hand. Your Conventional-Commits
