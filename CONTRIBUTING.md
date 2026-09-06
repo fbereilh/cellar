@@ -104,6 +104,18 @@ specs.
   `chore(ci): …`, `perf(dataflow): …`. Browse `git log` for the house style.
 - **PRs are squash-merged**, so the PR title becomes the commit on `main` (with the
   `(#NNN)` PR number appended). Give the PR a Conventional-Commits-style title.
+- **No bare `@word` or `#number` in a commit subject or PR title.** GitHub's
+  auto-generated release notes copy the title in as plain text with the backticks
+  stripped, so `` `@patch` `` becomes a live mention that notifies an unrelated
+  GitHub user (this really happened in v0.9.0), and `#123` cross-links an
+  unrelated issue - GitHub's own appended `(#NNN)` is fine, since it links this
+  repo's own PR. Write "fastcore's patch decorator" or "the patch decorator"
+  instead. A PR body is markdown, so only the backticked `` `@patch` `` is safe
+  there; a bare one mentions and notifies exactly as a title does. A commit
+  message is not markdown - GitHub autolinks it as plain text - so backticks
+  don't protect the body either: spell it out there too. A deliberate
+  `Closes #123` in a PR body is fine - that number is a real reference, which is
+  the whole point of the link.
 - **Don't hand-edit auto-generated files.** `CHANGELOG.md` is generated from the
   git history by [git-cliff](https://git-cliff.org) (run `make changelog` to
   regenerate; see below) - never edit it by hand. Your Conventional-Commits
