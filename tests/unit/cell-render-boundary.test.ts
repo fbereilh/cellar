@@ -29,8 +29,9 @@
  *     the boundary fails instead of passing on a mention elsewhere.
  *
  * The BEHAVIOURAL proof - a genuinely malformed output rendering as a placeholder in
- * a real browser while its neighbours keep working, and the windowed scroll position
- * staying put as it fails and as it scrolls in and out of the window - is
+ * a real browser while its neighbours keep working, the windowed scroll position
+ * staying put as it fails and as it scrolls in and out of the window, and a failed
+ * cell recovering IN PLACE once its cause is resolved - is
  * `tests/e2e/cell-render-boundary.spec.ts`.
  */
 import { describe, it, expect } from 'vitest';
@@ -204,7 +205,23 @@ describe('Notebook.svelte wiring', () => {
 
 	it('gives the boundary a `failed` snippet that renders the placeholder', () => {
 		expect(boundary).toMatch(/\{#snippet failed\(/);
-		expect(boundary).toContain('cellRenderFailure(cell, error)');
+		expect(boundary).toContain('cellRenderFailure(cell, error, reset)');
+	});
+
+	it('threads the boundary RESET into the placeholder, so a failed row can recover', () => {
+		// A boundary stays failed until `reset` is called, and both render branches key
+		// the row by `cell.id`, so nothing short of a windowed teardown recreates it -
+		// which never happens for a notebook that fits the viewport, nor under the
+		// "Render all cells" opt-out. Dropping the second snippet argument therefore
+		// makes the placeholder's own "clearing its output usually resolves it" copy a
+		// dead end until a page reload. Asserted here as well as in the browser because
+		// e2e runs in neither CI nor the no-mistakes gate.
+		expect(boundary).toMatch(/\{#snippet failed\(\s*error\s*,\s*reset\s*\)/);
+		const at = NOTEBOOK.indexOf('data-testid="cell-render-retry"');
+		expect(at, 'no Try again control on the placeholder').toBeGreaterThan(-1);
+		const button = NOTEBOOK.slice(NOTEBOOK.lastIndexOf('<button', at), at);
+		expect(button).toContain('onclick={retry}');
+		expect(NOTEBOOK).toMatch(/\{#snippet cellRenderFailure\([^)]*retry: \(\) => void\)/);
 	});
 
 	it('REPORTS the error rather than swallowing it', () => {

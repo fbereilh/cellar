@@ -39,6 +39,14 @@ import { paneMetric, setScrollTop } from './notebook-scroll';
  * cells BELOW the failure must not move as it fails, nor as it scrolls out of the
  * window into a spacer and back.
  *
+ * THE PLACEHOLDER IS NOT A DEAD END. A Svelte boundary stays failed until its `reset`
+ * is called, and both render branches key the row by cell id, so nothing recreates it
+ * on its own: windowing tears the row down when the cell leaves the window, but a
+ * notebook that fits the viewport emits no spacers at all and the "Render all cells"
+ * opt-out never windows. `a failed cell recovers IN PLACE…` is that case - it fixes
+ * the cause the way the placeholder's own copy tells the user to and then takes the
+ * one way back the boundary offers.
+ *
  * Needs the real runtime (uv + python3 + host-venv) like the rest of the E2E suite;
  * skips gracefully without it. The pure rules + source guards on the wiring are in
  * `tests/unit/cell-render-boundary.test.ts`.
@@ -64,6 +72,18 @@ const BIG_BAD_INDEX = 30;
  * closes it. A separate notebook because `BIG`'s own test needs that cell expanded.
  */
 const COLLAPSED = 'collapsed-broken.ipynb';
+/**
+ * A third copy of the small fixture, for the recovery case ALONE.
+ *
+ * Every test here shares one workspace and one live server document, and recovering
+ * means resolving the CAUSE - clearing the malformed output, which persists. Run
+ * against the shared `FIXTURE` it would leave the later tests a notebook with nothing
+ * left to fail. Its cell ids are remapped too, so an unscoped `[data-cell-id=…]`
+ * locator in another test cannot match two panes at once.
+ */
+const RECOVER = 'recover-broken.ipynb';
+const RECOVER_ID_PREFIX = 'rcvrbk00';
+const RECOVER_BAD_ID = BAD_ID.replace('brkout00', RECOVER_ID_PREFIX);
 
 let launcher: ChildProcess | null = null;
 let workspace = '';
@@ -133,6 +153,10 @@ test.beforeAll(async () => {
 	test.skip(!runtimeAvailable(), 'kernel runtime (uv + python3 + host-venv) not available - E2E is local-only');
 	workspace = mkdtempSync(join(tmpdir(), 'cellar-render-boundary-e2e-'));
 	copyFileSync(join(REPO, 'tests', 'e2e', 'fixtures', FIXTURE), join(workspace, FIXTURE));
+	writeFileSync(
+		join(workspace, RECOVER),
+		readFileSync(join(workspace, FIXTURE), 'utf8').replaceAll('brkout00', RECOVER_ID_PREFIX)
+	);
 
 	// The windowing case needs a notebook tall enough to window, so reuse the
 	// virtualization harness's generator and transplant the fixture's malformed
@@ -202,6 +226,45 @@ test('render all cells (?virtualize=0): the failure costs one cell, not the note
 	expect(errors.page, `unexpected page errors:\n${errors.page.join('\n')}`).toEqual([]);
 	expect(errors.console.filter((e) => !e.includes('failed to render'))).toEqual([]);
 	expect(errors.console.filter((e) => e.includes(`cell ${BAD_ID} failed to render`))).not.toEqual([]);
+});
+
+test('a failed cell recovers IN PLACE, with no windowed teardown to do it for us', async ({ page }) => {
+	test.setTimeout(120_000);
+	const errors = watchErrors(page);
+	await page.goto(`${baseURL}/?ws=${encodeURIComponent(workspace)}`);
+	await openFixture(page, RECOVER);
+	await expect(placeholder(page)).toBeVisible();
+
+	// The case the recovery has to cover: three cells fit the viewport, so `planWindow`
+	// emits NO spacers and this row is never torn down and rebuilt. Both render
+	// branches key the row by cell id, so without the boundary's own `reset` the
+	// placeholder would sit here until a page reload however the cause was resolved -
+	// while its copy tells the user that clearing the output resolves it.
+	await expect(page.locator('[data-testid="cell-spacer"]:visible')).toHaveCount(0);
+
+	// Resolve the CAUSE the way the placeholder tells the user to. The malformed
+	// payload leaves the model...
+	await page.locator('[data-testid="clear-all-outputs"]:visible').click();
+	await expect(page.locator('[data-testid="clear-all-outputs"]:visible')).toBeDisabled();
+	// ...and, on its own, that changes nothing on screen: a boundary stays failed until
+	// it is reset. This is the dead end the control exists to open.
+	await expect(placeholder(page)).toBeVisible();
+	expect(await cells(page)).toBe(HEALTHY_CELLS);
+
+	// One deliberate gesture, and the row comes back as a real cell in its own place.
+	await page.locator('[data-testid="cell-render-retry"]:visible').click();
+	await expect(placeholder(page)).toHaveCount(0);
+	await expect.poll(() => cells(page), { timeout: 10_000 }).toBe(HEALTHY_CELLS + 1);
+	const recovered = page.locator(`[data-testid="cell"][data-cell-id="${RECOVER_BAD_ID}"]:visible`);
+	await expect(recovered).toBeVisible();
+	// Recovered means USABLE, not merely painted: the row carries its cell toolbar
+	// again, so it can be run, cleared and typed in like any other.
+	await expect(recovered.getByTestId('run')).toBeVisible();
+
+	// Nothing was thrown, and the only errors are the boundary's own reports of the
+	// original failure - the retry did not fail a second time.
+	expect(errors.page, `unexpected page errors:\n${errors.page.join('\n')}`).toEqual([]);
+	expect(errors.console.filter((e) => !e.includes('failed to render'))).toEqual([]);
 });
 
 test('windowed (default): the notebook stays usable around the failed cell', async ({ page }) => {

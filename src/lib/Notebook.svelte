@@ -871,8 +871,22 @@
      claiming otherwise would make every "the cells are there" assertion in the suite
      pass over a notebook full of placeholders.
      Contrast doctrine: the ERROR hue is on the icon, the copy stays `base-content`
-     (`text-error` body text measures ~2:1 on the light card). -->
-{#snippet cellRenderFailure(cell: UICell, error: unknown)}
+     (`text-error` body text measures ~2:1 on the light card).
+
+     A boundary stays FAILED until its `reset` is called, and both render branches key
+     the row by `cell.id`, so nothing short of the row being torn down brings the cell
+     back: a `load()` refetch, a `cell:cleared` or a fresh `cells` array all reuse this
+     block. Windowing tears it down when the cell leaves the window, but `planWindow`
+     emits no spacers at all when every cell fits the viewport, and the "Render all
+     cells" opt-out never windows - so for a small notebook the placeholder was
+     permanent until a page reload, while its own copy told the user that clearing the
+     output or re-running would resolve it. `Try again` IS that way back: `reset`
+     recreates the row's contents on a deliberate user gesture, which cannot loop.
+     There is NO automatic reset. It would have to be driven by a real per-cell change
+     signal rather than a reactive tick, or a persistently-broken payload becomes a
+     throw/reset/throw churn on the main thread; the explicit control needs no such
+     proof, so the copy names it instead. -->
+{#snippet cellRenderFailure(cell: UICell, error: unknown, retry: () => void)}
 	{@const detail = failureDetail(error)}
 	<div
 		class="flex flex-col gap-1 rounded-lg border border-error/40 bg-(--cellar-surface-cell) p-3"
@@ -891,11 +905,23 @@
 		</div>
 		<p class="text-sm text-base-content/70">
 			The cell itself is unchanged and the rest of the notebook is unaffected. Clearing its
-			output or re-running it usually resolves it.
+			output or re-running it usually resolves the cause; Try again then renders it here.
 		</p>
 		{#if detail}
 			<code class="font-mono text-xs break-all text-base-content/70" data-testid="cell-render-error-detail">{detail}</code>
 		{/if}
+		<div class="mt-1 flex items-center">
+			<button
+				class="btn btn-ghost btn-xs gap-1.5"
+				onclick={retry}
+				title="Render this cell again"
+				aria-label="Try rendering this cell again"
+				data-testid="cell-render-retry"
+			>
+				<svg class="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 12a9 9 0 0 1 15.5-6.2L21 8" /><path d="M21 3v5h-5" /><path d="M21 12a9 9 0 0 1-15.5 6.2L3 16" /><path d="M3 21v-5h5" /></svg>
+				Try again
+			</button>
+		</div>
 	</div>
 {/snippet}
 
@@ -1005,8 +1031,8 @@
 				onDragStart={onDragStart}
 				onDragEnd={endDrag}
 			/>
-			{#snippet failed(error)}
-				{@render cellRenderFailure(cell, error)}
+			{#snippet failed(error, reset)}
+				{@render cellRenderFailure(cell, error, reset)}
 			{/snippet}
 		</svelte:boundary>
 	</div>
