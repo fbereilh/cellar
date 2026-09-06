@@ -419,12 +419,26 @@ test('the toolbar`s Interrupt does the same thing as its palette twin', async ({
 
 test('a mid-run Clear all drops the streaming cell`s output for good and keeps what follows', async ({ page }) => {
 	test.setTimeout(240_000);
-	// A hole in a cell's outputs throws while rendering. NOTE the per-cell render
-	// boundary now CATCHES a cell render throw and reports it on the console instead,
-	// so this listener no longer sees that shape; it still catches a throw raised
-	// outside a cell's render, so page errors are an assertion here, not diagnostics.
+	// A hole in a cell's outputs throws while rendering, so "did anything throw" is an
+	// ASSERTION here, not diagnostics. It takes TWO collectors, because the per-cell
+	// render boundary splits that one question in half: a throw that ESCAPES a
+	// boundary still surfaces as a `pageerror`, while a throw the boundary CAUGHT
+	// surfaces only as its own `console.error` report. Watching pageerror alone would
+	// pass for the weaker reason.
+	//
+	// The console half is FILTERED to the boundary's own prefix on purpose: this test
+	// interrupts a kernel and clears outputs mid-run, so unrelated console noise
+	// (aborted fetches, websocket reconnects) is legitimate here and a blanket
+	// zero-console-errors assertion would trade a real guard for a flaky one. The
+	// placeholder check below is the same claim in non-textual form, so it survives a
+	// reword of the log line.
 	const pageErrors: string[] = [];
+	const boundaryReports: string[] = [];
 	page.on('pageerror', (e) => pageErrors.push(String(e)));
+	page.on('console', (msg) => {
+		if (msg.type() === 'error' && /\[cellar\] cell .* failed to render/.test(msg.text()))
+			boundaryReports.push(msg.text());
+	});
 
 	await openNotebook(page, NB.clearMidRun);
 	// Every code cell starts with an output on disk — the streaming one included.
@@ -476,9 +490,13 @@ test('a mid-run Clear all drops the streaming cell`s output for good and keeps w
 	expect(persisted).not.toContain('saved run');
 
 	// That second element is the shape that used to land past the end of the emptied
-	// array and leave a hole: the notebook must still be rendering.
+	// array and leave a hole: the notebook must still be rendering. Nothing escaped a
+	// boundary (`pageErrors`), and no cell was absorbed BY one either, asserted both
+	// ways: the boundary's own report, and the placeholder it would have rendered.
 	await expect(streaming).toContainText('post-clear result');
 	expect(await page.getByTestId('cell').count()).toBeGreaterThan(0);
+	expect(await page.getByTestId('cell-render-error').count()).toBe(0);
+	expect(boundaryReports).toEqual([]);
 	expect(pageErrors).toEqual([]);
 
 	// The cells that were not running stay cleared.
