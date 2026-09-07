@@ -2480,17 +2480,16 @@
 		const cellar = { ...(cell.metadata?.cellar ?? {}) };
 		if (lang) cellar.language = lang;
 		else delete cellar.language;
-		// The same drops the server's `applyCellType` makes - neither the imports role
-		// nor the export flag may sit on a cell holding no Python - mirrored here for
-		// the `clampMoveIndex` reason: `cell:type` carries no metadata, so a client
-		// half that skipped them would keep drawing the imports/export badge over a
-		// cell the server has already stripped, with no event able to correct it
-		// before reload. `hide_input` is KEPT, exactly as the server keeps it.
+		// The same drop the server's `applyCellType` makes - the imports role may not
+		// sit on a cell holding no Python - mirrored here for the `clampMoveIndex`
+		// reason: `cell:type` carries no metadata, so a client half that skipped it
+		// would keep drawing the imports badge over a cell the server has already
+		// stripped, with no event able to correct it before reload. The EXPORT flag is
+		// KEPT, exactly as the server keeps it: a mark the current target cannot honour
+		// STRANDS and stays visible and clearable rather than being silently deleted
+		// from the user's committed notebook. `hide_input` is KEPT for its own reason.
 		const runnable = cell.cell_type === 'code' && !lang;
-		if (!runnable) {
-			if (cellar.role === IMPORTS_ROLE) delete cellar.role;
-			if (cellar.export) delete cellar.export;
-		}
+		if (!runnable && cellar.role === IMPORTS_ROLE) delete cellar.role;
 		cell.metadata = { ...(cell.metadata ?? {}), cellar };
 		if (cell.cell_type !== 'code') cell.outputs = [];
 	}

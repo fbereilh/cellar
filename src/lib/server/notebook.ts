@@ -1955,11 +1955,25 @@ function applyCellType(cell: Cell, cellType: LogicalCellType): void {
 	// Only a code cell holds outputs - markdown and raw carry none, and
 	// `serialize` would drop them anyway.
 	if (cell.cell_type !== 'code') cell.outputs = [];
-	// Neither the imports role nor the nbdev export flag may sit on a cell holding
-	// no Python: the kernel never sees a markdown or raw cell, and a SQL, Mojo or
-	// chat cell's source is not Python.
+	// The imports role may not sit on a cell holding no Python: the kernel never sees
+	// a markdown or raw cell, and a SQL, Mojo or chat cell's source is not Python, so
+	// every import routed into it would be stranded with nothing to run them.
 	if (!runnable && cell.metadata.cellar.role === IMPORTS_ROLE) delete cell.metadata.cellar.role;
-	if (!runnable && cell.metadata.cellar.export) delete cell.metadata.cellar.export;
+	// The EXPORT flag is deliberately NOT dropped, and `runnable` is the wrong
+	// question for it in any case: a Mojo cell is the ONLY eligible kind under a
+	// `.mojo` target, so clearing on conversion destroyed the mark on this feature's
+	// own happy path - paste a Modular example into a `code` cell (its `%%mojo`
+	// header makes it eligible), mark it, then convert it to the `mojo` type, which
+	// the agent doctrine tells agents to do.
+	//
+	// It is not dropped for an INELIGIBLE cell either. That is the same rule a target
+	// change already follows: a mark the current target cannot honour STRANDS
+	// (`exportMarkStranded`) and is shown by the greyed row toggle plus the export
+	// bar's one explanation, so the user clears it if they want to. Silently editing
+	// the user's committed `.ipynb` because they converted a cell is the loss that
+	// stance exists to prevent, and they cannot tell it apart from a target change -
+	// both are them editing their notebook and finding a mark quietly gone. Nothing
+	// reaches the module either way: `isExportCell` gates on eligibility.
 	// `hide_input` is deliberately KEPT: `$lib/hideInput` reads it only for a code
 	// cell, so it is already inert on a markdown or raw one, and dropping it would
 	// silently lose a report-view choice across a there-and-back conversion.

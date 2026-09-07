@@ -670,8 +670,15 @@
 	// is the model: accurate, and only where it applies).
 	const importWarning = $derived(exportImportWarning(exportResolved, root));
 	// The button names the file it writes, so it has to track the target's language:
-	// "Export to .py" over a `.mojo` target names a file that will never exist.
-	const exportExtension = $derived(exportLanguage === 'mojo' ? '.mojo' : '.py');
+	// "Export to .py" over a `.mojo` target names a file that will never exist - and
+	// with NO target configured it names none at all, since a bare "Export to .py"
+	// there told the user something its own click handler then contradicted ("Set a
+	// target module path first"). The nullable language is what tells the two apart,
+	// the same null branch `Cell.svelte`'s `exportModuleLabel`, the stranded
+	// explanation and the MCP refusal already carry.
+	const exportButtonLabel = $derived(
+		exportLanguage === null ? 'Export' : `Export to ${exportLanguage === 'mojo' ? '.mojo' : '.py'}`
+	);
 	// The notebook-wide stranded-mark explanation, stated ONCE (`$lib/exportRole`
 	// owns the wording, so the bar and each cell's short marker cannot drift). It
 	// takes the NULLABLE language, because "targets a .py module" and "targets
@@ -1293,7 +1300,7 @@
 					disabled={exporting}
 					data-testid="export-run"
 				>
-					{exporting ? 'Exporting…' : `Export to ${exportExtension}`}
+					{exporting ? 'Exporting…' : exportButtonLabel}
 				</button>
 				{#if exportResolveError}
 					<!-- A CONFIGURED target that resolves to no writable file: the module is

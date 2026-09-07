@@ -33,6 +33,7 @@ import { join } from 'node:path';
 import {
 	canExportCell,
 	exportLanguageOf,
+	exportCellCount,
 	exportMarkStranded,
 	exportStrandedCount,
 	exportStrandedExplanation,
@@ -682,6 +683,103 @@ describe('a mark stranded by a target-language change stays clearable', () => {
 	});
 });
 
+describe('converting a cell never deletes its export mark', () => {
+	/** A notebook with one code cell, a target, and that cell marked. */
+	async function marked(rel: string, source: string, target: string) {
+		const nb = nbmod.resolveNotebookPath(rel);
+		svc.useNotebook(`sess-${rel}`, rel);
+		const { ids } = await svc.addCells([{ cell_type: 'code' as const, source }], null, {
+			nb,
+			routeImports: false
+		});
+		const id = svc.resolveRef(nb, ids[0]);
+		nbmod.setExportTarget(target, nb);
+		nbmod.setCellExports([id], true, nb);
+		return { nb, id };
+	}
+	const cellOf = (nb: string, id: string) => nbmod.listCells(nb).find((c) => c.id === id)!;
+
+	it('THE HAPPY PATH: a %%mojo code cell marked for a .mojo target survives the conversion', async () => {
+		// A pasted Modular example is a plain `code` cell whose source opens with
+		// `%%mojo`, which is exactly what `exportLanguageOf` was widened to recognise -
+		// so under a `.mojo` target it is eligible and marking succeeds. The agent
+		// doctrine then tells the user to convert it to the `mojo` TYPE, and that
+		// conversion used to delete the flag, dropping the cell out of the module with
+		// no notice and no stranded marker, because the key itself was gone.
+		const { nb, id } = await marked('mojo-convert.ipynb', '%%mojo\ndef helper() -> Int:\n    return 1', 'lib/mc.mojo');
+		expect(isExportCell(cellOf(nb, id), 'mojo')).toBe(true);
+
+		nbmod.setCellType(id, 'mojo', nb);
+		const converted = cellOf(nb, id);
+		expect(converted.metadata?.cellar?.export).toBe(true);
+		// Still eligible, so it is still IN the module - not merely still flagged.
+		expect(isExportCell(converted, 'mojo')).toBe(true);
+		expect(exportMarkStranded(converted, 'mojo')).toBe(false);
+		expect(readFileSync(join(WS, 'lib/mc.mojo'), 'utf8')).toContain('def helper()');
+	});
+
+	it('a mojo -> code -> mojo round trip keeps the mark and the module', async () => {
+		const { nb, id } = await marked('mojo-round.ipynb', '%%mojo\ndef ring() -> Int:\n    return 2', 'lib/mr.mojo');
+		nbmod.setCellType(id, 'mojo', nb);
+		nbmod.setCellType(id, 'code', nb);
+		nbmod.setCellType(id, 'mojo', nb);
+		expect(cellOf(nb, id).metadata?.cellar?.export).toBe(true);
+		expect(readFileSync(join(WS, 'lib/mr.mojo'), 'utf8')).toContain('def ring()');
+	});
+
+	it('a mark that survives onto a MARKDOWN cell is inert, stranded and clearable', async () => {
+		// The consequence of keeping the flag: it can now sit on a cell type that had
+		// no export affordance at all. Verified rather than assumed - nothing may reach
+		// the module, the notebook-wide explanation must not claim a language the cell
+		// does not have, and unmarking must still work.
+		const { nb, id } = await marked('md-convert.ipynb', 'def one():\n    return 1', 'lib/md.py');
+		nbmod.setCellType(id, 'markdown', nb);
+		const asMd = cellOf(nb, id);
+		expect(asMd.metadata?.cellar?.export).toBe(true);
+
+		// Nothing reaches the module: eligibility, not the flag, decides that.
+		expect(isExportCell(asMd, 'python')).toBe(false);
+		expect(exportMarkStranded(asMd, 'python')).toBe(true);
+		expect(exportCellCount(nbmod.listCells(nb), 'python')).toBe(0);
+		expect(nbmod.exportPy(nb)).toMatchObject({ written: false, reason: 'no-cells' });
+
+		// The one explanation reads correctly for it: it says the module leaves the
+		// cell out, and never that the cell "is not Python".
+		const why = exportStrandedExplanation(exportStrandedCount(nbmod.listCells(nb), 'python'), 'python');
+		expect(why).toContain('cannot go in a .py module');
+		expect(why).not.toMatch(/is not (Python|Mojo)/);
+
+		// ...and the greyed toggle's click still clears it, because unmarking is not
+		// gated on eligibility.
+		expect(nbmod.setCellExport(id, false, nb)).toEqual({ ok: true });
+		expect('export' in (cellOf(nb, id).metadata?.cellar ?? {})).toBe(false);
+	});
+
+	it('a RAW cell behaves the same way, and re-MARKING one is still refused', async () => {
+		const { nb, id } = await marked('raw-convert-export.ipynb', 'def two():\n    return 2', 'lib/rc.py');
+		nbmod.setCellType(id, 'raw', nb);
+		expect(cellOf(nb, id).metadata?.cellar?.export).toBe(true);
+		expect(isExportCell(cellOf(nb, id), 'python')).toBe(false);
+		// Keeping a stale mark is not the same as letting one be CREATED: the setter
+		// still gates marking on eligibility, so no new mark can land here.
+		expect(nbmod.setCellExport(id, false, nb)).toEqual({ ok: true });
+		expect(nbmod.setCellExport(id, true, nb)).toEqual({ ok: false, reason: 'not-code' });
+	});
+
+	it('the imports role is still dropped, and outputs still cleared', async () => {
+		// Scoped tightly: only the EXPORT flag changed. An imports cell must hold
+		// Python, and a non-code cell carries no outputs.
+		const { nb, id } = await marked('scope-convert.ipynb', 'import os', 'lib/sc.py');
+		nbmod.setCellRole(id, 'imports', nb);
+		nbmod.setOutputs(id, [{ output_type: 'stream', name: 'stdout', text: ['x\n'] }], nb);
+		nbmod.setCellType(id, 'markdown', nb);
+		const asMd = cellOf(nb, id);
+		expect(asMd.metadata?.cellar?.role).toBeUndefined();
+		expect(asMd.outputs).toEqual([]);
+		expect(asMd.metadata?.cellar?.export).toBe(true);
+	});
+});
+
 describe('setExportTarget accepts .mojo and still refuses anything else', () => {
 	it('stores a .mojo target and refuses a .ts one', async () => {
 		const nb = nbmod.resolveNotebookPath('target.ipynb');
@@ -727,6 +825,30 @@ describe('the wiring the browser ships', () => {
 		// A cell that contributes no module source at all matches NEITHER target.
 		expect(canExportCell(md, 'python')).toBe(false);
 		expect(canExportCell(md, 'mojo')).toBe(false);
+	});
+
+	it('the client half KEEPS the export mark on a type change, like the server', () => {
+		// The two halves must stay in lockstep (`cell:type` carries no metadata, so a
+		// client that dropped the flag would draw a cell as unmarked until a reload,
+		// with no event able to correct it). Only source can say this: vitest runs
+		// without the SvelteKit plugin, so the component cannot be mounted. The SERVER
+		// half's behaviour is asserted against the real document above.
+		const live = read('LiveNotebook.svelte');
+		const fn = live.slice(live.indexOf('function applyCellTypeLocally('));
+		const body = fn.slice(0, fn.indexOf('\n\t}\n'));
+		expect(body).toContain('if (!runnable && cellar.role === IMPORTS_ROLE) delete cellar.role;');
+		expect(body).not.toContain('delete cellar.export');
+	});
+
+	it('the export button names no extension when there is no target', () => {
+		// A button reading "Export to .py" while its own click handler answers "Set a
+		// target module path first" tells the user something untrue. The null branch is
+		// the same one `exportModuleLabel`, `exportStrandedExplanation` and the MCP
+		// refusal already carry.
+		const bar = read('Notebook.svelte');
+		expect(bar).toContain("exportLanguage === null ? 'Export' :");
+		expect(bar).toContain('{exporting ? \'Exporting…\' : exportButtonLabel}');
+		expect(bar).not.toContain('`Export to ${exportExtension}`');
 	});
 
 	it('the cell badge reads the SHARED wording, not a local sentence', () => {

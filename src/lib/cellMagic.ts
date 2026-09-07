@@ -28,12 +28,29 @@ export const MOJO_MAGIC_HEADER = `%%${MOJO_MAGIC}`;
  * The name of a leading `%%name` cell magic, or null when the cell is not a cell
  * magic. IPython requires a cell magic to be the cell's first line; leading blank
  * lines are tolerated. The name decides how the body is (or is not) analyzed.
+ *
+ * It WALKS the leading lines rather than splitting the whole source into an array
+ * to read one of them (`detectPyNotebook` in `server/jupytext.ts` does the same,
+ * for the same reason). Since export eligibility started asking this through
+ * `hasMojoHeader`, it runs once per CODE CELL on paths this repo documents as hot:
+ * `docHazards`' filter on every `getNotebook` and every `persist`, `getNotebookMap`
+ * per cell, and the browser's `exportCount` / `exportStrandedCount` /
+ * `mojoMainDroppedIds` derivations over the whole cell list. Splitting allocated an
+ * array of every line of a multi-thousand-line cell to look at its first.
  */
 export function cellMagicName(source: string | null | undefined): string | null {
-	for (const raw of (source ?? '').split('\n')) {
-		if (raw.trim() === '') continue; // skip leading blank lines
-		const m = /^%%(\w+)/.exec(raw.trimStart());
-		return m ? m[1] : null; // the first non-blank line settles it
+	const src = source ?? '';
+	let i = 0;
+	while (i < src.length) {
+		const nl = src.indexOf('\n', i);
+		const stop = nl === -1 ? src.length : nl;
+		const raw = src.slice(i, stop);
+		if (raw.trim() !== '') {
+			const m = /^%%(\w+)/.exec(raw.trimStart());
+			return m ? m[1] : null; // the first non-blank line settles it
+		}
+		if (nl === -1) break; // a trailing blank line ends the walk
+		i = nl + 1;
 	}
 	return null;
 }
