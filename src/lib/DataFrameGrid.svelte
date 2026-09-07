@@ -40,11 +40,14 @@
 	// column with repeated values, `groupby().apply()`, `concat`, `explode`, `melt`
 	// and a flattened MultiIndex (whose parts dataframeHtml.ts joins with ' / ') all
 	// produce duplicate labels routinely. Keying by a duplicated label throws Svelte's
-	// `each_key_duplicate` DURING RENDER - and since nothing wraps a cell in an error
-	// boundary, that uncaught error takes down the whole notebook's render tree, not
-	// just this grid: with windowing on the render loop dies the moment the offending
-	// cell scrolls into the window (everything below it then stays blank forever),
-	// and with "Render all cells" on it throws at load and NOTHING renders at all.
+	// `each_key_duplicate` DURING RENDER, and at the time nothing wrapped a cell in an
+	// error boundary, so that uncaught error took down the whole notebook's render
+	// tree, not just this grid: with windowing on the render loop died the moment the
+	// offending cell scrolled into the window (everything below it then stayed blank
+	// forever), and with "Render all cells" on it threw at load and NOTHING rendered.
+	// `Notebook.svelte` now walls each row off in a `<svelte:boundary>`, so a throw
+	// here costs one cell - but that BOUNDS the class, it does not license one: a
+	// grid that renders as an error placeholder is still a broken grid.
 	// Positions are unique by construction and stable under this grid's own
 	// filter/sort, which reorder the rows but never change a row's identity.
 	type DfRow = { key: number; idx: DfValue; cells: DfValue[] };

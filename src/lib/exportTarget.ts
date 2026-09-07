@@ -84,7 +84,8 @@ export const EXPORT_BASE_LABELS: Record<ExportBase, string> = {
  * declaration that owner REFUSES outright (a `~` path, which Cellar never
  * expands) is not a usable in-workspace root either, so it warns like any other
  * root that cannot contain the module - a throw here would take down the whole
- * notebook render tree, which mounts no error boundary.
+ * notebook render tree, this being a `$derived` in the export BAR, outside the
+ * per-cell render boundary that wraps only the cell rows below it.
  */
 export function exportImportWarning(resolved: string | null, root: string | null): string | null {
 	if (!resolved || !root) return null;

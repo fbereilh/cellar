@@ -535,8 +535,9 @@ describe('exportImportWarning (the importability rule)', () => {
 	it('never throws on a declaration the shape owner REFUSES, and warns instead', () => {
 		const { exportImportWarning } = exportTargetLib;
 		// A hand-edited `~` root reaches the browser verbatim (`readRoot` returns an
-		// unnormalizable value as-is) and this runs inside a render-time $derived, which
-		// mounts no error boundary - so a throw here would blank the whole notebook.
+		// unnormalizable value as-is) and this runs inside a render-time $derived in the
+		// export BAR - outside the per-cell render boundary, which wraps only the cell
+		// rows below it - so a throw here would blank the whole notebook.
 		expect(() => exportImportWarning('lib/x.py', '~/elsewhere')).not.toThrow();
 		expect(exportImportWarning('lib/x.py', '~/elsewhere')).toMatch(/cannot import/);
 	});

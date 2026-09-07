@@ -846,6 +846,14 @@ spec files at a time. Install its browser once with `npx playwright install chro
   with `?virtualize=0` on the app URL (`=1` forces it back on). The URL parameter
   always wins, and both controls are then shown locked (Settings naming the
   parameter) so neither can pretend otherwise.
+- **One cell reads "Cellar could not render this cell"** - something in that cell's
+  output could not be drawn, so Cellar replaces just that cell with a placeholder
+  instead of letting the failure blank the whole notebook. Every other cell keeps
+  working, and the cell itself is untouched on disk. The placeholder names the cause
+  in one line and carries a **Try again** button that re-renders the cell in place;
+  clearing that cell's output or re-running it usually removes the cause first. The
+  full error is written to the browser's developer console - please include it if you
+  report the cell.
 - **A cell shows only a single header row** - it is collapsed: the chevron at the left
   of a cell's toolbar hides that cell's input *and* its output, leaving the header
   (cell id, type, run controls, run/stale badges) plus a one-line source preview. Click

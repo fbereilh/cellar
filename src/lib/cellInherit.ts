@@ -70,7 +70,9 @@ export function isInheritableCodeType(cellType: unknown): cellType is LogicalCel
  * `index - 1`; an index at or past the end appends and therefore looks at the last
  * cell. Out-of-range and empty inputs are the fallback, never a throw - this runs
  * inside click handlers and a `$derived`, where a throw takes the render tree with
- * it (nothing in `src/` mounts an error boundary).
+ * it: the app's only `<svelte:boundary>` wraps a notebook CELL row (see
+ * `cellRenderFailure.ts`), and it catches render-time throws only, never one from an
+ * event handler.
  */
 export function inheritedCodeType(
 	cells: readonly InheritCell[] | null | undefined,

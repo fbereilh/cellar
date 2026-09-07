@@ -171,8 +171,9 @@ describe('the cross-project user-setting store', () => {
  * The file is untyped JSON and `/api/user-settings` accepts any JSON value, so a
  * hand-edit (or a PUT) can put a number where a prefix belongs. Both readers hand
  * that straight to `expandDateTokens`, whose `text.replace` throws inside a
- * render-time `$derived` - and nothing in this app mounts a `<svelte:boundary>`, so
- * the throw would take the whole render tree rather than one field.
+ * render-time `$derived` - and the app's only `<svelte:boundary>` wraps a notebook
+ * CELL row (`$lib/cellRenderFailure`) while these surfaces render in the sidebar and
+ * in Settings, so the throw would take the whole render tree rather than one field.
  */
 describe('reading a default that is not text', () => {
 	it('degrades a non-string default to NO affix instead of throwing', () => {

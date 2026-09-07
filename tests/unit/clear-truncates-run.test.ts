@@ -15,9 +15,10 @@ import { join } from 'node:path';
  * What that one call buys, and why it is worth a test of its own: without it a
  * mid-run clear is undone at `run:end` (the accumulator re-persists the whole
  * transcript), and the next full frame lands past the end of the client's emptied
- * array, leaving a hole that throws while rendering — which, with no
- * `<svelte:boundary>` anywhere in `src/`, takes the whole notebook's render tree
- * down rather than one cell.
+ * array, leaving a hole that throws while rendering. The per-cell render boundary
+ * bounds that to one cell's placeholder now
+ * (`tests/unit/cell-render-boundary.test.ts`); before it, it took the whole
+ * notebook's render tree down.
  */
 
 let WS: string;

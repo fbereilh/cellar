@@ -433,9 +433,10 @@ describe('readDefaultProfile over a real ~/.databrickscfg', () => {
 		// configparser's SECTCRE does not trim, so `[work]` and `[work ]` are two legal,
 		// distinct sections to the SDK; this reader trims, so both arrive as `work`. Every
 		// surface renders the list through a keyed `{#each … (name)}`, and a duplicate key
-		// throws Svelte's `each_key_duplicate` during render - which, with no
-		// `<svelte:boundary>` anywhere in `src/`, takes down the whole page rather than one
-		// card. Deduped where the list is BUILT, so both the picker and the notice inherit it.
+		// throws Svelte's `each_key_duplicate` during render - which, these surfaces being
+		// in the sidebar rather than inside the per-cell render boundary, takes down the
+		// whole page rather than one card. Deduped where the list is BUILT, so both the
+		// picker and the notice inherit it.
 		const { cfg, verdict } = verdictFor(
 			'[work]\nhost = https://a.cloud.databricks.com\ntoken = pat\n[work ]\nhost = https://b.cloud.databricks.com\ntoken = pat\n'
 		);

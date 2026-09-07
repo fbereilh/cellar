@@ -12,9 +12,12 @@ import { runtimeAvailable, bootCellar, killCellar, REPO } from './harness';
  * The grid keys its row `{#each}` by the row's POSITION (`DataFrameGrid.svelte`).
  * Keying it by the pandas index LABEL - which pandas never guarantees to be unique
  * (`set_index` on a repeated column, groupby/concat/explode, a flattened MultiIndex)
- * - throws Svelte's `each_key_duplicate` DURING RENDER, and because nothing wraps a
- * cell in an error boundary that uncaught error kills the whole notebook's render
- * tree rather than just this grid. The observed damage, from the reported bug:
+ * - throws Svelte's `each_key_duplicate` DURING RENDER, and at the time nothing
+ * wrapped a cell in an error boundary, so that uncaught error killed the whole
+ * notebook's render tree rather than just this grid. (`Notebook.svelte` now walls
+ * each row off - `tests/e2e/cell-render-boundary.spec.ts` - which bounds the damage
+ * to one cell; the assertions below still demand a grid that renders, not one that
+ * degrades to a placeholder.) The observed damage, from the reported bug:
  *
  *   - windowing ON  : the render loop dies the moment the offending cell scrolls
  *                     into the window, so everything below it stays permanently
