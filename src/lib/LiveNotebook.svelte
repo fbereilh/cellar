@@ -4401,11 +4401,11 @@
 		'paste-above': () => pasteCells('above'),
 		'split-cell': () => splitActiveCell(),
 		// Tab / Shift+Tab. Both DECLINE (`false`) rather than swallow the keystroke
-		// wherever they do not apply - no editor, nothing completable before the
-		// caret, or a cell a Python kernel cannot honestly answer about - so Tab
-		// still moves focus out of the editor exactly as it did before, which is the
-		// keyboard user's way out. `?? false` covers the no-registered-API case for
-		// the same reason.
+		// wherever they do not apply - a cell a Python kernel cannot honestly answer
+		// about (markdown, raw, chat, SQL, mojo), no editor, or - for Tab - nothing
+		// completable before the caret on its line - so Tab still moves focus out of
+		// the editor exactly as it did before, which is the keyboard user's way out.
+		// `?? false` covers the no-registered-API case for the same reason.
 		'kernel-complete': () => apiOf(activeId)?.startCompletion() ?? false,
 		'kernel-docs': () => apiOf(activeId)?.showKernelDocs() ?? false,
 		// One action, both registry entries: the command-mode `e` and the global

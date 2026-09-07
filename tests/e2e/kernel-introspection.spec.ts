@@ -59,7 +59,13 @@ function notebookJson(): string {
 				source: [DEFINE_SRC],
 				outputs: []
 			},
-			{ cell_type: 'code', id: 'introspect-scratch-000', metadata: {}, execution_count: null, source: [''], outputs: [] }
+			{ cell_type: 'code', id: 'introspect-scratch-000', metadata: {}, execution_count: null, source: [''], outputs: [] },
+			// A MARKDOWN cell, for the Tab-must-not-be-swallowed case. Appended rather
+			// than converted from cell 0 or 1: every other test addresses those two by
+			// index, so a conversion left behind by a failure would silently retarget
+			// them. Empty on purpose - a markdown cell with no source opens in its edit
+			// view, so `focusCell` reaches its editor without a rendered-view dance.
+			{ cell_type: 'markdown', id: 'introspect-markdown-00', metadata: {}, source: [''] }
 		]
 	});
 }
@@ -310,6 +316,37 @@ test('Tab with nothing to complete still leaves the editor - the keyboard way ou
 	await expect
 		.poll(() => page.evaluate(() => document.activeElement?.className ?? ''))
 		.not.toContain('cm-content');
+});
+
+test('Tab is not swallowed in a cell the kernel cannot answer about', async ({ page }) => {
+	await openNotebook(page);
+	// A LIVE kernel throughout, so this is the scoping rule and not merely "there is
+	// nothing to complete": the same key, in the same notebook, at the same moment,
+	// completes in the Python cell below and declines in the markdown one.
+	await seedLiveNames(page);
+
+	// Markdown: `basicSetup` installs `autocompletion()` for EVERY cell, so a Tab
+	// that reported handled here would be swallowed for nothing - markdown brings no
+	// completion source at all - and would take with it the keyboard user's only way
+	// out of the editor.
+	await typeInto(page, 2, 'cellar_live_mark');
+	await expect(page.evaluate(() => document.activeElement?.className ?? '')).resolves.toContain('cm-content');
+	await page.keyboard.press('Tab');
+	await expect
+		.poll(() => page.evaluate(() => document.activeElement?.className ?? ''))
+		.not.toContain('cm-content');
+	// And no Python names were offered for prose on the way out.
+	await expect(page.getByTestId('cell').nth(2).locator('.cm-tooltip-autocomplete')).toHaveCount(0);
+
+	// The control: the identical text in a PYTHON code cell still completes from the
+	// live kernel, so the decline above is the cell type and not a dead binding.
+	await typeInto(page, 1, 'cellar_live_mark');
+	await closePopup(page, 1);
+	await page.keyboard.press('Tab');
+	await expect(completionLabels(page, 1).filter({ hasText: 'cellar_live_marker_xyz' }).first()).toBeVisible({
+		timeout: 20_000
+	});
+	await closePopup(page, 1);
 });
 
 test('neither feature blocks or breaks while a cell is running', async ({ page }) => {

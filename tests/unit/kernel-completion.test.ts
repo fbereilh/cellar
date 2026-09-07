@@ -16,8 +16,6 @@
  * real ipykernel in `kernel-introspect.test.ts` and in the e2e.
  */
 import { describe, it, expect } from 'vitest';
-import { readFileSync } from 'node:fs';
-import { join } from 'node:path';
 import { EditorState } from '@codemirror/state';
 import { CompletionContext, type CompletionResult } from '@codemirror/autocomplete';
 import { python } from '@codemirror/lang-python';
@@ -78,6 +76,39 @@ describe('it is really wired into the editor', () => {
 		// is in the middle of writing.
 		expect(ours.length).toBe(theirs.length + 1);
 		expect(theirs.length).toBeGreaterThan(0);
+	});
+
+	it('registers PER EDITOR, so a second notebook’s kernel is never asked about this one', async () => {
+		// The invariant the module's header argues for, asserted as BEHAVIOUR rather
+		// than as the shape of the registration call: two editors carrying DIFFERENT
+		// handles is what makes it observable at all, since a registration shared
+		// between them looks identical from inside either one. Each editor's own
+		// source is RUN, and each must reach its own handle and no other - two
+		// notebooks' kernels are different namespaces in different processes, so an
+		// editor answering through the other's would be confidently wrong.
+		const a = fakeHandle(okOutcome([{ text: 'from_a', type: 'instance' }], 0, 1));
+		const b = fakeHandle(okOutcome([{ text: 'from_b', type: 'instance' }], 0, 1));
+		const stateA = EditorState.create({
+			doc: 'x',
+			extensions: [python(), kernelCompletion(() => a.handle)]
+		});
+		const stateB = EditorState.create({
+			doc: 'x',
+			extensions: [python(), kernelCompletion(() => b.handle)]
+		});
+		const plain = EditorState.create({ doc: 'x', extensions: [python()] });
+		const shared = new Set(plain.languageDataAt<unknown>('autocomplete', 1));
+		const kernelSourceOf = (state: EditorState) => {
+			const own = state.languageDataAt<unknown>('autocomplete', 1).filter((s) => !shared.has(s));
+			expect(own.length).toBe(1); // exactly ONE kernel source per editor
+			return own[0] as (ctx: CompletionContext) => Promise<CompletionResult | null>;
+		};
+		const resA = await kernelSourceOf(stateA)(new CompletionContext(stateA, 1, true));
+		const resB = await kernelSourceOf(stateB)(new CompletionContext(stateB, 1, true));
+		expect(resA?.options.map((o) => o.label)).toEqual(['from_a']);
+		expect(resB?.options.map((o) => o.label)).toEqual(['from_b']);
+		expect(a.calls.length).toBe(1);
+		expect(b.calls.length).toBe(1);
 	});
 
 	it('hands back the SAME source object every time, so a query is not restarted per keystroke', () => {
@@ -273,19 +304,5 @@ describe('what CodeMirror does with the merged list', () => {
 		expect(res?.validFor).toBeInstanceOf(RegExp);
 		expect((res!.validFor as RegExp).test('thsep')).toBe(true);
 		expect((res!.validFor as RegExp).test('(')).toBe(false);
-	});
-});
-
-describe('a source guard nothing else can make', () => {
-	it('never registers on the process-wide python language singleton', () => {
-		// `pythonLanguage.data.of(...)` would look identical from inside one editor and
-		// hand EVERY editor in the app whichever notebook's kernel registered last -
-		// including a second notebook's, whose namespace is a different process.
-		const text = readFileSync(join(process.cwd(), 'src/lib/kernelCompletion.ts'), 'utf8');
-		// Comments stripped first: the module's own header NAMES the singleton in order
-		// to explain why it is not used, so a raw scan would match the explanation.
-		const code = text.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
-		expect(code).not.toMatch(/pythonLanguage\s*\.\s*data/);
-		expect(code).toContain('EditorState.languageData.of');
 	});
 });

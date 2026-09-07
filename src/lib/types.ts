@@ -206,9 +206,10 @@ export interface CellRegisterApi {
 	editorOverlayOpen: () => boolean;
 	/**
 	 * Tab: accept the open completion, else ask for one (the kernel's live names
-	 * plus CodeMirror's file-local ones). Returns false when there is no editor, or
-	 * when the caret has nothing before it to complete, so the keystroke keeps its
-	 * default behaviour and Tab still leaves the editor.
+	 * plus CodeMirror's file-local ones). Returns false for a cell with no
+	 * live-kernel completion (anything but a plain Python code cell), when there is
+	 * no editor, or when the caret has nothing before it on its line to complete, so
+	 * the keystroke keeps its default behaviour and Tab still leaves the editor.
 	 */
 	startCompletion: () => boolean;
 	/**

@@ -396,7 +396,10 @@ export const DEFAULT_SHORTCUTS: Shortcut[] = [
 		// Jupyter's completion key. Cellar bound nothing to Tab before, so the
 		// keystroke fell through to the browser and moved focus out of the editor -
 		// and it STILL does wherever completion does not apply, because the action
-		// returns NOT HANDLED there rather than swallowing the key. That is what
+		// returns NOT HANDLED there rather than swallowing the key. It declines on
+		// BOTH counts: a cell with no live-kernel completion (anything but a plain
+		// Python code cell - markdown, raw, chat, SQL and mojo offer no Python names
+		// to complete), and a caret with nothing before it on its line. That is what
 		// keeps a keyboard user's way out of the editor intact, and it is the only
 		// reason this can be bound at all without also adding an indent binding.
 		id: 'kernel-complete',

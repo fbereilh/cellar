@@ -1326,13 +1326,23 @@
 	 * Tab. Accepts the open suggestion if there is one (so a second Tab commits what
 	 * the first offered - Jupyter's feel), else asks for completions.
 	 *
-	 * Returns false - NOT HANDLED - with no editor, or when the caret has nothing
-	 * before it to complete (`tabStartsCompletion`). The dispatcher then leaves the
-	 * keystroke entirely alone, so Tab still moves focus out of the editor exactly as
-	 * it did before this feature existed: the keyboard user's way out, and the reason
+	 * Returns false - NOT HANDLED - in THREE cases: a cell with no live-kernel
+	 * completion (`kernelIntrospectFor()` is null, i.e. anything but a plain Python
+	 * code cell), no editor, or a caret with nothing before it on its line to
+	 * complete (`tabStartsCompletion`). The dispatcher then leaves the keystroke
+	 * entirely alone, so Tab still moves focus out of the editor exactly as it did
+	 * before this feature existed: the keyboard user's way out, and the reason
 	 * binding Tab needs no indent binding beside it.
+	 *
+	 * The handle gate is the SAME condition its sibling `requestKernelDocs` applies,
+	 * and it is load-bearing rather than symmetry: `startCompletion` reports handled
+	 * whenever `autocompletion()` is installed, which `basicSetup` does for EVERY
+	 * cell type, so without it Tab was swallowed in a markdown, raw or chat cell -
+	 * which contribute no completion source at all, so the key did nothing and took
+	 * the escape hatch with it - and opened PYTHON file-local names in a mojo cell.
 	 */
 	function requestCompletion(): boolean {
+		if (!kernelIntrospectFor()) return false;
 		if (!view) return false;
 		// An open suggestion is accepted first, so Tab-Tab is a complete gesture.
 		if (acceptCompletion(view)) return true;
