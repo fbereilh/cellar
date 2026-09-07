@@ -140,16 +140,16 @@ test('the warning names every cell losing its main, and never the last one', asy
 	await expect(badgeIn(page, ids[1])).toHaveCount(0);
 	await expect(badgeIn(page, ids[2])).toHaveCount(0);
 
-	// TWO notebook-level findings, both rendered: the code the export discarded, and
-	// the capability the surviving `main` costs the module. Neither may read as
-	// "will not compile" - dropping the main is what makes the module valid, and
-	// keeping it only stops a PYTHON import.
+	// ONE notebook-level finding is rendered: the code the export DISCARDED. It may
+	// not read as "will not compile" - dropping the main is what makes the module
+	// valid. The kept-main finding is agent-only and may not appear here: it fires on
+	// the commonest shape a `.mojo` export has, so as standing chrome it was
+	// permanent (`$lib/exportHazard`).
 	const hazards = page.locator('[data-testid="export-hazard"]:visible');
-	await expect(hazards).toHaveCount(2);
+	await expect(hazards).toHaveCount(1);
 	await expect(hazards.nth(0)).toHaveText(/lost a top-level def main/);
-	await expect(hazards.nth(1)).toHaveText(/NO PYTHON CELL CAN IMPORT IT/);
-	await expect(hazards.nth(1)).toHaveText(/still valid Mojo/);
 	await expect(hazards.nth(0)).not.toHaveText(/will not import/);
+	await expect(hazards.nth(0)).not.toHaveText(/NO PYTHON CELL CAN IMPORT IT/);
 
 	// ...and the module on disk matches what the badges said.
 	await page.locator('[data-testid="export-run"]:visible').click();
@@ -182,11 +182,9 @@ test('the warning appears and clears as the user edits a LATER cell', async ({ p
 	// Take the later main away again and the warning clears.
 	await retype(page, later, 'def other() -> Int:\n    return 2');
 	await expect(badgeIn(page, ids[0])).toHaveCount(0);
-	// One main survives either way, so the Python-import finding stands throughout -
-	// it is about the MODULE, not about any cell losing code.
-	await expect(page.locator('[data-testid="export-hazard"]:visible')).toHaveText([
-		/NO PYTHON CELL CAN IMPORT IT/
-	]);
+	// Nothing is dropped now, so the bar carries NOTHING: the kept-main finding is
+	// agent-only, and an ordinary Mojo export must not look like it went wrong.
+	await expect(page.locator('[data-testid="export-hazard"]:visible')).toHaveCount(0);
 });
 
 test('a .py target shows no Mojo warning and takes no Mojo cell', async ({ page, request }) => {
@@ -216,6 +214,56 @@ test('a .py target shows no Mojo warning and takes no Mojo cell', async ({ page,
 	await expect(page.locator('[data-testid="export-run"]:visible')).toHaveText('Export to .py');
 	await expect(page.locator('[data-testid="export-count"]:visible')).toHaveText('0 cells marked');
 	await expect(page.locator('[data-testid="main-dropped-badge"]:visible')).toHaveCount(0);
-	// ...and the toggle is not even offered on a cell that cannot reach this module.
+	// ...and the toggle is not even offered on a cell that cannot reach this module
+	// AND carries no flag to clear: there is no state for it to show.
 	await expect(page.locator(`[data-cell-id="${id}"]`).getByTestId('toggle-export')).toHaveCount(0);
+});
+
+test('the export toggle names the target language, and a stranded mark stays clearable', async ({
+	page,
+	request
+}) => {
+	// A Mojo notebook: the toggle must announce the module it really writes. A
+	// hardcoded ".py" here is a false statement in the accessible NAME, in exactly
+	// the place the feature is used.
+	const ids = await mojoNotebook(request, 'labels.ipynb', [HELPER], 'lib/labels.mojo');
+	await openNotebook(page, 'labels.ipynb');
+	const toggle = page.locator(`[data-cell-id="${ids[0]}"]`).getByTestId('toggle-export');
+	await expect(toggle).toHaveAttribute('aria-label', "Export this cell to the notebook's .mojo module");
+	await expect(toggle).toHaveAttribute('title', /\.mojo module/);
+	await expect(toggle).toHaveAttribute('aria-pressed', 'true');
+	await expect(toggle).not.toHaveAttribute('data-export-stranded', 'true');
+
+	// Repoint the target at a `.py` module. Nothing rewrites the notebook, so the
+	// Mojo cell keeps a flag it is now eligible for nowhere - and that key would be
+	// invisible if the toggle were simply omitted.
+	const repoint = await request.post(`${baseURL}/api/notebooks/export-py`, {
+		data: { op: 'set-target', target: 'lib/labels.py', base: 'workspace', path: 'labels.ipynb' }
+	});
+	expect(repoint.ok(), await repoint.text()).toBeTruthy();
+	await page.reload();
+	await openNotebook(page, 'labels.ipynb');
+
+	const stranded = page.locator(`[data-cell-id="${ids[0]}"]`).getByTestId('toggle-export');
+	await expect(stranded).toHaveAttribute('data-export-stranded', 'true');
+	// The reason is READABLE TEXT beside the control, not only a tooltip.
+	const note = page.locator(`[data-cell-id="${ids[0]}"]`).getByTestId('export-stranded-note');
+	await expect(note).toBeVisible();
+	await expect(note).toHaveText(/exported nowhere/);
+	await expect(page.locator('[data-testid="export-count"]:visible')).toHaveText('0 cells marked');
+
+	// Clicking it CLEARS the flag rather than trying to re-mark a cell the server
+	// refuses: the toggle and its note go, and the key leaves the notebook.
+	await stranded.click();
+	await expect(note).toHaveCount(0);
+	await expect(page.locator(`[data-cell-id="${ids[0]}"]`).getByTestId('toggle-export')).toHaveCount(0);
+	await expect
+		.poll(async () => {
+			const r = await request.get(`${baseURL}/api/notebooks?path=labels.ipynb`);
+			const cells = (await r.json()).notebook.cells as Array<{
+				metadata?: { cellar?: { export?: boolean } };
+			}>;
+			return cells[0].metadata?.cellar?.export;
+		})
+		.toBeUndefined();
 });

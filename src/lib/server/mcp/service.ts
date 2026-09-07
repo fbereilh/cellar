@@ -70,6 +70,7 @@ import {
 	exportMarkedTwice,
 	exportTargetLanguage
 } from '../../exportRole';
+import { hazardReport } from '../../exportHazard';
 import { isHiddenFromAgent } from '../../agentVisibility';
 import { computeHeadingNumbers, outlineHeadings } from '../../headings';
 import { buildImageBlocks, canInlineImage, imagePlaceholder, isInlinableImageMime, MAX_FULL_OUTPUT_IMAGE_BLOCKS } from './image';
@@ -2249,7 +2250,13 @@ function moduleHazard(target: string, exportTarget: string | null) {
 			// EVERY hazard, not just the first: a `.mojo` export can carry two at once
 			// (code dropped, and a kept `main` no Python cell can import), and they are
 			// different facts - reporting one would leave the other with no agent surface.
-			warning: `${exportTarget} was written, but ${hazards.map((h) => h.message).join(' Also: ')}`
+			// Joined through the SHARED `hazardReport`, the same rule the shell's
+			// manual-export notice uses, so the two cannot spell one set differently.
+			//
+			// The set is NOT narrowed by `humanExportHazards` here, and that is the point
+			// of this surface: `mojo-main-kept` reaches no human surface at all, so this
+			// is the only place it is still reported (`$lib/exportHazard`'s header).
+			warning: `${exportTarget} was written, but ${hazardReport(hazards)}`
 		}
 	};
 }

@@ -36,6 +36,7 @@
 	import type { SearchHighlightState } from '$lib/searchHighlight';
 	import type { Folding } from '$lib/headings';
 	import { kernelCardName } from '$lib/kernelBadge';
+	import { hazardReport, humanExportHazards } from '$lib/exportHazard';
 	import { reasonWithoutServerPath } from '$lib/serverMessage';
 	import type { KernelInfo, KernelListEntry, KernelCard } from '$lib/kernelBadge';
 	import { isBlameUnavailable, activeBlameFor, type BlameReport } from '$lib/blame';
@@ -1083,7 +1084,8 @@
 		// nonce-keyed notice - burying exactly the messages those refusals exist for
 		// ("it is not a Cellar-generated module", a non-.py or escaping target).
 		if (!r) return;
-		if (r.reason === 'no-target') showNotice('Set a target .py path at the top of the notebook first.');
+		if (r.reason === 'no-target')
+			showNotice('Set a target module path (.py or .mojo) at the top of the notebook first.');
 		else if (r.reason === 'no-cells') showNotice('No cells are marked for export - use the export toggle in a cell’s toolbar.');
 		// A deliberate refusal, not a failure: Cellar never overwrites a file it did
 		// not generate. Said here because nothing else would - this outcome is not an
@@ -1096,7 +1098,14 @@
 			// plain success. The hazard carries the server's own full sentence (what is
 			// wrong and what to change), so it REPLACES the success line rather than
 			// riding after it - this channel shows one message at a time.
-			if (r.hazards?.length) showNotice(`Wrote ${r.target}, but ${r.hazards[0].message}`);
+			//
+			// EVERY reportable hazard, joined by the SHARED `hazardReport` rather than a
+			// third joining rule beside the export bar's and MCP's: a set can carry more
+			// than one and they are different facts, so `hazards[0]` silently dropped
+			// the rest. Narrowed first by the ONE human-surface rule, so an agent-only
+			// kind neither raises this branch nor rides the sentence.
+			const shown = humanExportHazards(r.hazards ?? []);
+			if (shown.length) showNotice(`Wrote ${r.target}, but ${hazardReport(shown)}`);
 			else showNotice(`Exported ${r.count} ${r.count === 1 ? 'cell' : 'cells'} → ${r.target}.`);
 		}
 	}

@@ -11,7 +11,7 @@
 	import type { ExtractedCodeBlock } from '$lib/codeBlockExtract';
 	import type { WorkspaceRootOption } from '$lib/notebookRoot';
 	import { EXPORT_BASES, EXPORT_BASE_LABELS, exportImportWarning } from '$lib/exportTarget';
-	import { hazardSummaryClause, type ExportHazard } from '$lib/exportHazard';
+	import { hazardSummaryClause, humanExportHazards, type ExportHazard } from '$lib/exportHazard';
 	import type { ExportLanguage } from '$lib/exportRole';
 	import { reservedFailureHeight, failureDetail } from '$lib/cellRenderFailure';
 	import type { ExportPyResult } from '$lib/types';
@@ -812,6 +812,10 @@
 		// carrying the server's own reason; a bare "Export failed." here would be a
 		// second, less informative surface for the same event.
 		if (!r) return;
+		// Narrowed by the ONE human-surface rule before anything is worded: an
+		// agent-only kind may neither raise the warning branch nor word it
+		// (`$lib/exportHazard`).
+		const shown = humanExportHazards(r.hazards ?? []);
 		if (r.reason === 'no-target') exportFeedback = 'Set a target module path first (.py or .mojo).';
 		else if (r.reason === 'no-cells') exportFeedback = 'No cells are marked for export.';
 		// Nothing was written and that is deliberate, so the button may not read as a
@@ -824,12 +828,14 @@
 		// what happened and points at it rather than repeating it in the same bar.
 		// ...and WHICH warning is read off the hazard KINDS through the shared
 		// `hazardSummaryClause`, never assumed here: the kinds make different claims
-		// (`$lib/exportHazard`) - a `.py` module that will not import, a `.mojo` one
-		// that compiles precisely BECAUSE code was dropped from it, and one that keeps
-		// a main and so cannot be imported by a Python cell - and a `.mojo` export can
-		// carry two at once, so `hazards[0]` is not the question either.
-		else if (r.hazards?.length)
-			exportFeedback = `Wrote ${r.count} ${r.count === 1 ? 'cell' : 'cells'} → ${r.target}, but ${hazardSummaryClause(r.hazards)} - see the warning.`;
+		// (`$lib/exportHazard`) - a `.py` module that will not import, and a `.mojo`
+		// one that compiles precisely BECAUSE code was dropped from it - and a set can
+		// carry more than one, so `hazards[0]` is not the question either. `shown` is
+		// already narrowed, so an agent-only kind can neither raise this branch nor
+		// word it; without that, the commonest `.mojo` export read as having gone
+		// slightly wrong.
+		else if (shown.length)
+			exportFeedback = `Wrote ${r.count} ${r.count === 1 ? 'cell' : 'cells'} → ${r.target}, but ${hazardSummaryClause(shown)} - see the warning.`;
 		else exportFeedback = `Exported ${r.count} ${r.count === 1 ? 'cell' : 'cells'} → ${r.target}`;
 	}
 </script>
@@ -1286,14 +1292,23 @@
 					     will not import; a `.mojo` one that compiles because a `def
 					     main()` was dropped; one that keeps a main and so cannot be
 					     imported by a Python cell), and no single wording can make all
-					     three. EVERY hazard is rendered, not just the first: a `.mojo`
-					     export really can carry two at once, and one of them silently
-					     going unsaid is the reporting defect this channel exists to fix.
+					     three. EVERY hazard is rendered, not just the first: a set can
+					     carry more than one (a `.py` export reports one per offending
+					     line), and one of them silently going unsaid is the reporting
+					     defect this channel exists to fix. The set is already narrowed
+					     server-side by the ONE human-surface rule, so an agent-only kind
+					     never reaches this bar (`$lib/exportHazard`).
+					     KEYED BY POSITION, which is unique by construction: the list is
+					     built with no dedupe, so two marked cells holding the SAME
+					     offending line yield two hazards with identical `kind` and
+					     identical `statement` - a duplicate key throws during render, and
+					     with no error boundary anywhere in `src/` that takes down the
+					     whole notebook (the DataFrame-grid defect class).
 					     Ranked above the code-root warning: that one says the kernel
 					     cannot reach the module, these say what the module itself is.
 					     Below `exportResolveError`, which means no module can be written
 					     at all. -->
-					{#each exportHazards as hazard (hazard.kind + hazard.statement)}
+					{#each exportHazards as hazard, i (i)}
 						<span class="flex items-center gap-1 text-xs text-base-content/70" data-testid="export-hazard">
 							<svg class="h-3.5 w-3.5 shrink-0 text-warning" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3" /><path d="M12 9v4" /><path d="M12 17h.01" /></svg>
 							{hazard.message}

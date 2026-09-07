@@ -82,6 +82,36 @@ describe('the notebook view carries the hazard (what the export bar renders)', (
 		const { target } = await notebookWith('view-untargeted.ipynb', JOINED, { target: null });
 		expect(nbmod.getNotebook(target).exportHazards).toEqual([]);
 	});
+
+	it('can report two findings that are IDENTICAL but for their position', async () => {
+		// Why the bar keys its `{#each}` by POSITION: nothing dedupes the list, and
+		// `quoteStatement` folds identical raw lines to identical text, so two marked
+		// cells holding the SAME offending line produce two hazards with the same
+		// `kind` and the same `statement`. A key built from those two fields is a
+		// DUPLICATE, and Svelte throws `each_key_duplicate` during render - which, with
+		// no error boundary anywhere in `src/`, takes down the whole notebook.
+		const rel = 'view-dupe.ipynb';
+		const target = abs(rel);
+		svc.useNotebook(`sess-${rel}`, rel);
+		const { ids } = await svc.addCells(
+			[
+				{ cell_type: 'code', source: JOINED },
+				{ cell_type: 'code', source: JOINED }
+			],
+			null,
+			{ nb: target, routeImports: false }
+		);
+		nbmod.setExportTarget('out/view-dupe.py', target);
+		nbmod.setCellExports(
+			ids.map((id) => svc.resolveRef(target, id)),
+			true,
+			target
+		);
+		const hazards = nbmod.getNotebook(target).exportHazards;
+		expect(hazards).toHaveLength(2);
+		expect(hazards[0].kind).toBe(hazards[1].kind);
+		expect(hazards[0].statement).toBe(hazards[1].statement);
+	});
 });
 
 describe('the live push - a hazard or a moved target reaches the bar without a reload', () => {
@@ -439,7 +469,11 @@ describe('the two Svelte halves - source SHAPE guards, not behaviour', () => {
 		// once (code dropped, and a kept `main` no Python cell can import), and they are
 		// DIFFERENT claims, so one of them silently going unsaid is the reporting defect
 		// this channel exists to fix.
-		expect(src).toMatch(/\{#each exportHazards as hazard[^}]*\}/);
+		// KEYED BY POSITION: the list is built with no dedupe, so two marked cells
+		// holding the same offending line yield two hazards with an identical
+		// `kind`/`statement`, and a duplicate `{#each}` key throws during render - with
+		// no error boundary in `src/` that takes the whole notebook down.
+		expect(src).toContain('{#each exportHazards as hazard, i (i)}');
 		expect(src).toContain('{hazard.message}');
 		// The warning chain shows ONE arm. `exportResolveError` means no module was
 		// written at all, so it outranks this; this outranks the code-root warning,
@@ -451,16 +485,24 @@ describe('the two Svelte halves - source SHAPE guards, not behaviour', () => {
 
 	it('both manual-export surfaces branch on hazards ahead of the success wording', () => {
 		// `doExport`'s feedback line and the shell's notice are the two places a manual
-		// export is spoken. Both branch on hazards BEFORE the success wording.
+		// export is spoken. Both narrow the set through the SHARED human-surface rule
+		// and branch on what is left BEFORE the success wording, so an agent-only kind
+		// can neither raise the warning nor be dropped from a set that does.
 		const nb = read('lib/Notebook.svelte');
 		const fn = nb.slice(nb.indexOf('async function doExport()'), nb.indexOf('</script>'));
-		expect(fn).toContain('r.hazards?.length');
-		expect(fn.indexOf('r.hazards?.length')).toBeLessThan(fn.indexOf('exportFeedback = `Exported'));
+		expect(fn).toContain('humanExportHazards(r.hazards ?? [])');
+		expect(fn).toContain('shown.length');
+		expect(fn.indexOf('shown.length')).toBeLessThan(fn.indexOf('exportFeedback = `Exported'));
 
 		const page = read('routes/+page.svelte');
 		const notice = page.slice(page.indexOf('async function exportPy()'), page.indexOf('// Toggle the active notebook'));
-		expect(notice).toContain('r.hazards?.length');
-		expect(notice.indexOf('r.hazards?.length')).toBeLessThan(notice.indexOf('showNotice(`Exported'));
+		expect(notice).toContain('humanExportHazards(r.hazards ?? [])');
+		expect(notice).toContain('shown.length');
+		expect(notice.indexOf('shown.length')).toBeLessThan(notice.indexOf('showNotice(`Exported'));
+		// EVERY message, through the one shared joining rule - never `hazards[0]`,
+		// which silently dropped every finding after the first.
+		expect(notice).toContain('hazardReport(shown)');
+		expect(notice).not.toContain('r.hazards[0]');
 	});
 
 	it('LiveNotebook mentions the load seed and the live event in its dispatcher', () => {

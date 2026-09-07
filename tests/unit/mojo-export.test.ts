@@ -33,6 +33,7 @@ import { join } from 'node:path';
 import {
 	canExportCell,
 	exportLanguageOf,
+	exportMarkStranded,
 	exportTargetLanguage,
 	isExportCell
 } from '../../src/lib/exportRole';
@@ -49,7 +50,7 @@ import {
 	stripMojoMagicHeader
 } from '../../src/lib/mojoExport';
 import { generateModule, mojoExportHazards } from '../../src/lib/server/export-py';
-import { hazardSummaryClause } from '../../src/lib/exportHazard';
+import { hazardReport, hazardSummaryClause, humanExportHazards } from '../../src/lib/exportHazard';
 import type { Cell } from '../../src/lib/server/types';
 
 vi.mock('../../src/lib/server/dataflow', () => ({
@@ -386,6 +387,35 @@ describe('what the main handling costs is reported once, for the notebook', () =
 		expect(mojoExportHazards([])).toEqual([]);
 	});
 
+	it('the kept-main finding reaches the AGENT surface only', () => {
+		// Captain decision: the measured claim stands, but Python CALLING Mojo is a
+		// deferred direction and it is the only direction a kept `main` costs anything,
+		// so it may not sit as standing chrome nor ride an ordinary export's success
+		// line. `humanExportHazards` is the ONE rule every human surface narrows
+		// through; the agent surface passes the full set.
+		const both = mojoExportHazards([cell('a', MAIN), cell('b', MAIN)]);
+		expect(both.map((h) => h.kind)).toEqual(['mojo-main-dropped', 'mojo-main-kept']);
+		// The DROPPED finding keeps every surface: it says code the user wrote is gone.
+		expect(humanExportHazards(both).map((h) => h.kind)).toEqual(['mojo-main-dropped']);
+		// The commonest shape - one main, nothing dropped - now shows a human NOTHING.
+		const keptOnly = mojoExportHazards([cell('a', MAIN), cell('b', 'def h(): ...')]);
+		expect(keptOnly.map((h) => h.kind)).toEqual(['mojo-main-kept']);
+		expect(humanExportHazards(keptOnly)).toEqual([]);
+		// A `.py` export's hazards are untouched by the rule.
+		const future = [{ kind: 'future-import-joined' as const, statement: 'x', message: 'y' }];
+		expect(humanExportHazards(future)).toEqual(future);
+	});
+
+	it('a set is reported through the ONE joining rule, never hazards[0]', () => {
+		const both = mojoExportHazards([cell('aaaaaaaa-1111', MAIN), cell('bbbbbbbb-2222', MAIN)]);
+		const report = hazardReport(both);
+		// Every message is present, so no finding is silently dropped.
+		for (const h of both) expect(report).toContain(h.message);
+		expect(report).toContain(' Also: ');
+		expect(hazardReport([])).toBe('');
+		expect(hazardReport([both[0]])).toBe(both[0].message);
+	});
+
 	it('the one-clause summary is keyed by KIND, never by hazards[0]', () => {
 		// A surface that read `hazards[0]` would say "code was dropped" over a module
 		// that dropped none, or "it will not import" over one that compiles.
@@ -502,6 +532,57 @@ describe('a notebook whose target is .mojo exports its Mojo cells to one module'
 	});
 });
 
+describe('a mark stranded by a target-language change stays clearable', () => {
+	const py = { cell_type: 'code', source: 'x = 1', metadata: { cellar: { export: true } } };
+	const mojo = {
+		cell_type: 'code',
+		source: 'def main(): ...',
+		metadata: { cellar: { language: 'mojo', export: true } }
+	};
+
+	it('is the FLAG on an ineligible cell, in both directions', () => {
+		// Point the target at the other language and the flag stays where it is -
+		// nothing rewrites the user's committed `.ipynb` - so the cell contributes to
+		// no module while the key is still there.
+		expect(exportMarkStranded(py, 'mojo')).toBe(true);
+		expect(exportMarkStranded(mojo, 'python')).toBe(true);
+		// Eligible again: an ordinary mark, not a stranded one.
+		expect(exportMarkStranded(py, 'python')).toBe(false);
+		expect(exportMarkStranded(mojo, 'mojo')).toBe(false);
+		// An ineligible cell with NO flag has no state to clear.
+		expect(exportMarkStranded({ cell_type: 'code', source: 'x = 1' }, 'mojo')).toBe(false);
+		expect(exportMarkStranded({ cell_type: 'markdown', source: '# hi' }, 'python')).toBe(false);
+	});
+
+	it('the server clears it, so the greyed toggle is not a dead control', async () => {
+		// The whole point of rendering the toggle for such a cell: marking is gated on
+		// eligibility and UNMARKING is gated on nothing, so this is the one surface
+		// that can retire an otherwise invisible key.
+		const rel = 'stranded.ipynb';
+		const nb = nbmod.resolveNotebookPath(rel);
+		svc.useNotebook('sess-stranded', rel);
+		const { ids } = await svc.addCells([{ cell_type: 'code', source: 'x = 1' }], null, {
+			nb,
+			routeImports: false
+		});
+		const id = svc.resolveRef(nb, ids[0]);
+		nbmod.setExportTarget('lib/stranded.py', nb);
+		nbmod.setCellExports([id], true, nb);
+		// Repoint at a `.mojo` module: the Python cell is now eligible for nothing.
+		nbmod.setExportTarget('lib/stranded.mojo', nb);
+		const stranded = nbmod.listCells(nb).find((c) => c.id === id)!;
+		expect(exportMarkStranded(stranded, 'mojo')).toBe(true);
+		expect(isExportCell(stranded, 'mojo')).toBe(false);
+		// Re-MARKING is refused, which is why the toggle sends `false`...
+		expect(nbmod.setCellExport(id, true, nb)).toEqual({ ok: false, reason: 'not-code' });
+		// ...and clearing works, leaving no key behind in the committed notebook.
+		expect(nbmod.setCellExport(id, false, nb)).toEqual({ ok: true });
+		const cleared = nbmod.listCells(nb).find((c) => c.id === id)!;
+		expect('export' in (cleared.metadata?.cellar ?? {})).toBe(false);
+		expect(exportMarkStranded(cleared, 'mojo')).toBe(false);
+	});
+});
+
 describe('setExportTarget accepts .mojo and still refuses anything else', () => {
 	it('stores a .mojo target and refuses a .ts one', async () => {
 		const nb = nbmod.resolveNotebookPath('target.ipynb');
@@ -522,10 +603,31 @@ describe('the wiring the browser ships', () => {
 
 	it('states Mojo as a target MATCH, never as an exclusion', () => {
 		// A bare `&& !isMojoCell(cell)` is the version that would have to be UNPICKED
-		// the moment a .mojo target existed - the whole point of the target-aware shape.
-		const src = read('exportRole.ts');
-		expect(src).not.toMatch(/!\s*isMojoCell/);
-		expect(src).toMatch(/exportLanguageOf\(cell\) === lang/);
+		// the moment a .mojo target existed - the whole point of the target-aware shape,
+		// and a constraint no behavioural assertion can express, so it stays a source
+		// guard. WHAT the rule answers is asserted below, against the imported module.
+		expect(read('exportRole.ts')).not.toMatch(/!\s*isMojoCell/);
+	});
+
+	it('eligibility is a MATCH in both directions, for every cell language', () => {
+		// The behavioural half of the guard above: one sentence - a cell is exportable
+		// to a target iff its language matches the target's extension - gives every
+		// answer, so neither language is a special case of the other.
+		const py = { cell_type: 'code', source: 'x = 1' };
+		const mojoTyped = { cell_type: 'code', source: 'def main(): ...', metadata: { cellar: { language: 'mojo' } } };
+		const mojoMagic = { cell_type: 'code', source: '%%mojo\ndef main(): ...' };
+		const md = { cell_type: 'markdown', source: '# hi' };
+		for (const [cell, lang] of [
+			[py, 'python'],
+			[mojoTyped, 'mojo'],
+			[mojoMagic, 'mojo']
+		] as const) {
+			expect(canExportCell(cell, lang)).toBe(true);
+			expect(canExportCell(cell, lang === 'mojo' ? 'python' : 'mojo')).toBe(false);
+		}
+		// A cell that contributes no module source at all matches NEITHER target.
+		expect(canExportCell(md, 'python')).toBe(false);
+		expect(canExportCell(md, 'mojo')).toBe(false);
 	});
 
 	it('the cell badge reads the SHARED wording, not a local sentence', () => {

@@ -246,6 +246,31 @@ export function isExportCell(cell: ExportCell, lang: ExportLanguage = 'python'):
 	return cell?.metadata?.cellar?.export === true || hasExportDirective(cell);
 }
 
+/**
+ * Does this cell carry Cellar's own export FLAG while being INELIGIBLE for the
+ * module the notebook currently targets?
+ *
+ * Reachable and ordinary: mark some Python cells for a `.py` target, then point
+ * the target at a `.mojo` one (or the reverse). Nothing rewrites the notebook -
+ * silently editing the user's committed `.ipynb` because a setting moved is worse
+ * than the stale flag - so `metadata.cellar.export` stays where it is, `isExportCell`
+ * reads false, the cell contributes to no module and the export count drops.
+ *
+ * It exists because a row toggle that is merely ABSENT there leaves that flag with
+ * no surface at all: invisible in the notebook, still in the committed file, and
+ * clearable only by pointing the target back. So the toggle is RENDERED for such a
+ * cell - greyed, saying why, and still able to clear the flag, which the server
+ * allows (`setCellExports` gates only MARKING on eligibility, never unmarking).
+ *
+ * Deliberately the FLAG alone, never `hasExportDirective`: an `#| export` line is
+ * the cell's own source, which Cellar may not write and so may not remove, and it
+ * is Python vocabulary that says nothing about a `.mojo` target. There is nothing
+ * for a toggle to clear.
+ */
+export function exportMarkStranded(cell: ExportCell, lang: ExportLanguage = 'python'): boolean {
+	return cell?.metadata?.cellar?.export === true && !canExportCell(cell, lang);
+}
+
 /** Count of cells currently marked for export to a module of this language. */
 export function exportCellCount(
 	cells: readonly ExportCell[] | null | undefined,

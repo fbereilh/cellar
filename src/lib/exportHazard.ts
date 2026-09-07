@@ -33,9 +33,31 @@
  *     whole-module, hence a hazard; never worded as a compile failure, because it
  *     is not one.
  *
- * This holds what needs no filesystem: the hazard shape and the ONE wording for
- * each kind, so the export bar, the manual-export notice and the agent surface
- * cannot describe the same file differently (the `exportImportWarning`
+ * ## NOT EVERY KIND REACHES EVERY SURFACE (`humanExportHazards`)
+ *
+ * `mojo-main-kept` is AGENT-ONLY: it rides MCP's `module.warning` on
+ * `set_cell_export` / `set_export_target`, and it is recorded here, and it reaches
+ * no human surface at all. The reason is scope rather than doubt about the claim,
+ * which stays measured and true: Python CALLING Mojo is a deferred direction, and
+ * it is the only direction a kept `main` costs anything, so a standing warning
+ * about it today warns about a consequence of a use case Cellar does not yet
+ * support. It fires on the COMMONEST shape a `.mojo` export has - a module that
+ * keeps one `main` is the desired outcome, being both a library and a runnable
+ * program - so as export-bar chrome it was permanent, and appended to the manual
+ * export it made every ordinary Mojo export read as having gone slightly wrong.
+ * A notice users learn to ignore protects nothing (`misplacedDefaultExpError`
+ * makes the same call).
+ *
+ * `mojo-main-dropped` is the OPPOSITE case and keeps every surface it has: it says
+ * code the user WROTE was REMOVED, which is a real loss they must see while
+ * editing. The two kinds are never collapsed or reworded into each other - that is
+ * what the `kind` discriminant is for.
+ *
+ * This holds what needs no filesystem: the hazard shape, the ONE wording for each
+ * kind, the ONE rule for which kinds a human surface may show
+ * (`humanExportHazards`) and the ONE way a set of them is joined into a report
+ * (`hazardReport`), so the export bar, the manual-export notice and the agent
+ * surface cannot describe the same file differently (the `exportImportWarning`
  * precedent, for the same reason).
  *
  * ## WHAT A HAZARD CLAIMS, AND WHAT ITS ABSENCE DOES NOT
@@ -217,6 +239,41 @@ export function mojoMainKeptHazard(keptHandle: string): ExportHazard {
 		statement: quoteStatement(keptHandle),
 		message: mojoMainKeptHazardMessage(keptHandle)
 	};
+}
+
+/**
+ * The kinds a HUMAN surface may not show - see this file's header for why
+ * `mojo-main-kept` is one and `mojo-main-dropped` deliberately is not.
+ */
+const AGENT_ONLY_HAZARD_KINDS: ReadonlySet<ExportHazardKind> = new Set<ExportHazardKind>([
+	'mojo-main-kept'
+]);
+
+/**
+ * The hazards a human surface may show, out of a full set.
+ *
+ * The ONE rule, so the export bar's standing warning and the manual-export notice
+ * cannot disagree about which findings a person is shown, and so the agent surface
+ * - which passes the full set through - stays the single place a deferred-scope
+ * finding is still reported. A kind that is not agent-only survives untouched, so
+ * a `.py` export's hazards are byte-for-byte what they always were.
+ */
+export function humanExportHazards(hazards: readonly ExportHazard[]): ExportHazard[] {
+	return hazards.filter((h) => !AGENT_ONLY_HAZARD_KINDS.has(h.kind));
+}
+
+/**
+ * A whole hazard SET as one report, for a surface that shows a single line of text
+ * rather than one element per finding.
+ *
+ * EVERY message, never `hazards[0]`: the kinds make different claims and a `.mojo`
+ * export can carry more than one, so reporting the first silently drops the rest -
+ * the reporting defect this channel exists to fix. The ONE joining rule, shared by
+ * MCP's `module.warning` and the shell's manual-export notice, so a third spelling
+ * cannot appear beside them.
+ */
+export function hazardReport(hazards: readonly ExportHazard[]): string {
+	return hazards.map((h) => h.message).join(' Also: ');
 }
 
 /**

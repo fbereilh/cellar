@@ -36,7 +36,7 @@ import {
 	type ExportResult,
 	type ResolvedExportTarget
 } from './export-py';
-import type { ExportHazard } from '../exportHazard';
+import { humanExportHazards, type ExportHazard } from '../exportHazard';
 import {
 	canExportCell,
 	exportDirectiveOwnsCell,
@@ -347,7 +347,10 @@ function publishExportDerived(doc: NotebookDoc): void {
 	const info = resolveExportTarget(doc);
 	const resolved = info && info.ok ? info.target : null;
 	const resolveError = info && !info.ok ? info.error : null;
-	const hazards = docExportHazards(doc, info);
+	// Filtered through the ONE human-surface rule (`$lib/exportHazard`), so a kind
+	// this bar may not show cannot reach it - and cannot churn the change-only key
+	// either, which would publish an event no surface renders.
+	const hazards = humanExportHazards(docExportHazards(doc, info));
 	const key = [resolved ?? '', resolveError ?? '', ...hazards.map((h) => h.message)].join('\u0000');
 	if (key === doc.lastExportDerivedKey) return;
 	doc.lastExportDerivedKey = key;
@@ -510,8 +513,10 @@ function exportTargetView(doc: NotebookDoc): {
 		exportBase: readExportBase(doc),
 		exportResolved: info && info.ok ? info.target : null,
 		exportResolveError: info && !info.ok ? info.error : null,
-		// The SAME `info` is threaded in rather than resolved a second time here.
-		exportHazards: docExportHazards(doc, info)
+		// The SAME `info` is threaded in rather than resolved a second time here, and
+		// filtered through the ONE human-surface rule: this field feeds the export bar,
+		// where an agent-only kind may not appear (`$lib/exportHazard`).
+		exportHazards: humanExportHazards(docExportHazards(doc, info))
 	};
 }
 
