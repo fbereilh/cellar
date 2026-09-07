@@ -1,6 +1,6 @@
 import MarkdownIt from 'markdown-it';
-import DOMPurify from 'dompurify';
 import type { Config } from 'dompurify';
+import { sanitizeHtml } from '$lib/sanitizeHtml';
 import katexPlugin from '@vscode/markdown-it-katex';
 import type { MarkdownKatexOptions } from '@vscode/markdown-it-katex';
 import type { KatexOptions } from 'katex';
@@ -170,13 +170,18 @@ const OUTPUT_SANITIZE_CONFIG: Config = {
 };
 
 /**
- * The ONE sanitize call site: every renderer below funnels through it, so the
- * two configs above are the whole security surface for every markdown surface -
- * `MARKDOWN_SANITIZE_CONFIG` for content the USER authored, and
+ * The ONE sanitize call site for markdown: every renderer below funnels through
+ * it, so the two configs above are the whole security surface for every markdown
+ * surface - `MARKDOWN_SANITIZE_CONFIG` for content the USER authored, and
  * `OUTPUT_SANITIZE_CONFIG` for machine-emitted output.
+ *
+ * It delegates to `$lib/sanitizeHtml`, the app's ONE browser-side sanitize
+ * boundary, which is also where the rendered-link target policy lives (a link in
+ * rendered content opens in a new tab so a click cannot navigate the live
+ * session away). Read that module's header before changing this call.
  */
 function sanitize(html: string, config: Config = MARKDOWN_SANITIZE_CONFIG): string {
-	return DOMPurify.sanitize(html, config);
+	return sanitizeHtml(html, config);
 }
 
 /** Render AUTHORED markdown (notebook markdown cells, `.md` previews): math included. */

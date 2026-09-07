@@ -16,7 +16,7 @@
 	//
 	// Any widget type outside the supported set degrades to a small muted note —
 	// never a crash. Both themes are handled by daisyUI semantic classes.
-	import DOMPurify from 'dompurify';
+	import { sanitizeHtml } from '$lib/sanitizeHtml';
 	import { browser } from '$app/environment';
 	import { getWidgetState, widgetModelName, setWidgetTrait, type WidgetState } from '$lib/widgetStore.svelte';
 	import {
@@ -96,7 +96,7 @@
 	const barClass = $derived(progressBarClass(state));
 
 	// An HTML widget may carry markup (sanitized); Label is plain text.
-	const safeHtml = $derived(browser ? DOMPurify.sanitize(strValue) : '');
+	const safeHtml = $derived(browser ? sanitizeHtml(strValue) : '');
 
 	// Radio/toggle groups need a stable name to group inputs.
 	const groupName = $derived(`w-${modelId}`);
