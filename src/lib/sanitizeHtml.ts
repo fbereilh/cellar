@@ -1,24 +1,28 @@
 /**
- * Cellar - the ONE browser-side HTML sanitize boundary, and the ONE link-target
+ * Cellar - the ONE browser-side HTML sanitize boundary, and the ONE navigation
  * policy that rides on it.
  *
- * ## Why the two live together
+ * ## The guarantee
+ *
+ * RENDERED CONTENT MAY NEVER UNLOAD THE LIVE CELLAR SESSION. That is the rule;
+ * links are the instance it was requested for, not its boundary.
  *
  * Cellar is a LIVE SESSION: the kernel, the running notebook and every unsaved
  * editor buffer live in the browser tab that renders them. A `<a href>` in a
  * markdown cell, in a model's chat reply, in a kernel's `display(Markdown(...))`
  * or in a widget's `text/html` repr therefore is not an ordinary link - clicking
- * it navigates that tab away and takes the session with it. So every link Cellar
- * RENDERS from notebook content opens in a new tab, with
- * `rel="noreferrer noopener"` so the opened page gets no handle on the window it
- * came from (the same pair `ChatPanel.svelte` and `Databricks.svelte` already
+ * it navigates that tab away and takes the session with it. A `<form action>`
+ * in that same content causes the IDENTICAL harm at the IDENTICAL boundary: a
+ * submit is a same-tab navigation. So both are given `target="_blank"` plus
+ * `rel="noreferrer noopener"`, so the opened page gets no handle on the window
+ * it came from (the same pair `ChatPanel.svelte` and `Databricks.svelte` already
  * write by hand on their own hardcoded links).
  *
  * Applying it HERE - at the sanitize boundary - rather than at each renderer is
  * what makes it inheritable: `markdown.ts` funnels all three of its renderers
  * through one `sanitize()`, and the two widget surfaces sanitize raw `text/html`
- * directly, so a link cannot reach the page without passing through this
- * function. A renderer added later inherits the policy instead of having to
+ * directly, so nothing that navigates can reach the page without passing through
+ * this function. A renderer added later inherits the policy instead of having to
  * remember it.
  *
  * ## Why a DOMPurify HOOK rather than the markdown-it renderer
@@ -36,7 +40,8 @@
  *
  * - **Cellar's own chrome.** Nothing the app authors is sanitized, so no
  *   in-app navigation can reach this hook. Internal links keep navigating in
- *   place by construction, not by an exception in the rule.
+ *   place by construction, not by an exception in the rule. (The app authors no
+ *   `<form>` at all, so the form half cannot reach its own chrome either.)
  * - **A SAME-DOCUMENT anchor (`#section`, or a bare `#`).** Those do not
  *   navigate anywhere - the browser scrolls in place - so opening one in a new
  *   tab would be wrong, and would land the reader in a second copy of the app.
@@ -65,8 +70,8 @@ import type { Config } from 'dompurify';
 export const NEW_TAB_REL = 'noreferrer noopener';
 
 /**
- * The elements that navigate on click and therefore carry the policy, compared
- * against `localName` and NOT `tagName`.
+ * The elements that navigate on CLICK, compared against `localName` and NOT
+ * `tagName`.
  *
  * That is a correctness rule, not a style choice: only an element in the HTML
  * namespace uppercases its `tagName`, so an `<a>` inside an `<svg>` - which is
@@ -77,6 +82,53 @@ export const NEW_TAB_REL = 'noreferrer noopener';
  * {@link sanitizeHtml}. `localName` is lowercase in both namespaces.
  */
 const LINK_TAGS = new Set(['a', 'area']);
+
+/**
+ * The element that navigates on SUBMIT. It is handled apart from
+ * {@link LINK_TAGS} because its rule is strictly simpler and strictly stronger:
+ * EVERY form gets a target, unconditionally, since there is no such thing as a
+ * submit that stays in place.
+ *
+ * - An ABSENT `action` (which is also what DOMPurify leaves behind when it
+ *   REFUSES one, e.g. `action="javascript:..."`) defaults to the DOCUMENT'S OWN
+ *   URL, so submitting RELOADS the tab. Absent is the destructive case here,
+ *   which is the exact opposite of an absent `href` - do not reuse
+ *   {@link opensInNewTab} for a form.
+ * - An EMPTY `action` resolves to the current URL for the same reason.
+ * - A FRAGMENT `action="#x"` is NOT the in-place scroll the same value means on
+ *   an `<a>`: form submission navigates (a GET replaces the query with the
+ *   serialized form data), so it too unloads the tab.
+ *
+ * MEASURED against dompurify 3.4.11 (do not re-derive): `form` survives with
+ * `action`/`method`/`enctype`, and `target` on it is STRIPPED - so the exposure
+ * is real, and nothing untrusted can pre-set a target to defeat this. The
+ * submit-control OVERRIDES that would otherwise beat a target set on the form -
+ * `formaction`, `formtarget`, `formmethod`, `formenctype`, `formnovalidate` on
+ * `<button>` / `<input type=submit>` / `<input type=image>` - are ALL stripped
+ * too, as is the form-owner `form="id"` attribute that would re-associate a
+ * submit control with a form outside the sanitized tree. So covering the form
+ * element itself covers the whole vector; that is measured, not assumed, and is
+ * pinned by test.
+ *
+ * SCOPE: only the two raw-`text/html` widget surfaces (`WidgetOutput.svelte`,
+ * `WidgetOutputArea.svelte`) can reach this at all - every markdown renderer
+ * runs markdown-it with `html:false`, so no markdown surface can emit a form in
+ * the first place. The markdown paths were never at risk.
+ *
+ * NOTHING LEGITIMATE SUBMITS IN PLACE HERE, which is what makes an
+ * unconditional rule safe (verified, so it need not be re-derived): every
+ * INTERACTIVE ipywidget - `Text`, `Textarea`, `Password`, `Button`, `Dropdown`,
+ * `Checkbox`, `RadioButtons`, `Select`, `SelectMultiple`, `Combobox`,
+ * `ToggleButtons`, the sliders and the number inputs - is rendered by
+ * `WidgetOutput.svelte` as a native Svelte control whose interaction travels
+ * over the widget COMM (`$lib/widgetActions` -> `POST /api/widgets/<comm_id>`),
+ * never an HTML form submit; ipywidgets is a comm protocol in which a form has
+ * no role. Only the `HTML`/`HTMLMath` widget kinds and an `Output` widget's
+ * captured `text/html` reach the raw sanitize path, and both are display-only.
+ * Cellar's own source contains no `<form>` at all, and nothing the app authors
+ * is ever sanitized, so its own chrome cannot reach this hook.
+ */
+const FORM_TAG = 'form';
 
 /**
  * SVG 1.1's link spelling, which browsers still honour and DOMPurify's default
@@ -132,25 +184,38 @@ export function opensInNewTab(href: string | null | undefined): boolean {
 	return !href.trim().startsWith('#');
 }
 
+/** Send this element's navigation to a new tab, denying it a handle on us. */
+function openOut(node: Element): void {
+	node.setAttribute('target', '_blank');
+	node.setAttribute('rel', NEW_TAB_REL);
+}
+
 /**
  * Apply the policy to one already-sanitized element. Takes the element rather
  * than reaching for a document, so it is callable from the DOMPurify hook and
  * directly from a test.
  *
- * A link that stays in place has any `target` REMOVED rather than left alone:
+ * A FORM is unconditional - see {@link FORM_TAG} for why there is no in-place
+ * case to preserve.
+ *
+ * A LINK that stays in place has any `target` REMOVED rather than left alone:
  * the attribute cannot have come from Cellar (DOMPurify strips `target`, and
  * `html:false` escapes raw HTML in markdown anyway), so leaving one would mean
  * honoring a target from untrusted content on exactly the links this rule says
  * must not open a tab.
  */
-export function applyLinkPolicy(node: Element): void {
-	if (!LINK_TAGS.has(node.localName)) return;
+export function applyNavigationPolicy(node: Element): void {
+	const name = node.localName;
+	if (name === FORM_TAG) {
+		openOut(node);
+		return;
+	}
+	if (!LINK_TAGS.has(name)) return;
 	if (!opensInNewTab(linkHref(node))) {
 		node.removeAttribute('target');
 		return;
 	}
-	node.setAttribute('target', '_blank');
-	node.setAttribute('rel', NEW_TAB_REL);
+	openOut(node);
 }
 
 /**
@@ -161,16 +226,16 @@ export function applyLinkPolicy(node: Element): void {
  * installed.
  */
 let installed = false;
-function ensureLinkPolicy(): void {
+function ensureNavigationPolicy(): void {
 	if (installed || typeof DOMPurify.addHook !== 'function') return;
 	DOMPurify.addHook('afterSanitizeAttributes', (node) => {
-		applyLinkPolicy(node as Element);
+		applyNavigationPolicy(node as Element);
 	});
 	installed = true;
 }
 
 /**
- * Sanitize untrusted HTML for rendering, applying the link policy above.
+ * Sanitize untrusted HTML for rendering, applying the navigation policy above.
  *
  * Every browser-side `{@html}` of notebook / kernel / model content goes through
  * here - do not import `dompurify` for a value anywhere else, or that surface
@@ -180,6 +245,6 @@ function ensureLinkPolicy(): void {
  * past it either).
  */
 export function sanitizeHtml(dirty: string, config?: Config): string {
-	ensureLinkPolicy();
+	ensureNavigationPolicy();
 	return config ? DOMPurify.sanitize(dirty, config) : DOMPurify.sanitize(dirty);
 }

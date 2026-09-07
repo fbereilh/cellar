@@ -1,8 +1,10 @@
 // @vitest-environment jsdom
 //
-// A link Cellar RENDERS from notebook content must open in a NEW TAB, because
-// the tab it is rendered in holds the live session: the kernel, the running
-// notebook and every unsaved editor buffer. Navigating it away loses all three.
+// RENDERED CONTENT MAY NEVER UNLOAD THE LIVE CELLAR SESSION - the tab it is
+// rendered in holds the kernel, the running notebook and every unsaved editor
+// buffer, and navigating it away loses all three. So a link Cellar renders from
+// notebook content opens in a NEW TAB, and so does a `<form>`, whose submit is
+// the same same-tab navigation by another name.
 //
 // The rule lives at `src/lib/sanitizeHtml.ts` - the app's ONE browser-side
 // sanitize boundary - so every rendered surface inherits it rather than
@@ -18,7 +20,12 @@ import { describe, it, expect } from 'vitest';
 import { readFileSync, readdirSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { renderMarkdown, renderOutputMarkdown, renderChatReply } from '../../src/lib/markdown';
-import { sanitizeHtml, opensInNewTab, applyLinkPolicy, NEW_TAB_REL } from '../../src/lib/sanitizeHtml';
+import {
+	sanitizeHtml,
+	opensInNewTab,
+	applyNavigationPolicy,
+	NEW_TAB_REL
+} from '../../src/lib/sanitizeHtml';
 
 /** SVG 1.1's link spelling, which browsers still follow and DOMPurify still keeps. */
 const XLINK_NS = 'http://www.w3.org/1999/xlink';
@@ -72,7 +79,7 @@ describe('opensInNewTab - the one same-document rule', () => {
 	});
 });
 
-describe('applyLinkPolicy', () => {
+describe('applyNavigationPolicy', () => {
 	it('strips a target off a link that must stay in place', () => {
 		// The attribute cannot have come from Cellar, so honoring one from
 		// untrusted content on exactly the links this rule protects would be the
@@ -80,20 +87,20 @@ describe('applyLinkPolicy', () => {
 		const el = document.createElement('a');
 		el.setAttribute('href', '#section');
 		el.setAttribute('target', '_blank');
-		applyLinkPolicy(el);
+		applyNavigationPolicy(el);
 		expect(el.hasAttribute('target')).toBe(false);
 	});
 
 	it('ignores an element that does not navigate', () => {
 		const el = document.createElement('span');
-		applyLinkPolicy(el);
+		applyNavigationPolicy(el);
 		expect(el.attributes.length).toBe(0);
 	});
 
 	it('covers <area>, which navigates like <a>', () => {
 		const el = document.createElement('area');
 		el.setAttribute('href', 'https://example.com');
-		applyLinkPolicy(el);
+		applyNavigationPolicy(el);
 		expect(el.getAttribute('target')).toBe('_blank');
 		expect(el.getAttribute('rel')).toBe(NEW_TAB_REL);
 	});
@@ -104,7 +111,7 @@ describe('applyLinkPolicy', () => {
 		const el = document.createElementNS('http://www.w3.org/2000/svg', 'a');
 		expect(el.tagName).toBe('a');
 		el.setAttribute('href', 'https://example.com');
-		applyLinkPolicy(el);
+		applyNavigationPolicy(el);
 		expect(el.getAttribute('target')).toBe('_blank');
 		expect(el.getAttribute('rel')).toBe(NEW_TAB_REL);
 	});
@@ -112,7 +119,7 @@ describe('applyLinkPolicy', () => {
 	it("reads SVG's xlink:href, which navigates just like href", () => {
 		const el = document.createElementNS('http://www.w3.org/2000/svg', 'a');
 		el.setAttributeNS(XLINK_NS, 'xlink:href', 'https://example.com');
-		applyLinkPolicy(el);
+		applyNavigationPolicy(el);
 		expect(el.getAttribute('target')).toBe('_blank');
 		expect(el.getAttribute('rel')).toBe(NEW_TAB_REL);
 	});
@@ -121,7 +128,7 @@ describe('applyLinkPolicy', () => {
 		const el = document.createElementNS('http://www.w3.org/2000/svg', 'a');
 		el.setAttributeNS(XLINK_NS, 'xlink:href', '#setup');
 		el.setAttribute('target', '_blank');
-		applyLinkPolicy(el);
+		applyNavigationPolicy(el);
 		expect(el.hasAttribute('target')).toBe(false);
 	});
 
@@ -129,7 +136,7 @@ describe('applyLinkPolicy', () => {
 		const el = document.createElementNS('http://www.w3.org/2000/svg', 'a');
 		el.setAttribute('href', '#setup');
 		el.setAttributeNS(XLINK_NS, 'xlink:href', 'https://example.com');
-		applyLinkPolicy(el);
+		applyNavigationPolicy(el);
 		expect(el.hasAttribute('target')).toBe(false);
 	});
 });
@@ -171,10 +178,17 @@ describe('every rendered markdown surface opens its links out', () => {
 		// DOMPurify's default attribute allowlist does not include `target`, so a
 		// `target` written before sanitizing is stripped and the feature is
 		// silently inert. This pins the measurement the design rests on.
-		// `<form>` survives sanitizing but its `target` does not - the same
-		// allowlist that would have eaten a markdown-it-written one off an `<a>`.
-		const stripped = dom(sanitizeHtml('<form action="/x" target="_blank"></form>'));
-		expect(stripped.querySelector('form')?.hasAttribute('target')).toBe(false);
+		//
+		// The witness is an element the POLICY never touches: that allowlist is FLAT
+		// (one set for every element), so `target`'s absence from it is an
+		// element-independent fact, and all three elements that legitimately take
+		// `target` are now policy-covered (`<base>` is dropped outright).
+		const witness = dom(sanitizeHtml('<div target="_blank" title="kept">x</div>')).querySelector(
+			'div'
+		);
+		expect(witness?.hasAttribute('target')).toBe(false);
+		// ...and not merely because the element loses its attributes wholesale.
+		expect(witness?.getAttribute('title')).toBe('kept');
 		const link = dom(sanitizeHtml('<a href="https://example.com">x</a>'));
 		// ...and yet the policy's own target survives, because it is set after the
 		// attribute filter has run.
@@ -224,6 +238,94 @@ describe('every rendered markdown surface opens its links out', () => {
 		const a = anchor(sanitizeHtml('<p><a href="https://example.com">go</a></p>'));
 		expect(a.getAttribute('target')).toBe('_blank');
 		expect(a.getAttribute('rel')).toBe(NEW_TAB_REL);
+	});
+});
+
+describe('a rendered form cannot unload the session either', () => {
+	// A submit is a same-tab navigation, so it is the same harm at the same
+	// boundary. Every case here is UNCONDITIONAL, unlike the link rule: a form has
+	// no in-place case to preserve.
+	function form(html: string): HTMLFormElement {
+		const f = dom(sanitizeHtml(html)).querySelector('form');
+		if (!f) throw new Error(`no <form> in sanitized output: ${html}`);
+		return f as HTMLFormElement;
+	}
+
+	it('an action that leaves the document opens out', () => {
+		const f = form('<form action="/submit" method="post"><input type="submit"></form>');
+		expect(f.getAttribute('action')).toBe('/submit');
+		expect(f.getAttribute('target')).toBe('_blank');
+		expect(f.getAttribute('rel')).toBe(NEW_TAB_REL);
+	});
+
+	it('an ABSENT action opens out - it submits to the current document', () => {
+		// The mirror image of an absent `href`, which gets nothing: a form with no
+		// action submits to the document's own URL, so this is the destructive case
+		// rather than the inert one. It is also what DOMPurify leaves behind when it
+		// REFUSES an action, so that shape must not fall through untargeted either.
+		expect(form('<form><input type="submit"></form>').getAttribute('target')).toBe('_blank');
+		const refused = form('<form action="javascript:alert(1)"><input type="submit"></form>');
+		expect(refused.hasAttribute('action')).toBe(false);
+		expect(refused.getAttribute('target')).toBe('_blank');
+	});
+
+	it('an EMPTY action opens out', () => {
+		const f = form('<form action=""><input type="submit"></form>');
+		expect(f.getAttribute('action')).toBe('');
+		expect(f.getAttribute('target')).toBe('_blank');
+	});
+
+	it('a FRAGMENT action opens out, unlike the same value on a link', () => {
+		// Submitting to `#x` is a navigation (a GET replaces the query with the
+		// serialized form data), not the in-place scroll `<a href="#x">` performs -
+		// so the link rule must not be reused here.
+		expect(form('<form action="#setup"><input type="submit"></form>').getAttribute('target')).toBe(
+			'_blank'
+		);
+		const link = anchor(sanitizeHtml('<a href="#setup">x</a>'));
+		expect(link.hasAttribute('target')).toBe(false);
+	});
+
+	it('the submit-control overrides that would beat it do not survive', () => {
+		// This is the measurement the unconditional form rule rests on: a
+		// `<button formaction=... formtarget=_self>` would defeat a target set on
+		// the form, so if any of these survived, covering the form alone would not
+		// close the vector.
+		const html = sanitizeHtml(
+			'<form action="/x">' +
+				'<button type="submit" formaction="/y" formtarget="_self" formmethod="get" formenctype="text/plain" formnovalidate>go</button>' +
+				'<input type="submit" formaction="/y" formtarget="_self">' +
+				'<input type="image" src="/i.png" formaction="/y" formtarget="_top">' +
+				'</form>'
+		);
+		for (const attr of [
+			'formaction',
+			'formtarget',
+			'formmethod',
+			'formenctype',
+			'formnovalidate'
+		]) {
+			expect(html).not.toContain(attr);
+		}
+		// ...and a submit control cannot be re-associated with a form outside the
+		// sanitized tree either, which would sidestep the target the same way.
+		const owner = dom(
+			sanitizeHtml('<form id="f" action="/x"></form><button form="f" type="submit">go</button>')
+		);
+		expect(owner.querySelector('button')?.hasAttribute('form')).toBe(false);
+	});
+
+	it('no markdown renderer can emit a form at all', () => {
+		// The stated scope: `html:false` escapes raw HTML, so only the two raw
+		// `text/html` widget surfaces can reach the form half of the policy. If this
+		// ever fails, the markdown configs have been widened and the scope note in
+		// `sanitizeHtml.ts` is no longer true.
+		const src = '<form action="/x"><button type="submit">go</button></form>';
+		for (const render of [renderMarkdown, renderOutputMarkdown, renderChatReply]) {
+			const html = render(src);
+			expect(dom(html).querySelector('form')).toBeNull();
+			expect(html).toContain('&lt;form');
+		}
 	});
 });
 
