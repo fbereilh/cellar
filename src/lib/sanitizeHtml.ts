@@ -40,7 +40,8 @@
  * - **A SAME-DOCUMENT anchor (`#section`, or a bare `#`).** Those do not
  *   navigate anywhere - the browser scrolls in place - so opening one in a new
  *   tab would be wrong, and would land the reader in a second copy of the app.
- *   {@link opensInNewTab} is the one place that distinction is decided.
+ *   {@link opensInNewTab} is the one place that distinction is decided, and it
+ *   is the ONLY thing that stays in place: an EMPTY `href` does not (see there).
  * - **The iframed surfaces.** A rich `text/html` cell output
  *   (`HtmlOutput.svelte`) and the `.html` file preview (`HtmlPreview.svelte`)
  *   render inside a sandboxed iframe whose srcdoc already carries
@@ -63,25 +64,72 @@ import type { Config } from 'dompurify';
  */
 export const NEW_TAB_REL = 'noreferrer noopener';
 
-/** The elements that navigate on click and therefore carry the policy. */
-const LINK_TAGS = new Set(['A', 'AREA']);
+/**
+ * The elements that navigate on click and therefore carry the policy, compared
+ * against `localName` and NOT `tagName`.
+ *
+ * That is a correctness rule, not a style choice: only an element in the HTML
+ * namespace uppercases its `tagName`, so an `<a>` inside an `<svg>` - which is
+ * in the SVG namespace - reports `'a'` and silently missed an uppercase set,
+ * bypassing the policy entirely. It is reachable: neither sanitize config
+ * restricts `ALLOWED_TAGS`/`USE_PROFILES`, so DOMPurify's default profile keeps
+ * SVG, and the two widget surfaces hand a kernel's raw `text/html` straight to
+ * {@link sanitizeHtml}. `localName` is lowercase in both namespaces.
+ */
+const LINK_TAGS = new Set(['a', 'area']);
+
+/**
+ * SVG 1.1's link spelling, which browsers still honour and DOMPurify's default
+ * profile still keeps (measured: `xlink:href` survives sanitizing on an SVG
+ * `<a>`, and a `javascript:` value in it is refused exactly like the plain
+ * spelling). So the policy has to read BOTH, or an `<svg><a xlink:href=...>`
+ * navigates the live session away with no target on it.
+ */
+const XLINK_NS = 'http://www.w3.org/1999/xlink';
+
+/**
+ * The href this element would actually follow. `href` wins where both are
+ * present (SVG 2's own precedence); the namespaced read is tried before the
+ * qualified-name one because that is how the HTML parser stores `xlink:href`
+ * inside foreign content.
+ */
+function linkHref(node: Element): string | null {
+	const href = node.getAttribute('href');
+	if (href !== null) return href;
+	return node.getAttributeNS(XLINK_NS, 'href') ?? node.getAttribute('xlink:href');
+}
 
 /**
  * Does this `href` leave the current document?
  *
  * Everything does, EXCEPT a same-document fragment. `#section` and a bare `#`
  * are handled entirely by the browser (set the hash, scroll to the target, no
- * request, no unload), so they must stay in place - see the module header. A
- * missing or empty `href` is not a navigation at all (and is what an `href`
- * DOMPurify REFUSED, e.g. `javascript:`, leaves behind), so it gets nothing.
+ * request, no unload), so they must stay in place - see the module header.
+ *
+ * ABSENT and EMPTY are different cases and must not share a branch:
+ *
+ * - `null`/`undefined` - there is no `href` attribute, so there is nothing to
+ *   follow and a click does nothing. This is also what DOMPurify leaves behind
+ *   when it REFUSES an href (a `javascript:` URL): it REMOVES the attribute
+ *   rather than blanking it (measured). No target.
+ * - `''` or whitespace-only - the attribute is PRESENT and empty, which
+ *   resolves to the current document's URL, so a click RELOADS the Cellar tab
+ *   and destroys the live session it holds (kernel, running notebook, unsaved
+ *   editor buffers). That is precisely the harm this whole module exists to
+ *   prevent, so it opens out like any other outbound link. It is reachable from
+ *   ordinary content: markdown-it renders the empty link `[x]()` as
+ *   `<a href="">`, and DOMPurify keeps an empty value. The cost is that a stray
+ *   `[x]()` opens a SECOND Cellar tab - odd, but harmless (two tabs against one
+ *   instance is a supported, tested arrangement: kernels are server-side and per
+ *   notebook, and runs are serialized by the server-side run queue), and a
+ *   destroyed session is not.
  *
  * Note this is deliberately not "is the URL cross-origin": a relative `./x.csv`
  * or `?q=1` really does unload the Cellar tab, so it opens out like any other.
  */
 export function opensInNewTab(href: string | null | undefined): boolean {
-	const h = (href ?? '').trim();
-	if (h === '') return false;
-	return !h.startsWith('#');
+	if (href === null || href === undefined) return false;
+	return !href.trim().startsWith('#');
 }
 
 /**
@@ -96,8 +144,8 @@ export function opensInNewTab(href: string | null | undefined): boolean {
  * must not open a tab.
  */
 export function applyLinkPolicy(node: Element): void {
-	if (!LINK_TAGS.has(node.tagName)) return;
-	if (!opensInNewTab(node.getAttribute('href'))) {
+	if (!LINK_TAGS.has(node.localName)) return;
+	if (!opensInNewTab(linkHref(node))) {
 		node.removeAttribute('target');
 		return;
 	}
@@ -125,9 +173,11 @@ function ensureLinkPolicy(): void {
  * Sanitize untrusted HTML for rendering, applying the link policy above.
  *
  * Every browser-side `{@html}` of notebook / kernel / model content goes through
- * here - do not call `DOMPurify.sanitize` directly, or that surface silently
- * opts out of the policy (pinned by a source guard in
- * `tests/unit/rendered-link-target.test.ts`).
+ * here - do not import `dompurify` for a value anywhere else, or that surface
+ * silently opts out of the policy (pinned by a source guard in
+ * `tests/unit/rendered-link-target.test.ts`, which flags any non-type import of
+ * the module outside this file, so an alias or a re-exported wrapper cannot slip
+ * past it either).
  */
 export function sanitizeHtml(dirty: string, config?: Config): string {
 	ensureLinkPolicy();

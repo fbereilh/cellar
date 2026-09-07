@@ -20,6 +20,9 @@ import { join } from 'node:path';
 import { renderMarkdown, renderOutputMarkdown, renderChatReply } from '../../src/lib/markdown';
 import { sanitizeHtml, opensInNewTab, applyLinkPolicy, NEW_TAB_REL } from '../../src/lib/sanitizeHtml';
 
+/** SVG 1.1's link spelling, which browsers still follow and DOMPurify still keeps. */
+const XLINK_NS = 'http://www.w3.org/1999/xlink';
+
 /** Parse rendered HTML so assertions read the DOM, not a string. */
 function dom(html: string): HTMLElement {
 	const host = document.createElement('div');
@@ -52,13 +55,20 @@ describe('opensInNewTab - the one same-document rule', () => {
 		expect(opensInNewTab('?q=1')).toBe(true);
 	});
 
-	it('does nothing for a link with no href to follow', () => {
-		// This is also the shape DOMPurify leaves behind when it REFUSES an href
-		// (a `javascript:` URL), so it must not be given a target.
+	it('does nothing for an ABSENT href - there is nothing to follow', () => {
+		// This is the shape DOMPurify leaves behind when it REFUSES an href (a
+		// `javascript:` URL): it removes the attribute rather than blanking it, so
+		// a click goes nowhere and a target would be meaningless.
 		expect(opensInNewTab(null)).toBe(false);
 		expect(opensInNewTab(undefined)).toBe(false);
-		expect(opensInNewTab('')).toBe(false);
-		expect(opensInNewTab('   ')).toBe(false);
+	});
+
+	it('opens an EMPTY href out - it resolves to the current document', () => {
+		// Absent and empty are different cases. An empty `href` is PRESENT, and it
+		// resolves to the current URL, so clicking it RELOADS the Cellar tab and
+		// destroys the live session - exactly the harm this rule exists to prevent.
+		expect(opensInNewTab('')).toBe(true);
+		expect(opensInNewTab('   ')).toBe(true);
 	});
 });
 
@@ -86,6 +96,41 @@ describe('applyLinkPolicy', () => {
 		applyLinkPolicy(el);
 		expect(el.getAttribute('target')).toBe('_blank');
 		expect(el.getAttribute('rel')).toBe(NEW_TAB_REL);
+	});
+
+	it('matches the element by localName, so a namespaced <a> is covered', () => {
+		// Only an HTML-namespaced element uppercases its `tagName`; an SVG one
+		// reports `'a'`, so an uppercase comparison silently skipped it.
+		const el = document.createElementNS('http://www.w3.org/2000/svg', 'a');
+		expect(el.tagName).toBe('a');
+		el.setAttribute('href', 'https://example.com');
+		applyLinkPolicy(el);
+		expect(el.getAttribute('target')).toBe('_blank');
+		expect(el.getAttribute('rel')).toBe(NEW_TAB_REL);
+	});
+
+	it("reads SVG's xlink:href, which navigates just like href", () => {
+		const el = document.createElementNS('http://www.w3.org/2000/svg', 'a');
+		el.setAttributeNS(XLINK_NS, 'xlink:href', 'https://example.com');
+		applyLinkPolicy(el);
+		expect(el.getAttribute('target')).toBe('_blank');
+		expect(el.getAttribute('rel')).toBe(NEW_TAB_REL);
+	});
+
+	it('leaves an xlink:href fragment in place and strips its target', () => {
+		const el = document.createElementNS('http://www.w3.org/2000/svg', 'a');
+		el.setAttributeNS(XLINK_NS, 'xlink:href', '#setup');
+		el.setAttribute('target', '_blank');
+		applyLinkPolicy(el);
+		expect(el.hasAttribute('target')).toBe(false);
+	});
+
+	it('prefers href over xlink:href, as SVG 2 does', () => {
+		const el = document.createElementNS('http://www.w3.org/2000/svg', 'a');
+		el.setAttribute('href', '#setup');
+		el.setAttributeNS(XLINK_NS, 'xlink:href', 'https://example.com');
+		applyLinkPolicy(el);
+		expect(el.hasAttribute('target')).toBe(false);
 	});
 });
 
@@ -142,6 +187,36 @@ describe('every rendered markdown surface opens its links out', () => {
 		expect(a.hasAttribute('target')).toBe(false);
 	});
 
+	it('an empty link from markdown-it opens out rather than reloading the tab', () => {
+		// `[x]()` is ordinary content and markdown-it renders it as `<a href="">`,
+		// which DOMPurify keeps. Left in place it would reload the tab holding the
+		// kernel, the running notebook and every unsaved editor buffer.
+		const a = anchor(renderMarkdown('[x]()'));
+		expect(a.getAttribute('href')).toBe('');
+		expect(a.getAttribute('target')).toBe('_blank');
+		expect(a.getAttribute('rel')).toBe(NEW_TAB_REL);
+	});
+
+	it('an SVG anchor sanitized through the boundary is covered', () => {
+		// Reachable: neither sanitize config restricts `ALLOWED_TAGS`, so
+		// DOMPurify's default profile keeps SVG, and the widget surfaces hand a
+		// kernel's raw `text/html` straight to `sanitizeHtml`.
+		for (const spelling of ['href', 'xlink:href']) {
+			const a = anchor(
+				sanitizeHtml(`<svg><a ${spelling}="https://example.com"><text>go</text></a></svg>`)
+			);
+			expect(a.namespaceURI).toBe('http://www.w3.org/2000/svg');
+			expect(a.getAttribute('target')).toBe('_blank');
+			expect(a.getAttribute('rel')).toBe(NEW_TAB_REL);
+		}
+	});
+
+	it('an SVG same-document anchor still stays in place', () => {
+		const a = anchor(sanitizeHtml('<svg><a href="#setup"><text>go</text></a></svg>'));
+		expect(a.getAttribute('href')).toBe('#setup');
+		expect(a.hasAttribute('target')).toBe(false);
+	});
+
 	it('raw text/html output (the widget surfaces) is covered', () => {
 		// `WidgetOutput.svelte` / `WidgetOutputArea.svelte` sanitize a kernel's
 		// `text/html` directly - no markdown-it in sight - which is why the policy
@@ -166,10 +241,86 @@ describe('source guard: the boundary cannot be bypassed', () => {
 		return out;
 	}
 
-	it('only sanitizeHtml.ts calls DOMPurify.sanitize', () => {
+	// Matching the literal `DOMPurify.sanitize(` spelling would have been trivially
+	// bypassed - an aliased binding, `import { sanitize } from 'dompurify'`, a
+	// re-exported wrapper - so the invariant is stated one level up instead: NO
+	// file but `sanitizeHtml.ts` may import `dompurify` FOR A VALUE at all. A
+	// type-only import (`markdown.ts` still needs `Config`) reaches no runtime
+	// binding, so it is allowed.
+	const SPEC = String.raw`['"]dompurify['"]`;
+	const VALUE_IMPORTS: RegExp[] = [
+		// `import ... from 'dompurify'` / `export ... from 'dompurify'`, minus the
+		// type-only forms, which are subtracted by `isTypeOnly` below. The clause
+		// may span lines (a braced import often does) but may contain neither a
+		// quote nor a `;`, so it cannot run past the end of an EARLIER statement
+		// and mistake a preceding unrelated import for part of this one.
+		new RegExp(String.raw`\b(?:import|export)\s+([^;'"]*?)\s+from\s*${SPEC}`, 'g'),
+		// A bare side-effect import, and the two dynamic spellings.
+		new RegExp(String.raw`\bimport\s*${SPEC}`, 'g'),
+		new RegExp(String.raw`\b(?:require|import)\s*\(\s*${SPEC}`, 'g')
+	];
+
+	/** `import type X` / `import { type X, type Y }` - no runtime binding. */
+	function isTypeOnly(clause: string | undefined): boolean {
+		if (clause === undefined) return false;
+		const c = clause.trim();
+		if (/^type\b/.test(c)) return true;
+		const braced = /^\{([\s\S]*)\}$/.exec(c);
+		if (!braced) return false;
+		const specifiers = braced[1]
+			.split(',')
+			.map((x) => x.trim())
+			.filter(Boolean);
+		return specifiers.length > 0 && specifiers.every((x) => /^type\b/.test(x));
+	}
+
+	function importsDompurifyForValue(source: string): boolean {
+		for (const re of VALUE_IMPORTS) {
+			re.lastIndex = 0;
+			for (let m = re.exec(source); m; m = re.exec(source)) {
+				if (!isTypeOnly(m[1])) return true;
+			}
+		}
+		return false;
+	}
+
+	it('recognizes every way a file could reach for the module', () => {
+		// The guard is only worth its cost if it really answers about the bypasses
+		// it claims to close, so exercise the predicate itself.
+		expect(importsDompurifyForValue(`import DOMPurify from 'dompurify';`)).toBe(true);
+		expect(importsDompurifyForValue(`import { sanitize } from 'dompurify';`)).toBe(true);
+		expect(importsDompurifyForValue(`import * as dp from "dompurify";`)).toBe(true);
+		expect(importsDompurifyForValue(`export { sanitize } from 'dompurify';`)).toBe(true);
+		expect(importsDompurifyForValue(`const dp = require('dompurify');`)).toBe(true);
+		expect(importsDompurifyForValue(`const dp = await import('dompurify');`)).toBe(true);
+		expect(importsDompurifyForValue(`import 'dompurify';`)).toBe(true);
+		// ...and does not flag a type-only import, which reaches no runtime value.
+		expect(importsDompurifyForValue(`import type { Config } from 'dompurify';`)).toBe(false);
+		expect(importsDompurifyForValue(`import { type Config } from 'dompurify';`)).toBe(false);
+		expect(importsDompurifyForValue(`import MarkdownIt from 'markdown-it';`)).toBe(false);
+		// A preceding unrelated import must not be swept into the clause - that is
+		// what made the guard flag `markdown.ts`, whose dompurify import is
+		// type-only, when the clause was allowed to run across statements.
+		expect(
+			importsDompurifyForValue(
+				`import MarkdownIt from 'markdown-it';\nimport type { Config } from 'dompurify';`
+			)
+		).toBe(false);
+		expect(
+			importsDompurifyForValue(
+				`import MarkdownIt from 'markdown-it';\nimport DOMPurify from 'dompurify';`
+			)
+		).toBe(true);
+		// A multi-line braced import is still one clause.
+		expect(
+			importsDompurifyForValue(`import {\n\tsanitize,\n\taddHook\n} from 'dompurify';`)
+		).toBe(true);
+	});
+
+	it('only sanitizeHtml.ts imports dompurify for a value', () => {
 		const offenders = walk('src')
 			.filter((p) => !p.endsWith(join('lib', 'sanitizeHtml.ts')))
-			.filter((p) => /DOMPurify\s*\.\s*sanitize\s*\(/.test(readFileSync(p, 'utf8')));
+			.filter((p) => importsDompurifyForValue(readFileSync(p, 'utf8')));
 		expect(offenders).toEqual([]);
 	});
 });

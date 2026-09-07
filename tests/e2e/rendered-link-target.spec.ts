@@ -30,6 +30,7 @@ let baseURL = '';
 const EXTERNAL = 'https://example.com/docs';
 const RELATIVE = './linked-page.html';
 const ANCHOR_ID = 'anchor-target';
+const EMPTY_LINK_TEXT = 'reload me';
 
 const MD_CELL = [
 	'# Links',
@@ -39,6 +40,11 @@ const MD_CELL = [
 	`[relative](${RELATIVE})`,
 	'',
 	`[jump](#${ANCHOR_ID})`,
+	'',
+	// markdown-it renders an empty link as `<a href="">`, which resolves to the
+	// current document - so left in place a click would RELOAD this tab and take
+	// the live session with it. It must open out like any other outbound link.
+	`[${EMPTY_LINK_TEXT}]()`,
 	'',
 	'bare https://example.com/bare too'
 ].join('\n');
@@ -145,6 +151,36 @@ test('a markdown-cell link opens a new tab and the session survives', async ({ p
 	await expect(rendered).toBeVisible();
 	// The kernel namespace is intact: re-running reads back the marker set before
 	// the link was clicked, which a reload or a fresh kernel would have lost.
+	await markerCell.getByTestId('run').click();
+	await expect(markerCell.getByTestId('output')).toContainText('alive');
+});
+
+test('an empty link opens a new tab rather than reloading the session away', async ({
+	page,
+	context
+}) => {
+	await openNotebook(page);
+	const rendered = page.getByTestId('markdown-rendered').first();
+	const empty = rendered.locator('a[href=""]');
+	await expect(empty).toHaveText(EMPTY_LINK_TEXT);
+	await expect(empty).toHaveAttribute('target', '_blank');
+	await expect(empty).toHaveAttribute('rel', 'noreferrer noopener');
+
+	// Establish live session state that only survives if this tab is not unloaded.
+	const markerCell = page.locator('[data-testid="cell"][data-cell-id="code-links-aaaaaa"]');
+	await markerCell.getByTestId('run').click();
+	await expect(markerCell.getByTestId('output')).toContainText('alive');
+
+	const urlBefore = page.url();
+	const [popup] = await Promise.all([context.waitForEvent('page'), empty.click()]);
+	await popup.waitForLoadState('domcontentloaded').catch(() => {});
+	expect(popup).not.toBe(page);
+	await popup.close();
+
+	// The original tab neither navigated nor reloaded: re-running reads back the
+	// marker defined before the click, which a reload would have lost with the
+	// kernel session it was stamped against.
+	expect(page.url()).toBe(urlBefore);
 	await markerCell.getByTestId('run').click();
 	await expect(markerCell.getByTestId('output')).toContainText('alive');
 });
