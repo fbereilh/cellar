@@ -37,6 +37,7 @@ import {
 	exportMarkStranded,
 	exportStrandedCount,
 	exportStrandedExplanation,
+	exportStrandedSummary,
 	exportTargetLanguage,
 	isExportCell,
 	EXPORT_STRANDED_BADGE,
@@ -615,31 +616,74 @@ describe('a mark stranded by a target-language change stays clearable', () => {
 		expect(exportStrandedCount(null)).toBe(0);
 	});
 
+	it('summarises how many stranded cells have a module language of their own', () => {
+		// The second number is what decides which REMEDY the bar may name: a cell that
+		// contributes no module source in ANY language is stranded whatever the target
+		// says, so pointing the target elsewhere cannot resolve it.
+		const md = { cell_type: 'markdown', source: '# hi', metadata: { cellar: { export: true } } };
+		expect(exportStrandedSummary([py, md], 'mojo')).toEqual({ count: 2, withLanguage: 1 });
+		expect(exportStrandedSummary([md], 'python')).toEqual({ count: 1, withLanguage: 0 });
+		expect(exportStrandedSummary([mojo], 'python')).toEqual({ count: 1, withLanguage: 1 });
+		expect(exportStrandedSummary([py], 'python')).toEqual({ count: 0, withLanguage: 0 });
+		expect(exportStrandedSummary(null)).toEqual({ count: 0, withLanguage: 0 });
+	});
+
 	it('says NO TARGET and A DIFFERENT LANGUAGE as the different facts they are', () => {
 		// `canExportCell` falls back to `python` with nothing configured, so a language
 		// alone cannot tell the two apart - and the fallback made every marked Mojo cell
 		// claim the notebook "targets a .py module" over a notebook that targets
 		// nothing, naming a file that does not exist.
-		const none = exportStrandedExplanation(2, null);
+		const withLang = { count: 2, withLanguage: 2 };
+		const none = exportStrandedExplanation(withLang, null);
 		expect(none).toContain('no target module');
 		expect(none).not.toContain('.py');
 		expect(none).not.toContain('.mojo');
 		expect(none).toContain('Set a target path');
 
-		const py = exportStrandedExplanation(2, 'python');
+		const py = exportStrandedExplanation(withLang, 'python');
 		expect(py).toContain('.py module');
 		expect(py).not.toContain('no target module');
-		expect(exportStrandedExplanation(2, 'mojo')).toContain('.mojo module');
+		expect(exportStrandedExplanation(withLang, 'mojo')).toContain('.mojo module');
 
 		// Singular and plural both read, since the count is whatever the notebook has.
-		expect(exportStrandedExplanation(1, 'mojo')).toContain('1 cell is marked');
-		expect(exportStrandedExplanation(3, 'mojo')).toContain('3 cells are marked');
+		expect(exportStrandedExplanation({ count: 1, withLanguage: 1 }, 'mojo')).toContain('1 cell is marked');
+		expect(exportStrandedExplanation({ count: 3, withLanguage: 3 }, 'mojo')).toContain('3 cells are marked');
 
 		// It never claims what LANGUAGE the stranded cells are: the set can be mixed (a
 		// Mojo cell beside a markdown cell carrying a hand-edited flag), so it states
 		// only that the module leaves them out.
 		for (const lang of [null, 'python', 'mojo'] as const)
-			expect(exportStrandedExplanation(2, lang)).not.toMatch(/is not (Python|Mojo)/);
+			expect(exportStrandedExplanation(withLang, lang)).not.toMatch(/is not (Python|Mojo)/);
+	});
+
+	it('names a remedy that can actually resolve the cells it is about', () => {
+		// Keeping the mark through a conversion made "no module source in ANY language"
+		// the commonest stranded shape, and for such a cell no target extension can
+		// help - so the point-the-target remedy would send the user to change a setting
+		// that resolves nothing. The remedy turns on `withLanguage`, not on the target.
+		for (const lang of [null, 'python', 'mojo'] as const) {
+			const say = exportStrandedExplanation({ count: 2, withLanguage: 0 }, lang);
+			expect(say).toContain('contribute no module source');
+			expect(say).toContain("clear each mark from the cell's toolbar");
+			// ...and it names NO target action, in any of its spellings.
+			expect(say).not.toMatch(/Point the target|Set a target/);
+			// It states what was observed and no more: never which language they are.
+			expect(say).not.toMatch(/is not (Python|Mojo)|their own language/);
+		}
+
+		// A cell that DOES have a language keeps the target remedy, since changing the
+		// extension really would take it - and the sentence still names no language.
+		for (const lang of ['python', 'mojo'] as const) {
+			const say = exportStrandedExplanation({ count: 1, withLanguage: 1 }, lang);
+			expect(say).toContain('Point the target at a module that takes them');
+			expect(say).not.toContain('their own language');
+			expect(say).not.toContain('no module source');
+		}
+		// A MIXED set keeps it too: the target remedy applies to the cells that have a
+		// language, and clearing covers the rest.
+		const mixed = exportStrandedExplanation({ count: 3, withLanguage: 1 }, 'python');
+		expect(mixed).toContain('Point the target');
+		expect(mixed).toContain("clear each mark from the cell's toolbar");
 	});
 
 	it('the per-cell marker stays a MARKER, never the notebook-wide sentence', () => {
@@ -745,8 +789,12 @@ describe('converting a cell never deletes its export mark', () => {
 
 		// The one explanation reads correctly for it: it says the module leaves the
 		// cell out, and never that the cell "is not Python".
-		const why = exportStrandedExplanation(exportStrandedCount(nbmod.listCells(nb), 'python'), 'python');
-		expect(why).toContain('cannot go in a .py module');
+		// A markdown cell contributes no module source in ANY language, so the one
+		// explanation must name clearing the mark and no target action at all.
+		const why = exportStrandedExplanation(exportStrandedSummary(nbmod.listCells(nb), 'python'), 'python');
+		expect(why).toContain('contributes no module source');
+		expect(why).toContain("clear the mark from the cell's toolbar");
+		expect(why).not.toMatch(/Point the target|Set a target/);
 		expect(why).not.toMatch(/is not (Python|Mojo)/);
 
 		// ...and the greyed toggle's click still clears it, because unmarking is not
@@ -880,7 +928,7 @@ describe('the wiring the browser ships', () => {
 		expect(cell).not.toContain('exportStrandedExplanation(');
 		// ...while the bar renders the one explanation, built by the shared rule.
 		expect(bar).toContain('data-testid="export-stranded"');
-		expect(bar).toContain('exportStrandedExplanation(exportStrandedCount, exportLanguage)');
+		expect(bar).toContain('exportStrandedExplanation(exportStranded, exportLanguage)');
 		expect(bar).toContain('{strandedExplanation}');
 	});
 
@@ -892,7 +940,7 @@ describe('the wiring the browser ships', () => {
 		expect(live).toContain('const exportModuleLanguage = $derived(exportTargetLanguage(exportResolved ?? exportTarget));');
 		expect(live).toContain("const exportLanguage = $derived(exportModuleLanguage ?? 'python');");
 		expect(live).toContain('exportLanguage={exportModuleLanguage}');
-		expect(live).toContain('exportStrandedCount={exportStrandedCells}');
+		expect(live).toContain('exportStranded={exportStranded}');
 	});
 
 	it('the unsaved-edit notice names the target module, not always .py', () => {

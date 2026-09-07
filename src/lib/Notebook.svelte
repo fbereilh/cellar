@@ -12,7 +12,11 @@
 	import type { WorkspaceRootOption } from '$lib/notebookRoot';
 	import { EXPORT_BASES, EXPORT_BASE_LABELS, exportImportWarning } from '$lib/exportTarget';
 	import { hazardSummaryClause, humanExportHazards, type ExportHazard } from '$lib/exportHazard';
-	import { exportStrandedExplanation, type ExportLanguage } from '$lib/exportRole';
+	import {
+		exportStrandedExplanation,
+		type ExportLanguage,
+		type ExportStrandedSummary
+	} from '$lib/exportRole';
 	import { reservedFailureHeight, failureDetail } from '$lib/cellRenderFailure';
 	import type { ExportPyResult } from '$lib/types';
 	import {
@@ -130,12 +134,15 @@
 		/** How many cells are currently marked for export. */
 		exportCount?: number;
 		/**
-		 * How many cells carry an export flag the current target cannot honour - the
-		 * target's extension moved under a mark nothing rewrites, or there is no
-		 * target at all. Reported ONCE here, since it is a notebook-wide fact; each
-		 * affected cell carries only a short marker (`EXPORT_STRANDED_BADGE`).
+		 * The cells carrying an export flag the current target cannot honour - the
+		 * target's extension moved under a mark nothing rewrites, the cell was
+		 * converted to a type that contributes no module source, or there is no target
+		 * at all. Reported ONCE here, since it is a notebook-wide fact; each affected
+		 * cell carries only a short marker (`EXPORT_STRANDED_BADGE`). It is a SUMMARY
+		 * rather than a count because the remedy turns on how many of those cells have
+		 * a module language at all (`$lib/exportRole`).
 		 */
-		exportStrandedCount?: number;
+		exportStranded?: ExportStrandedSummary;
 		/**
 		 * Set (or clear, with '') the notebook's `.py` export target. Called ONCE PER
 		 * EDIT, from the input's `change` (a blur after typing, or Enter) - never per
@@ -288,7 +295,7 @@
 		onSetExport,
 		exportTarget = null,
 		exportCount = 0,
-		exportStrandedCount = 0,
+		exportStranded = { count: 0, withLanguage: 0 },
 		onSetExportTarget,
 		onExportPy,
 		exportBase = 'workspace',
@@ -684,7 +691,7 @@
 	// takes the NULLABLE language, because "targets a .py module" and "targets
 	// nothing" are different facts and only the nullable value can tell them apart.
 	const strandedExplanation = $derived(
-		exportStrandedCount > 0 ? exportStrandedExplanation(exportStrandedCount, exportLanguage) : null
+		exportStranded.count > 0 ? exportStrandedExplanation(exportStranded, exportLanguage) : null
 	);
 	// Whether the notebook has any runnable (code) cell — gates the "Run all" button.
 	const hasCodeCell = $derived(cells.some((c) => c.cell_type === 'code'));

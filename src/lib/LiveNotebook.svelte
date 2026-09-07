@@ -34,7 +34,7 @@
 		exportCellCount,
 		exportDirectiveOwnsCell,
 		exportMarkedTwice,
-		exportStrandedCount,
+		exportStrandedSummary,
 		exportTargetLanguage,
 		isExportCell
 	} from '$lib/exportRole';
@@ -273,10 +273,11 @@
 	const exportLanguage = $derived(exportModuleLanguage ?? 'python');
 	const exportCount = $derived(exportCellCount(cells, exportLanguage));
 	// Cells whose export FLAG is set but which no longer match the target's language
-	// (or which have no target to match at all). Counted here beside `exportCount`,
+	// (or which have no target to match at all). Summarised here beside `exportCount`,
 	// so the bar states the notebook-wide fact ONCE from the same cell list the
-	// count comes from.
-	const exportStrandedCells = $derived(exportStrandedCount(cells, exportLanguage));
+	// count comes from - and it carries how many of them have a module language of
+	// their own, since that is what decides which remedy the bar may name.
+	const exportStranded = $derived(exportStrandedSummary(cells, exportLanguage));
 	/**
 	 * The cells whose top-level `def main()` the next `.mojo` export will DROP - a
 	 * Mojo module can define main only once, so the LAST exported cell that defines
@@ -4639,7 +4640,7 @@
 			onSetExport={setExport}
 			exportTarget={exportTarget}
 			exportCount={exportCount}
-			exportStrandedCount={exportStrandedCells}
+			exportStranded={exportStranded}
 			exportLanguage={exportModuleLanguage}
 			{mojoMainDropped}
 			onSetExportTarget={setExportTargetValue}

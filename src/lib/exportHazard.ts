@@ -9,9 +9,9 @@
  * signal was the eventual import failure.
  *
  * A hazard is a POSITIVE, DETECTED finding about the module the export just wrote
- * that the user would otherwise learn only from the file. There are two KINDS,
- * and they are NOT the same claim - the `kind` discriminant exists so one can
- * never be worded as the other:
+ * that the user would otherwise learn only from the file. There are THREE KINDS,
+ * and no two of them are the same claim - the `kind` discriminant exists so one
+ * can never be worded as another:
  *
  *   - `future-import-joined` (a `.py` target): the generated module will NOT
  *     COMPILE. The rest of this header is about that kind, and about that kind

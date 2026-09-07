@@ -287,6 +287,47 @@ export const EXPORT_STRANDED_BADGE = 'not exported';
 export const EXPORT_STRANDED_CELL_TITLE = 'Not exported - click to clear this stale mark';
 
 /**
+ * What the stranded marks in a notebook amount to: how many there are, and how
+ * many of them are on a cell that CONTRIBUTES module source at all.
+ *
+ * The second number is what makes the remedy honest. A stranded cell is either a
+ * code cell in the other language - which a different target extension WOULD
+ * take - or a cell that contributes no module source in ANY language, for which
+ * no target could ever work; and since a conversion now keeps the mark
+ * (`applyCellType`), the second is the commonest kind there is. One remedy for
+ * both told half the users to change a setting that cannot help them.
+ */
+export interface ExportStrandedSummary {
+	/** Stranded marks in the notebook. Zero means the bar says nothing. */
+	count: number;
+	/** How many of those sit on a cell with a module language of its own. */
+	withLanguage: number;
+}
+
+/** The stranded marks in a notebook, counted in ONE pass over its cells. */
+export function exportStrandedSummary(
+	cells: readonly ExportCell[] | null | undefined,
+	lang: ExportLanguage = 'python'
+): ExportStrandedSummary {
+	let count = 0;
+	let withLanguage = 0;
+	for (const c of cells ?? []) {
+		if (!exportMarkStranded(c, lang)) continue;
+		count++;
+		if (exportLanguageOf(c) !== null) withLanguage++;
+	}
+	return { count, withLanguage };
+}
+
+/** How many cells carry a stranded export mark for a module of this language. */
+export function exportStrandedCount(
+	cells: readonly ExportCell[] | null | undefined,
+	lang: ExportLanguage = 'python'
+): number {
+	return exportStrandedSummary(cells, lang).count;
+}
+
+/**
  * The ONE full explanation of stranded marks, for the export bar.
  *
  * `moduleLanguage` is the language the CONFIGURED target names, or **null when no
@@ -296,30 +337,36 @@ export const EXPORT_STRANDED_CELL_TITLE = 'Not exported - click to clear this st
  * "this notebook targets nothing", and asserting the first over the second names a
  * file that does not exist.
  *
- * Neither wording claims what LANGUAGE the stranded cells are: the set can be
- * mixed (a Mojo cell under a `.py` target beside a markdown cell carrying a
- * hand-edited flag), so it states only what was observed - they are marked, and
- * the module leaves them out.
+ * ## THE REMEDY MAY NOT NAME AN ACTION THAT CANNOT HELP
+ *
+ * Which remedy applies turns on `summary.withLanguage`, not on the target. A cell
+ * that contributes NO module source in any language is stranded whatever the
+ * target says, so "point the target elsewhere" is advice that resolves nothing for
+ * it, and that is now the commonest stranded shape: a conversion keeps the mark
+ * (`applyCellType`), so a marked code cell turned into markdown or raw lands
+ * exactly there. With none of the stranded cells carrying a language, clearing the
+ * mark is the ONLY thing that resolves them, and the sentence says so and stops.
+ *
+ * No wording claims what LANGUAGE the stranded cells ARE - the set can be mixed (a
+ * Mojo cell under a `.py` target beside a markdown cell carrying a hand-edited
+ * flag), so each states only what was observed: they are marked, the module leaves
+ * them out, and whether any of them has a module language at all.
  */
 export function exportStrandedExplanation(
-	count: number,
+	summary: ExportStrandedSummary,
 	moduleLanguage: ExportLanguage | null
 ): string {
+	const { count, withLanguage } = summary;
 	const subject = count === 1 ? '1 cell is marked for export' : `${count} cells are marked for export`;
 	const them = count === 1 ? 'it is' : 'they are';
 	const mark = count === 1 ? 'the mark' : 'each mark';
+	const clear = `clear ${mark} from the cell's toolbar`;
+	if (withLanguage === 0)
+		return `${subject}, but ${count === 1 ? 'contributes' : 'contribute'} no module source, so ${them} exported nowhere whatever the target is. To resolve it, ${clear}.`;
 	if (moduleLanguage === null)
-		return `${subject}, but this notebook has no target module, so ${them} exported nowhere. Set a target path above, or clear ${mark} from the cell's toolbar.`;
+		return `${subject}, but this notebook has no target module, so ${them} exported nowhere. Set a target path above, or ${clear}.`;
 	const ext = moduleLanguage === 'mojo' ? '.mojo' : '.py';
-	return `${subject}, but cannot go in a ${ext} module, so ${them} exported nowhere. Point the target at a module in their own language, or clear ${mark} from the cell's toolbar.`;
-}
-
-/** How many cells carry a stranded export mark for a module of this language. */
-export function exportStrandedCount(
-	cells: readonly ExportCell[] | null | undefined,
-	lang: ExportLanguage = 'python'
-): number {
-	return (cells ?? []).filter((c) => exportMarkStranded(c, lang)).length;
+	return `${subject}, but cannot go in a ${ext} module, so ${them} exported nowhere. Point the target at a module that takes them, or ${clear}.`;
 }
 
 /** Count of cells currently marked for export to a module of this language. */
