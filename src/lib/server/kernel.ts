@@ -29,7 +29,7 @@ import { realpathSync } from 'node:fs';
 import { basename, sep } from 'node:path';
 import { KernelManager, ServerConnection, CommsOverSubshells, KernelAPI } from '@jupyterlab/services';
 import type { Kernel, KernelMessage } from '@jupyterlab/services';
-import { clearRunQueue } from './run-queue';
+import { clearRunQueue, queueStateFor } from './run-queue';
 import { abortChatRuns, abortChatRunsUnder } from './chat/active';
 import { getActiveNotebookPath, workspaceRelative, resolveNotebookPath } from './notebook';
 import { workspaceRoot } from './fstree';
@@ -55,6 +55,8 @@ import { logInfo, logWarn, logError } from './logs';
 import { sampleKernelMemory } from './kernelMemory';
 import type { RunStreamEvent, ExecuteOptions, SessionId, KernelStatus } from './types';
 import type { KernelListEntry } from '$lib/kernelBadge';
+import { asText, stripAnsi } from '$lib/outputText';
+import type { CompleteOutcome, InspectOutcome, IntrospectRefusal } from '$lib/kernelIntrospect';
 
 type KernelConnection = Kernel.IKernelConnection;
 type StatusListener = (sender: KernelConnection, status: Kernel.Status) => void;
@@ -2553,6 +2555,279 @@ export async function ensureMojoMagic(nbPath?: string | null): Promise<MojoSetup
 export function currentSessionId(nbPath?: string | null): SessionId | null {
 	const nbKernel = kernels.get(resolveNb(nbPath));
 	return nbKernel && nbKernel.connection ? nbKernel.sessionId : null;
+}
+
+// --- Editor introspection over Jupyter's SHELL channel ----------------------
+// `complete_request` (Tab completion that knows the live namespace) and
+// `inspect_request` (the Shift+Tab documentation tooltip). See
+// `$lib/kernelIntrospect` for WHY these are real shell requests rather than an
+// `execute()` probe - the short version is that both queue behind a running cell
+// (measured), but only a probe would additionally hold this kernel's `execChain`
+// lock and so park the user's NEXT run behind a tooltip.
+//
+// Three rules bind both, and each is load-bearing:
+//
+//  1. NEITHER MAY START A KERNEL. They read `kernels` directly and never call
+//     `getKernel`: a keystroke must not boot a Python process, and "there is no
+//     kernel" is a perfectly good answer for an editor to fall back from.
+//  2. NEITHER MAY SEND TO A KERNEL THAT CANNOT ANSWER NOW. A busy kernel would
+//     queue the request behind the running cell for that cell's whole life
+//     (measured: 7.55s behind an 8s sleep), and a DISCONNECTED socket parks the
+//     message in @jupyterlab's `_pendingMessages` until a reconnect that may
+//     never come. Both are refusals with their own names, not waits.
+//  3. THE WAIT IS BOUNDED ANYWAY. Guard 2 is a check-then-send, so the kernel can
+//     legitimately go busy in between; and `requestComplete`/`requestInspect`
+//     hand back only a promise, so there is no future to dispose. The timeout is
+//     what turns that race into a refusal instead of a hang.
+//
+// A restart mid-request rejects the underlying future ("Canceled future for ...
+// before replies were done") rather than leaving it pending; both callers await
+// inside a try/catch, so that rejection is handled and can never surface as the
+// unhandled rejection that `commsOverSubshells = Disabled` exists to prevent.
+
+/** Sentinel for the timeout leg of a shell-reply race - never equal to a real reply. */
+const TIMED_OUT: unique symbol = Symbol('cellar.introspect.timeout');
+
+/**
+ * How long to wait for a shell reply before giving up (`CELLAR_KERNEL_INTROSPECT_TIMEOUT_MS`,
+ * default 3000).
+ *
+ * ONE knob for both requests deliberately: they ask the same question of the same
+ * channel, and both are only ever sent to a kernel this module has just checked is
+ * idle and connected - measured at 3-180 ms against a real ipykernel. The bound is
+ * generous enough that a large namespace or a slow first Jedi call still answers,
+ * and short enough that the race in rule 3 costs a tooltip rather than a hang.
+ */
+function introspectTimeoutMs(): number {
+	return envMs('CELLAR_KERNEL_INTROSPECT_TIMEOUT_MS', 3000);
+}
+
+/**
+ * How long to wait for a kernel that is busy with CELLAR'S OWN internal work
+ * before giving up on it (`CELLAR_KERNEL_INTROSPECT_IDLE_WAIT_MS`, default 500).
+ *
+ * A USER cell run never waits - see `waitForIntrospectable`. This window exists for
+ * the internal probes, which are what makes the kernel briefly busy at exactly the
+ * moment a user reaches for completion: `onRunEnd` refreshes the variable inspector,
+ * which is an `execute({internal:true})` on the same shell channel. Measured in a
+ * real browser, that probe lands right on top of "run a cell, then type a name it
+ * defined" - the CORE case for kernel-aware completion - and refusing there is a
+ * DEAD END rather than a delay, because CodeMirror does not re-run a completion
+ * source on its own.
+ *
+ * Half a second is chosen against what it is waiting for (a namespace probe, tens
+ * of milliseconds) rather than against typing latency: nothing is blocked while it
+ * waits, and a wait that runs out still refuses rather than sending.
+ */
+function introspectIdleWaitMs(): number {
+	return envMs('CELLAR_KERNEL_INTROSPECT_IDLE_WAIT_MS', 500);
+}
+
+/** How often to re-read the kernel while waiting out an internal probe. */
+const INTROSPECT_IDLE_POLL_MS = 20;
+
+/**
+ * Is a USER cell run holding notebook `nbPath`'s kernel?
+ *
+ * Read from the run queue rather than from jupyter's status, and the two are NOT
+ * interchangeable. The queue is the EARLIER signal for a real run - a run claims
+ * the kernel synchronously at dequeue while the idle->busy flip lands a beat later,
+ * so reading only the status leaves a window in which a request is sent into the
+ * back of a cell that has already started. And it is the NARROWER one: jupyter
+ * reports `busy` for Cellar's own internal probes too, which are not a user's work
+ * and are over in milliseconds (see `waitForIntrospectable`).
+ */
+function userRunHoldsKernel(abs: string): boolean {
+	return queueStateFor(abs).running != null;
+}
+
+/**
+ * `introspectTarget`, but willing to wait out CELLAR'S OWN brief internal work.
+ *
+ * The asymmetry is the point, and it is what makes "never blocks while a cell is
+ * running" and "works right after a run" both true:
+ *
+ *   - a USER run holding the kernel refuses IMMEDIATELY and is never waited for.
+ *     That request would sit in the kernel behind the cell for the cell's whole
+ *     life (measured: 7.55s behind an 8s sleep), which is the thing this feature
+ *     must never do.
+ *   - a kernel merely reporting `busy` with NO run in the queue is Cellar's own
+ *     doing - the variable-inspector probe that fires on `run:end`, a Databricks
+ *     ping, a startup injection. Refusing there is a DEAD END, because CodeMirror
+ *     does not re-run a completion source by itself, so the user sees no kernel
+ *     names until they type another character. Waiting a beat costs nothing and
+ *     covers the single most common moment to want them: just after a run.
+ *
+ * The queue is re-read every poll, so a real run STARTING during the wait converts
+ * it into the immediate refusal rather than being waited out.
+ */
+async function waitForIntrospectable(
+	abs: string
+): Promise<{ ok: true; kernel: KernelConnection } | { ok: false; reason: IntrospectRefusal }> {
+	let verdict = introspectTarget(abs);
+	if (verdict.ok || verdict.reason !== 'busy' || userRunHoldsKernel(abs)) return verdict;
+	const deadline = Date.now() + introspectIdleWaitMs();
+	while (Date.now() < deadline) {
+		await delay(INTROSPECT_IDLE_POLL_MS);
+		if (userRunHoldsKernel(abs)) return { ok: false, reason: 'busy' };
+		verdict = introspectTarget(abs);
+		if (verdict.ok || verdict.reason !== 'busy') return verdict;
+	}
+	return verdict;
+}
+
+/**
+ * Whether notebook `nbPath`'s kernel can be asked a shell question RIGHT NOW, and
+ * if not, which fact stops it. Returns the live connection when it can.
+ *
+ * Every branch names a distinct state rather than collapsing into one failure,
+ * because the tooltip shows the reason and a wrong one sends the user to fix
+ * something that is not wrong.
+ *
+ * This is the INSTANTANEOUS reading. `busy` here covers both a user run (from the
+ * queue) and Cellar's own internal work (from jupyter's status), which callers must
+ * tell apart - `waitForIntrospectable` is the one that does, and is what every
+ * caller uses.
+ */
+function introspectTarget(
+	abs: string
+): { ok: true; kernel: KernelConnection } | { ok: false; reason: IntrospectRefusal } {
+	const nbKernel = kernels.get(abs);
+	// No `getKernel` here, on purpose: see rule 1 above.
+	if (!nbKernel || !nbKernel.connection) return { ok: false, reason: 'no_kernel' };
+	const kernel = nbKernel.connection;
+	if (userRunHoldsKernel(abs)) return { ok: false, reason: 'busy' };
+	switch (kernel.status) {
+		case 'idle':
+			break;
+		case 'busy':
+			return { ok: false, reason: 'busy' };
+		case 'restarting':
+		case 'autorestarting':
+			return { ok: false, reason: 'restarting' };
+		case 'dead':
+			return { ok: false, reason: 'dead' };
+		default:
+			// starting / terminating / unknown: not a state that can answer, and none of
+			// them is a restart or a death, so neither of those words may be used.
+			return { ok: false, reason: 'not_ready' };
+	}
+	// A disconnected (or still-connecting) socket does not fail the send - it QUEUES
+	// it in `_pendingMessages`, so the promise would simply never settle. That is the
+	// one wedge shape a timeout alone would only paper over.
+	if (kernel.connectionStatus !== 'connected') return { ok: false, reason: 'not_connected' };
+	return { ok: true, kernel };
+}
+
+/**
+ * Send one shell request and bound the wait. `timeout` and `failed` stay distinct:
+ * the first means the kernel was asked and said nothing, the second that the ask
+ * itself did not survive (a dead-kernel throw, a restart cancelling the future).
+ */
+async function awaitShellReply<T>(
+	send: () => Promise<T>
+): Promise<{ ok: true; reply: T } | { ok: false; reason: IntrospectRefusal }> {
+	const timedOut: Promise<typeof TIMED_OUT> = delay(introspectTimeoutMs()).then(() => TIMED_OUT);
+	let reply: T | typeof TIMED_OUT;
+	try {
+		// `send()` is called inside the try because `requestComplete`/`requestInspect`
+		// reach `_sendMessage`, which THROWS synchronously for a kernel it believes is
+		// dead - a rejection here, since both are async, but only if we are inside.
+		reply = await Promise.race([send(), timedOut]);
+	} catch {
+		return { ok: false, reason: 'failed' };
+	}
+	if (reply === TIMED_OUT) return { ok: false, reason: 'timeout' };
+	return { ok: true, reply };
+}
+
+/**
+ * Ask notebook `nbPath`'s LIVE kernel to complete `code` at `cursorPos`.
+ *
+ * The reply's `cursor_start`/`cursor_end` are returned verbatim as the
+ * replacement range - the protocol's own answer to "what does this completion
+ * replace", which is exactly what a file-only completer has to guess at. Types
+ * come from IPython's `_jupyter_types_experimental` metadata when it is there;
+ * a kernel that sends none yields `type: null` per match rather than an invented
+ * one (see `completionType`, where a null type is what keeps CodeMirror's
+ * cross-source dedupe working).
+ */
+export async function completeInKernel(
+	nbPath: string | null | undefined,
+	code: string,
+	cursorPos: number
+): Promise<CompleteOutcome> {
+	const abs = resolveNb(nbPath);
+	const target = await waitForIntrospectable(abs);
+	if (!target.ok) return target;
+	const got = await awaitShellReply(() =>
+		target.kernel.requestComplete({ code, cursor_pos: cursorPos })
+	);
+	if (!got.ok) return got;
+	const content = got.reply.content;
+	if (content.status !== 'ok') return { ok: false, reason: 'failed' };
+	const texts = Array.isArray(content.matches) ? content.matches.filter((m): m is string => typeof m === 'string') : [];
+	const types = experimentalTypes(content.metadata);
+	return {
+		ok: true,
+		matches: texts.map((text) => ({ text, type: types.get(text) ?? null })),
+		cursorStart: typeof content.cursor_start === 'number' ? content.cursor_start : cursorPos,
+		cursorEnd: typeof content.cursor_end === 'number' ? content.cursor_end : cursorPos
+	};
+}
+
+/**
+ * IPython's per-match type metadata as `text -> type`, keyed by TEXT rather than
+ * by index: the list is an experimental, optional field whose length is not
+ * promised to match `matches`, so pairing by position could label one candidate
+ * with another's type. An absent or malformed field yields an empty map, which is
+ * the honest "this kernel offered no types".
+ */
+function experimentalTypes(metadata: unknown): Map<string, string> {
+	const out = new Map<string, string>();
+	const raw = (metadata as { _jupyter_types_experimental?: unknown } | undefined)?._jupyter_types_experimental;
+	if (!Array.isArray(raw)) return out;
+	for (const entry of raw) {
+		const e = entry as { text?: unknown; type?: unknown };
+		if (typeof e?.text === 'string' && typeof e?.type === 'string' && !out.has(e.text)) out.set(e.text, e.type);
+	}
+	return out;
+}
+
+/**
+ * Ask notebook `nbPath`'s LIVE kernel about the object at `cursorPos` in `code`.
+ *
+ * The whole cell source is submitted, not a hand-extracted name: IPython's own
+ * `token_at_cursor` is what finds the callable, and it is the thing that makes
+ * Shift+Tab work from INSIDE a call's arguments - verified against a real kernel
+ * for `myfunc(1, `, `x = myfunc(1, 2, `, `print(len(` and a multi-line cell.
+ * Extracting the name here would be a second, worse copy of that rule.
+ *
+ * `detail` is the protocol's own escalation: 0 is the signature + docstring, 1
+ * adds the source. `found: false` is a real answer (there is no such object),
+ * NOT a refusal, so the tooltip can say so instead of blaming the kernel.
+ */
+export async function inspectInKernel(
+	nbPath: string | null | undefined,
+	code: string,
+	cursorPos: number,
+	detail: 0 | 1
+): Promise<InspectOutcome> {
+	const abs = resolveNb(nbPath);
+	const target = await waitForIntrospectable(abs);
+	if (!target.ok) return target;
+	const got = await awaitShellReply(() =>
+		target.kernel.requestInspect({ code, cursor_pos: cursorPos, detail_level: detail })
+	);
+	if (!got.ok) return got;
+	const content = got.reply.content;
+	if (content.status !== 'ok') return { ok: false, reason: 'failed' };
+	// ANSI-stripped here rather than in the browser: IPython colours the section
+	// headers (`Signature:`, `Docstring:`, `File:`) with SGR codes, Cellar renders
+	// every other kernel text the same way (`stripAnsi`, shared with tracebacks and
+	// copy-output), and nothing downstream will ever want the escapes back.
+	const text = stripAnsi(asText((content.data as Record<string, unknown> | undefined)?.['text/plain']));
+	return { ok: true, found: !!content.found, text, detail };
 }
 
 /**

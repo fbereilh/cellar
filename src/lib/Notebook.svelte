@@ -6,6 +6,7 @@
 	import type { StalenessEntry } from '$lib/staleness';
 	import type { CellChangeStatus } from '$lib/gitdiff';
 	import type { CellHighlight } from '$lib/searchHighlight';
+	import type { KernelIntrospectHandle } from '$lib/kernelIntrospect';
 	import type { CollapsedRecord } from '$lib/cellCollapse';
 	import type { ExtractedCodeBlock } from '$lib/codeBlockExtract';
 	import type { WorkspaceRootOption } from '$lib/notebookRoot';
@@ -182,6 +183,12 @@
 		/** Lift a rendered code block out of a cell's prose into a new cell below it. */
 		onExtractCode?: (id: string, block: ExtractedCodeBlock) => Promise<boolean>;
 		onActivate?: (id: string, gesture?: CellActivation) => void;
+		/**
+		 * The notebook's handle on its live kernel, drilled to every cell for Tab
+		 * completion and the Shift+Tab documentation tooltip. `Cell` narrows it to the
+		 * cells a Python kernel can honestly answer about.
+		 */
+		kernelIntrospect?: KernelIntrospectHandle | null;
 		onRegister?: (id: string, api: CellRegisterApi | null) => void;
 		onEditorFocus?: (id: string) => void;
 		onEditorBlur?: (id: string) => void;
@@ -279,6 +286,7 @@
 		onSetRawEdit,
 		onExtractCode,
 		onActivate,
+		kernelIntrospect,
 		onRegister,
 		onEditorFocus,
 		onEditorBlur,
@@ -1023,6 +1031,7 @@
 				{searchWholeWord}
 				{searchRegex}
 				searchHighlight={cellHighlights?.get(cell.id) ?? null}
+				{kernelIntrospect}
 				onRegister={onRegister}
 				onEditorFocus={onEditorFocus}
 				onEditorBlur={onEditorBlur}

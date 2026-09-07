@@ -198,8 +198,25 @@ export interface CellRegisterApi {
 	 * collapsed cell first - asking to type in a cell is asking to see it.
 	 */
 	enterEdit: () => void;
-	/** True while CodeMirror owns an overlay (completion tooltip / search panel). */
+	/**
+	 * True while CodeMirror owns an overlay (completion tooltip / search panel /
+	 * the Shift+Tab kernel-documentation tooltip). Escape belongs to whichever of
+	 * those is showing before it leaves for command mode.
+	 */
 	editorOverlayOpen: () => boolean;
+	/**
+	 * Tab: accept the open completion, else ask for one (the kernel's live names
+	 * plus CodeMirror's file-local ones). Returns false when there is no editor, or
+	 * when the caret has nothing before it to complete, so the keystroke keeps its
+	 * default behaviour and Tab still leaves the editor.
+	 */
+	startCompletion: () => boolean;
+	/**
+	 * Shift+Tab: show this cell's kernel documentation tooltip, or expand the one
+	 * already open. Returns false for a cell that has no live-kernel docs to show
+	 * (markdown, raw, chat, SQL, mojo), so the keystroke is not swallowed there.
+	 */
+	showKernelDocs: () => boolean;
 	/**
 	 * Run this cell (code) or render it (markdown), using the editor's live text.
 	 * `advance` moves focus to the next cell (Shift+Enter); `focusNext` picks

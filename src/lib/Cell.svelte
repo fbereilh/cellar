@@ -3,7 +3,7 @@
 	import { browser } from '$app/environment';
 	import { EditorView } from '@codemirror/view';
 	import { EditorState, Compartment } from '@codemirror/state';
-	import { completionStatus } from '@codemirror/autocomplete';
+	import { acceptCompletion, completionStatus, startCompletion } from '@codemirror/autocomplete';
 	import { searchPanelOpen } from '@codemirror/search';
 	import { basicSetup } from 'codemirror';
 	import { python } from '@codemirror/lang-python';
@@ -25,10 +25,21 @@
 	import { isHiddenFromAgent } from '$lib/agentVisibility';
 	import { isCodeHidden } from '$lib/hideInput';
 	import { collapsedPreview } from '$lib/cellCollapse';
-	import { isSqlCell, isRawCell, isChatCell, isMojoCell, offersCellType, logicalCellType } from '$lib/cellLanguage';
+	import {
+		isSqlCell,
+		isRawCell,
+		isChatCell,
+		isMojoCell,
+		isPythonCodeCell,
+		offersCellType,
+		logicalCellType
+	} from '$lib/cellLanguage';
 	import { relativeTime, formatDuration, formatElapsed } from '$lib/relativeTime';
 	import { nowMs, subscribeNow, runNowMs, subscribeRunNow } from '$lib/now.svelte';
 	import { cmSearchHighlight, setCmSearch, activeCmMatch } from '$lib/cmSearchHighlight';
+	import { kernelCompletion, tabStartsCompletion } from '$lib/kernelCompletion';
+	import { kernelDocTooltip, docTooltipOpen, showKernelDocs } from '$lib/kernelDocTooltip';
+	import type { KernelIntrospectHandle } from '$lib/kernelIntrospect';
 	import { findOccurrences, type CellHighlight, type HighlightField } from '$lib/searchHighlight';
 	import { matchesCellId } from '$lib/search';
 	import { copyOutputText, hasCopyableOutput } from '$lib/copyCell';
@@ -139,6 +150,12 @@
 		searchRegex?: boolean;
 		/** This cell's highlight payload (present iff it has ≥1 match), or null. */
 		searchHighlight?: CellHighlight | null;
+		/**
+		 * This notebook's handle on its live kernel, for Tab completion and the
+		 * Shift+Tab documentation tooltip. Undefined when the notebook has none to
+		 * offer; `kernelIntrospectFor` narrows it further to Python code cells.
+		 */
+		kernelIntrospect?: KernelIntrospectHandle | null;
 		/** Hands the notebook this cell's imperative API (null on teardown). */
 		onRegister?: (id: string, api: CellRegisterApi | null) => void;
 		/** Reports this card's rendered height (px) into the notebook's height cache
@@ -197,6 +214,7 @@
 		searchWholeWord = false,
 		searchRegex = false,
 		searchHighlight = null,
+		kernelIntrospect,
 		onRegister,
 		onMeasure,
 		onEditorFocus,
@@ -1283,7 +1301,53 @@
 	 */
 	function editorOverlayOpen() {
 		if (!view) return false;
-		return completionStatus(view.state) != null || searchPanelOpen(view.state);
+		return completionStatus(view.state) != null || searchPanelOpen(view.state) || docTooltipOpen(view.state);
+	}
+
+	/**
+	 * This cell's handle on the live kernel, or null when there is nothing live to
+	 * ask about it.
+	 *
+	 * Scoped to PLAIN PYTHON CODE CELLS (`isPythonCodeCell`, the strict test - a
+	 * foreign nbformat `cell_type` must not be read as code), because the kernel's
+	 * completer and `token_at_cursor` speak Python about the Python namespace:
+	 * markdown and raw are prose, a chat cell's source is a question for a model, a
+	 * SQL cell's source is SQL that only becomes Python at RUN time, and a mojo
+	 * cell's is Mojo compiled by a `%%mojo` subprocess. Answering any of those with
+	 * Python names would be confidently wrong rather than merely unhelpful.
+	 *
+	 * A function, not a derived value: the CodeMirror extensions are installed once
+	 * per editor and must read the CURRENT prop on every use.
+	 */
+	const kernelIntrospectFor = (): KernelIntrospectHandle | null =>
+		isPythonCodeCell(cell) ? (kernelIntrospect ?? null) : null;
+
+	/**
+	 * Tab. Accepts the open suggestion if there is one (so a second Tab commits what
+	 * the first offered - Jupyter's feel), else asks for completions.
+	 *
+	 * Returns false - NOT HANDLED - with no editor, or when the caret has nothing
+	 * before it to complete (`tabStartsCompletion`). The dispatcher then leaves the
+	 * keystroke entirely alone, so Tab still moves focus out of the editor exactly as
+	 * it did before this feature existed: the keyboard user's way out, and the reason
+	 * binding Tab needs no indent binding beside it.
+	 */
+	function requestCompletion(): boolean {
+		if (!view) return false;
+		// An open suggestion is accepted first, so Tab-Tab is a complete gesture.
+		if (acceptCompletion(view)) return true;
+		// `startCompletion` ALWAYS reports handled once `autocompletion()` is
+		// installed, so the decline has to be decided here - see `tabStartsCompletion`.
+		if (!tabStartsCompletion(view.state, view.state.selection.main.head)) return false;
+		return startCompletion(view);
+	}
+
+	/** Shift+Tab. Declines (false) for a cell with no live-kernel docs to show. */
+	function requestKernelDocs(): boolean {
+		const handle = kernelIntrospectFor();
+		if (!handle) return false;
+		buildEditor();
+		return view ? showKernelDocs(view, handle) : false;
 	}
 
 	const language = new Compartment();
@@ -1361,6 +1425,16 @@
 					EDITOR_THEME,
 					// Find-in-page match highlighting (Search P4), driven by `setCmSearch`.
 					cmSearchHighlight,
+					// Live-kernel introspection: Tab completion that knows the running
+					// namespace, and the Shift+Tab documentation tooltip. Both read
+					// `kernelIntrospectFor()` per use rather than capturing it, because an
+					// editor outlives any one value of the prop - a notebook with no kernel
+					// when this editor was built gets one on its first run. Installed for
+					// EVERY cell type: the handle is null for the ones that have no live
+					// Python behind them, so the completion source and the tooltip both
+					// simply decline there.
+					kernelCompletion(kernelIntrospectFor),
+					kernelDocTooltip,
 					// No run/escape keymap here on purpose: every notebook shortcut,
 					// edit-mode ones included, is declared in `shortcuts.svelte.js` and
 					// dispatched by LiveNotebook's capture-phase handler (which runs
@@ -1453,6 +1527,8 @@
 			},
 			enterEdit,
 			editorOverlayOpen,
+			startCompletion: requestCompletion,
+			showKernelDocs: requestKernelDocs,
 			run: doRun,
 			// Flip a markdown cell to its rendered view. Markdown never executes on the
 			// kernel, so "running" it (agent run_cell / add_and_run) means rendering it;

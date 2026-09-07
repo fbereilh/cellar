@@ -16,6 +16,11 @@
 		textNotebookTypeForReason,
 		textNotebookTypeMessage
 	} from '$lib/cellLanguage';
+	import type {
+		CompleteOutcome,
+		InspectOutcome,
+		KernelIntrospectHandle
+	} from '$lib/kernelIntrospect';
 	import {
 		applyGesture,
 		extendSelection,
@@ -1483,6 +1488,55 @@
 	/** The per-cell API for `id`, or undefined (safe for a null/absent selection). */
 	function apiOf(id: string | null | undefined): CellRegisterApi | undefined {
 		return id ? cellApis[id] : undefined;
+	}
+
+	// ---- Live-kernel editor introspection ------------------------------------
+	// The handle every cell editor asks for Tab completion and the Shift+Tab
+	// documentation tooltip. It lives HERE because this is the only layer that knows
+	// which notebook the editor belongs to - a cell knows its id, never its
+	// notebook - and it is drilled down as a prop rather than reached for globally,
+	// so the CodeMirror extensions stay transport-free and testable against a fake.
+	//
+	// One object for the life of this component: `Cell` installs it into a
+	// long-lived editor extension, so a new object per render would be a new
+	// completion source per render (and CodeMirror restarts a query whose source
+	// identity changed). That is safe because `path` is read at CALL time rather
+	// than captured - a rename/move remaps a tab's path on the SAME component
+	// instance, so a captured value would keep addressing the old notebook.
+	const kernelIntrospect: KernelIntrospectHandle = {
+		complete: (code, cursorPos, signal) =>
+			introspectRequest<CompleteOutcome>('/api/kernel/complete', { code, cursorPos }, signal),
+		inspect: (code, cursorPos, detail, signal) =>
+			introspectRequest<InspectOutcome>('/api/kernel/inspect', { code, cursorPos, detail }, signal)
+	};
+
+	/**
+	 * POST one introspection request for THIS notebook.
+	 *
+	 * A verdict the SERVER reached comes back as its own `{ok:false, reason}` shape
+	 * and is RETURNED, because it says something true about the kernel that the
+	 * tooltip can state. Anything else - a rejected fetch, an aborted one, a reply
+	 * that is not this route's shape (a proxy's HTML error page) - THROWS, because
+	 * nothing was observed about the kernel and a `reason` invented here would claim
+	 * one. That is the same refusal-vs-no-verdict split the rest of this file makes
+	 * (see `commitExportTarget`); each caller decides what to do with a throw:
+	 * completion falls silently back to CodeMirror's own sources, the tooltip says
+	 * only that the server could not be reached.
+	 */
+	async function introspectRequest<T>(
+		url: string,
+		body: Record<string, unknown>,
+		signal?: AbortSignal
+	): Promise<T> {
+		const res = await fetch(url, {
+			method: 'POST',
+			headers: { 'content-type': 'application/json' },
+			body: JSON.stringify({ ...body, path }),
+			signal
+		});
+		const parsed = (await res.json().catch(() => null)) as { ok?: unknown } | null;
+		if (!parsed || typeof parsed.ok !== 'boolean') throw new Error(`introspection failed (${res.status})`);
+		return parsed as T;
 	}
 
 	// The editor holding focus IS edit mode; losing it drops back to command mode.
@@ -4346,6 +4400,14 @@
 		'paste-below': () => pasteCells('below'),
 		'paste-above': () => pasteCells('above'),
 		'split-cell': () => splitActiveCell(),
+		// Tab / Shift+Tab. Both DECLINE (`false`) rather than swallow the keystroke
+		// wherever they do not apply - no editor, nothing completable before the
+		// caret, or a cell a Python kernel cannot honestly answer about - so Tab
+		// still moves focus out of the editor exactly as it did before, which is the
+		// keyboard user's way out. `?? false` covers the no-registered-API case for
+		// the same reason.
+		'kernel-complete': () => apiOf(activeId)?.startCompletion() ?? false,
+		'kernel-docs': () => apiOf(activeId)?.showKernelDocs() ?? false,
 		// One action, both registry entries: the command-mode `e` and the global
 		// `Mod-Shift-e` resolve their target the same way (hover, then focus), so a
 		// Firefox user - whose Ctrl+Shift+E the browser keeps - hovers and presses `e`.
@@ -4570,6 +4632,7 @@
 			onSetRawEdit={setRawEdit}
 			onExtractCode={extractCodeBlock}
 			onActivate={activateCell}
+			{kernelIntrospect}
 			onRegister={registerCell}
 			onEditorFocus={onEditorFocus}
 			onEditorBlur={onEditorBlur}
