@@ -801,22 +801,28 @@ export function registerTools(server: McpServer) {
 		// resolveMany expanded it to: an id the model cannot find anywhere in its own
 		// call reads as the tool answering about some other cell.
 		const asGiven = (full: string | undefined) => (full == null ? full : (ids[res.ids.indexOf(full)] ?? full));
-		// THREE facts share this refusal and each gets its OWN sentence, because each
+		// FOUR facts share this refusal and each gets its OWN sentence, because each
 		// names a different thing to change. A cell with no module source at all
 		// (markdown/SQL/raw) is not a language MISMATCH - nothing was compared - so it
 		// says what it is. A code cell in the other language IS a comparison, so it
-		// names both languages and the extension that would admit it. And a code cell
-		// under NO target has nothing to be compared against: `targetLanguage` is null
-		// there, and wording it as a mismatch would name a `.py` module this notebook
-		// does not have and send the caller to change an extension that does not exist
-		// (the browser's `exportStrandedExplanation` carries the same null branch).
+		// names both languages and the extension that would admit it. A code cell under
+		// NO target has nothing to be compared against: `targetLanguage` is null there,
+		// and wording it as a mismatch would name a `.py` module this notebook does not
+		// have and send the caller to change an extension that does not exist (the
+		// browser's `exportStrandedExplanation` carries the same null branch). And a
+		// target that IS configured yet names no module Cellar can build is a THIRD
+		// state, not either of those: naming one is not the remedy (there is one) and
+		// changing an extension is not either (there is no module to compare against),
+		// so it says what was seen and points at the error `get_notebook_map` reports.
 		if ('notCode' in r)
 			return notFound(
 				r.cellLanguage == null
 					? `cell ${asGiven(r.notCode)} is not a code cell, so it has no module source to export`
-					: r.targetLanguage == null
-						? `cell ${asGiven(r.notCode)} is ${cellLang(r.cellLanguage)} code and this notebook has no export target, so there is no module to mark it for: name one with set_export_target (a ${moduleExt(r.cellLanguage)} path takes ${cellLang(r.cellLanguage)} cells)`
-						: `cell ${asGiven(r.notCode)} is ${cellLang(r.cellLanguage)} code but this notebook's export target is a ${moduleExt(r.targetLanguage)} module (a .py target takes Python code cells, a .mojo target Mojo cells)`
+					: r.targetLanguage != null
+						? `cell ${asGiven(r.notCode)} is ${cellLang(r.cellLanguage)} code but this notebook's export target is a ${moduleExt(r.targetLanguage)} module (a .py target takes Python code cells, a .mojo target Mojo cells)`
+						: r.targetConfigured
+							? `cell ${asGiven(r.notCode)} is ${cellLang(r.cellLanguage)} code and this notebook's export target names no module Cellar can build, so nothing is exported: read export_target_error from get_notebook_map, then fix the target with set_export_target (a ${moduleExt(r.cellLanguage)} path takes ${cellLang(r.cellLanguage)} cells)`
+							: `cell ${asGiven(r.notCode)} is ${cellLang(r.cellLanguage)} code and this notebook has no export target, so there is no module to mark it for: name one with set_export_target (a ${moduleExt(r.cellLanguage)} path takes ${cellLang(r.cellLanguage)} cells)`
 			);
 		// The one refusal that is not about the cell TYPE: nbdev's `#| export` in the
 		// source marks it, and Cellar never writes a directive, so there is no metadata

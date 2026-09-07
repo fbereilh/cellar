@@ -2410,7 +2410,7 @@
 	 * are the user's document intent and are still written.
 	 */
 	const unsavedExportEdit = $derived(
-		`a cell edit that belongs in the ${exportModuleLanguage === 'mojo' ? '.mojo' : '.py'} module could not be saved`
+		`a cell edit that belongs in the ${exportModuleLanguage === null ? 'module' : `${exportModuleLanguage === 'mojo' ? '.mojo' : '.py'} module`} could not be saved`
 	);
 	function unsavedExportEditNotice(outcome: 'skipped' | 'proceeding'): string {
 		const said = unsavedExportEdit;

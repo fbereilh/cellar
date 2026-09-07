@@ -285,11 +285,15 @@ export function findTopLevelMain(source: string | null | undefined): MainBlock |
 		}
 		break;
 	}
-	// Give trailing blank AND comment lines back to the residue. A comment sitting
-	// between `main` and the next top-level definition belongs to what FOLLOWS, so
-	// swallowing it into the dropped block would silently delete it; one INSIDE the
-	// body, with indented code after it, is not trailing and stays in the block.
-	while (end > last && (lines[end].blank || lines[end].comment)) end--;
+	// Give trailing blank lines, and trailing COLUMN-0 comments, back to the residue.
+	// A comment at indent 0 between `main` and the next top-level definition belongs
+	// to what FOLLOWS, so swallowing it into the dropped block would silently delete
+	// it. An INDENTED one cannot belong to a top-level definition - it is part of the
+	// body being dropped - and handing it back left a stray fragment of the discarded
+	// block sitting at file scope in the generated module, right after the drop
+	// comment. A comment inside the body with indented code after it is not trailing
+	// either way and stays in the block.
+	while (end > last && (lines[end].blank || (lines[end].comment && lines[end].indent === 0))) end--;
 	return { start: lines[first].start, end: lines[end].end };
 }
 

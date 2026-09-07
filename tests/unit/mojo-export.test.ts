@@ -233,6 +233,28 @@ describe('findTopLevelMain', () => {
 		expect(out2).toContain('def helper():');
 	});
 
+	it('keeps an INDENTED trailing comment inside the dropped block, at either edge', () => {
+		// The give-back is for COLUMN-0 comments, which belong to the top-level
+		// definition that FOLLOWS. An indented one cannot: it is the last line of the
+		// body being dropped, and handing it back left a fragment of the discarded
+		// block sitting at file scope right after the drop comment - a git-tracked
+		// artifact reading as an exporter bug.
+		const src = 'def main():\n    print(1)\n    # done\nX = 1\n';
+		const out = dropMainBlock(src);
+		expect(out).not.toContain('# done');
+		expect(out).toContain('X = 1');
+		expect(codeOf(out)).not.toContain('print(1)');
+		// At the very END of the cell there is no following definition at all, so an
+		// indented trailing comment has even less claim to survive.
+		const tail = dropMainBlock('def main():\n    print(1)\n    # done\n');
+		expect(tail).toBe(`${MAIN_DROPPED_COMMENT}\n`);
+		// The mirror, so neither rule can swallow the other: a column-0 comment at the
+		// same position is still handed back.
+		const col0 = dropMainBlock('def main():\n    print(1)\n# done\nX = 1\n');
+		expect(col0).toContain('# done');
+		expect(col0).toContain('X = 1');
+	});
+
 	it('a `#` opening a line INSIDE a triple-quoted string is not a comment', () => {
 		// The comment rule may not override the string tracking: string content that
 		// happens to start with `#` is not a line that can extend a suite, and reading
@@ -943,16 +965,23 @@ describe('the wiring the browser ships', () => {
 		expect(live).toContain('exportStranded={exportStranded}');
 	});
 
-	it('the unsaved-edit notice names the target module, not always .py', () => {
+	it('the unsaved-edit notice names the target module, and names NONE with no target', () => {
 		// Same missed-site class as the label sweep: on a `.mojo` notebook a failed
 		// autosave during an export or a mark reported ".py module" about a file the
-		// notebook never writes. Derived from the nullable target language, so it also
-		// cannot name an extension when nothing is configured.
+		// notebook never writes. It is also reachable with NO target at all - both
+		// callers settle their cell edits before the server ever answers `no-target` -
+		// so the null branch is required too, exactly as on the export button and the
+		// cell toggle. Wording that lives inline in a component vitest cannot mount, so
+		// this is one of the documented `.svelte` source guards.
 		const live = read('LiveNotebook.svelte');
 		expect(live).toContain(
+			"`a cell edit that belongs in the ${exportModuleLanguage === null ? 'module' : `${exportModuleLanguage === 'mojo' ? '.mojo' : '.py'} module`} could not be saved`"
+		);
+		// The two shapes that name `.py` for a notebook that targets nothing.
+		expect(live).not.toContain("const UNSAVED_EXPORT_EDIT = 'a cell edit that belongs in the .py module");
+		expect(live).not.toContain(
 			"`a cell edit that belongs in the ${exportModuleLanguage === 'mojo' ? '.mojo' : '.py'} module could not be saved`"
 		);
-		expect(live).not.toContain("const UNSAVED_EXPORT_EDIT = 'a cell edit that belongs in the .py module");
 	});
 
 	it('the notebook derives the badge set from the shared rule, per cell', () => {

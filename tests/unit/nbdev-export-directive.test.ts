@@ -345,7 +345,7 @@ describe('a directive-marked cell cannot be unmarked from Cellar', () => {
 		expect(nbmod.setCellExport(MD, true, NB)).toEqual({ ok: false, reason: 'not-code' });
 		// `targetLanguage` is null: this notebook names no target, and the record carries
 		// the absent case rather than the `python` eligibility fallback.
-		expect(svc.setCellExport([MD], true, NB)).toEqual({ ok: false, notCode: MD, cellLanguage: null, targetLanguage: null });
+		expect(svc.setCellExport([MD], true, NB)).toEqual({ ok: false, notCode: MD, cellLanguage: null, targetLanguage: null, targetConfigured: false });
 		expect(nbmod.listCells(NB)[0].metadata?.cellar?.export).toBeUndefined();
 	});
 

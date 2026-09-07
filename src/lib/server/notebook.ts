@@ -34,8 +34,10 @@ import {
 	docExportHazards,
 	docHumanExportHazards,
 	docExportLanguage,
+	docExportTargetInfo,
 	docExportTargetLanguage,
 	type ExportResult,
+	type ExportTargetLanguageInfo,
 	type ResolvedExportTarget
 } from './export-py';
 import type { ExportHazard } from '../exportHazard';
@@ -1420,17 +1422,28 @@ export function setExportTarget(
 
 /**
  * The module LANGUAGE a notebook's export target names, BY PATH, or **null when
- * no target is configured** - the one question the agent layer asks, so it never
- * re-derives it from a target string.
+ * it names none** - the one question the agent layer asks, so it never re-derives
+ * it from a target string.
  *
  * Nullable on purpose. `docExportLanguage`'s `python` fallback is the ELIGIBILITY
  * answer and must never be read as a fact about the notebook: reported as one, a
  * refusal names a `.py` module over a notebook that targets nothing and sends an
  * agent to change an extension that does not exist. Callers deciding ELIGIBILITY
- * apply `?? 'python'` themselves; callers WORDING an outcome keep the null.
+ * apply `?? 'python'` themselves; callers WORDING an outcome keep the null - and
+ * a caller that must tell the two nulls apart reads `exportTargetInfoFor`.
  */
 export function exportTargetLanguageFor(nb?: string | null): ExportLanguage | null {
 	return docExportTargetLanguage(docFor(nb));
+}
+
+/**
+ * BOTH facts about a notebook's export target, from ONE resolution: whether one
+ * is configured at all, and the module language it names. The agent layer reads
+ * this where a refusal has to distinguish "no target" from "a target that names
+ * no module Cellar can build" - see `ExportTargetLanguageInfo`.
+ */
+export function exportTargetInfoFor(nb?: string | null): ExportTargetLanguageInfo {
+	return docExportTargetInfo(docFor(nb));
 }
 
 /** What a set-target/set-base caller reports back: the stored form + its resolution. */

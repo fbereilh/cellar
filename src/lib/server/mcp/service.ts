@@ -29,7 +29,7 @@ import {
 	setExportTarget as setExportTargetDoc,
 	InvalidExportTargetError,
 	setCellExports as setCellExportsDoc,
-	exportTargetLanguageFor,
+	exportTargetInfoFor,
 	exportTargetInfo,
 	isPyTextNotebook,
 	lastExportError,
@@ -2006,10 +2006,12 @@ export function setCellExport(ids: string[], exported: boolean, nb?: string | nu
 	if (isPyTextNotebook(target)) return { ok: false as const, refused: 'py-notebook' as const };
 	// Eligibility is a MATCH against the target's module language, not a fixed
 	// "is this Python" - see `exportRole`'s `canExportCell`. Kept NULLABLE here and
-	// defaulted only where eligibility is asked: `null` is "no target configured",
-	// which the refusal must be able to say rather than naming a `.py` module the
-	// notebook does not have.
-	const targetLang = exportTargetLanguageFor(target);
+	// defaulted only where eligibility is asked, and carried alongside whether a
+	// target is CONFIGURED at all: there are three states, and the refusal must be
+	// able to say which one it saw rather than naming a `.py` module the notebook
+	// does not have.
+	const targetInfo = exportTargetInfoFor(target);
+	const targetLang = targetInfo.language;
 	const lang = targetLang ?? 'python';
 	const full: string[] = [];
 	const seen = new Set<string>();
@@ -2032,9 +2034,17 @@ export function setCellExport(ids: string[], exported: boolean, nb?: string | nu
 		// fallback: with no target configured there is nothing to mismatch AGAINST, and
 		// naming a `.py` module there is the same assert-more-than-was-observed defect
 		// with the sign flipped (the browser's `exportStrandedExplanation` carries a null
-		// branch for exactly this).
+		// branch for exactly this). `targetConfigured` rides beside it because a null
+		// language has TWO causes and they name different remedies: no target at all, or
+		// a target that IS set and names no module Cellar can build.
 		if (exported && !canExportCell(cell, lang))
-			return { ok: false as const, notCode: ref, cellLanguage: exportLanguageOf(cell), targetLanguage: targetLang };
+			return {
+				ok: false as const,
+				notCode: ref,
+				cellLanguage: exportLanguageOf(cell),
+				targetLanguage: targetLang,
+				targetConfigured: targetInfo.configured
+			};
 		// A cell whose SOURCE carries nbdev's `#| export` cannot be UNMARKED here:
 		// Cellar never writes a directive, so clearing the metadata half would leave
 		// the cell exported while the result claimed it was not. Reported by name, and

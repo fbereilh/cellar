@@ -372,33 +372,65 @@ export function hazardsFor(cells: readonly Cell[], lang: ExportLanguage): Export
 }
 
 /**
- * The module LANGUAGE a resolved target names, falling back to `python`.
+ * The module LANGUAGE a resolved target names, or **null when it names none** -
+ * a hand-edited `export_target`, or one whose base does not resolve, where the
+ * stored form is the only spelling in hand and it is not a module Cellar builds.
  *
- * The fallback is the legacy question and can only be reached by a target no
- * setter would accept: a hand-edited `export_target`, or one whose base does not
- * resolve (where the stored form is the only spelling in hand). `setExportTarget`
- * refuses anything but `.py`/`.mojo`, and a `#|default_exp` directive always names
- * a `.py` module.
+ * NULLABLE ON PURPOSE, and the `?? 'python'` default is written by the callers
+ * that DECIDE ELIGIBILITY rather than baked in here. Folded into the accessor it
+ * turned "no answer" into a confident false claim at every surface that REPORTS a
+ * target, which produced the same defect five separate times: a refusal, a
+ * warning or a label naming a `.py` module over a notebook that has none, sending
+ * the reader to change an extension that does not exist. A reporting caller can
+ * no longer obtain the default by accident.
  */
-function targetLanguage(info: ResolvedExportTarget): ExportLanguage {
-	return exportTargetLanguage(info.ok ? info.target : info.path) ?? 'python';
+function targetModuleLanguage(info: ResolvedExportTarget): ExportLanguage | null {
+	return exportTargetLanguage(info.ok ? info.target : info.path);
 }
 
 /**
- * The module language a DOCUMENT's export target names, or **null when no target
- * is configured at all** - the HONEST answer, and the one anything that SPEAKS
- * about the target must read.
+ * The module language export ELIGIBILITY is decided against, for a RESOLVED
+ * target - the legacy question, so an unrecognized target answers `python`
+ * exactly as it did before `.mojo` targets existed.
+ */
+function eligibilityLanguage(info: ResolvedExportTarget): ExportLanguage {
+	return targetModuleLanguage(info) ?? 'python';
+}
+
+/**
+ * BOTH facts a surface needs to word an export target honestly, read from ONE
+ * resolution: whether a target is CONFIGURED at all, and the module language it
+ * names.
  *
- * Kept apart from `docExportLanguage` because the `python` fallback there is an
- * ELIGIBILITY answer, not a fact about the notebook: collapsed into it, a refusal
- * or a warning names a `.py` module over a notebook that targets nothing, and
- * sends the reader to change an extension that does not exist. That is the defect
- * `exportStrandedExplanation` was given a null branch for on the browser side; the
- * agent side reads this for the same reason.
+ * They are separate because there are THREE states, not two, and each names a
+ * different thing to change: no target (name one), a target naming a module
+ * (`.py`/`.mojo`, so a cell in the other language is a real mismatch), and a
+ * target that IS configured but names no module Cellar can build - where the
+ * remedy is to fix that target, not to name one and not to change an extension.
+ * Collapsed into the language alone, the third state borrowed one of the other
+ * two sentences and asserted something the resolution never established.
+ */
+export interface ExportTargetLanguageInfo {
+	/** Is an export target configured at all, resolvable or not? */
+	configured: boolean;
+	/** The module language it names, or null when it names none Cellar builds. */
+	language: ExportLanguage | null;
+}
+
+export function docExportTargetInfo(doc: NotebookDoc): ExportTargetLanguageInfo {
+	const info = resolveExportTarget(doc);
+	return info
+		? { configured: true, language: targetModuleLanguage(info) }
+		: { configured: false, language: null };
+}
+
+/**
+ * The module language a DOCUMENT's export target names, or **null when it names
+ * none** - the HONEST answer, and the one anything that SPEAKS about the target
+ * must read. `docExportTargetInfo` says WHICH null it is.
  */
 export function docExportTargetLanguage(doc: NotebookDoc): ExportLanguage | null {
-	const info = resolveExportTarget(doc);
-	return info ? targetLanguage(info) : null;
+	return docExportTargetInfo(doc).language;
 }
 
 /**
@@ -412,7 +444,8 @@ export function docExportTargetLanguage(doc: NotebookDoc): ExportLanguage | null
  * stated rather than hidden - a Mojo cell can only be MARKED once the notebook
  * names a `.mojo` target, which is honest, since before that there is no module
  * for the mark to describe. Anything that WORDS that outcome must read
- * `docExportTargetLanguage` instead, which does not invent the target.
+ * `docExportTargetInfo`/`docExportTargetLanguage` instead, which do not invent
+ * the target.
  */
 export function docExportLanguage(doc: NotebookDoc): ExportLanguage {
 	return docExportTargetLanguage(doc) ?? 'python';
@@ -445,7 +478,7 @@ function docHazards(
 	keep: (hazards: ExportHazard[]) => ExportHazard[]
 ): ExportHazard[] {
 	if (!resolved) return [];
-	const lang = targetLanguage(resolved);
+	const lang = eligibilityLanguage(resolved);
 	const exported = doc.cells.filter((c: Cell) => isExportCell(c, lang));
 	if (!exported.length) return [];
 	const hazards = keep(hazardsFor(exported, lang));
@@ -947,7 +980,7 @@ export function exportNotebookToPy(doc: NotebookDoc): ExportResult {
 	// The target's EXTENSION decides which cells may go in (`exportRole`'s
 	// `canExportCell`), so a `.mojo` target assembles the notebook's Mojo cells and a
 	// `.py` one its Python cells - one rule, both languages.
-	const lang = targetLanguage(info);
+	const lang = eligibilityLanguage(info);
 	const exportedCells = doc.cells.filter((c: Cell) => isExportCell(c, lang));
 	const exported = exportedCells.map((c) => c.source);
 	if (!exported.length)
