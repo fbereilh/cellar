@@ -14,6 +14,7 @@
 
 import type { ImportChangeStamps } from './importBindings';
 import type { ExportHazard } from '../exportHazard';
+import type { ExportLanguage } from '../exportRole';
 
 export type { ImportChangeStamps };
 
@@ -213,6 +214,15 @@ export interface NotebookView {
 	 * cannot resolve. What the importability warning is decided from.
 	 */
 	exportResolved: string | null;
+	/**
+	 * The MODULE LANGUAGE the effective target names (`.py` -> python, `.mojo` ->
+	 * mojo), or **null when no target is configured at all**. Resolved once, on the
+	 * server, and carried rather than re-derived: eligibility falls back to `python`
+	 * with nothing configured, so a reader that re-derives a bare language cannot
+	 * tell a `.py` target from no target and any sentence built on it names a module
+	 * that does not exist.
+	 */
+	exportLanguage: ExportLanguage | null;
 	/** Why a CONFIGURED target cannot resolve (base `git` with no repo, an escape, an unknown base), else null. */
 	exportResolveError: string | null;
 	/**

@@ -36,6 +36,10 @@ const notFound = (msg: string) => ({ content: [{ type: 'text' as const, text: ms
 const pyNotebookRefusal = (what: string) =>
 	`refused: this is a .py text notebook (jupytext/Databricks source). It carries no per-cell metadata and generates no module, so ${what} - convert it to .ipynb first.`;
 
+/** How an export language is NAMED to an agent: the source it holds, and the module it goes in. */
+const cellLang = (lang: 'python' | 'mojo') => (lang === 'mojo' ? 'Mojo' : 'Python');
+const moduleExt = (lang: 'python' | 'mojo') => (lang === 'mojo' ? '.mojo' : '.py');
+
 /**
  * Run an ADD handler, turning the doc layer's `.py`-notebook type refusal
  * (`raw`, `chat`) into a tool error that NAMES the cause instead of an
@@ -571,8 +575,9 @@ Follow this house style:
    own \`def main():\` and its own imports, and you must never write a "define here,
    use there" pair across two Mojo cells — it cannot work. Never put Mojo in a
    python cell or Python in a mojo cell. A mojo cell has no dataflow, so it never
-   shows a staleness verdict, cannot be the imports cell, and cannot be exported to
-   the .py module. Output is stdout only (buffered until the cell finishes), and a
+   shows a staleness verdict and cannot be the imports cell; it IS exportable, to a
+   .mojo target (clause 5), never to a .py one. Output is stdout only (buffered
+   until the cell finishes), and a
    compile error comes back as a MojoCompilationError naming a temp path. If the
    Mojo toolchain is missing the cell fails with the exact install command — relay
    it; Cellar never installs it for the user.
@@ -796,15 +801,22 @@ export function registerTools(server: McpServer) {
 		// resolveMany expanded it to: an id the model cannot find anywhere in its own
 		// call reads as the tool answering about some other cell.
 		const asGiven = (full: string | undefined) => (full == null ? full : (ids[res.ids.indexOf(full)] ?? full));
-		// Two facts share this refusal and each gets its OWN sentence: a cell with no
-		// module source at all (markdown/SQL/raw) is not a language MISMATCH - nothing
-		// was compared - so it says what it is, while a code cell in the other language
-		// names both languages and the extension that would admit it.
+		// THREE facts share this refusal and each gets its OWN sentence, because each
+		// names a different thing to change. A cell with no module source at all
+		// (markdown/SQL/raw) is not a language MISMATCH - nothing was compared - so it
+		// says what it is. A code cell in the other language IS a comparison, so it
+		// names both languages and the extension that would admit it. And a code cell
+		// under NO target has nothing to be compared against: `targetLanguage` is null
+		// there, and wording it as a mismatch would name a `.py` module this notebook
+		// does not have and send the caller to change an extension that does not exist
+		// (the browser's `exportStrandedExplanation` carries the same null branch).
 		if ('notCode' in r)
 			return notFound(
 				r.cellLanguage == null
 					? `cell ${asGiven(r.notCode)} is not a code cell, so it has no module source to export`
-					: `cell ${asGiven(r.notCode)} is ${r.cellLanguage === 'mojo' ? 'Mojo' : 'Python'} code but this notebook's export target is a ${r.targetLanguage === 'mojo' ? '.mojo' : '.py'} module (a .py target takes Python code cells, a .mojo target Mojo cells)`
+					: r.targetLanguage == null
+						? `cell ${asGiven(r.notCode)} is ${cellLang(r.cellLanguage)} code and this notebook has no export target, so there is no module to mark it for: name one with set_export_target (a ${moduleExt(r.cellLanguage)} path takes ${cellLang(r.cellLanguage)} cells)`
+						: `cell ${asGiven(r.notCode)} is ${cellLang(r.cellLanguage)} code but this notebook's export target is a ${moduleExt(r.targetLanguage)} module (a .py target takes Python code cells, a .mojo target Mojo cells)`
 			);
 		// The one refusal that is not about the cell TYPE: nbdev's `#| export` in the
 		// source marks it, and Cellar never writes a directive, so there is no metadata

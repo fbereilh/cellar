@@ -34,6 +34,7 @@ import {
 	docExportHazards,
 	docHumanExportHazards,
 	docExportLanguage,
+	docExportTargetLanguage,
 	type ExportResult,
 	type ResolvedExportTarget
 } from './export-py';
@@ -507,6 +508,7 @@ function notebookView(doc: NotebookDoc): NotebookView {
  */
 function exportTargetView(doc: NotebookDoc): {
 	exportBase: string;
+	exportLanguage: ExportLanguage | null;
 	exportResolved: string | null;
 	exportResolveError: string | null;
 	exportHazards: ExportHazard[];
@@ -514,6 +516,11 @@ function exportTargetView(doc: NotebookDoc): {
 	const info = resolveExportTarget(doc);
 	return {
 		exportBase: readExportBase(doc),
+		// The language THIS resolution named, carried rather than re-derived by the
+		// reader: `getNotebookMap` is the most frequently called agent read tool and
+		// `resolveExportTarget` sweeps every cell for a `#|default_exp` directive when
+		// no target is stored, so asking a second time doubles that sweep on it.
+		exportLanguage: info ? exportTargetLanguage(info.ok ? info.target : info.path) : null,
 		exportResolved: info && info.ok ? info.target : null,
 		exportResolveError: info && !info.ok ? info.error : null,
 		// The SAME `info` is threaded in rather than resolved a second time here, and
@@ -1412,14 +1419,18 @@ export function setExportTarget(
 }
 
 /**
- * The module LANGUAGE a notebook's export target names, BY PATH - the one question
- * the agent layer asks, so it never re-derives it from a target string.
+ * The module LANGUAGE a notebook's export target names, BY PATH, or **null when
+ * no target is configured** - the one question the agent layer asks, so it never
+ * re-derives it from a target string.
  *
- * `python` for a notebook with no target: see `docExportLanguage` for why that is
- * the honest legacy answer rather than "no language".
+ * Nullable on purpose. `docExportLanguage`'s `python` fallback is the ELIGIBILITY
+ * answer and must never be read as a fact about the notebook: reported as one, a
+ * refusal names a `.py` module over a notebook that targets nothing and sends an
+ * agent to change an extension that does not exist. Callers deciding ELIGIBILITY
+ * apply `?? 'python'` themselves; callers WORDING an outcome keep the null.
  */
-export function exportLanguageFor(nb?: string | null): ExportLanguage {
-	return docExportLanguage(docFor(nb));
+export function exportTargetLanguageFor(nb?: string | null): ExportLanguage | null {
+	return docExportTargetLanguage(docFor(nb));
 }
 
 /** What a set-target/set-base caller reports back: the stored form + its resolution. */

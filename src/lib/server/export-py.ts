@@ -385,8 +385,25 @@ function targetLanguage(info: ResolvedExportTarget): ExportLanguage {
 }
 
 /**
- * The module language a DOCUMENT's export target names - the one question every
- * export-eligibility caller outside this file asks, so none of them re-derives it
+ * The module language a DOCUMENT's export target names, or **null when no target
+ * is configured at all** - the HONEST answer, and the one anything that SPEAKS
+ * about the target must read.
+ *
+ * Kept apart from `docExportLanguage` because the `python` fallback there is an
+ * ELIGIBILITY answer, not a fact about the notebook: collapsed into it, a refusal
+ * or a warning names a `.py` module over a notebook that targets nothing, and
+ * sends the reader to change an extension that does not exist. That is the defect
+ * `exportStrandedExplanation` was given a null branch for on the browser side; the
+ * agent side reads this for the same reason.
+ */
+export function docExportTargetLanguage(doc: NotebookDoc): ExportLanguage | null {
+	const info = resolveExportTarget(doc);
+	return info ? targetLanguage(info) : null;
+}
+
+/**
+ * The module language export ELIGIBILITY is decided against - the one question
+ * every eligibility caller outside this file asks, so none of them re-derives it
  * from a path.
  *
  * A notebook with NO target configured answers `python`: that is what every
@@ -394,11 +411,11 @@ function targetLanguage(info: ResolvedExportTarget): ExportLanguage {
  * unconfigured notebook behaves exactly as it always has. The consequence is
  * stated rather than hidden - a Mojo cell can only be MARKED once the notebook
  * names a `.mojo` target, which is honest, since before that there is no module
- * for the mark to describe.
+ * for the mark to describe. Anything that WORDS that outcome must read
+ * `docExportTargetLanguage` instead, which does not invent the target.
  */
 export function docExportLanguage(doc: NotebookDoc): ExportLanguage {
-	const info = resolveExportTarget(doc);
-	return info ? targetLanguage(info) : 'python';
+	return docExportTargetLanguage(doc) ?? 'python';
 }
 
 /**

@@ -29,7 +29,7 @@ import {
 	setExportTarget as setExportTargetDoc,
 	InvalidExportTargetError,
 	setCellExports as setCellExportsDoc,
-	exportLanguageFor,
+	exportTargetLanguageFor,
 	exportTargetInfo,
 	isPyTextNotebook,
 	lastExportError,
@@ -933,8 +933,11 @@ export async function getNotebookMap(nb?: string | null) {
 	const view = getNotebook(nb);
 	// Which module language this notebook's target names, so `export: true` marks the
 	// cells that really go into it - a Python cell under a `.mojo` target contributes
-	// nothing and must not be reported as exported.
-	const exportLang = exportLanguageFor(nb);
+	// nothing and must not be reported as exported. Read off the view `getNotebook`
+	// already resolved rather than resolved again: this is the most frequently called
+	// agent read tool, and with no target stored `resolveExportTarget` sweeps every
+	// cell looking for a `#|default_exp` directive, so a second call doubles it.
+	const exportLang = view.exportLanguage ?? 'python';
 	// The number each section renders with, so the agent reads the SAME heading the
 	// human does ("1. Setup", not "Setup") and can see the numbering is already
 	// being done for it - which is what stops it hardcoding a number into the source.
@@ -2002,8 +2005,12 @@ export function setCellExport(ids: string[], exported: boolean, nb?: string | nu
 	const target = nb ?? getActiveNotebookPath();
 	if (isPyTextNotebook(target)) return { ok: false as const, refused: 'py-notebook' as const };
 	// Eligibility is a MATCH against the target's module language, not a fixed
-	// "is this Python" - see `exportRole`'s `canExportCell`.
-	const lang = exportLanguageFor(target);
+	// "is this Python" - see `exportRole`'s `canExportCell`. Kept NULLABLE here and
+	// defaulted only where eligibility is asked: `null` is "no target configured",
+	// which the refusal must be able to say rather than naming a `.py` module the
+	// notebook does not have.
+	const targetLang = exportTargetLanguageFor(target);
+	const lang = targetLang ?? 'python';
 	const full: string[] = [];
 	const seen = new Set<string>();
 	for (const ref of ids) {
@@ -2020,8 +2027,14 @@ export function setCellExport(ids: string[], exported: boolean, nb?: string | nu
 		// language mismatch asserts a comparison that was never made - a markdown cell
 		// does not "not match" Python, it has nothing to match with - and sends an agent
 		// looking for a target extension to change when no target could ever admit it.
+		//
+		// `targetLanguage` is likewise the NULLABLE fact, never the `python` eligibility
+		// fallback: with no target configured there is nothing to mismatch AGAINST, and
+		// naming a `.py` module there is the same assert-more-than-was-observed defect
+		// with the sign flipped (the browser's `exportStrandedExplanation` carries a null
+		// branch for exactly this).
 		if (exported && !canExportCell(cell, lang))
-			return { ok: false as const, notCode: ref, cellLanguage: exportLanguageOf(cell), targetLanguage: lang };
+			return { ok: false as const, notCode: ref, cellLanguage: exportLanguageOf(cell), targetLanguage: targetLang };
 		// A cell whose SOURCE carries nbdev's `#| export` cannot be UNMARKED here:
 		// Cellar never writes a directive, so clearing the metadata half would leave
 		// the cell exported while the result claimed it was not. Reported by name, and
