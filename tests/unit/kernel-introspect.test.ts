@@ -154,6 +154,59 @@ beforeEach(() => {
 	}
 });
 
+describe('the routes answer a malformed request in their OWN shape', () => {
+	type RoutePost = (e: { request: Request }) => Promise<Response>;
+
+	/** POST a body to a route handler, exactly as SvelteKit would. */
+	async function post(handler: RoutePost, body: unknown) {
+		const res = await handler({
+			request: new Request('http://localhost/api/kernel/x', {
+				method: 'POST',
+				headers: { 'content-type': 'application/json' },
+				body: JSON.stringify(body)
+			})
+		});
+		return { status: res.status, body: (await res.json()) as Record<string, unknown> };
+	}
+
+	async function routePost(route: 'complete' | 'inspect'): Promise<RoutePost> {
+		const mod =
+			route === 'complete'
+				? await import('../../src/routes/api/kernel/complete/+server.js')
+				: await import('../../src/routes/api/kernel/inspect/+server.js');
+		return mod.POST as unknown as RoutePost;
+	}
+
+	it('refuses a path that escapes the workspace with a 400, not an unhandled 500', async () => {
+		// `resolveNotebookPath` THROWS for such a path. Left uncaught it escaped as a
+		// generic 500, which says nothing the client can read - and these routes promise
+		// that a kernel REFUSAL is a 200 `{ok:false, reason}` while only a MALFORMED
+		// request is a 4xx, so an escaping path belongs on the 4xx side with the reason.
+		const escaping = { path: '../../elsewhere.ipynb', code: 'x', cursorPos: 1 };
+		const complete = await routePost('complete');
+		const inspect = await routePost('inspect');
+
+		const c = await post(complete, escaping);
+		expect(c.status).toBe(400);
+		expect(c.body).toMatchObject({ ok: false, reason: 'failed' });
+		expect(String(c.body.message)).toContain('escapes workspace');
+
+		const i = await post(inspect, { ...escaping, detail: 0 });
+		expect(i.status).toBe(400);
+		expect(i.body).toMatchObject({ ok: false, reason: 'failed' });
+		expect(String(i.body.message)).toContain('escapes workspace');
+	});
+
+	it('still answers a VALID request as a 200 kernel verdict', async () => {
+		// The guard must not turn every failure into a 400: with no kernel for this
+		// notebook the honest answer is still a 200 the editor reads as "no kernel
+		// completions" and falls back from.
+		const res = await post(await routePost('complete'), { path: 'never-opened.ipynb', code: 'x', cursorPos: 1 });
+		expect(res.status).toBe(200);
+		expect(res.body).toMatchObject({ ok: false, reason: 'no_kernel' });
+	});
+});
+
 describe('a keystroke never boots a kernel', () => {
 	it('refuses `no_kernel` for a notebook that has none, and starts nothing', async () => {
 		const startsBefore = h.starts;

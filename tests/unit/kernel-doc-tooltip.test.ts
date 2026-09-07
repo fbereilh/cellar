@@ -221,6 +221,39 @@ describe('dismissal follows the editor’s other overlays', () => {
 		expect(docTooltipOpen(view.state)).toBe(false);
 	});
 
+	it('a mousedown INSIDE it is not a blur - the 22em scroll box stays readable', async () => {
+		// `.cm-cellar-doc` is `overflow: auto`, so dragging its scrollbar (or clicking
+		// its text) would move focus off `.cm-content` and the blur rule above would
+		// dismiss the very docstring being read. Cancelling the default is what stops
+		// the focus change - the same guard `@codemirror/autocomplete` puts on its own
+		// list ("Prevent focus change when clicking the scrollbar").
+		const view = mount('t.hello(');
+		await open(view, ok());
+		const dom = tooltipDom(view)!;
+		const onBox = new MouseEvent('mousedown', { bubbles: true, cancelable: true });
+		dom.dispatchEvent(onBox);
+		expect(onBox.defaultPrevented).toBe(true);
+		expect(docTooltipOpen(view.state)).toBe(true);
+
+		// A press on the body TEXT bubbles to the same guard, so selecting a signature
+		// does not close it either.
+		const onBody = new MouseEvent('mousedown', { bubbles: true, cancelable: true });
+		dom.querySelector('pre')!.dispatchEvent(onBody);
+		expect(onBody.defaultPrevented).toBe(true);
+		expect(docTooltipOpen(view.state)).toBe(true);
+
+		// The guard is scoped to the tooltip: a press elsewhere on the page is untouched.
+		const elsewhere = document.body.appendChild(document.createElement('div'));
+		const outside = new MouseEvent('mousedown', { bubbles: true, cancelable: true });
+		elsewhere.dispatchEvent(outside);
+		expect(outside.defaultPrevented).toBe(false);
+		elsewhere.remove();
+
+		// And a GENUINE blur - clicking another cell, tabbing away - still closes it.
+		view.contentDOM.dispatchEvent(new FocusEvent('blur', { bubbles: false }));
+		expect(docTooltipOpen(view.state)).toBe(false);
+	});
+
 	it('Escape closes it, and only then falls through to command mode', async () => {
 		const view = mount('t.hello(');
 		await open(view, ok());

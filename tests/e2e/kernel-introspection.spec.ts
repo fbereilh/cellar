@@ -148,6 +148,26 @@ async function closePopup(page: Page, i: number) {
 
 const docTooltip = (page: Page) => page.getByTestId('kernel-doc-tooltip');
 
+/**
+ * The text CodeMirror currently has SELECTED in cell `i`'s editor.
+ *
+ * A snippet field is a selection, so this is how "the caret moved to the next
+ * field" is observed without reaching into CodeMirror's internals. Scoped to the
+ * cell for the same reason `completionLabels` is.
+ */
+function selectedText(page: Page, i: number): Promise<string> {
+	return page
+		.getByTestId('cell')
+		.nth(i)
+		.locator('.cm-content')
+		.evaluate((el) => {
+			const sel = el.ownerDocument.getSelection();
+			if (!sel || sel.rangeCount === 0) return '';
+			const range = sel.getRangeAt(0);
+			return el.contains(range.commonAncestorContainer) ? sel.toString() : '';
+		});
+}
+
 /** How many kernels the server reports live right now. */
 function liveKernelCount(page: Page): Promise<number> {
 	return page.evaluate(async () => {
@@ -316,6 +336,49 @@ test('Tab with nothing to complete still leaves the editor - the keyboard way ou
 	await expect
 		.poll(() => page.evaluate(() => document.activeElement?.className ?? ''))
 		.not.toContain('cm-content');
+});
+
+test('Tab still walks a snippet’s fields - the editor keeps its own binding', async ({ page }) => {
+	await openNotebook(page);
+	await seedLiveNames(page);
+	// `@codemirror/lang-python` ships snippets whose `apply` installs a Prec.highest
+	// Tab -> nextSnippetField binding. The notebook's dispatcher is a window CAPTURE
+	// listener, so it runs FIRST and would swallow that key; only a real browser can
+	// show which one won.
+	await typeInto(page, 1, 'de');
+	// `def` appears TWICE in the merged list - the bare keyword from `globals`, and the
+	// SNIPPET, which is the one that installs the field keymap. They are told apart by
+	// the snippet's own `detail`, never by position.
+	const defSnippet = completionLabels(page, 1).filter({
+		has: page.locator('.cm-completionDetail', { hasText: 'function' })
+	});
+	await expect(defSnippet.first()).toBeVisible({ timeout: 20_000 });
+	await defSnippet.first().click();
+	// The snippet lands with the caret on its FIRST field, `name`.
+	const cell = page.getByTestId('cell').nth(1);
+	await expect(cell.locator('.cm-content')).toContainText('def name(params):');
+	await expect.poll(() => selectedText(page, 1)).toBe('name');
+
+	// Tab must move to the NEXT field rather than opening a completion.
+	await page.keyboard.press('Tab');
+	await expect.poll(() => selectedText(page, 1)).toBe('params');
+	await expect(cell.locator('.cm-tooltip-autocomplete')).toHaveCount(0);
+	await expect(docTooltip(page)).toHaveCount(0);
+
+	// And Shift+Tab must move BACK rather than opening the docs tooltip.
+	await page.keyboard.press('Shift+Tab');
+	await expect.poll(() => selectedText(page, 1)).toBe('name');
+	await expect(docTooltip(page)).toHaveCount(0);
+
+	// Escape leaves the snippet; Tab is a completion key again immediately after.
+	await page.keyboard.press('Escape');
+	await typeInto(page, 1, 'cellar_live_mark');
+	await closePopup(page, 1);
+	await page.keyboard.press('Tab');
+	await expect(completionLabels(page, 1).filter({ hasText: 'cellar_live_marker_xyz' }).first()).toBeVisible({
+		timeout: 20_000
+	});
+	await closePopup(page, 1);
 });
 
 test('Tab is not swallowed in a cell the kernel cannot answer about', async ({ page }) => {

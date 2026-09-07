@@ -15,7 +15,14 @@ import { readIntrospectRequest } from '$lib/server/introspect-request';
  * malformed request is a 4xx.
  */
 export async function POST({ request }) {
-	const req = await readIntrospectRequest(request);
-	if (!req.ok) return json({ ok: false, reason: 'failed', message: req.message }, { status: 400 });
-	return json(await completeInKernel(req.path ? resolveNotebookPath(req.path) : null, req.code, req.cursorPos));
+	try {
+		const req = await readIntrospectRequest(request);
+		if (!req.ok) return json({ ok: false, reason: 'failed', message: req.message }, { status: 400 });
+		return json(await completeInKernel(req.path ? resolveNotebookPath(req.path) : null, req.code, req.cursorPos));
+	} catch (err) {
+		// `resolveNotebookPath` THROWS for a path that escapes the workspace, which is a
+		// malformed request rather than anything the kernel said - so it takes the same
+		// 400 shape as every other bad field instead of an unhandled 500.
+		return json({ ok: false, reason: 'failed', message: String(err?.message ?? err) }, { status: 400 });
+	}
 }

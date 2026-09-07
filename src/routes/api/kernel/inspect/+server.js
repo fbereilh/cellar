@@ -18,11 +18,17 @@ import { readIntrospectRequest } from '$lib/server/introspect-request';
  * states to the user.
  */
 export async function POST({ request }) {
-	const req = await readIntrospectRequest(request);
-	if (!req.ok) return json({ ok: false, reason: 'failed', message: req.message }, { status: 400 });
-	if (req.detail !== 0 && req.detail !== 1)
-		return json({ ok: false, reason: 'failed', message: 'detail must be 0 or 1' }, { status: 400 });
-	return json(
-		await inspectInKernel(req.path ? resolveNotebookPath(req.path) : null, req.code, req.cursorPos, req.detail)
-	);
+	try {
+		const req = await readIntrospectRequest(request);
+		if (!req.ok) return json({ ok: false, reason: 'failed', message: req.message }, { status: 400 });
+		if (req.detail !== 0 && req.detail !== 1)
+			return json({ ok: false, reason: 'failed', message: 'detail must be 0 or 1' }, { status: 400 });
+		return json(
+			await inspectInKernel(req.path ? resolveNotebookPath(req.path) : null, req.code, req.cursorPos, req.detail)
+		);
+	} catch (err) {
+		// See the completion route: an escaping `path` is a malformed request, not a
+		// verdict about a kernel, so it answers 400 in this route's own shape.
+		return json({ ok: false, reason: 'failed', message: String(err?.message ?? err) }, { status: 400 });
+	}
 }

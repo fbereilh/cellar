@@ -56,7 +56,10 @@ async function query(
 	explicit = false
 ): Promise<CompletionResult | null> {
 	const source = kernelCompletionSource(() => handle);
-	const state = EditorState.create({ doc });
+	// `python()` so the state has a real syntax tree: the implicit path's second gate
+	// resolves the node at the caret, and without a language every position resolves
+	// to the document node and the gate could never fire.
+	const state = EditorState.create({ doc, extensions: [python()] });
 	return await source(new CompletionContext(state, pos, explicit));
 }
 
@@ -138,11 +141,45 @@ describe('when it asks, and when it does not', () => {
 		expect(f.calls).toEqual([]);
 	});
 
+	it('never asks while the caret is inside a COMMENT, however completable the character before it', async () => {
+		// `COMPLETABLE_BEFORE` matches every word character of `# import da`, so the
+		// character rule alone left this source asking the kernel on every keystroke of
+		// a comment - and IPython answers namespace matches for the extracted prefix,
+		// so a completion list really could pop up in prose.
+		const f = fakeHandle(okOutcome([{ text: 'database', type: 'instance' }], 9, 11));
+		expect(await query('# import da', 11, f.handle)).toBeNull();
+		expect(f.calls).toEqual([]);
+	});
+
+	it('never asks while the caret is inside a STRING, on the implicit path', async () => {
+		const f = fakeHandle(okOutcome([{ text: 'data/', type: 'path' }], 6, 8));
+		expect(await query("open('da')", 8, f.handle)).toBeNull();
+		expect(await query('x = f"pre{1}post"', 15, f.handle)).toBeNull();
+		expect(f.calls).toEqual([]);
+	});
+
+	it('still completes after a DOT - the gate drops PropertyName, which is the headline case', async () => {
+		// `@codemirror/lang-python`'s own `dontComplete` includes `PropertyName`, which
+		// is why its sources bail after a dot. Copying that list wholesale here would
+		// disable live-object attribute completion, the thing this source exists for.
+		const f = fakeHandle(okOutcome([{ text: 'pathsep', type: 'instance' }], 3, 5));
+		const res = await query('os.pa', 5, f.handle);
+		expect(res?.options.map((o) => o.label)).toEqual(['pathsep']);
+		expect(f.calls.length).toBe(1);
+	});
+
 	it('asks anyway when the user pressed Tab - which is what reaches path completion in a string', async () => {
 		const f = fakeHandle(okOutcome([{ text: 'data/', type: 'path' }], 6, 6));
 		const res = await query("open('", 6, f.handle, true);
 		expect(res?.options.map((o) => o.label)).toEqual(['data/']);
 		expect(f.calls[0]).toMatchObject({ code: "open('", cursorPos: 6 });
+	});
+
+	it('asks anyway when the user pressed Tab inside a COMMENT too - explicit bypasses both gates', async () => {
+		const f = fakeHandle(okOutcome([{ text: 'database', type: 'instance' }], 9, 11));
+		const res = await query('# import da', 11, f.handle, true);
+		expect(res?.options.map((o) => o.label)).toEqual(['database']);
+		expect(f.calls.length).toBe(1);
 	});
 });
 

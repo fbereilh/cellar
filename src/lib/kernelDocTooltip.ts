@@ -16,8 +16,10 @@
  * rather than inventing a rule - it closes on Escape (an editor-local keymap at
  * `Prec.highest`, exactly as `completionKeymap` closes the completion tooltip), on
  * a document change, on any caret move, and on blur (`closeOnBlur`, the completion
- * default). `docTooltipOpen` is what lets `Cell.editorOverlayOpen()` yield Escape
- * to it before the notebook's own Escape takes the user to command mode.
+ * default) - with the same mousedown guard the completion list uses so a click or a
+ * scrollbar drag INSIDE the tooltip is not a blur at all. `docTooltipOpen` is what
+ * lets `Cell.editorOverlayOpen()` yield Escape to it before the notebook's own
+ * Escape takes the user to command mode.
  *
  * A refusal IS rendered here, unlike in `kernelCompletion` where it is silent. The
  * difference is that Shift+Tab is a direct question: showing nothing would read as
@@ -127,6 +129,14 @@ function renderDom(state: Omit<DocState, 'tooltip'>): HTMLElement {
 	// makes a screen reader announce an answer the user explicitly asked for.
 	dom.setAttribute('role', 'tooltip');
 	dom.setAttribute('aria-live', 'polite');
+	// The tooltip is a 22em SCROLL BOX (`.cm-cellar-doc` sets `overflow: auto`), so a
+	// mousedown inside it - dragging the scrollbar to read a long docstring - would
+	// otherwise move focus off `.cm-content`, fire `blur`, and dismiss the very thing
+	// being read. `@codemirror/autocomplete` guards its own list the same way
+	// ("Prevent focus change when clicking the scrollbar"): cancel the default so
+	// focus never leaves the editor. A genuine blur - clicking another cell, tabbing
+	// away - is untouched and still closes it.
+	dom.addEventListener('mousedown', (e) => e.preventDefault());
 	const body = document.createElement('pre');
 	body.className = `${DOC_TOOLTIP_CLASS}-body`;
 	body.textContent = state.text ?? state.message ?? 'Looking up documentation…';

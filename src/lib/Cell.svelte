@@ -3,7 +3,13 @@
 	import { browser } from '$app/environment';
 	import { EditorView } from '@codemirror/view';
 	import { EditorState, Compartment } from '@codemirror/state';
-	import { acceptCompletion, completionStatus, startCompletion } from '@codemirror/autocomplete';
+	import {
+		acceptCompletion,
+		completionStatus,
+		hasNextSnippetField,
+		hasPrevSnippetField,
+		startCompletion
+	} from '@codemirror/autocomplete';
 	import { searchPanelOpen } from '@codemirror/search';
 	import { basicSetup } from 'codemirror';
 	import { python } from '@codemirror/lang-python';
@@ -1340,10 +1346,18 @@
 	 * cell type, so without it Tab was swallowed in a markdown, raw or chat cell -
 	 * which contribute no completion source at all, so the key did nothing and took
 	 * the escape hatch with it - and opened PYTHON file-local names in a mojo cell.
+	 *
+	 * A FOURTH decline covers an ACTIVE SNIPPET FIELD. `@codemirror/lang-python` ships
+	 * snippets (`def`, `for`, `class`, …) whose `apply` installs `addSnippetKeymap` at
+	 * `Prec.highest`, binding Tab to `nextSnippetField`; the notebook's dispatcher is a
+	 * window CAPTURE listener that `stopPropagation`s, so it runs BEFORE that keymap.
+	 * Declining - rather than calling the command here - lets the keystroke fall
+	 * through, so CodeMirror keeps owning field navigation unchanged.
 	 */
 	function requestCompletion(): boolean {
 		if (!kernelIntrospectFor()) return false;
 		if (!view) return false;
+		if (hasNextSnippetField(view.state)) return false;
 		// An open suggestion is accepted first, so Tab-Tab is a complete gesture.
 		if (acceptCompletion(view)) return true;
 		// `startCompletion` ALWAYS reports handled once `autocompletion()` is
@@ -1352,10 +1366,15 @@
 		return startCompletion(view);
 	}
 
-	/** Shift+Tab. Declines (false) for a cell with no live-kernel docs to show. */
+	/**
+	 * Shift+Tab. Declines (false) for a cell with no live-kernel docs to show, and -
+	 * for the reason given above `requestCompletion` - while a snippet field is
+	 * active, so `prevSnippetField` still moves BACK through a snippet's fields.
+	 */
 	function requestKernelDocs(): boolean {
 		const handle = kernelIntrospectFor();
 		if (!handle) return false;
+		if (view && hasPrevSnippetField(view.state)) return false;
 		buildEditor();
 		return view ? showKernelDocs(view, handle) : false;
 	}

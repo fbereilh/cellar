@@ -16,6 +16,12 @@
  *  - With no kernel (or a busy one) the kernel source returns null and the editor
  *    behaves exactly as it did before this feature existed.
  *
+ * THE IMPLICIT PATH IS GATED TWICE, because it runs at keystroke frequency: the
+ * character before the caret must be completable (`COMPLETABLE_BEFORE`) AND the
+ * caret must not sit in a comment or a string (`DONT_COMPLETE_IN`, which is
+ * lang-python's own `dontComplete` minus `PropertyName`). An explicit Tab bypasses
+ * both, which is what keeps IPython's path completion inside `open('` reachable.
+ *
  * The cost of merging is duplicates, and CodeMirror already solves it: `sortOptions`
  * drops an option whose label, `detail`, `apply`, `boost` AND `type` all match one
  * already emitted (a null `type` on either side counts as a match). That is the
@@ -26,6 +32,7 @@
 
 import { EditorState } from '@codemirror/state';
 import type { Extension } from '@codemirror/state';
+import { syntaxTree } from '@codemirror/language';
 import type { Completion, CompletionContext, CompletionResult, CompletionSource } from '@codemirror/autocomplete';
 import {
 	completionType,
@@ -38,13 +45,35 @@ import {
  * Fire without an explicit request only when the caret sits just after something
  * completable: an identifier character or the dot that opens an attribute.
  *
- * Deliberately narrow. This source is the one thing here that runs at keystroke
- * frequency, and a request per character typed inside prose or a string literal
- * would be a round trip per keystroke for an answer nobody asked for. Tab
- * (`explicit`) bypasses it entirely, which is what keeps IPython's path completion
- * inside `open('` reachable.
+ * The first half of the implicit gate. This source is the one thing here that runs
+ * at keystroke frequency, so it declines wherever the keystroke is plainly not a
+ * completion gesture. Tab (`explicit`) bypasses it entirely, which is what keeps
+ * IPython's path completion inside `open('` reachable.
  */
 const COMPLETABLE_BEFORE = /[\w.]$/;
+
+/**
+ * Syntax nodes the implicit path refuses to complete inside: prose and string
+ * literals. The second half of the implicit gate, and the reason a character typed
+ * in a comment costs no round trip - `COMPLETABLE_BEFORE` alone matches every word
+ * character of `# import da`, so without this the source asked the kernel on every
+ * keystroke of a comment and could pop a namespace list there.
+ *
+ * These three are `@codemirror/lang-python`'s own `dontComplete` list MINUS
+ * `PropertyName`, and dropping that one is deliberate: completing after a dot is
+ * precisely what this source exists for (the file-local sources bail there), so
+ * copying the list wholesale would disable the headline case.
+ *
+ * `explicit` (Tab) is NOT gated by this - a Tab inside `open('` is a direct request
+ * and reaches IPython's path completion.
+ */
+const DONT_COMPLETE_IN = ['String', 'FormatString', 'Comment'];
+
+/** True when `pos` sits inside prose or a string literal - see `DONT_COMPLETE_IN`. */
+function inDontCompleteNode(state: EditorState, pos: number): boolean {
+	const inner = syntaxTree(state).resolveInner(pos, -1);
+	return DONT_COMPLETE_IN.indexOf(inner.name) > -1;
+}
 
 /**
  * Once the kernel has answered, typing more identifier characters filters the list
@@ -90,6 +119,7 @@ export function kernelCompletionSource(getHandle: () => KernelIntrospectHandle |
 		if (!context.explicit) {
 			const before = doc.sliceString(Math.max(0, context.pos - 1), context.pos);
 			if (!COMPLETABLE_BEFORE.test(before)) return null;
+			if (inDontCompleteNode(context.state, context.pos)) return null;
 		}
 		const code = doc.toString();
 		// An HTTP request the query can outlive: CodeMirror aborts a stale query, and
@@ -160,10 +190,14 @@ function replacementRange(
 /**
  * The extension form: registers the source as language data for THIS editor only.
  *
- * `EditorState.languageData` rather than `pythonLanguage.data.of(...)` because the
- * latter is a process-wide singleton - every editor in the app would get one
- * notebook's kernel. This contributes alongside the language's own sources, so
- * `autocompletion()` (already in `basicSetup`) collects all three.
+ * Either `EditorState.languageData.of(...)` or `pythonLanguage.data.of(...)` would
+ * work and both are per-STATE - `Language.data` is a plain `Facet`, so neither
+ * registers anything process-wide. This one is chosen because it does not depend on
+ * what the editor's language `Compartment` currently holds: the extension is
+ * installed once per editor and the null-handle gate in `Cell.kernelIntrospectFor`
+ * is what scopes the source to the cells a Python kernel can honestly answer about.
+ * It contributes alongside the language's own sources, so `autocompletion()`
+ * (already in `basicSetup`) collects all three.
  *
  * The source object is created ONCE per extension so its identity is stable:
  * `autocompletion` reuses an active source by reference across transactions, and a
