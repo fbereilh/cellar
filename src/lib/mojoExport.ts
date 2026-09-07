@@ -137,6 +137,15 @@ interface ScannedLine {
 	text: string;
 	indent: number;
 	blank: boolean;
+	/**
+	 * The line is nothing but a `#` comment. Load-bearing rather than decoration: a
+	 * comment produces no INDENT/DEDENT token, so a column-0 comment INSIDE a suite
+	 * is legal (measured against Mojo 1.0.0 - `def main():` / `    print(1)` /
+	 * `# a separator` / `    print(2)` compiles and runs, printing 1 then 2). Read as
+	 * a top-level line it ended the body early and orphaned the indented code after
+	 * it at file scope, which is a hard compile error in the generated module.
+	 */
+	comment: boolean;
 	/** True when the line's first character is inside an unterminated `"""`/`'''`. */
 	inString: boolean;
 }
@@ -168,6 +177,10 @@ function scanLines(src: string): ScannedLine[] {
 			text,
 			indent: text.length - text.trimStart().length,
 			blank: trimmed === '',
+			// A `#` opening a line that STARTS inside a triple-quoted string is string
+			// content, never a comment, so the state carried from the previous line
+			// decides this too.
+			comment: triple === null && trimmed.startsWith('#'),
 			inString: triple !== null
 		});
 		// Walk the line's characters to carry the triple-quote state to the next one.
@@ -223,11 +236,11 @@ function bracketDelta(text: string): number {
  * The span of a top-level `def main(...)` block in a Mojo cell, or null.
  *
  * The block is the `def` line (continued across lines while its brackets are
- * open), every following blank or INDENTED line, and any decorator lines
+ * open), every following blank, COMMENT or INDENTED line, and any decorator lines
  * immediately above it - a decorator left behind with its `def` removed is a
  * compile error, which is the one thing this transform must never produce.
- * Trailing blank lines are left OUT of the span, so they stay in the residue and
- * the surrounding blocks keep their own spacing.
+ * Trailing blank and comment lines are left OUT of the span, so they stay in the
+ * residue and the surrounding blocks keep their own spacing.
  *
  * The FIRST such block wins. A cell with two top-level `main`s does not compile
  * on its own either, so there is no honest second answer to give.
@@ -260,18 +273,23 @@ export function findTopLevelMain(source: string | null | undefined): MainBlock |
 		last++;
 		depth += bracketDelta(lines[last].text);
 	}
-	// The body: every following blank or indented line, up to the next top-level one.
+	// The body: every following blank, COMMENT or indented line, up to the next
+	// top-level one. A comment-only line at column 0 does not end a suite (see
+	// `ScannedLine.comment`), so it may not end the block either.
 	let end = last;
 	for (let i = last + 1; i < lines.length; i++) {
 		const l = lines[i];
-		if (l.inString || l.blank || l.indent > 0) {
+		if (l.inString || l.blank || l.comment || l.indent > 0) {
 			end = i;
 			continue;
 		}
 		break;
 	}
-	// Give trailing blank lines back to the residue.
-	while (end > last && lines[end].blank) end--;
+	// Give trailing blank AND comment lines back to the residue. A comment sitting
+	// between `main` and the next top-level definition belongs to what FOLLOWS, so
+	// swallowing it into the dropped block would silently delete it; one INSIDE the
+	// body, with indented code after it, is not trailing and stays in the block.
+	while (end > last && (lines[end].blank || lines[end].comment)) end--;
 	return { start: lines[first].start, end: lines[end].end };
 }
 

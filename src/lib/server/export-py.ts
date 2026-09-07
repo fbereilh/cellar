@@ -33,6 +33,7 @@ import { nbdevLibPath } from './nbdev';
 import { isExportBase, type ExportBase } from '../exportTarget';
 import {
 	futureImportJoinedHazard,
+	humanExportHazards,
 	mojoMainDroppedHazard,
 	mojoMainKeptHazard,
 	type ExportHazard
@@ -413,32 +414,61 @@ export function docExportLanguage(doc: NotebookDoc): ExportLanguage {
  * hand (`exportTargetView`, which resolves for its own fields) does not pay a
  * second resolution - the `canonicalWorkspace()` optional-argument idiom. A lone
  * call resolves once, itself.
+ *
+ * `keep` narrows the set BEFORE the foreign-module file read, which is what makes
+ * `docHumanExportHazards` cheap rather than merely correct: `mojo-main-kept` is
+ * agent-only and fires on the commonest `.mojo` shape, so filtering after the read
+ * would have charged every `getNotebook` and every `persist` of such a notebook an
+ * `existsSync` + `readFileSync` - on the process carrying the kernel websockets
+ * and the SSE fan-out - for a hazard the browser then discards.
  */
-export function docExportHazards(
+function docHazards(
 	doc: NotebookDoc,
-	resolved: ResolvedExportTarget | null = resolveExportTarget(doc)
+	resolved: ResolvedExportTarget | null,
+	keep: (hazards: ExportHazard[]) => ExportHazard[]
 ): ExportHazard[] {
 	if (!resolved) return [];
 	const lang = targetLanguage(resolved);
 	const exported = doc.cells.filter((c: Cell) => isExportCell(c, lang));
 	if (!exported.length) return [];
-	const hazards = hazardsFor(exported, lang);
+	const hazards = keep(hazardsFor(exported, lang));
 	// The foreign-module question is asked LAST in code and FIRST in meaning: over a
 	// target the clobber guard declines there is no module of ours and never will be,
 	// so a hazard sentence describes a file that cannot exist - MCP's `moduleHazard`
 	// says outright that `<target>` WAS written, and the export bar's own claim about
 	// the module these marks describe is equally beside the point when no export can
 	// land. Ordering it here is what keeps that bar and `moduleHazard` (which reads
-	// this same function through `exportHazardsFor`) from describing one document
+	// this same rule through `exportHazardsFor`) from describing one document
 	// differently - the drift the shared-rule convention exists to prevent.
 	// `exportNotebookToPy` already zeroes its own hazards on that branch, for the
 	// same reason.
 	//
-	// Asked only once there IS a hazard to suppress, so the file read costs nothing
-	// on the ordinary `getNotebook` / persist path.
+	// Asked only once a hazard THIS CALLER would report survives, so an ordinary
+	// notebook pays no file read at all, and a `.mojo` one pays it on the browser
+	// path only when something the bar really shows fired.
 	if (!hazards.length) return [];
 	if (resolved.ok && foreignModuleAt(resolved.target)) return [];
 	return hazards;
+}
+
+/** Every hazard the document's marks carry, agent-only kinds included. */
+export function docExportHazards(
+	doc: NotebookDoc,
+	resolved: ResolvedExportTarget | null = resolveExportTarget(doc)
+): ExportHazard[] {
+	return docHazards(doc, resolved, (h) => h);
+}
+
+/**
+ * The hazards a HUMAN surface may show (`$lib/exportHazard`'s `humanExportHazards`
+ * is the one rule), narrowed before the foreign-module read so the kinds the
+ * browser discards cost it nothing.
+ */
+export function docHumanExportHazards(
+	doc: NotebookDoc,
+	resolved: ResolvedExportTarget | null = resolveExportTarget(doc)
+): ExportHazard[] {
+	return docHazards(doc, resolved, humanExportHazards);
 }
 
 /**

@@ -12,7 +12,7 @@
 	import type { WorkspaceRootOption } from '$lib/notebookRoot';
 	import { EXPORT_BASES, EXPORT_BASE_LABELS, exportImportWarning } from '$lib/exportTarget';
 	import { hazardSummaryClause, humanExportHazards, type ExportHazard } from '$lib/exportHazard';
-	import type { ExportLanguage } from '$lib/exportRole';
+	import { exportStrandedExplanation, type ExportLanguage } from '$lib/exportRole';
 	import { reservedFailureHeight, failureDetail } from '$lib/cellRenderFailure';
 	import type { ExportPyResult } from '$lib/types';
 	import {
@@ -109,11 +109,17 @@
 		/** The notebook's export target (module path), or null when unset. */
 		exportTarget?: string | null;
 		/**
-		 * The MODULE LANGUAGE that target's extension names (`.py` -> python,
-		 * `.mojo` -> mojo; `python` when nothing is configured). It decides which
+		 * The MODULE LANGUAGE this notebook's target names (`.py` -> python, `.mojo`
+		 * -> mojo), or **null when no target is configured at all**. It decides which
 		 * cells may be marked, so each Cell needs it to draw its export toggle.
+		 *
+		 * NULLABLE on purpose: eligibility falls back to `python` with nothing
+		 * configured (the legacy default), so a bare language cannot tell "this
+		 * notebook targets a `.py` module" from "this notebook targets nothing", and
+		 * any copy that says the first over the second names a file that does not
+		 * exist. The fallback is applied where ELIGIBILITY is asked and nowhere else.
 		 */
-		exportLanguage?: ExportLanguage;
+		exportLanguage?: ExportLanguage | null;
 		/**
 		 * The cells whose top-level `def main()` a `.mojo` export will DROP, because a
 		 * later exported cell defines one too and a Mojo module can hold only one
@@ -123,6 +129,13 @@
 		mojoMainDropped?: ReadonlySet<string>;
 		/** How many cells are currently marked for export. */
 		exportCount?: number;
+		/**
+		 * How many cells carry an export flag the current target cannot honour - the
+		 * target's extension moved under a mark nothing rewrites, or there is no
+		 * target at all. Reported ONCE here, since it is a notebook-wide fact; each
+		 * affected cell carries only a short marker (`EXPORT_STRANDED_BADGE`).
+		 */
+		exportStrandedCount?: number;
 		/**
 		 * Set (or clear, with '') the notebook's `.py` export target. Called ONCE PER
 		 * EDIT, from the input's `change` (a blur after typing, or Enter) - never per
@@ -246,7 +259,7 @@
 		selectedIds = EMPTY_SELECTION,
 		keyMode = 'command',
 		staleness = {},
-		exportLanguage = 'python',
+		exportLanguage = null,
 		mojoMainDropped = EMPTY_MAIN_DROPPED,
 		hidden = new Set(),
 		foldedIds = new Set(),
@@ -275,6 +288,7 @@
 		onSetExport,
 		exportTarget = null,
 		exportCount = 0,
+		exportStrandedCount = 0,
 		onSetExportTarget,
 		onExportPy,
 		exportBase = 'workspace',
@@ -658,6 +672,13 @@
 	// The button names the file it writes, so it has to track the target's language:
 	// "Export to .py" over a `.mojo` target names a file that will never exist.
 	const exportExtension = $derived(exportLanguage === 'mojo' ? '.mojo' : '.py');
+	// The notebook-wide stranded-mark explanation, stated ONCE (`$lib/exportRole`
+	// owns the wording, so the bar and each cell's short marker cannot drift). It
+	// takes the NULLABLE language, because "targets a .py module" and "targets
+	// nothing" are different facts and only the nullable value can tell them apart.
+	const strandedExplanation = $derived(
+		exportStrandedCount > 0 ? exportStrandedExplanation(exportStrandedCount, exportLanguage) : null
+	);
 	// Whether the notebook has any runnable (code) cell — gates the "Run all" button.
 	const hasCodeCell = $derived(cells.some((c) => c.cell_type === 'code'));
 	// Whether THIS notebook's kernel is executing or has work waiting — gates
@@ -1324,6 +1345,22 @@
 					     workspace file it names (under the workspace base they are the same
 					     string, and the echo would be noise). -->
 					<span class="font-mono text-xs text-base-content/55" data-testid="export-resolved">→ {exportResolved}</span>
+				{/if}
+				{#if strandedExplanation}
+					<!-- Marks the current target cannot honour, explained ONCE for the
+					     notebook. Each affected cell carries only a short "not exported"
+					     marker beside its greyed toggle: this is a notebook-wide fact, and
+					     repeating a sentence per cell would wrap fifteen toolbar rows to
+					     say one thing (the Databricks runtime card renders its reason once
+					     on the card, not once per control). Rendered OUTSIDE the warning
+					     chain above rather than as another arm of it - a hazard describes
+					     the module these marks build, this describes marks the module
+					     leaves out, and both can be true at once. Warning tint on the ICON,
+					     `base-content` copy (the GitNotebooks contrast rule). -->
+					<span class="flex items-center gap-1 text-xs text-base-content/70" data-testid="export-stranded">
+						<svg class="h-3.5 w-3.5 shrink-0 text-warning" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3" /><path d="M12 9v4" /><path d="M12 17h.01" /></svg>
+						{strandedExplanation}
+					</span>
 				{/if}
 				{#if exportFeedback}
 					<span class="text-xs text-base-content/70" data-testid="export-feedback">{exportFeedback}</span>

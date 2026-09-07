@@ -32,11 +32,12 @@ import {
 	exportNotebookToPy,
 	resolveExportTarget,
 	docExportHazards,
+	docHumanExportHazards,
 	docExportLanguage,
 	type ExportResult,
 	type ResolvedExportTarget
 } from './export-py';
-import { humanExportHazards, type ExportHazard } from '../exportHazard';
+import type { ExportHazard } from '../exportHazard';
 import {
 	canExportCell,
 	exportDirectiveOwnsCell,
@@ -347,10 +348,12 @@ function publishExportDerived(doc: NotebookDoc): void {
 	const info = resolveExportTarget(doc);
 	const resolved = info && info.ok ? info.target : null;
 	const resolveError = info && !info.ok ? info.error : null;
-	// Filtered through the ONE human-surface rule (`$lib/exportHazard`), so a kind
+	// Narrowed through the ONE human-surface rule (`$lib/exportHazard`), so a kind
 	// this bar may not show cannot reach it - and cannot churn the change-only key
-	// either, which would publish an event no surface renders.
-	const hazards = humanExportHazards(docExportHazards(doc, info));
+	// either, which would publish an event no surface renders. Asked as
+	// `docHumanExportHazards` rather than filtered afterwards, so the agent-only
+	// kinds cost this path no file read.
+	const hazards = docHumanExportHazards(doc, info);
 	const key = [resolved ?? '', resolveError ?? '', ...hazards.map((h) => h.message)].join('\u0000');
 	if (key === doc.lastExportDerivedKey) return;
 	doc.lastExportDerivedKey = key;
@@ -514,9 +517,9 @@ function exportTargetView(doc: NotebookDoc): {
 		exportResolved: info && info.ok ? info.target : null,
 		exportResolveError: info && !info.ok ? info.error : null,
 		// The SAME `info` is threaded in rather than resolved a second time here, and
-		// filtered through the ONE human-surface rule: this field feeds the export bar,
+		// narrowed through the ONE human-surface rule: this field feeds the export bar,
 		// where an agent-only kind may not appear (`$lib/exportHazard`).
-		exportHazards: humanExportHazards(docExportHazards(doc, info))
+		exportHazards: docHumanExportHazards(doc, info)
 	};
 }
 

@@ -677,8 +677,11 @@ describe('the wiring the browser ships (source guards - see the file header)', (
 		// user's committed `.ipynb`. Both halves are shared predicates, never a second,
 		// looser rule derived here.
 		expect(openGates(cell, 'data-testid="toggle-export"')).toEqual(['{#if canExport || exportStranded}']);
-		expect(cell).toContain('const canExport = $derived(canExportCell(cell, exportLanguage));');
-		expect(cell).toContain('const exportStranded = $derived(exportMarkStranded(cell, exportLanguage));');
+		expect(cell).toContain('const canExport = $derived(canExportCell(cell, exportCellLanguage));');
+		expect(cell).toContain('const exportStranded = $derived(exportMarkStranded(cell, exportCellLanguage));');
+		// ELIGIBILITY applies the legacy `python` default; every SENTENCE reads the
+		// nullable prop, so none of them can name a module the notebook does not have.
+		expect(cell).toContain("const exportCellLanguage = $derived(exportLanguage ?? 'python');");
 		expect(openGates(cell, 'data-testid="toggle-agent-hidden"')).toEqual([]);
 	});
 
@@ -697,22 +700,26 @@ describe('the wiring the browser ships (source guards - see the file header)', (
 
 	// WHY SOURCE: `aria-pressed` IS the state for a screen reader; without it the
 	// toggles announce as plain buttons and the state is sighted-only.
-	it('both are toggle buttons with a name that is stable across STATE', () => {
+	it('both are toggle buttons with a name that is stable across PRESSED state', () => {
 		for (const [t, name] of [
-			// The export toggle names the module it really writes, so the name tracks the
-			// TARGET's extension - a fact about the notebook, not a state of the control.
-			// It may still never branch on the toggle's own state: that is
-			// `aria-pressed`'s job, and a name that moves too announces one fact twice.
-			['toggle-export', 'aria-label={`Export this cell to the notebook\'s ${exportExtension} module`}'],
+			// The export toggle's name describes what the control DOES, which depends on
+			// the notebook's target (and on whether the mark is stranded), so it is built
+			// in the script as `exportToggleName` and the markup reads that. It may still
+			// never branch on the PRESSED state here: that is `aria-pressed`'s job, and a
+			// name that moves with it announces one fact twice.
+			['toggle-export', 'aria-label={exportToggleName}'],
 			['toggle-agent-hidden', 'aria-label="Hide this cell from AI agents"']
 		]) {
 			const btn = toggleButtonTag(cell, `data-testid="${t}"`);
 			expect(btn, t).toMatch(/aria-pressed=\{/);
 			expect(btn, t).toContain(name);
 			const label = btn.slice(btn.indexOf('aria-label='));
-			for (const state of ['isExport', 'exportStranded', 'agentHidden'])
+			for (const state of ['isExport', 'agentHidden'])
 				expect(label.slice(0, label.indexOf('\n')), `${t}: the name reads ${state}`).not.toContain(state);
 		}
+		// ...and the derived it reads is likewise free of the pressed state.
+		const derived = cell.slice(cell.indexOf('const exportToggleName = $derived('));
+		expect(derived.slice(0, derived.indexOf('\n\t//'))).not.toContain('isExport');
 	});
 
 	// WHY SOURCE: the flag is a DISCLOSURE rule with one owner; a second inline

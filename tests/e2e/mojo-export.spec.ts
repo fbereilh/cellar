@@ -246,16 +246,35 @@ test('the export toggle names the target language, and a stranded mark stays cle
 
 	const stranded = page.locator(`[data-cell-id="${ids[0]}"]`).getByTestId('toggle-export');
 	await expect(stranded).toHaveAttribute('data-export-stranded', 'true');
-	// The reason is READABLE TEXT beside the control, not only a tooltip.
-	const note = page.locator(`[data-cell-id="${ids[0]}"]`).getByTestId('export-stranded-note');
-	await expect(note).toBeVisible();
-	await expect(note).toHaveText(/exported nowhere/);
+	await expect(stranded).toHaveAttribute('aria-label', "Clear this cell's stale export mark");
+	// The CELL carries a short marker, and the reason is stated ONCE for the notebook
+	// in the export bar - not repeated on every previously marked cell.
+	const badge = page.locator(`[data-cell-id="${ids[0]}"]`).getByTestId('export-stranded-badge');
+	await expect(badge).toBeVisible();
+	await expect(badge).toHaveText('not exported');
+	const bar = page.locator('[data-testid="export-stranded"]:visible');
+	await expect(bar).toHaveCount(1);
+	await expect(bar).toHaveText(/1 cell is marked for export/);
+	await expect(bar).toHaveText(/\.py module/);
 	await expect(page.locator('[data-testid="export-count"]:visible')).toHaveText('0 cells marked');
+
+	// CLEARING the target is a different fact and may not be worded as the first: the
+	// notebook then targets nothing, so nothing may name a `.py` module.
+	const cleared = await request.post(`${baseURL}/api/notebooks/export-py`, {
+		data: { op: 'set-target', target: '', base: 'workspace', path: 'labels.ipynb' }
+	});
+	expect(cleared.ok(), await cleared.text()).toBeTruthy();
+	await page.reload();
+	await openNotebook(page, 'labels.ipynb');
+	const noTarget = page.locator('[data-testid="export-stranded"]:visible');
+	await expect(noTarget).toHaveText(/no target module/);
+	await expect(noTarget).not.toHaveText(/\.py/);
+	await expect(page.locator(`[data-cell-id="${ids[0]}"]`).getByTestId('export-stranded-badge')).toBeVisible();
 
 	// Clicking it CLEARS the flag rather than trying to re-mark a cell the server
 	// refuses: the toggle and its note go, and the key leaves the notebook.
-	await stranded.click();
-	await expect(note).toHaveCount(0);
+	await page.locator(`[data-cell-id="${ids[0]}"]`).getByTestId('toggle-export').click();
+	await expect(page.locator('[data-testid="export-stranded"]:visible')).toHaveCount(0);
 	await expect(page.locator(`[data-cell-id="${ids[0]}"]`).getByTestId('toggle-export')).toHaveCount(0);
 	await expect
 		.poll(async () => {

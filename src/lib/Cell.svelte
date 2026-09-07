@@ -33,6 +33,8 @@
 		exportDirectiveOwnsCell,
 		exportMarkStranded,
 		exportMarkedTwice,
+		EXPORT_STRANDED_BADGE,
+		EXPORT_STRANDED_CELL_TITLE,
 		type ExportLanguage
 	} from '$lib/exportRole';
 	import { MAIN_DROPPED_BADGE, MAIN_DROPPED_REASON } from '$lib/mojoExport';
@@ -105,11 +107,17 @@
 		/** Staleness verdict ($lib/staleness), or null. */
 		staleState?: StalenessEntry | null;
 		/**
-		 * The MODULE LANGUAGE the notebook's export target names (`$lib/exportRole`).
-		 * A cell is eligible for the export toggle only when its own language matches,
-		 * so this is what decides whether the toggle is drawn at all.
+		 * The MODULE LANGUAGE the notebook's export target names (`$lib/exportRole`),
+		 * or **null when no target is configured at all**. A cell is eligible for the
+		 * export toggle only when its own language matches, so this is what decides
+		 * whether the toggle is drawn at all.
+		 *
+		 * NULLABLE on purpose: eligibility falls back to `python` with nothing
+		 * configured, so a bare language cannot tell a `.py` target from no target,
+		 * and copy built on it named a module that does not exist. The fallback is
+		 * applied to ELIGIBILITY only; every sentence reads the nullable value.
 		 */
-		exportLanguage?: ExportLanguage;
+		exportLanguage?: ExportLanguage | null;
 		/**
 		 * This cell is marked for a `.mojo` export AND a LATER exported cell also
 		 * defines a top-level `def main()`, so this one's `main` will not be written
@@ -207,7 +215,7 @@
 		selected = false,
 		keyMode = 'command',
 		staleState = null,
-		exportLanguage = 'python',
+		exportLanguage = null,
 		mainDropped = false,
 		dragging = false,
 		foldedIds = new Set(),
@@ -346,26 +354,41 @@
 	// is the strict test, so such a cell got a toggle whose `aria-pressed` could
 	// never move and whose setter always skipped it. An always-visible control that
 	// can never apply is worse than one behind a menu, so it is GATED, not disabled.
-	const canExport = $derived(canExportCell(cell, exportLanguage));
-	const isExport = $derived(isExportCell(cell, exportLanguage));
-	// The extension the notebook's target names, so every label this control speaks
-	// says which module the mark is about. The bar's own `Export to .mojo` button is
-	// derived the same way - a hardcoded ".py" here announced the wrong file in
-	// exactly the place the feature is used, `aria-label` (the accessible NAME)
-	// included.
-	const exportExtension = $derived(exportLanguage === 'mojo' ? '.mojo' : '.py');
-	// Cellar's own flag is set, but this cell can no longer go in the module the
-	// notebook targets - the target's extension moved under a mark nothing rewrites
-	// (`exportMarkStranded`). The toggle is RENDERED for such a cell rather than
-	// omitted, greyed and saying why in adjacent TEXT (never only in `title`, which a
-	// control the user cannot hover would hide), and it still CLEARS the flag: the
+	// The legacy default, applied to ELIGIBILITY and nowhere else: with no target
+	// configured a Python code cell is still markable, exactly as it always was.
+	// Every SENTENCE below reads the nullable prop instead, so none of them claims a
+	// module the notebook does not have.
+	const exportCellLanguage = $derived(exportLanguage ?? 'python');
+	const canExport = $derived(canExportCell(cell, exportCellLanguage));
+	const isExport = $derived(isExportCell(cell, exportCellLanguage));
+	// How this control NAMES the module it writes to. With a target it is that
+	// target's own extension (the bar's `Export to .mojo` button is derived the same
+	// way); with none there is no file to name, so it says only "module" rather than
+	// inventing a `.py` one.
+	const exportModuleLabel = $derived(
+		exportLanguage === null ? 'module' : `${exportLanguage === 'mojo' ? '.mojo' : '.py'} module`
+	);
+	// Cellar's own flag is set, but this cell can go in no module the notebook
+	// currently names - the target's extension moved under a mark nothing rewrites,
+	// or the target was cleared (`exportMarkStranded`). The toggle is RENDERED for
+	// such a cell rather than omitted, greyed, and it still CLEARS the flag: the
 	// server gates marking on eligibility and unmarking on nothing, so this is the
 	// one surface that can retire an otherwise invisible key from the user's
 	// committed `.ipynb`. Scoped to the MARKED case - an ineligible cell with no flag
 	// has no state to clear, so it keeps the omitted toggle.
-	const exportStranded = $derived(exportMarkStranded(cell, exportLanguage));
-	const exportStrandedReason = $derived(
-		`Marked for export, but this notebook now targets a ${exportExtension} module and this cell is not ${exportLanguage === 'mojo' ? 'Mojo' : 'Python'} - it is exported nowhere. Click to clear the mark.`
+	//
+	// What it SAYS here is deliberately a short marker, not a sentence: the reason is
+	// a NOTEBOOK-WIDE fact, so it is stated once in the export bar
+	// (`exportStrandedExplanation`) and a per-cell copy would repeat one sentence on
+	// every previously marked cell, wrapping each toolbar row to say the same thing.
+	const exportStranded = $derived(exportMarkStranded(cell, exportCellLanguage));
+	// The accessible NAME. It tracks what the control DOES - clear a stale mark, or
+	// write this cell to the notebook's module - and never the pressed state, which
+	// is `aria-pressed`'s job.
+	const exportToggleName = $derived(
+		exportStranded
+			? "Clear this cell's stale export mark"
+			: `Export this cell to the notebook's ${exportModuleLabel}`
 	);
 	// Marked by nbdev's `#| export` in the cell's own SOURCE rather than by
 	// `metadata.cellar.export`. The toggle then shows ON (it IS exported - showing an
@@ -380,12 +403,12 @@
 	// every state (the state is `aria-pressed`'s job - a label that moves announces
 	// the same fact twice), and a browser exposes `title` as the accessible
 	// DESCRIPTION beside that name, which is exactly the right split for a reason.
-	const exportByDirective = $derived(exportDirectiveOwnsCell(cell, exportLanguage));
+	const exportByDirective = $derived(exportDirectiveOwnsCell(cell, exportCellLanguage));
 	// ...and marked by Cellar's own flag AS WELL, in which case the title may not
 	// promise that removing the line stops the export: the flag would still mark it.
 	// The shared rule (`exportMarkedTwice`) is what keeps this tooltip, the shell's
 	// refusal notice and MCP's saying the same true thing about the same cell.
-	const exportMarkedBoth = $derived(exportMarkedTwice(cell, exportLanguage));
+	const exportMarkedBoth = $derived(exportMarkedTwice(cell, exportCellLanguage));
 	// Withheld from every agent surface (`cellar.hidden_from_agent`, the shared
 	// predicate MCP filters every read through). Deliberately UNGATED: unlike export
 	// and hide-code this applies to every cell type - a markdown cell's prose is as
@@ -2189,10 +2212,12 @@
 					     where it cannot apply rather than permanently disabled. Presence
 					     follows the cell TYPE, never the flag - with ONE exception, which is
 					     about a flag that is already there: a STRANDED mark (`exportStranded`,
-					     the target's extension moved under it) renders the toggle greyed, with
-					     its reason in adjacent text, so the key is visible in the notebook and
-					     clearable in place instead of sitting invisible in the committed
-					     `.ipynb`. Every label names the target's real extension. -->
+					     the target's extension moved under it, or the target cleared) renders
+					     the toggle greyed beside a SHORT marker, so the key is visible in the
+					     notebook and clearable in place instead of sitting invisible in the
+					     committed `.ipynb`. The reason itself is a notebook-wide fact and is
+					     stated once in the export bar, never once per cell. Every label names
+					     the target's real module, and none names one when there is none. -->
 					<button
 						class="btn btn-ghost btn-xs btn-square {exportStranded
 							? 'bg-base-content/5 text-base-content/35 hover:text-base-content/60'
@@ -2202,15 +2227,15 @@
 						onclick={toggleExport}
 						aria-pressed={isExport || exportStranded}
 						title={exportStranded
-							? exportStrandedReason
+							? EXPORT_STRANDED_CELL_TITLE
 							: exportMarkedBoth
 								? 'Exported twice - by the "#| export" line in this cell AND by Cellar\'s own flag. Remove that line, then unmark it here to clear the flag'
 								: exportByDirective
 									? 'Exported by the "#| export" line in this cell - remove that line to stop exporting it'
 									: isExport
-										? `Exported to the notebook's ${exportExtension} module - click to unmark`
-										: `Mark for export to the notebook's ${exportExtension} module`}
-						aria-label={`Export this cell to the notebook's ${exportExtension} module`}
+										? `Exported to the notebook's ${exportModuleLabel} - click to unmark`
+										: `Mark for export to the notebook's ${exportModuleLabel}`}
+						aria-label={exportToggleName}
 						data-directive-export={exportByDirective ? 'true' : undefined}
 						data-export-stranded={exportStranded ? 'true' : undefined}
 						data-testid="toggle-export"
@@ -2218,15 +2243,14 @@
 						<svg class="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v12" /><path d="m8 11 4 4 4-4" /><path d="M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2" /></svg>
 					</button>
 					{#if exportStranded}
-						<!-- The reason, as TEXT beside the greyed control rather than only in its
-						     `title` - the Databricks runtime card's stance: a reason a user has
-						     to hover for is a reason they never read. The warning tint rides the
-						     ICON, not the copy (`text-warning` body copy fails contrast on the
-						     light theme - the GitNotebooks rule). -->
-						<span class="flex items-center gap-1 text-xs text-base-content/70" data-testid="export-stranded-note">
-							<svg class="h-3.5 w-3.5 shrink-0 text-warning" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3" /><path d="M12 9v4" /><path d="M12 17h.01" /></svg>
-							{exportStrandedReason}
-						</span>
+						<!-- A SHORT marker beside the greyed control, so the stale mark is
+						     visible on the cell without hovering. The WHY is a notebook-wide
+						     fact and lives once in the export bar; a sentence here would be
+						     reproduced on every previously marked cell, wrapping each toolbar
+						     row to say the same thing (the Databricks runtime card renders its
+						     reason once on the card, not once per control). Weight matched to
+						     the sibling `main not exported` badge. -->
+						<span class="text-xs text-base-content/50" data-testid="export-stranded-badge">{EXPORT_STRANDED_BADGE}</span>
 					{/if}
 				{/if}
 				<!-- Withhold this cell from every agent surface. The sparkle is Cellar's own

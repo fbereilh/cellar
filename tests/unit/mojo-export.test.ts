@@ -34,8 +34,12 @@ import {
 	canExportCell,
 	exportLanguageOf,
 	exportMarkStranded,
+	exportStrandedCount,
+	exportStrandedExplanation,
 	exportTargetLanguage,
-	isExportCell
+	isExportCell,
+	EXPORT_STRANDED_BADGE,
+	EXPORT_STRANDED_CELL_TITLE
 } from '../../src/lib/exportRole';
 import {
 	MAIN_DROPPED_BADGE,
@@ -190,6 +194,51 @@ describe('findTopLevelMain', () => {
 		expect(out).toContain('def after():');
 		expect(codeOf(out)).not.toContain('def main(');
 		expect(codeOf(out)).not.toContain('print(1)');
+	});
+
+	it('a column-0 comment INSIDE the body does not end the block', () => {
+		// The reviewer's exact repro, and a defect that shipped broken Mojo. A comment
+		// produces no INDENT/DEDENT token, so this source compiles and RUNS under Mojo
+		// 1.0.0 (printing 1 then 2). Read as a top-level line it ended the body early
+		// and left `    print(2)` orphaned at file scope, which the compiler rejects
+		// with "expressions must not appear at file scope".
+		const src = 'def main():\n    print(1)\n# a separator\n    print(2)\n';
+		const out = dropMainBlock(src);
+		expect(out).toBe(`${MAIN_DROPPED_COMMENT}\n`);
+		expect(out).not.toContain('print(2)');
+		expect(out).not.toContain('# a separator');
+		// ...and through the ONE function the exporter really calls.
+		const { sources } = mojoModuleSources([src, 'def main():\n    print("keeper")']);
+		expect(sources[0]).toBe(`${MAIN_DROPPED_COMMENT}\n`);
+	});
+
+	it('gives a TRAILING comment back to the residue, so it is never swallowed', () => {
+		// A comment between `main` and the next top-level definition belongs to what
+		// FOLLOWS. Dropping the block must not delete it - the trailing-blank walk had
+		// to learn about comments too, or the fix above would silently eat one.
+		const src = 'def main():\n    print(1)\n\n# belongs to helper\ndef helper():\n    return 1\n';
+		const out = dropMainBlock(src);
+		expect(out).toContain('# belongs to helper');
+		expect(out).toContain('def helper():');
+		expect(codeOf(out)).not.toContain('print(1)');
+		// The two halves in one source: the interior comment stays INSIDE the block,
+		// the trailing one stays OUT of it.
+		const both = 'def main():\n    print(1)\n# interior\n    print(2)\n# trailing\ndef helper():\n    return 1\n';
+		const out2 = dropMainBlock(both);
+		expect(out2).not.toContain('# interior');
+		expect(out2).not.toContain('print(2)');
+		expect(out2).toContain('# trailing');
+		expect(out2).toContain('def helper():');
+	});
+
+	it('a `#` opening a line INSIDE a triple-quoted string is not a comment', () => {
+		// The comment rule may not override the string tracking: string content that
+		// happens to start with `#` is not a line that can extend a suite, and reading
+		// it as one would run the block past the string's close.
+		const src = 'def main():\n    x = """\n# not a comment\n"""\n\nY = 1\n';
+		const out = dropMainBlock(src);
+		expect(out).toContain('Y = 1');
+		expect(out).not.toContain('# not a comment');
 	});
 
 	it('leaves everything else in the cell byte-identical', () => {
@@ -554,6 +603,56 @@ describe('a mark stranded by a target-language change stays clearable', () => {
 		expect(exportMarkStranded({ cell_type: 'markdown', source: '# hi' }, 'python')).toBe(false);
 	});
 
+	it('counts stranded marks across the notebook, for the one bar explanation', () => {
+		// The bar states this notebook-wide fact ONCE, so it needs the count rather
+		// than a per-cell sentence.
+		const clean = { cell_type: 'code', source: 'x = 1' };
+		expect(exportStrandedCount([py, mojo, clean], 'mojo')).toBe(1);
+		expect(exportStrandedCount([py, mojo, clean], 'python')).toBe(1);
+		expect(exportStrandedCount([py, clean], 'python')).toBe(0);
+		expect(exportStrandedCount([], 'mojo')).toBe(0);
+		expect(exportStrandedCount(null)).toBe(0);
+	});
+
+	it('says NO TARGET and A DIFFERENT LANGUAGE as the different facts they are', () => {
+		// `canExportCell` falls back to `python` with nothing configured, so a language
+		// alone cannot tell the two apart - and the fallback made every marked Mojo cell
+		// claim the notebook "targets a .py module" over a notebook that targets
+		// nothing, naming a file that does not exist.
+		const none = exportStrandedExplanation(2, null);
+		expect(none).toContain('no target module');
+		expect(none).not.toContain('.py');
+		expect(none).not.toContain('.mojo');
+		expect(none).toContain('Set a target path');
+
+		const py = exportStrandedExplanation(2, 'python');
+		expect(py).toContain('.py module');
+		expect(py).not.toContain('no target module');
+		expect(exportStrandedExplanation(2, 'mojo')).toContain('.mojo module');
+
+		// Singular and plural both read, since the count is whatever the notebook has.
+		expect(exportStrandedExplanation(1, 'mojo')).toContain('1 cell is marked');
+		expect(exportStrandedExplanation(3, 'mojo')).toContain('3 cells are marked');
+
+		// It never claims what LANGUAGE the stranded cells are: the set can be mixed (a
+		// Mojo cell beside a markdown cell carrying a hand-edited flag), so it states
+		// only that the module leaves them out.
+		for (const lang of [null, 'python', 'mojo'] as const)
+			expect(exportStrandedExplanation(2, lang)).not.toMatch(/is not (Python|Mojo)/);
+	});
+
+	it('the per-cell marker stays a MARKER, never the notebook-wide sentence', () => {
+		// Fifteen repointed cells must not produce fifteen copies of one explanation:
+		// the cell carries a short marker and the bar carries the reason.
+		expect(EXPORT_STRANDED_BADGE.length).toBeLessThan(20);
+		expect(EXPORT_STRANDED_CELL_TITLE.length).toBeLessThan(60);
+		for (const text of [EXPORT_STRANDED_BADGE, EXPORT_STRANDED_CELL_TITLE]) {
+			expect(text).not.toContain('.py');
+			expect(text).not.toContain('.mojo');
+			expect(text).not.toContain('target');
+		}
+	});
+
 	it('the server clears it, so the greyed toggle is not a dead control', async () => {
 		// The whole point of rendering the toggle for such a cell: marking is gated on
 		// eligibility and UNMARKING is gated on nothing, so this is the one surface
@@ -640,6 +739,50 @@ describe('the wiring the browser ships', () => {
 		expect(MAIN_DROPPED_REASON).toMatch(/not exported/);
 		expect(MAIN_DROPPED_REASON).toMatch(/later exported cell/);
 		expect(MAIN_DROPPED_BADGE.length).toBeLessThan(30); // it sits in the toolbar row
+	});
+
+	it('the stranded reason is stated ONCE for the notebook, never once per cell', () => {
+		// The captain's correction: the greyed toggle stays, but the notebook-wide fact
+		// belongs in the bar. Fifteen repointed cells must not render fifteen copies of
+		// one sentence, each wrapping that cell's toolbar row - the Databricks runtime
+		// card renders its reason once on the card, not once per control.
+		const cell = read('Cell.svelte');
+		const bar = read('Notebook.svelte');
+		// The cell carries the SHORT shared marker and its short shared title...
+		expect(cell).toContain('data-testid="export-stranded-badge"');
+		expect(cell).toContain('{EXPORT_STRANDED_BADGE}');
+		expect(cell).toContain('EXPORT_STRANDED_CELL_TITLE');
+		// ...and no sentence of its own, by any route (the CALL form, so the comment
+		// that points at the bar's rule is not mistaken for a second copy of it).
+		expect(cell).not.toContain('exportStrandedReason');
+		expect(cell).not.toContain('exportStrandedExplanation(');
+		// ...while the bar renders the one explanation, built by the shared rule.
+		expect(bar).toContain('data-testid="export-stranded"');
+		expect(bar).toContain('exportStrandedExplanation(exportStrandedCount, exportLanguage)');
+		expect(bar).toContain('{strandedExplanation}');
+	});
+
+	it('the nullable module language reaches the bar and the cells unchanged', () => {
+		// `exportLanguage` is null when NO target is configured, and only the nullable
+		// value can tell that from a `.py` target. The eligibility fallback is applied
+		// where eligibility is asked, never before the prop is passed down.
+		const live = read('LiveNotebook.svelte');
+		expect(live).toContain('const exportModuleLanguage = $derived(exportTargetLanguage(exportResolved ?? exportTarget));');
+		expect(live).toContain("const exportLanguage = $derived(exportModuleLanguage ?? 'python');");
+		expect(live).toContain('exportLanguage={exportModuleLanguage}');
+		expect(live).toContain('exportStrandedCount={exportStrandedCells}');
+	});
+
+	it('the unsaved-edit notice names the target module, not always .py', () => {
+		// Same missed-site class as the label sweep: on a `.mojo` notebook a failed
+		// autosave during an export or a mark reported ".py module" about a file the
+		// notebook never writes. Derived from the nullable target language, so it also
+		// cannot name an extension when nothing is configured.
+		const live = read('LiveNotebook.svelte');
+		expect(live).toContain(
+			"`a cell edit that belongs in the ${exportModuleLanguage === 'mojo' ? '.mojo' : '.py'} module could not be saved`"
+		);
+		expect(live).not.toContain("const UNSAVED_EXPORT_EDIT = 'a cell edit that belongs in the .py module");
 	});
 
 	it('the notebook derives the badge set from the shared rule, per cell', () => {
@@ -737,6 +880,33 @@ describe.skipIf(!MOJO_BIN)(`the generated module against a REAL mojo${why}`, () 
 		const r = mojo(dir, ['doc', 'blankline.mojo', '-o', '/dev/null']);
 		expect(r.out, r.out).not.toMatch(/error:/);
 		expect(r.ok).toBe(true);
+	});
+
+	it('a column-0 comment inside a dropped main leaves a module that compiles', () => {
+		// "Silently uncompilable" is a property only the compiler can prove. The shipped
+		// scan ended the body at the comment and orphaned `print(2)` at file scope; the
+		// CONTROL below runs the same cells through the un-fixed shape so this case
+		// cannot pass vacuously.
+		const cells = ['def main():\n    print(1)\n# a separator\n    print(2)\n', 'def main():\n    print("keeper")'];
+		writeFileSync(join(dir, 'col0comment.mojo'), generateModule(mojoModuleSources(cells).sources, 'c0.ipynb', 'mojo'));
+		const r = mojo(dir, ['doc', 'col0comment.mojo', '-o', '/dev/null']);
+		expect(r.out, r.out).not.toMatch(/error:/);
+		expect(r.ok).toBe(true);
+		// The INPUT was legitimate all along: the untouched first cell runs and prints
+		// 1 then 2, so nothing about it justified generating a broken module.
+		writeFileSync(join(dir, 'col0input.mojo'), cells[0]);
+		const input = mojo(dir, ['run', 'col0input.mojo']);
+		expect(input.ok, input.out).toBe(true);
+		expect(input.out.replace(/\s+/g, ' ')).toContain('1 2');
+
+		// CONTROL: the pre-fix residue - the body cut at the comment - is what the
+		// compiler rejects, which is what makes the assertion above load-bearing.
+		writeFileSync(
+			join(dir, 'col0broken.mojo'),
+			generateModule([`${MAIN_DROPPED_COMMENT}\n# a separator\n    print(2)\n`, cells[1]], 'cb.ipynb', 'mojo')
+		);
+		const broken = mojo(dir, ['doc', 'col0broken.mojo', '-o', '/dev/null']);
+		expect(broken.ok).toBe(false);
 	});
 
 	it('CONTROL: the Python generator output fails on __all__ AND on duplicate main', () => {

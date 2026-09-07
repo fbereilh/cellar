@@ -34,6 +34,7 @@
 		exportCellCount,
 		exportDirectiveOwnsCell,
 		exportMarkedTwice,
+		exportStrandedCount,
 		exportTargetLanguage,
 		isExportCell
 	} from '$lib/exportRole';
@@ -268,8 +269,14 @@
 	// target expressed under a non-workspace base still answers; `python` when no
 	// target is configured, the same legacy default the server applies, so the
 	// toggle on an unconfigured notebook behaves exactly as it always has.
-	const exportLanguage = $derived(exportTargetLanguage(exportResolved ?? exportTarget) ?? 'python');
+	const exportModuleLanguage = $derived(exportTargetLanguage(exportResolved ?? exportTarget));
+	const exportLanguage = $derived(exportModuleLanguage ?? 'python');
 	const exportCount = $derived(exportCellCount(cells, exportLanguage));
+	// Cells whose export FLAG is set but which no longer match the target's language
+	// (or which have no target to match at all). Counted here beside `exportCount`,
+	// so the bar states the notebook-wide fact ONCE from the same cell list the
+	// count comes from.
+	const exportStrandedCells = $derived(exportStrandedCount(cells, exportLanguage));
 	/**
 	 * The cells whose top-level `def main()` the next `.mojo` export will DROP - a
 	 * Mojo module can define main only once, so the LAST exported cell that defines
@@ -2401,11 +2408,14 @@
 	 * the export ABORTS (the module is its whole product), while a mark and a target
 	 * are the user's document intent and are still written.
 	 */
-	const UNSAVED_EXPORT_EDIT = 'a cell edit that belongs in the .py module could not be saved';
+	const unsavedExportEdit = $derived(
+		`a cell edit that belongs in the ${exportModuleLanguage === 'mojo' ? '.mojo' : '.py'} module could not be saved`
+	);
 	function unsavedExportEditNotice(outcome: 'skipped' | 'proceeding'): string {
+		const said = unsavedExportEdit;
 		return outcome === 'skipped'
-			? `Export skipped: ${UNSAVED_EXPORT_EDIT}, so the module would not have matched the notebook. Fix the edit and export again.`
-			: `${UNSAVED_EXPORT_EDIT[0].toUpperCase()}${UNSAVED_EXPORT_EDIT.slice(1)}, so the module may not include it. Fix the edit and export again.`;
+			? `Export skipped: ${said}, so the module would not have matched the notebook. Fix the edit and export again.`
+			: `${said[0].toUpperCase()}${said.slice(1)}, so the module may not include it. Fix the edit and export again.`;
 	}
 
 	async function editCell(id: string, source: string, { keepalive = false }: { keepalive?: boolean } = {}) {
@@ -4630,7 +4640,8 @@
 			onSetExport={setExport}
 			exportTarget={exportTarget}
 			exportCount={exportCount}
-			{exportLanguage}
+			exportStrandedCount={exportStrandedCells}
+			exportLanguage={exportModuleLanguage}
 			{mojoMainDropped}
 			onSetExportTarget={setExportTargetValue}
 			onExportPy={exportPy}
