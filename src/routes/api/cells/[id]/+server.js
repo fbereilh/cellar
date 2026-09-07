@@ -27,14 +27,27 @@ import { TextNotebookCellTypeError, isLogicalCellTypeName } from '$lib/cellLangu
  *  nothing", because that is not literally true and the shape that would make it
  *  true is the wrong one. Each refusal is settled before every field BELOW it:
  *  `cell_type` is first and `setCellType` throws before it mutates, so a rejected
- *  type persists nothing at all; `export` is next and `setCellExport` decides its
- *  refusal before it writes, so a 409 there persists none of the fields after it
- *  (`source`, `scrolled`, `role`, `hideInput`, `hiddenFromAgent`). What it does NOT
- *  undo is a `cell_type` in the SAME body that already succeeded — `setCellType`
- *  writes and persists on success, and it must stay first, since a type change is
- *  exactly what can make a cell ineligible for the field below it. No shipped
- *  caller sends both. Either way it is each writer's own rule that decides here —
- *  never a second copy of it. */
+ *  type persists nothing at all; `export` decides its refusal before it writes, so
+ *  a 409 there persists none of the fields after it (`scrolled`, `role`,
+ *  `hideInput`, `hiddenFromAgent`). What it does NOT undo is a `cell_type` or a
+ *  `source` in the SAME body that already succeeded — each writes and persists on
+ *  success, and both must stay ABOVE `export`.
+ *
+ *  `cell_type` is above it because a type change is exactly what can make a cell
+ *  ineligible for the field below. `source` is above it for TWO reasons, and both
+ *  are about `export` reading the source rather than about tidiness: `setCellExport`
+ *  decides its 409 from `exportDirectiveOwnsCell(cell)`, so with `export` first that
+ *  refusal was judged against the source this very request is about to replace; and
+ *  marking a cell REGENERATES the `.py` module, so with `export` first the module
+ *  was built from the pre-edit source - a state that never existed. (`export` sat
+ *  above `source` between #102 and this fix, which is what broke the two
+ *  `export-target-section` e2e cases; e2e runs in neither CI nor the gate, so the
+ *  regression pin is `tests/unit/cell-patch-field-order.test.ts`.) The cost is
+ *  stated rather than hidden: a refused `export` now leaves that body's `source`
+ *  persisted, which is the right direction - discarding text the user typed because
+ *  an unrelated flag was refused is the loss `hiddenFromAgent` below argues against.
+ *  Either way it is each writer's own rule that decides here — never a second copy
+ *  of it. */
 export async function PATCH({ params, request }) {
 	const body = await request.json();
 	if (body.cell_type != null) {
@@ -61,14 +74,14 @@ export async function PATCH({ params, request }) {
 	// directive-owned, so the source it would inspect is the stale copy that made it
 	// wrong. See `SetCellExportResult`.
 	//
-	// It sits directly under `cell_type` and above every other field for the ordering
-	// reason the header states.
+	// It sits under `cell_type` and `source` - both of which it READS - and above
+	// every other field, for the ordering reason the header states.
+	if (typeof body.source === 'string') setSource(params.id, body.source, body.nb, body.originId);
 	if ('export' in body) {
 		const r = setCellExport(params.id, !!body.export, body.nb, body.originId);
 		if (!r.ok && r.reason === 'export-directive-owns-cell')
 			return json({ ok: false, reason: r.reason, alsoFlagged: !!r.alsoFlagged }, { status: 409 });
 	}
-	if (typeof body.source === 'string') setSource(params.id, body.source, body.nb, body.originId);
 	if ('scrolled' in body) setOutputScrolled(params.id, body.scrolled, body.nb);
 	if ('role' in body) setCellRole(params.id, body.role, body.nb, body.originId);
 	if ('hideInput' in body) setHideInput(params.id, body.hideInput, body.nb, body.originId);
