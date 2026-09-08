@@ -305,7 +305,9 @@ export function parseDataFrameHtml(html: string | null | undefined): DataFramePa
 		const cells = rowCells(hr);
 		return cells.length > 0 && cells.every((c) => c.tagName === 'TD');
 	});
-	const declaredDtypes = dtypeRow ? rowCells(dtypeRow).map(cellText) : null;
+	// Expanded like the label rows, so the two line up by POSITION whatever a
+	// producer does with colspan - a misaligned dtype is a silently wrong column type.
+	const declaredDtypes = dtypeRow ? expandRow(dtypeRow) : null;
 
 	// Classify the remaining header rows. A pandas NAMED INDEX renders as a second
 	// row of `[indexName, '', '', …]` and a Styler as one carrying `th.index_name`;
@@ -327,7 +329,6 @@ export function parseDataFrameHtml(html: string | null | undefined): DataFramePa
 	}
 	const levelRows = rest.filter((hr) => hr !== nameRow);
 	if (levelRows.length === 0) return null;
-	const labelRow = levelRows[0];
 
 	const bodyRows = Array.from(tbody.querySelectorAll(':scope > tr')).filter(
 		(tr) => tr.querySelectorAll('td').length > 0
@@ -375,7 +376,8 @@ export function parseDataFrameHtml(html: string | null | undefined): DataFramePa
 
 	const dtypes = declaredDtypes ? declaredDtypes.slice(indexCols).filter((_, i) => keepCol[i]) : null;
 
-	const indexName = nameRow ? (rowCells(nameRow)[0] ? cellText(rowCells(nameRow)[0]) : '') : '';
+	const nameCells = nameRow ? rowCells(nameRow) : [];
+	const indexName = nameCells[0] ? cellText(nameCells[0]) : '';
 
 	const index: (string | number | null)[] = [];
 	const data: (string | number | null)[][] = [];
