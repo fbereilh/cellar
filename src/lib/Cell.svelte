@@ -29,6 +29,7 @@
 	import { isImportsCell } from '$lib/importsRole';
 	import { canExportCell, isExportCell, exportDirectiveOwnsCell, exportMarkedTwice } from '$lib/exportRole';
 	import { isHiddenFromAgent } from '$lib/agentVisibility';
+	import { isPageOutput } from '$lib/pageOutput';
 	import { isCodeHidden } from '$lib/hideInput';
 	import { collapsedPreview } from '$lib/cellCollapse';
 	import {
@@ -806,7 +807,12 @@
 					return { tone: 'result', markdownHtml: isChat ? renderChatReply(md) : renderOutputMarkdown(md), segments: null };
 				}
 				if (d['text/plain']) {
-					tone = 'result';
+					// `func?` / `func??` documentation is INFORMATION, not the cell's
+					// value, so it takes the plain tone a `print` gets rather than the
+					// green `result` one - which at `??` length would be several KB of
+					// bold green source. See `$lib/pageOutput` for the whole rule; every
+					// other text/plain display is untouched.
+					tone = isPageOutput(o) ? 'stdout' : 'result';
 					text = asText(d['text/plain']);
 				} else {
 					// Last resort for a genuinely unhandled mimetype — name it so the
