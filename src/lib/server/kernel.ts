@@ -40,6 +40,7 @@ import { databricksRuntimeEnvCode } from './databricksRuntime';
 import { MOJO_SETUP_CODE, parseMojoSetup, type MojoSetup } from './mojo';
 import { CONTROL_COMM_TARGET, RESTART_MAGIC_CODE, controlOp } from './controlMagic';
 import { WIDGETS_SHIM_CODE } from './widgetsShim';
+import { pagePayloadOutputs } from './execPayload';
 import { publish, publishGlobal } from './events';
 import {
 	openWidget,
@@ -3158,6 +3159,15 @@ export async function execute(
 
 	try {
 		const reply = await Promise.race([future.done, abortRace]);
+		// `func?` / `func??`. IPython answers those itself and returns the answer as a
+		// `page` PAYLOAD on this reply, emitting no iopub output at all - so without
+		// this the cell runs green and shows nothing. Translated here, beside the iopub
+		// switch above, because it is the same job (a Jupyter wire message becoming an
+		// nbformat output) and this is the one seam every run path shares. Emitted
+		// BEFORE `done` so a caller accumulating outputs (run.ts) has it in hand when it
+		// finalizes, and after every iopub frame, which is the order the kernel sent
+		// them in. See execPayload.ts for why this is an output and not a tooltip.
+		for (const output of pagePayloadOutputs(reply.content)) onEvent({ type: 'output', output });
 		onEvent({ type: 'done', status: reply.content.status, execution_count: (reply.content as { execution_count?: number | null }).execution_count ?? null, session });
 		return reply.content;
 	} finally {
