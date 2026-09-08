@@ -1,9 +1,9 @@
 <script lang="ts">
 	// Renders a rich `text/html` cell output (Bokeh, Altair, folium, ipywidgets'
-	// HTML reprs, plotly's HTML renderer, styled DataFrames, …) inside a **sandboxed
-	// iframe**. The iframe uses `sandbox="allow-scripts"` WITHOUT `allow-same-origin`,
-	// so embedded JS runs (interactive viz work) in a unique opaque origin that
-	// cannot touch the app's DOM, cookies, or storage.
+	// HTML reprs, plotly's HTML renderer, a styled DataFrame the grid refuses, …)
+	// inside a **sandboxed iframe**. The iframe uses `sandbox="allow-scripts"`
+	// WITHOUT `allow-same-origin`, so embedded JS runs (interactive viz work) in a
+	// unique opaque origin that cannot touch the app's DOM, cookies, or storage.
 	//
 	// The content renders on an explicit **white** card with dark text, in both app
 	// themes — the same convention as classic Jupyter / nbconvert. Rich HTML outputs
@@ -22,7 +22,7 @@
 	// one function - read that header before touching the reporter.
 	//
 	// The injected stylesheet - including the comfortable table defaults a bare
-	// Styler / `_repr_html_` gets, and the low-specificity rule that keeps a user's
+	// `_repr_html_` table gets, and the low-specificity rule that keeps a user's
 	// own styling winning - lives in `htmlOutputStyle.ts`; read its header first.
 	import { browser } from '$app/environment';
 	import { OUTPUT_HTML_CSS } from '$lib/htmlOutputStyle';

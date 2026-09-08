@@ -357,9 +357,10 @@ function declaredShape(doc: Document): { rows: number; cols: number } | null {
 }
 
 /**
- * Parse a DataFrame `text/html` repr (pandas or polars) into a DataFramePayload,
- * or return null when the HTML is not a recognizable dataframe table (the caller
- * then falls back: HtmlOutput when rendering, tag-stripped text when copying).
+ * Parse a DataFrame `text/html` repr (pandas, polars, or a pandas Styler) into a
+ * DataFramePayload, or return null when the HTML is not a recognizable dataframe
+ * table (the caller then falls back: HtmlOutput when rendering, tag-stripped text
+ * when copying).
  * Browser-only (uses DOMParser); returns null in a non-DOM context - which is why
  * a saved DataFrame repr copies as a stripped table outside a browser.
  */

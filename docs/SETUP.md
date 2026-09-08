@@ -820,9 +820,10 @@ spec files at a time. Install its browser once with `npx playwright install chro
   them. Re-export the file self-contained (e.g. plotly's `include_plotlyjs=True`,
   bokeh's `INLINE`, `jupyter nbconvert --embed-images`) and it renders in full.
 - **A wide HTML table output has its own sideways scrollbar** - rich `text/html`
-  output (a pandas `Styler`, a table from `IPython.display.HTML`) gets comfortable
-  padding and alignment by default, and a table too wide for the output area
-  overflows into that output's own horizontal scroll instead of being squeezed.
+  output that is not read as a DataFrame (a table from `IPython.display.HTML`,
+  another library's own `_repr_html_`, a `Styler` the grid turns down) gets
+  comfortable padding and alignment by default, and a table too wide for the output
+  area overflows into that output's own horizontal scroll instead of being squeezed.
   Text columns still wrap, and the notebook page itself never scrolls sideways.
   Anything you style yourself (`set_table_styles`, `set_properties`, an inline
   `style`) overrides those defaults, so you keep full control of a table you have
@@ -835,8 +836,23 @@ spec files at a time. Install its browser once with `npx playwright install chro
   column; a label/value layout table whose cells hold plain text inherits the numeric
   right-align (a cell holding a paragraph, list, or other block content keeps normal
   left alignment); and Cellar drops the default table border, so `<table border="1">`
-  no longer draws a grid. Style the table yourself - an inline `style`, a stylesheet
-  the output carries, or a pandas `Styler` - and your rules win.
+  no longer draws a grid. Style the table yourself - an inline `style` or a
+  stylesheet the output carries - and your rules win. (A pandas `Styler` is the
+  exception: it is normally read as a DataFrame and rendered in the interactive
+  grid instead, which keeps its formatted values and caption but drops its CSS -
+  see the entry below.)
+- **A styled DataFrame lost its colours, or a plain one renders as a grid** -
+  Cellar reads a tabular `text/html` output back into its interactive grid: pandas
+  and polars frames, and a pandas `Styler`. The grid keeps every row and column, the
+  values as the `Styler` formatted them, its `set_caption` title, and a hidden index
+  (`.hide(axis='index')`); it cannot express CSS, so a background gradient, per-cell
+  colours or bars are dropped. There is no per-output switch back to the coloured
+  static table. Cellar refuses the grid - leaving the static HTML table - when it
+  cannot read the layout with confidence: a parsed column count that disagrees with
+  the frame's own declared shape, a `Styler` over 2 MB of HTML, or one whose cells
+  hold markup (a link, an image, an inline sparkline) that a text grid would flatten
+  or drop. A pandas `Series` is the one shape that shows the grid live and reopens as
+  plain text: it has no HTML repr for Cellar to read back from the saved notebook.
 - **A long notebook keeps only its visible cells in the page** - by default Cellar
   renders the cells near the viewport and collapses the rest into a placeholder of
   the same height, so a several-hundred-cell notebook opens and scrolls like a short

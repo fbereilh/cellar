@@ -26,15 +26,18 @@
 //                                              output - so an image-only cell
 //                                              offers no copy-output at all)
 //   5. `text/html` that PARSES as a     -> the same tab-separated table, via the
-//      pandas DataFrame repr               ONE parser `$lib/dataframeHtml`. A
-//                                          SAVED notebook lost the structured
+//      DataFrame table (pandas, polars,     ONE parser `$lib/dataframeHtml`. A
+//      or a pandas Styler)                  SAVED notebook lost the structured
 //                                          MIME to clean-on-save and carries only
 //                                          this repr, which is exactly how
 //                                          renderOutput still shows it as a grid -
 //                                          so a live and a re-opened DataFrame
-//                                          copy the same shape. Browser-only
-//                                          (DOMParser); outside a DOM it simply
-//                                          falls through to step 6.
+//                                          copy the same shape. A Styler's caption
+//                                          comes along, and a frame with no index
+//                                          contributes no index COLUMN, both
+//                                          exactly as the grid draws them.
+//                                          Browser-only (DOMParser); outside a DOM
+//                                          it simply falls through to step 6.
 //   6. any OTHER `text/html`            -> tag-stripped text, table cells
 //                                          tab-separated. Raw markup is never
 //                                          pasted. Every row keeps its column
@@ -383,8 +386,8 @@ export function outputCopyText(o: CellOutput): string {
 				// the whole joined string twice on this path.
 				const html = asText(d['text/html']);
 				// A SAVED DataFrame: clean-on-save stripped the structured MIME, so this
-				// pandas repr is what renderOutput itself re-parses back into the grid.
-				// Same parser, same table - never a second one.
+				// repr - pandas, polars, or a pandas Styler - is what renderOutput itself
+				// re-parses back into the grid. Same parser, same table - never a second one.
 				const parsed = parseDataFrameHtml(html);
 				if (parsed) return dataframeTable(parsed);
 				return htmlToPlainText(html);

@@ -4,9 +4,9 @@
  *
  * The iframe has no `allow-same-origin`, so the app's `app.css` cannot reach
  * inside it - whatever styling a rich HTML output gets, cellar has to inject
- * here. Without it a bare pandas Styler / `_repr_html_` table renders with the
- * browser's default 1px cell padding: technically correct, painful to scan, and
- * the reason users hand-roll a `set_table_styles` helper on every table.
+ * here. Without it a bare `_repr_html_` table renders with the browser's default
+ * 1px cell padding: technically correct, painful to scan, and the reason users
+ * hand-roll a `set_table_styles` helper on every table.
  *
  * SCOPE, stated as it really is: these are comfortable DEFAULTS for EVERY
  * `<table>` in a rich `text/html` output, not for pandas-shaped tables alone.
@@ -27,7 +27,9 @@
  * hand-written `display(HTML('<table border="1">…'))` loses that grid - restore
  * it with explicit CSS (a `style` attribute, or a stylesheet rule the output
  * carries), which beats this block. An author who wants a specific grid should
- * reach for explicit CSS or a pandas Styler, never the `border=` attribute.
+ * reach for explicit CSS, never the `border=` attribute - and note a Styler is
+ * not the way to get one either, since a Styler is normally read as a DataFrame
+ * and routed to the grid (see the surface note at the end of this comment).
  *
  * Two narrowings were considered and are REJECTED, so do not reintroduce them:
  * carving `border:0` back to preserve the `border=` attribute buys one legacy
