@@ -37,7 +37,11 @@
  *
  * `mojo-main-kept` is AGENT-ONLY: it rides MCP's `module.warning` on
  * `set_cell_export` / `set_export_target`, and it is recorded here, and it reaches
- * no human surface at all. The reason is scope rather than doubt about the claim,
+ * no human surface IN THE APP - the generated module states the same fact in its
+ * own header (`MAIN_KEPT_COMMENT`, emitted by `generateMojoModule`, since the file
+ * is the only place a reader of a shared `.mojo` can learn it), which is a
+ * separate emission rather than this hazard channel. The reason is scope rather
+ * than doubt about the claim,
  * which stays measured and true: Python CALLING Mojo is a deferred direction, and
  * it is the only direction a kept `main` costs anything, so a standing warning
  * about it today warns about a consequence of a use case Cellar does not yet

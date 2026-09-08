@@ -3068,7 +3068,8 @@
 	 * accepted price of having no skip-check to get wrong.
 	 *
 	 * The route refuses a `.py` text notebook (which stores no cellar metadata), a
-	 * target escaping the workspace and one that is not a `.py` module, and it emits
+	 * target escaping the workspace and one that names no module Cellar can generate
+	 * (anything but `.py` or `.mojo`), and it emits
 	 * `notebook:export-target` only on success, which this tab would echo-suppress
 	 * anyway. So without reading the response the input kept showing a rejected path
 	 * and the export bar read as configured over metadata holding nothing, reverting

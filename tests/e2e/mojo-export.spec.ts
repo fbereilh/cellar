@@ -202,11 +202,14 @@ test('a .py target shows no Mojo warning and takes no Mojo cell', async ({ page,
 	const id = ((await view.json()).notebook.cells as Array<{ id: string }>)[0].id;
 	await request.patch(`${baseURL}/api/cells/${id}`, { data: { source: MAIN, cell_type: 'mojo', nb: rel } });
 	// The server REFUSES the mark - a Mojo cell has no place in a `.py` module - and
-	// the flag simply never lands. The route reports `not-code` SILENTLY (a
-	// deliberate, pre-existing scope decision documented at the PATCH handler), so
-	// the observable is the OUTCOME rather than the status.
+	// SAYS SO: `not-code` is one of the two refusals the PATCH handler reports as a
+	// 409, precisely because the browser applies this mark optimistically and would
+	// otherwise be left showing a flag that exists in no file. Both halves are
+	// observable, so both are asserted: the reported refusal, and the flag that
+	// never lands.
 	const marked = await request.patch(`${baseURL}/api/cells/${id}`, { data: { export: true, nb: rel } });
-	expect(marked.ok(), await marked.text()).toBeTruthy();
+	expect(marked.status(), await marked.text()).toBe(409);
+	expect(await marked.json()).toEqual({ ok: false, reason: 'not-code', alsoFlagged: false });
 	const after = await request.get(`${baseURL}/api/notebooks?path=${encodeURIComponent(rel)}`);
 	const cells = (await after.json()).notebook.cells as Array<{ metadata?: { cellar?: { export?: boolean } } }>;
 	expect(cells[0].metadata?.cellar?.export).toBeUndefined();

@@ -1,15 +1,27 @@
 /**
- * Cellar — nbdev-style selective export to a `.py` module.
+ * Cellar - nbdev-style selective export to a generated module.
  *
- * A notebook can name a target `.py` module (`notebook.metadata.cellar.export_target`,
+ * A notebook can name a target module (`notebook.metadata.cellar.export_target`,
  * nbdev's `#|default_exp`) and mark individual code cells for export
  * (`metadata.cellar.export`, nbdev's `#|export`). The target's path may be
  * expressed relative to the workspace (the default - and what an ABSENT
  * `metadata.cellar.export_base` permanently means, so every pre-base notebook
  * resolves unchanged), to the notebook's own folder, or to the notebook's git
  * root (see `$lib/exportTarget` and `resolveExportTarget` below). This module
- * reads the marked cells IN ORDER and writes a clean Python module: a "do not
- * edit" header, a best-effort `__all__`, and the exported sources concatenated.
+ * reads the marked cells IN ORDER and writes a clean module: a "do not edit"
+ * header and the exported sources concatenated.
+ *
+ * The target's EXTENSION names the module's LANGUAGE (`exportTargetLanguage`),
+ * and that is also what decides which cells are eligible (`canExportCell`):
+ *
+ *   - `.py` - a Python module, plus a best-effort `__all__` and the `__future__`
+ *     hoist. This is the whole of what this file describes unless a rule says
+ *     otherwise.
+ *   - `.mojo` - a Mojo module. `__all__` and the `__future__` hoist have no Mojo
+ *     equivalent and are omitted; the `%%mojo` magic line and the duplicate-`main`
+ *     rule are owned by `$lib/mojoExport`, which this file calls rather than
+ *     restating. Everything else - the header, the joining, determinism and the
+ *     refuse-to-overwrite-a-foreign-module guard - carries over unchanged.
  *
  * This is deliberately DISTINCT from the jupytext `.py` export in
  * `jupytext-actions.ts`: that mirrors the WHOLE notebook as a text notebook (cell

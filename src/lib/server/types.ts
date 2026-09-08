@@ -265,12 +265,15 @@ export interface KernelSpec {
 /** Notebook-level `cellar` metadata namespace (round-trips through clean-on-save). */
 export interface NotebookCellarNamespace {
 	/**
-	 * nbdev-style export target: a `.py` module path, relative to the recorded
-	 * `export_base` (workspace-relative when that key is absent - the permanent
-	 * legacy meaning). Always STORED relative to its base, whatever a caller
-	 * passed - `setExportTarget` validates the path (resolving inside the
-	 * workspace, and a `.py` file, since the exporter WRITES it) and normalizes
-	 * it there, so the committed `.ipynb` stays portable.
+	 * nbdev-style export target: the generated module's path, relative to the
+	 * recorded `export_base` (workspace-relative when that key is absent - the
+	 * permanent legacy meaning). Its EXTENSION names the module's language and
+	 * therefore which cells may go in it (`.py` or `.mojo`, see
+	 * `exportTargetLanguage`). Always STORED relative to its base, whatever a
+	 * caller passed - `setExportTarget` validates the path (resolving inside the
+	 * workspace, and naming one of those two extensions, since the exporter
+	 * WRITES it) and normalizes it there, so the committed `.ipynb` stays
+	 * portable.
 	 */
 	export_target?: string;
 	/**

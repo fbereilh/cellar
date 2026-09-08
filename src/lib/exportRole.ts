@@ -4,8 +4,12 @@
  * A code cell can be marked for export to a generated module (nbdev's `#|export`),
  * recorded as `metadata.cellar.export = true`. The `cellar` namespace is the one
  * clean-on-save preserves, so the flag survives a save byte-for-byte and produces
- * no git noise. Only code cells can be exported (a markdown/SQL cell carries no
- * module source), so converting a cell away from code drops the flag.
+ * no git noise. Only a code cell can CONTRIBUTE module source (a markdown/SQL/raw
+ * cell has none), but a cell the current target cannot take KEEPS its flag rather
+ * than losing it - a target change and a cell-type conversion both leave it
+ * STRANDED (`exportMarkStranded`), because silently editing the user's committed
+ * `.ipynb` is worse than a stale key they can see and clear. `isExportCell`
+ * ignores a stranded mark, so nothing stranded ever reaches a generated module.
  *
  * ELIGIBILITY IS TARGET-AWARE: the export target's extension names the module's
  * LANGUAGE (`.py` or `.mojo`, see `exportTargetLanguage`) and a cell is eligible

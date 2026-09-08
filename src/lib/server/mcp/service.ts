@@ -1878,7 +1878,8 @@ export function setReportView(enabled: boolean, nb?: string | null) {
  * `setExportTargetDoc` validates through the exporter's own `resolveInWorkspace`,
  * because the regeneration is best-effort, so such a target would otherwise sit in
  * the metadata generating nothing on every later export while this call reported it
- * set. A path that is not a `.py` module is refused the same way and for a sharper
+ * set. A path naming no module Cellar can generate (anything but `.py` or `.mojo`)
+ * is refused the same way and for a sharper
  * reason: the exporter WRITES to it, so an ordinary source file named here would be
  * overwritten the moment a cell is marked. Only a refusal of the PATH is reported as
  * `invalid` (told apart by `InvalidExportTargetError`, thrown where the path is
