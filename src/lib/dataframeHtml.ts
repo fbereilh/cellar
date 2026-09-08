@@ -143,6 +143,9 @@ const POLARS_QUOTED_DTYPES = new Set(['str', 'cat', 'enum']);
  */
 const MAX_STYLER_HTML_CHARS = 2 * 1024 * 1024;
 
+/** The HTML spec's own ceiling on `colspan`. */
+const MAX_COLSPAN = 1000;
+
 // pandas' truncation marker, as a literal "..." (or a unicode ellipsis).
 function isEllipsis(s: string): boolean {
 	const t = s.trim();
@@ -216,7 +219,11 @@ function inferDtype(data: (string | number | null)[][], col: number): string {
 function expandRow(tr: Element): string[] {
 	const out: string[] = [];
 	for (const c of rowCells(tr)) {
-		const span = Math.max(1, parseInt(c.getAttribute('colspan') || '1', 10) || 1);
+		// Clamped to the HTML spec's own ceiling. This runs on arbitrary output html
+		// on the render path, so an absurd `colspan="999999999"` must cost a bounded
+		// array rather than the tab: a table that really is that wide is refused a
+		// moment later by the row-width check anyway.
+		const span = Math.min(MAX_COLSPAN, Math.max(1, parseInt(c.getAttribute('colspan') || '1', 10) || 1));
 		const text = cellText(c);
 		for (let i = 0; i < span; i++) out.push(text);
 	}

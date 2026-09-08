@@ -140,6 +140,15 @@ describe('the refusal: a parsed shape that disagrees with the declared one', () 
 		expect(parseDataFrameHtml(faked)).toBeNull();
 	});
 
+	it('cannot be made to allocate an absurd header by a colspan', () => {
+		// Arbitrary output html reaches this on the render path, so a `colspan` past
+		// the HTML spec's own 1000 ceiling must cost a bounded array, not the tab.
+		const bomb = F.pandas_plain.replace('<th>a</th>', '<th colspan="999999999">a</th>');
+		const p = parseDataFrameHtml(bomb);
+		// Either refused outright or bounded - never a billion-entry header.
+		expect(p === null || p.columns.length <= 1000).toBe(true);
+	});
+
 	it('refuses a body row whose cell count disagrees with the header', () => {
 		const short = F.pandas_plain.replace('<td>x</td>', '');
 		expect(parseDataFrameHtml(short)).toBeNull();
