@@ -318,7 +318,10 @@ describe('the exclusions are shaped so the NEXT language inherits them', () => {
 	// `exportLanguageOf`), so it names both languages BY CONSTRUCTION - which is the
 	// shape this whole block argues for, not a regression of it: the rule is still
 	// one positive predicate, and it is still a MATCH rather than an exclusion.
-	// `tests/unit/mojo-export.test.ts` guards that distinction ("no `!isMojoCell`").
+	// `tests/unit/mojo-export.test.ts` pins that distinction BEHAVIOURALLY, with a
+	// truth table over the imported module answering both target languages for every
+	// cell language - a flat exclusion cannot produce it, having no `.mojo` target to
+	// answer for.
 	it('no Python-semantics engine mentions mojo', () => {
 		for (const f of ['server/dataflow.ts', 'staleness.ts', 'server/imports-cell.ts']) {
 			const src = read(f);

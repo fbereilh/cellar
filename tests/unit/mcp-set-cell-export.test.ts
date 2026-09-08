@@ -1064,7 +1064,7 @@ describe('at the wire: the tool is really callable', () => {
 		// No `setExportTarget` call at all: this notebook targets nothing, and the doc
 		// layer reports the ABSENCE rather than the eligibility fallback.
 		expect(nbmod.getExportTarget(target)).toBeNull();
-		expect(nbmod.exportTargetLanguageFor(target)).toBeNull();
+		expect(nbmod.exportTargetInfoFor(target)).toEqual({ configured: false, language: null });
 		// The record carries the absent case explicitly rather than the fallback, so
 		// `server.ts` cannot word one as the other.
 		expect(svc.setCellExport([ids[0]], true, target)).toMatchObject({
@@ -1126,7 +1126,6 @@ describe('at the wire: the tool is really callable', () => {
 		// A target IS configured and it resolves to nothing buildable: the two facts
 		// the refusal must be able to tell apart, from one resolution.
 		expect(nbmod.exportTargetInfoFor(target)).toEqual({ configured: true, language: null });
-		expect(nbmod.exportTargetLanguageFor(target)).toBeNull();
 		expect(nbmod.getNotebook(target).exportResolveError).toContain('#|default_exp late');
 		// ELIGIBILITY is unchanged by the nullable accessor: the `python` default moved
 		// to the call site that decides it, so a Python cell is still markable here

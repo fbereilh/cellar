@@ -21,23 +21,30 @@
  * so every write here is a real write. It lives in its own file because that mock
  * is file-wide and the sibling `export-hazard-report.test.ts` should not carry it.
  *
- * ## 2. `get_notebook_map` resolves the export target ONCE
+ * ## 2. `get_notebook_map` adds no export-target resolution of its own
  *
  * It is the most frequently called agent read tool, and with no `export_target`
  * stored `resolveExportTarget` sweeps EVERY cell for a `#|default_exp` directive -
  * the cost that function's own header documents its `includes` pre-check as
- * bounding. Asking the doc layer a second time for the target's LANGUAGE doubled
- * that sweep on it. The map's output is identical either way, so the module
- * boundary is wrapped and the call counted.
+ * bounding. Asking the doc layer AGAIN for the target's LANGUAGE added a whole
+ * extra sweep to it. The map's output is identical either way, so the module
+ * boundary is wrapped and the resolutions counted.
+ *
+ * The BASELINE is measured, never hardcoded: the map composes `getNotebook` (which
+ * resolves for its own view fields) with the one resolution `display.export_target`
+ * reports, so the claim is that it pays for those and nothing more. A magic number
+ * would have to be re-guessed whenever either surface changes, and - the failure
+ * this file already shipped once - a counter wired to a function nothing calls
+ * cannot fail at all, which reports a safety that does not exist.
  */
 import { describe, it, expect, beforeAll, vi } from 'vitest';
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-const { moduleReads, langCalls } = vi.hoisted(() => ({
+const { moduleReads, resolves } = vi.hoisted(() => ({
 	moduleReads: [] as string[],
-	langCalls: { n: 0 }
+	resolves: { n: 0 }
 }));
 
 vi.mock('node:fs', async () => {
@@ -49,16 +56,27 @@ vi.mock('node:fs', async () => {
 	return { ...actual, default: { ...actual, readFileSync }, readFileSync };
 });
 
-vi.mock('../../src/lib/server/notebook', async () => {
-	const actual = await vi.importActual<typeof import('../../src/lib/server/notebook')>(
-		'../../src/lib/server/notebook'
+// The doc layer's export-target RESOLUTION entry points, wrapped where the callers
+// cross the module boundary. Counting `resolveExportTarget` alone would not do it:
+// the accessors above it (`docExportTargetInfo`, `docExportTargetLanguage`,
+// `docExportLanguage`) reach it by an INTRA-module reference the mock cannot see, so
+// a caller that asked for the language would resolve the target without moving the
+// count. Every one of these four performs a resolution, and every caller outside
+// `export-py.ts` reaches one of them.
+vi.mock('../../src/lib/server/export-py', async () => {
+	const actual = await vi.importActual<typeof import('../../src/lib/server/export-py')>(
+		'../../src/lib/server/export-py'
 	);
+	const counted = <A extends unknown[], R>(fn: (...args: A) => R) => (...args: A): R => {
+		resolves.n++;
+		return fn(...args);
+	};
 	return {
 		...actual,
-		exportTargetLanguageFor: (nb?: string | null) => {
-			langCalls.n++;
-			return actual.exportTargetLanguageFor(nb);
-		}
+		resolveExportTarget: counted(actual.resolveExportTarget),
+		docExportTargetInfo: counted(actual.docExportTargetInfo),
+		docExportTargetLanguage: counted(actual.docExportTargetLanguage),
+		docExportLanguage: counted(actual.docExportLanguage)
 	};
 });
 
@@ -124,7 +142,7 @@ describe('docHumanExportHazards narrows BEFORE the foreign-module read', () => {
 	});
 });
 
-describe('get_notebook_map resolves the export target once', () => {
+describe('get_notebook_map adds no export-target resolution of its own', () => {
 	async function notebook(rel: string, cellType: 'code' | 'mojo', source: string) {
 		const nb = nbmod.resolveNotebookPath(rel);
 		svc.useNotebook(`sess-${rel}`, rel);
@@ -144,17 +162,24 @@ describe('get_notebook_map resolves the export target once', () => {
 		);
 	}
 
-	it('asks the doc layer for the language ZERO extra times, and still reports the marks', async () => {
-		// The language rides the view `getNotebook` already resolved, so this tool
-		// resolves the target exactly once. A second `exportTargetLanguageFor(nb)` call
-		// is what doubled the per-cell `default_exp` sweep on the hottest read tool.
+	it('adds NO resolution of its own for the language, and still reports the marks', async () => {
+		// The language rides the view `getNotebook` already resolved. Asking the doc
+		// layer again is what added a whole extra per-cell `default_exp` sweep to the
+		// hottest read tool, so the budget is measured against the surfaces the map
+		// composes rather than against a number: the view, plus the ONE resolution
+		// `display.export_target` needs to report where the marks land.
 		const { nb, id } = await notebook('map-cost.ipynb', 'code', 'def one():\n    return 1');
 		nbmod.setExportTarget('lib/map-cost.py', nb);
 		nbmod.setCellExports([id], true, nb);
 
-		langCalls.n = 0;
+		resolves.n = 0;
+		nbmod.getNotebook(nb);
+		const view = resolves.n;
+		expect(view).toBeGreaterThan(0); // the counter is wired to something live
+
+		resolves.n = 0;
 		const map = await svc.getNotebookMap(nb);
-		expect(langCalls.n).toBe(0);
+		expect(resolves.n).toBe(view + 1);
 		// ...and the answer it derived instead is the right one.
 		expect(map.display.export_target).toBe('lib/map-cost.py');
 		expect(leaves(map.sections).find((l) => l.id === svc.resolveRef(nb, id).slice(0, 8))?.export ?? true).toBe(true);
@@ -183,6 +208,6 @@ describe('get_notebook_map resolves the export target once', () => {
 		// `python`, the VIEW does not.
 		const { nb } = await notebook('map-none.ipynb', 'code', 'x = 1');
 		expect(nbmod.getNotebook(nb).exportLanguage).toBeNull();
-		expect(nbmod.exportTargetLanguageFor(nb)).toBeNull();
+		expect(nbmod.exportTargetInfoFor(nb)).toEqual({ configured: false, language: null });
 	});
 });

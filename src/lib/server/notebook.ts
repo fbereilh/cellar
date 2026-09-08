@@ -35,7 +35,6 @@ import {
 	docHumanExportHazards,
 	docExportLanguage,
 	docExportTargetInfo,
-	docExportTargetLanguage,
 	type ExportResult,
 	type ExportTargetLanguageInfo,
 	type ResolvedExportTarget
@@ -1421,26 +1420,18 @@ export function setExportTarget(
 }
 
 /**
- * The module LANGUAGE a notebook's export target names, BY PATH, or **null when
- * it names none** - the one question the agent layer asks, so it never re-derives
- * it from a target string.
- *
- * Nullable on purpose. `docExportLanguage`'s `python` fallback is the ELIGIBILITY
- * answer and must never be read as a fact about the notebook: reported as one, a
- * refusal names a `.py` module over a notebook that targets nothing and sends an
- * agent to change an extension that does not exist. Callers deciding ELIGIBILITY
- * apply `?? 'python'` themselves; callers WORDING an outcome keep the null - and
- * a caller that must tell the two nulls apart reads `exportTargetInfoFor`.
- */
-export function exportTargetLanguageFor(nb?: string | null): ExportLanguage | null {
-	return docExportTargetLanguage(docFor(nb));
-}
-
-/**
  * BOTH facts about a notebook's export target, from ONE resolution: whether one
  * is configured at all, and the module language it names. The agent layer reads
  * this where a refusal has to distinguish "no target" from "a target that names
  * no module Cellar can build" - see `ExportTargetLanguageInfo`.
+ *
+ * The ONE notebook-addressed accessor, and deliberately not a pair: a
+ * language-only sibling existed briefly and was superseded the moment a refusal
+ * had to tell the two nulls apart, since one resolution answers both questions
+ * and a second accessor only invites a second resolution on a hot read path.
+ * `language` is nullable on purpose - `docExportLanguage`'s `python` fallback is
+ * the ELIGIBILITY answer and must never be read as a fact about the notebook, or
+ * a refusal names a `.py` module over a notebook that targets nothing.
  */
 export function exportTargetInfoFor(nb?: string | null): ExportTargetLanguageInfo {
 	return docExportTargetInfo(docFor(nb));

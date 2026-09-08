@@ -85,9 +85,10 @@ export interface CellarNamespace {
 	/** Cell role, e.g. the pinned imports cell ('imports'). */
 	role?: string | null;
 	/**
-	 * nbdev-style export flag: include this cell in the `.py` module. Only a PYTHON
-	 * code cell may carry it - a SQL cell is an nbformat `code` cell too, so the
-	 * eligibility test lives in `exportRole.ts` (`canExportCell`/`isExportCell`),
+	 * nbdev-style export flag: include this cell in the generated module. Which cells
+	 * MAY carry it is TARGET-AWARE - the target's extension names the module language
+	 * (`.py` or `.mojo`) and a code cell is eligible iff its own language matches - so
+	 * the eligibility test lives in `exportRole.ts` (`canExportCell`/`isExportCell`),
 	 * which every surface reads; a stale or hand-edited flag anywhere else is inert.
 	 */
 	export?: boolean;

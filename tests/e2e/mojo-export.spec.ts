@@ -79,8 +79,9 @@ async function mojoNotebook(api: APIRequestContext, rel: string, sources: string
 		ids.push((await added.json()).cell.id as string);
 	}
 	for (const [i, id] of ids.entries()) {
-		// The TYPE lands first: converting a cell drops its export flag, so marking
-		// before converting would be silently undone.
+		// The TYPE lands first because eligibility is a language MATCH: under a `.mojo`
+		// target the server refuses a mark on an untagged code cell, which the starter
+		// notebook's first cell still is. Conversion itself KEEPS an existing mark.
 		const patched = await api.patch(`${baseURL}/api/cells/${id}`, {
 			data: { cell_type: 'mojo', source: sources[i], nb: rel }
 		});
