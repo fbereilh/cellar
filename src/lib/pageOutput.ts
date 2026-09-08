@@ -26,12 +26,26 @@
  * colour, which is why nothing here needs to defend against one.
  */
 
-/** The metadata a documentation output carries. */
-export const PAGE_OUTPUT_METADATA = { cellar: { page: true } } as const;
+/**
+ * The metadata a documentation output carries.
+ *
+ * A FACTORY rather than a shared constant: every output gets its own object, so
+ * no two outputs can ever share a nested one for something downstream to mutate.
+ */
+export function pageOutputMetadata(): Record<string, unknown> {
+	return { cellar: { page: true } };
+}
 
-/** True for an output `execPayload.ts` built from a `page` payload. */
-export function isPageOutput(output: { metadata?: unknown } | null | undefined): boolean {
-	const meta = output?.metadata;
+/**
+ * True for an output `execPayload.ts` built from a `page` payload.
+ *
+ * Takes `unknown` rather than a narrowed output type on purpose: it is asked about
+ * every nbformat output kind (a `stream` carries no `metadata` field at all), and
+ * the value it reads arrives from a persisted `.ipynb`, i.e. from untrusted bytes.
+ */
+export function isPageOutput(output: unknown): boolean {
+	if (!output || typeof output !== 'object') return false;
+	const meta = (output as { metadata?: unknown }).metadata;
 	if (!meta || typeof meta !== 'object') return false;
 	const cellar = (meta as { cellar?: unknown }).cellar;
 	if (!cellar || typeof cellar !== 'object') return false;

@@ -355,7 +355,9 @@ test('the documentation survives a reload, and a restart leaves it alone', async
 	// whole reason for that choice.
 	await openNotebook(page);
 	await showCell(page, 'qmark-scratch-6000000');
-	await expect(cell().getByTestId('output')).toContainText('Signature:', { timeout: 30_000 });
+	// The same generous budget every kernel-facing wait here uses: a full-suite run
+	// under load is what this file's own timings are set against.
+	await expect(cell().getByTestId('output')).toContainText('Signature:', { timeout: 90_000 });
 
 	// And a kernel restart - requirement 4's "nothing breaks" - neither removes it
 	// nor stops the next lookup from working.
