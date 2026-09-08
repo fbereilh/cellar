@@ -50,10 +50,32 @@
 // anticipated. A layout change in a future polars therefore costs the grid, never
 // the data.
 //
+// MULTIINDEX COLUMNS ARE FLATTENED WITH ' / ', not refused. The grid is a flat
+// table - one header row - so a nested header has to be flattened somehow, and
+// `' / '` is already this module's separator for a flattened MultiIndex ROW label
+// (see below), so columns and rows now read the same way. It is also strictly
+// better than what the LIVE grid used to show for the same frame, which was
+// python's tuple repr `('A', 'x')`: `kernel.ts`'s formatter flattens the same way
+// now, so live and re-opened agree. Flattening can collide (two tuples onto one
+// label) - harmless for a COLUMN, whose `{#each}` in DataFrameGrid is deliberately
+// unkeyed, unlike the row `{#each}` that a duplicate label really would break.
+//
 // Everything is best-effort and never throws: any shape we can't confidently map
-// (no recognizable table, MultiIndex column headers with colspans, an empty body,
-// a body row whose cell count disagrees with the header) returns null so the
-// caller falls back to its own rendering.
+// (no recognizable table, no columns, a body row whose cell count disagrees with
+// the header, a count that disagrees with the declared shape) returns null so the
+// caller falls back to its own rendering. An EMPTY body is not one of those: a
+// zero-row frame whose header parsed is a perfectly good frame, and it is what
+// the live grid already shows for one.
+//
+// A pandas SERIES is the one shape deliberately left degrading. It has no
+// `_repr_html_` AT ALL (measured), so a saved notebook carries only its
+// `text/plain` repr and there is nothing here to parse: live it is a grid (the
+// kernel formatter takes `Series` too, via `to_frame()`), re-opened it is plain
+// text. Closing that needs one of two things, and both are worse than the gap:
+// keeping the structured MIME through clean-on-save, which is the zero-git-diff
+// doctrine that MIME is stripped for; or having the formatter emit an html repr
+// pandas itself never produces, which would change what the saved `.ipynb`
+// contains and how every OTHER tool renders it.
 //
 // TWO consumers, and this is deliberately the ONE parser they share: Cell.svelte's
 // `renderOutput` (which falls back to HtmlOutput) and `$lib/copyCell` (which falls
@@ -186,6 +208,21 @@ function inferDtype(data: (string | number | null)[][], col: number): string {
 	return 'object';
 }
 
+/**
+ * One header row as a FLAT array of column positions, `colspan` expanded - so a
+ * MultiIndex level (`<th colspan="2">A</th>`) lines up with the level below it and
+ * every level can be read at the same position.
+ */
+function expandRow(tr: Element): string[] {
+	const out: string[] = [];
+	for (const c of rowCells(tr)) {
+		const span = Math.max(1, parseInt(c.getAttribute('colspan') || '1', 10) || 1);
+		const text = cellText(c);
+		for (let i = 0; i < span; i++) out.push(text);
+	}
+	return out;
+}
+
 /** The `<th>`/`<td>` cells of one row, in document order. */
 function rowCells(tr: Element): Element[] {
 	return Array.from(tr.children).filter((el) => el.tagName === 'TH' || el.tagName === 'TD');
@@ -259,14 +296,6 @@ export function parseDataFrameHtml(html: string | null | undefined): DataFramePa
 	const headerRows = Array.from(thead.querySelectorAll(':scope > tr'));
 	if (headerRows.length === 0) return null;
 
-	// MultiIndex columns render header cells with colspan > 1 (and stacked header
-	// rows) — too ambiguous to flatten reliably. Bail to HtmlOutput.
-	for (const hr of headerRows) {
-		for (const th of Array.from(hr.querySelectorAll('th'))) {
-			if (parseInt(th.getAttribute('colspan') || '1', 10) > 1) return null;
-		}
-	}
-
 	const shape = declaredShape(doc);
 
 	// A header row made entirely of `<td>` is polars' dtype row - pandas puts only
@@ -277,9 +306,28 @@ export function parseDataFrameHtml(html: string | null | undefined): DataFramePa
 		return cells.length > 0 && cells.every((c) => c.tagName === 'TD');
 	});
 	const declaredDtypes = dtypeRow ? rowCells(dtypeRow).map(cellText) : null;
-	// The column labels come from the first header row that is not that dtype row.
-	const labelRow = headerRows.find((hr) => hr !== dtypeRow);
-	if (!labelRow) return null;
+
+	// Classify the remaining header rows. A pandas NAMED INDEX renders as a second
+	// row of `[indexName, '', '', …]` and a Styler as one carrying `th.index_name`;
+	// everything else is a COLUMN LEVEL, of which a MultiIndex has several. Only a
+	// row after the first can be the name row - a first row read as one would leave
+	// no labels at all - and the `restEmpty` test is what tells it from a further
+	// MultiIndex level, whose other positions carry real labels.
+	const rest = headerRows.filter((hr) => hr !== dtypeRow);
+	if (rest.length === 0) return null;
+	let nameRow: Element | null = null;
+	for (const hr of rest.slice(1)) {
+		const cells = rowCells(hr);
+		const first = cells[0] ? cellText(cells[0]) : '';
+		const restEmpty = cells.slice(1).every((c) => cellText(c) === '');
+		if (hr.querySelector('th.index_name') || (first !== '' && cells.length > 1 && restEmpty)) {
+			nameRow = hr;
+			break;
+		}
+	}
+	const levelRows = rest.filter((hr) => hr !== nameRow);
+	if (levelRows.length === 0) return null;
+	const labelRow = levelRows[0];
 
 	const bodyRows = Array.from(tbody.querySelectorAll(':scope > tr')).filter(
 		(tr) => tr.querySelectorAll('td').length > 0
@@ -296,16 +344,25 @@ export function parseDataFrameHtml(html: string | null | undefined): DataFramePa
 	// declared column count that already matches the header means there is no index
 	// cell to drop, otherwise assume pandas' single leading one, which is what
 	// `to_html()` emits by default.
-	const labelCells = rowCells(labelRow);
+	const levels = levelRows.map(expandRow);
+	const width = Math.max(...levels.map((l) => l.length));
 	const indexCols =
 		bodyRows.length > 0
 			? bodyRows[0].querySelectorAll('th').length
-			: shape && labelCells.length === shape.cols
+			: shape && width === shape.cols
 				? 0
 				: 1;
 	const hasIndex = indexCols > 0;
 
-	const rawColumns = labelCells.slice(indexCols).map(cellText);
+	// One label per column position, joining that position's non-empty part from
+	// each level. A truncated MultiIndex frame writes an ellipsis at every level of
+	// its elided column, which must stay recognizable as one rather than becoming
+	// "... / ...".
+	const rawColumns: string[] = [];
+	for (let i = indexCols; i < width; i++) {
+		const parts = levels.map((l) => l[i] ?? '').filter((t) => t !== '');
+		rawColumns.push(parts.length > 0 && parts.every(isEllipsis) ? '...' : parts.join(' / '));
+	}
 	if (rawColumns.length === 0) return null;
 	// When a frame truncates columns it inserts a literal "..." ellipsis column
 	// (pandas' "…" / polars' `&hellip;`); drop it so the grid shows real columns
@@ -318,15 +375,7 @@ export function parseDataFrameHtml(html: string | null | undefined): DataFramePa
 
 	const dtypes = declaredDtypes ? declaredDtypes.slice(indexCols).filter((_, i) => keepCol[i]) : null;
 
-	// A named index renders as a second header row: [indexName, '', '', …].
-	let indexName = '';
-	const nameRow = headerRows.find((hr) => hr !== labelRow && hr !== dtypeRow);
-	if (nameRow) {
-		const cells = rowCells(nameRow);
-		const first = cells[0] ? cellText(cells[0]) : '';
-		const restEmpty = cells.slice(1).every((c) => cellText(c) === '');
-		if (first && restEmpty) indexName = first;
-	}
+	const indexName = nameRow ? (rowCells(nameRow)[0] ? cellText(rowCells(nameRow)[0]) : '') : '';
 
 	const index: (string | number | null)[] = [];
 	const data: (string | number | null)[][] = [];
@@ -361,7 +410,6 @@ export function parseDataFrameHtml(html: string | null | undefined): DataFramePa
 				})
 		);
 	}
-	if (data.length === 0) return null;
 
 	// Truncation footer: "<p>N rows × M columns</p>" (× is ×; accept a plain
 	// 'x' too). Present only when pandas truncated the frame.

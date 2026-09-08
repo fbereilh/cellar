@@ -211,11 +211,46 @@ describe('pandas is untouched', () => {
 		]);
 	});
 
-	it('still refuses MultiIndex columns and non-dataframe html', () => {
-		expect(parseDataFrameHtml(F.pandas_multiindex_cols)).toBeNull();
+	it('still refuses html that is not a dataframe table at all', () => {
 		expect(parseDataFrameHtml('<div><table><tr><td>hi</td></tr></table></div>')).toBeNull();
 		expect(parseDataFrameHtml('')).toBeNull();
 		expect(parseDataFrameHtml(null)).toBeNull();
+	});
+});
+
+describe('shapes that rendered as a grid live and lost it on reopen', () => {
+	it('keeps an EMPTY frame a grid - a zero-row frame whose header parsed is a frame', () => {
+		const p = parseDataFrameHtml(F.pandas_empty_4col)!;
+		expect(p.columns).toEqual(['a', 'b', 'c', 'd']);
+		expect(p.data).toEqual([]);
+		expect(p.total_rows).toBe(0);
+		expect(p.truncated_rows).toBe(false);
+		// This is what the LIVE payload holds for the same frame, so the two agree.
+	});
+
+	it('keeps an empty polars frame too, reading its column count from the shape', () => {
+		const p = parseDataFrameHtml(F.polars_empty)!;
+		expect(p.columns).toEqual(['a', 'b']);
+		expect(p.has_index).toBe(false);
+		expect(p.data).toEqual([]);
+	});
+
+	it('flattens MultiIndex columns with the separator this module already uses', () => {
+		// The grid has one header row, so a nested header must flatten somehow, and
+		// `' / '` is what a MultiIndex ROW label already flattens to. The live grid
+		// shows the SAME labels (kernel.ts flattens identically), where it used to
+		// show python's tuple repr `('A', 'x')`.
+		const p = parseDataFrameHtml(F.pandas_multiindex_cols)!;
+		expect(p.columns).toEqual(['A / x', 'A / y', 'B / x', 'B / y']);
+		expect(p.data).toEqual([[1, 2, 3, 4]]);
+		expect(p.index).toEqual([0]);
+	});
+
+	it('reads the column-index NAMES row as a level, not as the row index name', () => {
+		const p = parseDataFrameHtml(F.pandas_multiindex_cols_named)!;
+		expect(p.columns).toEqual(['A / x', 'A / y']);
+		// `top`/`bot` name the COLUMNS' levels; they are not the row index's name.
+		expect(p.index_name).toBe('');
 	});
 });
 
@@ -278,8 +313,27 @@ describe('pandas Styler: the FORMATTED values, the caption, and the layout it de
 		expect(parseDataFrameHtml(bigPandas)).not.toBeNull();
 	});
 
-	it('still refuses a MultiIndex-column Styler', () => {
-		expect(parseDataFrameHtml(F.styler_multiindex_cols)).toBeNull();
+	it('flattens a MultiIndex-column Styler like any other', () => {
+		const p = parseDataFrameHtml(F.styler_multiindex_cols)!;
+		expect(p.columns).toEqual(['A / x', 'A / y', 'B / x', 'B / y']);
+		expect(p.data).toEqual([[1, 2, 3, 4]]);
+	});
+});
+
+describe('kernel formatter source guard: the LIVE labels flatten the same way', () => {
+	// The live payload is built by python injected at kernel start, so it cannot be
+	// driven from here; what makes "live and re-opened agree" true is that BOTH
+	// sides flatten a MultiIndex label with ' / '. The parser's half is asserted
+	// above against real reprs, and the end-to-end proof (one kernel, one frame,
+	// both renderings) is `tests/e2e/dataframe-polars-styler.spec.ts`.
+	const src = readFileSync(join(REPO, 'src/lib/server/kernel.ts'), 'utf8');
+
+	it('flattens a tuple/list label with the same separator', () => {
+		expect(src).toContain("return ' / '.join(str(_p) for _p in _v)");
+		expect(src).toContain("'columns': [str(_cellar_flat(_c)) for _c in _sub.columns],");
+		expect(src).toContain("'index': [_cellar_flat(_i) for _i in _split.get('index', [])],");
+		// The regression: python's tuple repr, which is what the grid used to show.
+		expect(src).not.toContain("'columns': [str(_c) for _c in _sub.columns],");
 	});
 });
 
@@ -303,5 +357,16 @@ describe('DataFrameGrid source guard: the index column follows has_index', () =>
 		// The empty-state colspan has to follow, or a no-index grid's message is
 		// one column too wide.
 		expect(src).toContain('colspan={columns.length + (hasIndex ? 1 : 0)}');
+	});
+
+	it('tells a genuinely empty frame from a filter that matched nothing', () => {
+		// A zero-row frame now reaches the grid on reopen too, and "No rows match
+		// “”." over an empty query reads as a broken filter.
+		expect(src).toContain('{#if rawData.length === 0}This DataFrame has no rows.');
+	});
+
+	it('renders a caption when the payload carries one', () => {
+		expect(src).toMatch(/const caption = \$derived\(payload\?\.caption \?\? ''\)/);
+		expect(src).toMatch(/data-testid="df-caption"/);
 	});
 });

@@ -1275,6 +1275,17 @@ const DATAFRAME_FORMATTER_CODE = [
 	"    _MIME = 'application/vnd.cellar.dataframe+json'",
 	'    _MAX_ROWS = 500',
 	'    _MAX_COLS = 100',
+	// A MultiIndex column/row label arrives here as a tuple (and, once it has been
+	// through `to_json`, as a list). Flatten it with ' / ' - the separator
+	// `$lib/dataframeHtml` already uses for a flattened MultiIndex ROW label, so a
+	// LIVE frame and the same frame RE-OPENED from its saved `_repr_html_` show the
+	// same header. Before this the live grid showed python's tuple repr,
+	// `('A', 'x')`. A scalar is returned untouched, so a plain frame's payload is
+	// byte-identical and a numeric index label stays a number for the grid's sort.
+	'    def _cellar_flat(_v):',
+	'        if isinstance(_v, (list, tuple)):',
+	"            return ' / '.join(str(_p) for _p in _v)",
+	'        return _v',
 	'    def _payload(_df):',
 	'        _total_rows = int(_df.shape[0])',
 	'        _total_cols = int(_df.shape[1])',
@@ -1285,9 +1296,9 @@ const DATAFRAME_FORMATTER_CODE = [
 	'        except Exception:',
 	'            _idx_name = None',
 	'        return {',
-	"            'columns': [str(_c) for _c in _sub.columns],",
+	"            'columns': [str(_cellar_flat(_c)) for _c in _sub.columns],",
 	"            'dtypes': [str(_t) for _t in _sub.dtypes],",
-	"            'index': _split.get('index', []),",
+	"            'index': [_cellar_flat(_i) for _i in _split.get('index', [])],",
 	"            'index_name': _idx_name,",
 	"            'data': _split.get('data', []),",
 	"            'total_rows': _total_rows,",

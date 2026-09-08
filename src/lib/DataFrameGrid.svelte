@@ -225,7 +225,10 @@
 				{#if pageRows.length === 0}
 					<tr>
 						<td class="px-3 py-4 text-center text-base-content/50" colspan={columns.length + (hasIndex ? 1 : 0)} data-testid="df-empty">
-							No rows match “{query}”.
+							<!-- A frame with no rows at all is a legitimate zero-row frame, not a
+							     filter that matched nothing - saying "no rows match" over an empty
+							     query reads as a broken filter. -->
+							{#if rawData.length === 0}This DataFrame has no rows.{:else}No rows match “{query}”.{/if}
 						</td>
 					</tr>
 				{/if}
