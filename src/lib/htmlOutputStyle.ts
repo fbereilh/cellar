@@ -168,7 +168,8 @@
  * *Styler* is now read by that same parser and routed to the grid too, so what
  * this stylesheet still serves is every OTHER rich table: statsmodels'
  * `simpletable`, folium and Bokeh chrome, hand-written markup, and a Styler the
- * grid refuses (MultiIndex columns, or one past its size ceiling).
+ * grid refuses (one past its size ceiling, one whose data cells hold MARKUP rather
+ * than text, or a shape mismatch).
  */
 export const OUTPUT_HTML_CSS = `
 html,body{margin:0;padding:8px;background:#ffffff;color:#1f2937;font-family:system-ui,-apple-system,sans-serif;font-size:14px;}

@@ -28,8 +28,9 @@ import { horizontallyOverflowingBoxes, isCellMounted, paneMetric, setScrollTop }
  * `col_heading`/`row_heading`/`data` classes - that is the Styler token, and with
  * it they would render as a grid and never reach this stylesheet at all. What
  * still reaches it is every other rich table: statsmodels' `simpletable`, folium
- * and Bokeh chrome, a hand-written `<table>`, and a Styler the grid refuses
- * (MultiIndex columns, or one past its size ceiling). The two `#T_…`-scoped
+ * and Bokeh chrome, a hand-written `<table>`, and a Styler the grid refuses (one
+ * past its size ceiling, one whose data cells hold MARKUP rather than text, or a
+ * shape mismatch). The two `#T_…`-scoped
  * fixtures keep those ids because the CASCADE is what is under test, and an
  * id-scoped rule is exactly what `set_table_styles` emits.
  *

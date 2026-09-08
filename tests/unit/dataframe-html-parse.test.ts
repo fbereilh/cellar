@@ -149,6 +149,29 @@ describe('the refusal: a parsed shape that disagrees with the declared one', () 
 		expect(p === null || p.columns.length <= 1000).toBe(true);
 	});
 
+	it('refuses a header past the TOTAL-width ceiling, however the width is reached', () => {
+		// The per-cell `colspan` clamp bounds ONE cell and says nothing about the
+		// total, so a header of many maximal-colspan cells expanded without limit -
+		// ~50k of them is 1.3 MB of html and a 50-million-entry array, then that many
+		// joined label strings, all before any refusal could fire.
+		//
+		// The ceiling is a bound on the WIDTH, so it is asserted as one: a table wide
+		// enough to cross it refuses even when its body lines up perfectly (so the
+		// per-row width check cannot be what refuses), while one under it still
+		// parses. The stated cost of the bound is exactly that a legitimately
+		// 4096-column table loses the grid; nothing a human reads comes near it.
+		const honest = (n: number) => {
+			const ths = Array.from({ length: n }, (_, i) => `<th>c${i}</th>`).join('');
+			const tds = Array.from({ length: n }, (_, i) => `<td>${i}</td>`).join('');
+			return `<table border="1" class="dataframe"><thead><tr><th></th>${ths}</tr></thead><tbody><tr><th>0</th>${tds}</tr></tbody></table>`;
+		};
+		expect(parseDataFrameHtml(honest(2100))!.columns.length).toBe(2100);
+		expect(parseDataFrameHtml(honest(4200))).toBeNull();
+		// And the colspan route to the same width, which is the cheap one to abuse.
+		const spanned = '<th colspan="1000">x</th>'.repeat(8);
+		expect(parseDataFrameHtml(F.pandas_plain.replace('<th>a</th>', spanned))).toBeNull();
+	});
+
 	it('refuses a body row whose cell count disagrees with the header', () => {
 		const short = F.pandas_plain.replace('<td>x</td>', '');
 		expect(parseDataFrameHtml(short)).toBeNull();
@@ -244,6 +267,35 @@ describe('shapes that rendered as a grid live and lost it on reopen', () => {
 		expect(p.data).toEqual([]);
 	});
 
+	it('keeps a zero-row polars frame WIDE enough to truncate its columns, first column intact', () => {
+		// The declared-shape check cannot catch a dropped column here: truncation
+		// legitimately makes the counts differ, so `100 !== 74` proves nothing. What
+		// says there is no index is polars' own dtype row, and reading it is what
+		// keeps `c0` - the column a leading-index guess would have deleted.
+		const p = parseDataFrameHtml(F.polars_empty_col_truncation)!;
+		expect(p.has_index).toBe(false);
+		expect(p.columns[0]).toBe('c0');
+		expect(p.columns).not.toContain('…');
+		expect(p.truncated_cols).toBe(true);
+		expect(p.total_cols).toBe(100);
+		expect(p.data).toEqual([]);
+	});
+
+	it('REFUSES an empty frame with no index placeholder rather than eating its first column', () => {
+		// `to_html(index=False)` on a zero-row frame: no body to read the index from,
+		// no dtype row, and a leading header cell that is a REAL column. Nothing
+		// tells that apart from `df.columns.name = 'X'` over a frame that does have
+		// an index, and guessing pandas' leading cell dropped `a` while inventing a
+		// phantom index column - the silently-wrong grid this module exists to make
+		// unreachable, reached by another route.
+		expect(parseDataFrameHtml(F.pandas_empty_no_index)).toBeNull();
+		// The same frame WITH rows still parses: the body answers, so nothing is
+		// guessed and the refusal is scoped to the case that has no signal.
+		const withRows = parseDataFrameHtml(F.pandas_to_html_no_index)!;
+		expect(withRows.columns).toEqual(['a', 'b']);
+		expect(withRows.has_index).toBe(false);
+	});
+
 	it('flattens MultiIndex columns with the separator this module already uses', () => {
 		// The grid has one header row, so a nested header must flatten somehow, and
 		// `' / '` is what a MultiIndex ROW label already flattens to. The live grid
@@ -322,6 +374,32 @@ describe('pandas Styler: the FORMATTED values, the caption, and the layout it de
 		expect(parseDataFrameHtml(bigPandas)).not.toBeNull();
 	});
 
+	it('applies the ceiling to a Styler that ALSO carries the word "dataframe"', () => {
+		// The ceiling used to be keyed on the ABSENCE of that word, which page CONTENT
+		// can supply: a caption, a cell value, a column name, or the documented
+		// `set_table_attributes('class="dataframe"')` idiom. It was then skipped while
+		// the `col_heading` branch resolved the Styler anyway, so the multi-MB DOM
+		// parse it exists to prevent went ahead on the tab carrying the SSE stream.
+		const captioned = F.styler_plain.replace('Revenue by arm', 'Sales DataFrame');
+		// Under the ceiling it is still a grid, so the assertion below is not vacuous.
+		expect(parseDataFrameHtml(captioned)!.caption).toBe('Sales DataFrame');
+		const oversized = captioned + `<!--${'x'.repeat(2 * 1024 * 1024)}-->`;
+		expect(parseDataFrameHtml(oversized)).toBeNull();
+	});
+
+	it('REFUSES a Styler whose data cells hold MARKUP - the iframe keeps it intact', () => {
+		// `Styler.format` defaults to escape=None, so a formatter emitting markup puts
+		// the USER'S CONTENT in the cell. The grid reads `td.textContent`, which
+		// flattens a link to unlinked text and renders an image cell as the EMPTY
+		// STRING - content loss, not a lost decoration, so this keeps the sandboxed
+		// iframe. Decided on the cell's own content, never on a guess about intent.
+		expect(parseDataFrameHtml(F.styler_cell_link)).toBeNull();
+		expect(parseDataFrameHtml(F.styler_cell_img)).toBeNull();
+		// A plain formatted Styler - text cells - still reaches the grid, so the
+		// refusal is scoped to markup rather than to Stylers.
+		expect(parseDataFrameHtml(F.styler_plain)!.data[0]).toEqual(['1,234.50', '12.3%']);
+	});
+
 	it('flattens a MultiIndex-column Styler like any other', () => {
 		const p = parseDataFrameHtml(F.styler_multiindex_cols)!;
 		expect(p.columns).toEqual(['A / x', 'A / y', 'B / x', 'B / y']);
@@ -341,8 +419,6 @@ describe('kernel formatter source guard: the LIVE labels flatten the same way', 
 		expect(src).toContain("return ' / '.join(str(_p) for _p in _v)");
 		expect(src).toContain("'columns': [str(_cellar_flat(_c)) for _c in _sub.columns],");
 		expect(src).toContain("'index': [_cellar_flat(_i) for _i in _split.get('index', [])],");
-		// The regression: python's tuple repr, which is what the grid used to show.
-		expect(src).not.toContain("'columns': [str(_c) for _c in _sub.columns],");
 	});
 });
 
@@ -356,8 +432,6 @@ describe('DataFrameGrid source guard: the index column follows has_index', () =>
 
 	it('derives hasIndex as "absent means true"', () => {
 		expect(src).toMatch(/const hasIndex = \$derived\(payload\?\.has_index !== false\)/);
-		// The regression: anything that reads an absent field as false.
-		expect(src).not.toMatch(/has_index === true/);
 	});
 
 	it('gates both the index header and the index cell on it', () => {

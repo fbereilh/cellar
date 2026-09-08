@@ -30,6 +30,18 @@
 // rendered values, are private). What the grid structurally cannot express is the
 // CSS: a background gradient, per-cell colours, bars. Those are dropped.
 //
+// WHICH Stylers get the grid, then: one whose data cells hold TEXT - formatted
+// values and a caption, which is what `.style` is overwhelmingly written for. One
+// whose cells hold MARKUP does NOT: `Styler.format` defaults to `escape=None`, so
+// a formatter emitting `<a href=…>link</a>`, an `<img>` or an inline SVG sparkline
+// puts real ELEMENT children in a `td`, and the grid reads a cell as
+// `td.textContent` - which flattens the link to bare text and renders the image
+// cell as the EMPTY STRING. That is content loss rather than a lost decoration, so
+// such a Styler REFUSES and keeps the sandboxed iframe with its markup intact. The
+// test is the cell's own CONTENT, never a guess about intent, and it is scoped to
+// the Styler branch: `to_html(escape=False)` on the `class="dataframe"` path has
+// always flattened the same way, and changing that is not this module's business.
+//
 // THE LAYOUT IS READ, NEVER ASSUMED, and that is this module's central rule.
 // It used to hardcode pandas' leading index cell (`firstThs.slice(1)`), so every
 // producer without one - polars, and `df.to_html(index=False)` - had its FIRST
@@ -146,6 +158,20 @@ const MAX_STYLER_HTML_CHARS = 2 * 1024 * 1024;
 /** The HTML spec's own ceiling on `colspan`. */
 const MAX_COLSPAN = 1000;
 
+/**
+ * Ceiling on how many column positions a header may expand to.
+ *
+ * An ALLOCATION BOUND over arbitrary output html, not a claim about real frames:
+ * the live kernel payload caps at 100 columns and pandas' repr at 20, so nothing a
+ * human reads comes near this. The per-cell `MAX_COLSPAN` clamp bounds ONE cell and
+ * says nothing about the total, so ~50k `<th colspan="1000">` (about 1.3 MB of
+ * html) expanded to a 50-million-entry array and then to that many joined label
+ * strings, on the render path, before any refusal could fire. `expandRow` therefore
+ * stops at this ceiling too - one past it, so the caller can still SEE the overflow
+ * and refuse rather than silently truncating a header.
+ */
+const MAX_HEADER_COLUMNS = 4096;
+
 // pandas' truncation marker, as a literal "..." (or a unicode ellipsis).
 function isEllipsis(s: string): boolean {
 	const t = s.trim();
@@ -225,7 +251,12 @@ function expandRow(tr: Element): string[] {
 		// moment later by the row-width check anyway.
 		const span = Math.min(MAX_COLSPAN, Math.max(1, parseInt(c.getAttribute('colspan') || '1', 10) || 1));
 		const text = cellText(c);
-		for (let i = 0; i < span; i++) out.push(text);
+		for (let i = 0; i < span; i++) {
+			// One PAST the ceiling, so the caller reads an overflow rather than a
+			// header silently truncated to exactly the bound.
+			if (out.length > MAX_HEADER_COLUMNS) return out;
+			out.push(text);
+		}
 	}
 	return out;
 }
@@ -237,6 +268,53 @@ function rowCells(tr: Element): Element[] {
 
 function cellText(el: Element): string {
 	return el.textContent?.trim() ?? '';
+}
+
+/**
+ * How many leading header cells belong to the INDEX when there is NO BODY to read
+ * it from - or null when nothing says, which REFUSES the whole table.
+ *
+ * A zero-row frame still has a header, and that header alone cannot tell
+ * `df.columns.name = 'X'` (an index IS present, its placeholder carrying the
+ * columns' name) from `to_html(index=False)` (no index, first cell a real column) -
+ * guessing either way silently drops a real column or invents a phantom index one,
+ * which is the silently-wrong grid this module exists to make unreachable. So only
+ * two positive signals answer:
+ *
+ *  - a DTYPE ROW (a header row of pure `<td>`) is polars, which has no index at
+ *    all. A dialect fact rather than a guess.
+ *  - otherwise an EMPTY leading header cell is pandas' index placeholder, which
+ *    `_repr_html_` always emits. That keeps an ordinary empty pandas frame's grid.
+ *
+ * Anything else refuses, and the output keeps its honest static table.
+ */
+function emptyBodyIndexCols(firstLevel: string[] | undefined, hasDtypeRow: boolean): number | null {
+	if (hasDtypeRow) return 0;
+	if (firstLevel && firstLevel.length > 0 && firstLevel[0] === '') return 1;
+	return null;
+}
+
+/**
+ * Does a Styler-resolved table hold MARKUP in its data cells rather than text?
+ *
+ * The grid can express a formatted VALUE and a caption; it cannot express a link,
+ * an image or an inline SVG - it reads a cell as `td.textContent`, which flattens
+ * `<a href=…>link</a>` to bare unlinked text and renders an `<img>`/`<svg>` cell as
+ * the EMPTY STRING. That is losing the user's CONTENT, not a decoration, so such a
+ * table falls back to the sandboxed iframe, which keeps the markup intact.
+ *
+ * Decided on the cell's own content - real element children - never on a guess
+ * about intent: `Styler.format` defaults to `escape=None`, so elements in a data
+ * cell mean the user's own formatter emitted them (pandas escapes what it renders
+ * itself).
+ */
+function holdsCellMarkup(bodyRows: Element[]): boolean {
+	for (const tr of bodyRows) {
+		for (const td of Array.from(tr.querySelectorAll('td'))) {
+			if (td.children.length > 0) return true;
+		}
+	}
+	return false;
 }
 
 /**
@@ -277,10 +355,25 @@ export function parseDataFrameHtml(html: string | null | undefined): DataFramePa
 	// that whole bundle) because a fragment parsed without a doctype lands in quirks
 	// mode, where class matching is case-insensitive.
 	// A Styler carries no `dataframe` class at all, so it is admitted by its own
-	// cheap token - and only under a size ceiling, because unlike a `_repr_html_`
-	// its HTML is not bounded by pandas' display options.
-	const styled = !/dataframe/i.test(html);
-	if (styled && !(/col_heading/.test(html) && html.length <= MAX_STYLER_HTML_CHARS)) return null;
+	// cheap token, `col_heading` - and only under a size ceiling, because unlike a
+	// `_repr_html_` its HTML is not bounded by pandas' display options.
+	//
+	// THE CEILING IS DECIDED BY THAT SAME STRUCTURAL TOKEN, never by the ABSENCE of
+	// the word "dataframe": a caption reading "Sales DataFrame", a cell value
+	// mentioning it, a column named `dataframe_id`, a `set_table_styles` selector
+	// copied from `.dataframe` CSS, or the documented
+	// `set_table_attributes('class="dataframe"')` idiom all put that word in a
+	// Styler's html - and keyed on it the ceiling was skipped while the Styler
+	// branch below resolved the table anyway, so the multi-MB parse it exists to
+	// prevent went ahead. The cheap length compare comes FIRST, so an oversized
+	// bundle that is not a `class="dataframe"` table is refused without a second
+	// full-string scan. The `class="dataframe"` admission itself stays uncapped.
+	const dataframeClass = /dataframe/i.test(html);
+	if (html.length > MAX_STYLER_HTML_CHARS) {
+		if (!dataframeClass || /col_heading/.test(html)) return null;
+	} else if (!dataframeClass && !/col_heading/.test(html)) {
+		return null;
+	}
 	let doc: Document;
 	try {
 		doc = new DOMParser().parseFromString(html, 'text/html');
@@ -291,11 +384,14 @@ export function parseDataFrameHtml(html: string | null | undefined): DataFramePa
 	// `table.dataframe` first (pandas/polars), then the Styler shape: the first
 	// table carrying pandas' own semantic header class. Never keyed on the
 	// `id="T_<hex>"`, which is a per-render uuid and settable by the user.
+	const dataframeTable = doc.querySelector('table.dataframe');
 	const table =
-		doc.querySelector('table.dataframe') ??
+		dataframeTable ??
 		Array.from(doc.querySelectorAll('table')).find((t) => t.querySelector('th.col_heading')) ??
 		null;
 	if (!table) return null;
+	// Which branch answered, so the markup refusal below stays scoped to the Styler.
+	const isStyler = table !== dataframeTable;
 	const thead = table.querySelector('thead');
 	const tbody = table.querySelector('tbody');
 	if (!thead || !tbody) return null;
@@ -341,6 +437,11 @@ export function parseDataFrameHtml(html: string | null | undefined): DataFramePa
 		(tr) => tr.querySelectorAll('td').length > 0
 	);
 
+	// Scoped to the Styler branch deliberately: `to_html(escape=False)` on the
+	// `class="dataframe"` path has flattened markup this way since long before this
+	// parser, and changing that is a separate decision nobody asked for.
+	if (isStyler && holdsCellMarkup(bodyRows)) return null;
+
 	// How many leading header cells belong to the INDEX rather than to a column?
 	// Read from the BODY, where pandas writes its index labels as `<th>` row headers
 	// (one per index level, so a MultiIndex row has several) and polars writes none
@@ -348,18 +449,21 @@ export function parseDataFrameHtml(html: string | null | undefined): DataFramePa
 	// `<th>` (`df.columns.name = 'X'`), so a leading non-empty cell does not mean
 	// there is no index. The first body row is the one to read - a MultiIndex
 	// continuation row carries fewer `<th>`, its outer levels being spanned by a
-	// `rowspan` above it. With no body to read (an empty frame) fall back: a
-	// declared column count that already matches the header means there is no index
-	// cell to drop, otherwise assume pandas' single leading one, which is what
-	// `to_html()` emits by default.
+	// `rowspan` above it. With no body to read at all, `emptyBodyIndexCols` decides -
+	// and REFUSES rather than guessing.
 	const levels = levelRows.map(expandRow);
 	const width = Math.max(...levels.map((l) => l.length));
+	// Past the allocation bound nothing below may run: `rawColumns`, `keepCol` and
+	// `columns` are each O(width) and the only refusal that would otherwise stop
+	// them - the per-row width check - comes after all three.
+	if (width > MAX_HEADER_COLUMNS) return null;
 	const indexCols =
 		bodyRows.length > 0
 			? bodyRows[0].querySelectorAll('th').length
-			: shape && width === shape.cols
-				? 0
-				: 1;
+			: emptyBodyIndexCols(levels[0], declaredDtypes !== null);
+	// No body, no dtype row and a labelled leading cell: nothing says whether that
+	// cell is an index or a column, so there is no honest grid to render.
+	if (indexCols === null) return null;
 	const hasIndex = indexCols > 0;
 
 	// One label per column position, joining that position's non-empty part from

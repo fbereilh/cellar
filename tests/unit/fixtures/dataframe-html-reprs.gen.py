@@ -60,6 +60,12 @@ out["polars_row_truncation"] = pl.DataFrame(
 )._repr_html_()
 out["polars_col_truncation"] = pl.DataFrame({f"c{i}": [1, 2] for i in range(100)})._repr_html_()
 out["polars_empty"] = pl.DataFrame({"a": [], "b": []})._repr_html_()
+# Zero rows AND wide enough for the repr to truncate columns: the empty body has no
+# index to read, and the declared shape legitimately disagrees with the parsed count
+# (truncation), so only polars' own dtype row can say there is no index column.
+out["polars_empty_col_truncation"] = pl.DataFrame(
+    {f"c{i}": [] for i in range(100)}
+)._repr_html_()
 out["polars_series"] = pl.Series("s", [1, 2, 3])._repr_html_()
 out["polars_dtypes"] = pl.DataFrame(
     {"d": [dt.date(2020, 1, 1)], "f": [1.5], "b": [True], "l": [[1, 2]]}
@@ -74,6 +80,9 @@ _cn = pd.DataFrame({"a": [1], "b": [2]})
 _cn.columns.name = "COLS"
 out["pandas_columns_name"] = _cn._repr_html_()
 out["pandas_empty_4col"] = pd.DataFrame(columns=["a", "b", "c", "d"])._repr_html_()
+# Zero rows and NO index placeholder: the header's first cell is a real column, so
+# nothing distinguishes it from a `columns.name` placeholder. Must refuse.
+out["pandas_empty_no_index"] = pd.DataFrame(columns=["a", "b"]).to_html(index=False)
 out["pandas_row_truncation"] = pd.DataFrame({"v": range(200)})._repr_html_()
 out["pandas_col_truncation"] = pd.DataFrame(
     np.arange(60).reshape(2, 30), columns=[f"c{i}" for i in range(30)]
@@ -105,6 +114,19 @@ out["styler_multiindex_cols"] = (
     ._repr_html_()
 )
 out["styler_bare"] = pd.DataFrame({"a": [1, 2], "b": ["x", "y"]}).style.set_uuid("fx")._repr_html_()
+
+# `Styler.format` defaults to escape=None, so a formatter may put the user's own
+# MARKUP in a cell - which `textContent` flattens (a link) or empties (an image).
+_links = pd.DataFrame({"name": ["a", "b"], "url": ["https://x/1", "https://x/2"]})
+out["styler_cell_link"] = (
+    _links.style.set_uuid("fx").format({"url": lambda u: f'<a href="{u}">link</a>'})._repr_html_()
+)
+_sparks = pd.DataFrame({"k": ["a", "b"], "spark": ["1", "2"]})
+out["styler_cell_img"] = (
+    _sparks.style.set_uuid("fx")
+    .format({"spark": lambda v: f'<img src="data:image/gif;base64,R0lGOD{v}" />'})
+    ._repr_html_()
+)
 
 out["_versions"] = {"pandas": pd.__version__, "polars": pl.__version__}
 with open(sys.argv[1], "w") as fh:
