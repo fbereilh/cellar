@@ -123,8 +123,10 @@ The consequence is that a directive-marked cell **cannot be unmarked from Cellar
 every surface says so rather than reporting a change the notebook did not take:
 
 - `setCellExport` returns `{ok:false, reason:'export-directive-owns-cell'}`.
-- `PATCH /api/cells/[id]` answers 409 with that reason. Its siblings (`no-such-cell`,
-  `not-code`) stay silent exactly as before - widening those is a separate change.
+- `PATCH /api/cells/[id]` answers 409 with that reason, and with `not-code` beside it
+  (see AGENTS.md's nbdev-export entry for why that one was widened once eligibility became
+  target-aware). `no-such-cell` stays silent exactly as before - widening it is a separate
+  change.
 - MCP `set_cell_export` refuses all-or-nothing, naming the handle the agent supplied and
   the line to remove.
 - The row toggle shows **ON** (an unticked control over a cell the exporter writes is the
