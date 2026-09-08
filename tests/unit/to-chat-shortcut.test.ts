@@ -28,6 +28,7 @@
  * the no-mistakes gate, hence this CI-visible check.
  */
 import { describe, it, expect, beforeAll, vi } from 'vitest';
+import { isExportCell } from '../../src/lib/exportRole';
 import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -199,7 +200,7 @@ describe('converting a multi-cell selection to chat (setCellTypes, the bulk path
 		expect(cell.outputs).toHaveLength(1);
 	});
 
-	it('drops the imports role and the export flag - a chat cell holds no Python', () => {
+	it('drops the imports role, KEEPS the export mark - a chat cell holds no Python', () => {
 		const { nb, ids } = makeNotebook('flags.ipynb', 1);
 		nbmod.setCellRole(ids[0], 'imports', nb);
 		nbmod.setCellExports([ids[0]], true, nb);
@@ -207,7 +208,13 @@ describe('converting a multi-cell selection to chat (setCellTypes, the bulk path
 		nbmod.setCellTypes([ids[0]], 'chat', nb);
 		const cellar = nbmod.listCells(nb)[0].metadata?.cellar ?? {};
 		expect(cellar.role).toBeUndefined();
-		expect(cellar.export).toBeUndefined();
+		// The EXPORT mark deliberately SURVIVES the conversion. Clearing it silently is
+		// the loss that was rejected for a target-language change, and a type change is
+		// the same act from the user's side. The cell simply strands: `isExportCell`
+		// ignores it, so nothing reaches the generated module, and the greyed-out toggle
+		// is how it is seen and cleared.
+		expect(cellar.export).toBe(true);
+		expect(isExportCell(nbmod.listCells(nb)[0], 'python')).toBe(false);
 		// `hide_input` is deliberately KEPT, exactly as it is for markdown and raw.
 		expect(cellar.hide_input).toBe(true);
 	});
