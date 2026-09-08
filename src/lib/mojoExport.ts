@@ -148,6 +148,18 @@ interface ScannedLine {
 	comment: boolean;
 	/** True when the line's first character is inside an unterminated `"""`/`'''`. */
 	inString: boolean;
+	/**
+	 * The line OPENS inside an unclosed bracket, so it continues the logical line
+	 * above it rather than starting one of its own.
+	 *
+	 * Load-bearing for the same reason `comment` is: a bracketed continuation may
+	 * legally sit at COLUMN 0 (`def main():` / `    var x = add(` / `1,` / `)` /
+	 * `    print(x)` is one statement), so an indent-only scan read `1,` as a new
+	 * top-level line, ended the body there and orphaned the rest at file scope. It
+	 * is also how a MULTI-LINE decorator above the `def` is recognised upward: the
+	 * line immediately above is the decorator's closing `)`, not its `@`.
+	 */
+	continued: boolean;
 }
 
 /**
@@ -166,6 +178,7 @@ function scanLines(src: string): ScannedLine[] {
 	const out: ScannedLine[] = [];
 	let i = 0;
 	let triple: '"""' | "'''" | null = null;
+	let depth = 0;
 	while (i <= src.length) {
 		const nl = src.indexOf('\n', i);
 		const stop = nl === -1 ? src.length : nl;
@@ -181,9 +194,13 @@ function scanLines(src: string): ScannedLine[] {
 			// content, never a comment, so the state carried from the previous line
 			// decides this too.
 			comment: triple === null && trimmed.startsWith('#'),
-			inString: triple !== null
+			inString: triple !== null,
+			continued: triple === null && depth > 0
 		});
-		// Walk the line's characters to carry the triple-quote state to the next one.
+		// Walk the line's characters to carry the triple-quote AND bracket state to the
+		// next one. Counting brackets HERE rather than per line is what makes the depth
+		// string-aware for free: a `(` inside a docstring, or inside a single-quoted
+		// literal, is skipped by the very same walk that already tracks the quotes.
 		for (let j = 0; j < text.length; ) {
 			if (triple) {
 				if (text.startsWith(triple, j)) {
@@ -206,6 +223,10 @@ function scanLines(src: string): ScannedLine[] {
 				j++;
 				continue;
 			}
+			if (ch === '(' || ch === '[' || ch === '{') depth++;
+			// An unmatched closer is broken source; clamping keeps it from making every
+			// later line read as a continuation and swallowing the rest of the cell.
+			else if ((ch === ')' || ch === ']' || ch === '}') && depth > 0) depth--;
 			j++;
 		}
 		if (nl === -1) break;
@@ -214,33 +235,38 @@ function scanLines(src: string): ScannedLine[] {
 	return out;
 }
 
-/** Net bracket depth a line contributes, ignoring comments and string literals. */
-function bracketDelta(text: string): number {
-	let depth = 0;
-	for (let j = 0; j < text.length; j++) {
-		const ch = text[j];
-		if (ch === '#') break;
-		if (ch === '"' || ch === "'") {
-			const q = ch;
-			j++;
-			while (j < text.length && text[j] !== q) j += text[j] === '\\' ? 2 : 1;
-			continue;
-		}
-		if (ch === '(' || ch === '[' || ch === '{') depth++;
-		else if (ch === ')' || ch === ']' || ch === '}') depth--;
-	}
-	return depth;
-}
-
 /**
  * The span of a top-level `def main(...)` block in a Mojo cell, or null.
  *
  * The block is the `def` line (continued across lines while its brackets are
- * open), every following blank, COMMENT or INDENTED line, and any decorator lines
- * immediately above it - a decorator left behind with its `def` removed is a
- * compile error, which is the one thing this transform must never produce.
- * Trailing blank and comment lines are left OUT of the span, so they stay in the
- * residue and the surrounding blocks keep their own spacing.
+ * open), every following blank, COMMENT, CONTINUATION or INDENTED line, and every
+ * decorator above it together with the blank and comment lines between them - a
+ * decorator left behind with its `def` removed is the one thing this transform
+ * must never produce. Trailing blank and column-0 comment lines are left OUT of
+ * the span, so they stay in the residue and the surrounding blocks keep their own
+ * spacing.
+ *
+ * ## Every edge of this scan is decided by what BELONGS to the block, never by
+ * indentation alone
+ *
+ * Three defects of one shape have already shipped from here, each producing a
+ * silently wrong `.mojo`, so the rules are stated rather than implied:
+ *
+ *   - A COLUMN-0 COMMENT does not end a suite (Mojo emits no INDENT/DEDENT for
+ *     one), so it may not end the body; see `ScannedLine.comment`.
+ *   - A BRACKETED CONTINUATION may legally sit at column 0, so it may not end the
+ *     body either; see `ScannedLine.continued`.
+ *   - A DECORATOR belongs to the `def` below it even when it SPANS LINES (the
+ *     line immediately above the `def` is then its closing `)`, not its `@`) and
+ *     even when BLANK or COMMENT lines sit between the two, both of which are
+ *     legal Mojo. Leaving one behind is not always loud: a stranded decorator
+ *     followed by another `def` COMPILES CLEAN and silently attaches to a
+ *     function the user never decorated, which is worse than the `struct` and
+ *     end-of-module shapes that do error.
+ *
+ * The block therefore STARTS at the topmost decorator line: blanks and comments
+ * above that belong to whatever precedes and stay in the residue, exactly as the
+ * trailing trim keeps a column-0 comment out of the block at the other end.
  *
  * The FIRST such block wins. A cell with two top-level `main`s does not compile
  * on its own either, so there is no honest second answer to give.
@@ -251,35 +277,45 @@ export function findTopLevelMain(source: string | null | undefined): MainBlock |
 	let at = -1;
 	for (let i = 0; i < lines.length; i++) {
 		const l = lines[i];
-		if (l.inString || l.blank || l.indent !== 0) continue;
+		if (l.inString || l.continued || l.blank || l.indent !== 0) continue;
 		if (MAIN_DEF_RE.test(l.text)) {
 			at = i;
 			break;
 		}
 	}
 	if (at === -1) return null;
-	// Decorators immediately above, contiguously (blank lines between a decorator
-	// and its `def` are legal but vanishingly rare; a blank stops the walk).
+	// Decorators above the `def`, each resolved to the START of its own logical line
+	// so a multi-line one is taken whole, and with blank/comment lines between two
+	// decorators - or between a decorator and the `def` - skipped rather than treated
+	// as the end of the run. `first` only moves when a decorator is really found, so
+	// a skipped run that turns out to sit above ordinary code stays in the residue.
 	let first = at;
-	while (first > 0) {
-		const prev = lines[first - 1];
-		if (prev.inString || prev.blank || prev.indent !== 0 || !DECORATOR_RE.test(prev.text)) break;
-		first--;
+	let scan = at - 1;
+	while (scan >= 0) {
+		const l = lines[scan];
+		if (l.inString) break;
+		if (l.blank || l.comment) {
+			scan--;
+			continue;
+		}
+		let head = scan;
+		while (head > 0 && lines[head].continued) head--;
+		const decorator = lines[head];
+		if (decorator.inString || decorator.continued || decorator.indent !== 0) break;
+		if (!DECORATOR_RE.test(decorator.text)) break;
+		first = head;
+		scan = head - 1;
 	}
 	// The `def` header, continued while its brackets stay open.
 	let last = at;
-	let depth = bracketDelta(lines[at].text);
-	while (depth > 0 && last + 1 < lines.length) {
-		last++;
-		depth += bracketDelta(lines[last].text);
-	}
-	// The body: every following blank, COMMENT or indented line, up to the next
-	// top-level one. A comment-only line at column 0 does not end a suite (see
-	// `ScannedLine.comment`), so it may not end the block either.
+	while (last + 1 < lines.length && lines[last + 1].continued) last++;
+	// The body: every following blank, COMMENT, CONTINUATION or indented line, up to
+	// the next top-level one. Neither a column-0 comment nor a dedented bracket
+	// continuation ends a suite, so neither may end the block.
 	let end = last;
 	for (let i = last + 1; i < lines.length; i++) {
 		const l = lines[i];
-		if (l.inString || l.blank || l.comment || l.indent > 0) {
+		if (l.inString || l.continued || l.blank || l.comment || l.indent > 0) {
 			end = i;
 			continue;
 		}
@@ -292,8 +328,13 @@ export function findTopLevelMain(source: string | null | undefined): MainBlock |
 	// body being dropped - and handing it back left a stray fragment of the discarded
 	// block sitting at file scope in the generated module, right after the drop
 	// comment. A comment inside the body with indented code after it is not trailing
-	// either way and stays in the block.
-	while (end > last && (lines[end].blank || (lines[end].comment && lines[end].indent === 0))) end--;
+	// either way and stays in the block. A blank line INSIDE a string is content, not
+	// spacing, so it is never handed back.
+	while (
+		end > last &&
+		((lines[end].blank && !lines[end].inString) || (lines[end].comment && lines[end].indent === 0))
+	)
+		end--;
 	return { start: lines[first].start, end: lines[end].end };
 }
 

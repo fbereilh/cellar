@@ -275,6 +275,144 @@ describe('findTopLevelMain', () => {
 	});
 });
 
+// ---------------------------------------------------------------------------
+// the EDGES of the dropped block
+// ---------------------------------------------------------------------------
+
+/**
+ * Three defects of ONE shape have shipped from this scan, each generating a wrong
+ * `.mojo` in silence: the magic-header strip cutting at the first newline rather
+ * than the first non-blank line, the body scan ending at a column-0 comment, and
+ * the decorator walk absorbing only CONTIGUOUS single-line decorators. So the
+ * block's edges are covered systematically rather than case by case.
+ *
+ * Measured against Mojo 1.0.0 while writing this, and the reason the assertions
+ * below are about the module's TEXT and not only about whether it compiles: a
+ * stranded decorator followed by another `def` COMPILES CLEAN and silently
+ * attaches to a function the user never decorated. Only the `struct` and
+ * nothing-follows shapes error, so a suite that asserted "it fails to compile"
+ * would pass while the worst outcome went undetected. The compiler tier below
+ * carries all three consequences.
+ */
+describe("the dropped block's edges", () => {
+	const AFTER = 'def after() -> Int:\n    return 2';
+
+	describe('above the def: decorators belong to the block', () => {
+		it('takes a decorator held off by BLANK lines, leaving none stranded', () => {
+			const src = `X = 1\n\n@parameter\n\ndef main():\n    print(1)\n\n${AFTER}\n`;
+			const out = dropMainBlock(src);
+			// The silent shape: stranded, this `@parameter` attaches to `after`.
+			expect(out).not.toContain('@parameter');
+			expect(out).toContain('X = 1');
+			expect(out).toContain(AFTER);
+			expect(codeOf(out)).not.toContain('def main');
+			expect(codeOf(out)).not.toContain('print(1)');
+		});
+
+		it('takes a decorator held off by a COMMENT, and the comment with it', () => {
+			const src = `@parameter\n# why this one is parameterised\ndef main():\n    print(1)\n\n${AFTER}\n`;
+			const out = dropMainBlock(src);
+			expect(out).not.toContain('@parameter');
+			// The comment sits BETWEEN the decorator and its def, so it belongs to the
+			// block; left behind it would be a stray note about code that is gone.
+			expect(out).not.toContain('# why this one is parameterised');
+			expect(out).toContain(AFTER);
+		});
+
+		it('takes a MULTI-LINE decorator whole, closing bracket and all', () => {
+			// The line immediately above the `def` is `)`, not `@`, so an upward walk that
+			// only recognises a line starting with `@` leaves the whole call behind.
+			const src = `@always_inline(\n    "nodebug"\n)\ndef main():\n    print(1)\n\n${AFTER}\n`;
+			const out = dropMainBlock(src);
+			expect(out).not.toContain('@always_inline');
+			expect(out).not.toContain('nodebug');
+			// ...and no orphaned fragment of it either, which is the loud half.
+			expect(
+				codeOf(out)
+					.split('\n')
+					.map((l) => l.trim())
+			).not.toContain(')');
+			expect(out).toContain(AFTER);
+		});
+
+		it('takes a RUN of decorators, with blanks and comments between them', () => {
+			const src =
+				'@parameter\n\n# a note between two decorators\n\n@always_inline(\n    "nodebug"\n)\ndef main():\n    print(1)\n';
+			// Every line of the cell belongs to the block, so nothing but the comment is left.
+			expect(dropMainBlock(src)).toBe(`${MAIN_DROPPED_COMMENT}\n`);
+		});
+
+		it('leaves blanks and comments ABOVE the topmost decorator in the residue', () => {
+			// The mirror of the trailing trim: what sits above the run belongs to whatever
+			// PRECEDES, so swallowing it would silently delete the user's own note.
+			const src = 'X = 1\n\n# a note about X\n\n@parameter\ndef main():\n    print(1)\n';
+			expect(dropMainBlock(src)).toBe(`X = 1\n\n# a note about X\n\n${MAIN_DROPPED_COMMENT}\n`);
+		});
+
+		it('never mistakes a preceding bracketed statement for a decorator', () => {
+			// The upward walk resolves a logical line, so it must not read the `)` closing
+			// an ordinary call as a decorator's and swallow the statement above it.
+			const indented = 'X = compute(\n    1\n)\ndef main():\n    print(1)\n';
+			expect(dropMainBlock(indented)).toBe(`X = compute(\n    1\n)\n${MAIN_DROPPED_COMMENT}\n`);
+			// ...including when the continuation dedents to column 0.
+			const flush = 'X = compute(\n1\n)\ndef main():\n    print(1)\n';
+			expect(dropMainBlock(flush)).toBe(`X = compute(\n1\n)\n${MAIN_DROPPED_COMMENT}\n`);
+		});
+
+		it('never mistakes an indented line, or an `@` inside a string, for a decorator', () => {
+			const body = 'def helper():\n    pass\ndef main():\n    print(1)\n';
+			expect(dropMainBlock(body)).toBe(`def helper():\n    pass\n${MAIN_DROPPED_COMMENT}\n`);
+			// String CONTENT that happens to start with `@` is not a decorator, and taking
+			// it would cut a hole in the middle of a literal.
+			const str = 'DOC = """\n@parameter\n"""\ndef main():\n    print(1)\n';
+			const strOut = dropMainBlock(str);
+			expect(strOut).toContain('@parameter');
+			expect(strOut).toBe(`DOC = """\n@parameter\n"""\n${MAIN_DROPPED_COMMENT}\n`);
+		});
+	});
+
+	describe('below the header: the body', () => {
+		it('carries a bracket continuation that dedents to COLUMN 0', () => {
+			// Inside brackets indentation carries no meaning, so `1,` is not a new
+			// top-level line. Reading it as one ended the body there and left the rest of
+			// the statement - and the indented line after it - orphaned at file scope.
+			const src = `def main():\n    var x = add(\n1,\n2,\n)\n    print(x)\n\n${AFTER}\n`;
+			const out = dropMainBlock(src);
+			expect(out).toBe(`${MAIN_DROPPED_COMMENT}\n\n${AFTER}\n`);
+			expect(out).not.toContain('1,');
+			expect(out).not.toContain('print(x)');
+		});
+
+		it('carries blank runs inside the body', () => {
+			const src = `def main():\n    print(1)\n\n\n    print(2)\n\n${AFTER}\n`;
+			const out = dropMainBlock(src);
+			expect(out).toBe(`${MAIN_DROPPED_COMMENT}\n\n${AFTER}\n`);
+			expect(out).not.toContain('print(2)');
+		});
+
+		it('carries a string holding `#` and `def main(` without ending early', () => {
+			const src = `def main():\n    doc = """\n# not a comment\ndef main():\n"""\n    print(doc)\n\n${AFTER}\n`;
+			const out = dropMainBlock(src);
+			expect(out).toBe(`${MAIN_DROPPED_COMMENT}\n\n${AFTER}\n`);
+			expect(out).not.toContain('# not a comment');
+			expect(out).not.toContain('print(doc)');
+		});
+	});
+
+	describe('the trailing trim, in both directions', () => {
+		it('hands trailing blank lines at the end of the cell back', () => {
+			expect(dropMainBlock('def main():\n    print(1)\n\n\n')).toBe(`${MAIN_DROPPED_COMMENT}\n\n\n`);
+		});
+
+		it('hands a column-0 comment back but keeps an indented one', () => {
+			// The two rules meet in one source: the indented comment is the last line of
+			// the body being dropped, the column-0 one belongs to `after`.
+			const src = `def main():\n    print(1)\n    # done\n# belongs to after\n${AFTER}\n`;
+			expect(dropMainBlock(src)).toBe(`${MAIN_DROPPED_COMMENT}\n# belongs to after\n${AFTER}\n`);
+		});
+	});
+});
+
 describe('stripMojoMagicHeader', () => {
 	it('removes only a leading %%mojo line', () => {
 		expect(stripMojoMagicHeader(`%%mojo\n${MAIN}`)).toBe(MAIN);
@@ -868,18 +1006,11 @@ describe('setExportTarget accepts .mojo and still refuses anything else', () => 
 describe('the wiring the browser ships', () => {
 	const read = (p: string) => readFileSync(new URL(`../../src/lib/${p}`, import.meta.url), 'utf8');
 
-	it('states Mojo as a target MATCH, never as an exclusion', () => {
-		// A bare `&& !isMojoCell(cell)` is the version that would have to be UNPICKED
-		// the moment a .mojo target existed - the whole point of the target-aware shape,
-		// and a constraint no behavioural assertion can express, so it stays a source
-		// guard. WHAT the rule answers is asserted below, against the imported module.
-		expect(read('exportRole.ts')).not.toMatch(/!\s*isMojoCell/);
-	});
-
 	it('eligibility is a MATCH in both directions, for every cell language', () => {
-		// The behavioural half of the guard above: one sentence - a cell is exportable
-		// to a target iff its language matches the target's extension - gives every
-		// answer, so neither language is a special case of the other.
+		// One sentence - a cell is exportable to a target iff its language matches the
+		// target's extension - gives every answer, so neither language is a special case
+		// of the other, and a `&& !isMojoCell(cell)` exclusion could not produce this
+		// table (it has no `.mojo` target to answer for).
 		const py = { cell_type: 'code', source: 'x = 1' };
 		const mojoTyped = { cell_type: 'code', source: 'def main(): ...', metadata: { cellar: { language: 'mojo' } } };
 		const mojoMagic = { cell_type: 'code', source: '%%mojo\ndef main(): ...' };
@@ -1106,6 +1237,90 @@ describe.skipIf(!MOJO_BIN)(`the generated module against a REAL mojo${why}`, () 
 		);
 		const broken = mojo(dir, ['doc', 'col0broken.mojo', '-o', '/dev/null']);
 		expect(broken.ok).toBe(false);
+	});
+
+	it('a decorator held off from its main by a BLANK line leaves nothing stranded', () => {
+		// The measured consequence that makes this the worst of the three decorator
+		// shapes: a stranded decorator followed by another `def` COMPILES CLEAN and
+		// silently attaches to a function the user never decorated, so no compile-based
+		// assertion can catch it. Both halves are driven here - the fixed module runs
+		// correctly, and the pre-fix residue is shown to be SILENT, which is what makes
+		// the text assertions in the unit tier load-bearing rather than belt-and-braces.
+		const cells = [
+			'@parameter\n\ndef main():\n    print("dropped")\n\ndef lead() -> Int:\n    return 7\n',
+			'def main():\n    print("kept", lead())\n'
+		];
+		writeFileSync(join(dir, 'deco_blank.mojo'), generateModule(mojoModuleSources(cells).sources, 'db.ipynb', 'mojo'));
+		const r = mojo(dir, ['run', 'deco_blank.mojo']);
+		expect(r.ok, r.out).toBe(true);
+		expect(r.out).toContain('kept 7');
+
+		writeFileSync(
+			join(dir, 'deco_stranded.mojo'),
+			`@parameter\n\n${MAIN_DROPPED_COMMENT}\n\ndef lead() -> Int:\n    return 7\n\ndef main():\n    print("kept", lead())\n`
+		);
+		const stranded = mojo(dir, ['doc', 'deco_stranded.mojo', '-o', '/dev/null']);
+		expect(stranded.out, stranded.out).not.toMatch(/error:/);
+		expect(stranded.ok).toBe(true);
+	});
+
+	it('a decorator held off by a COMMENT is absorbed, and stranding it is LOUD', () => {
+		const cells = [
+			'@parameter\n# why this one is parameterised\ndef main():\n    print("dropped")\n\nstruct Pair(Copyable, Movable):\n    var a: Int\n    var b: Int\n    def __init__(out self, a: Int, b: Int):\n        self.a = a\n        self.b = b\n',
+			'def main():\n    var p = Pair(2, 3)\n    print("kept", p.a + p.b)\n'
+		];
+		writeFileSync(join(dir, 'deco_comment.mojo'), generateModule(mojoModuleSources(cells).sources, 'dc.ipynb', 'mojo'));
+		const r = mojo(dir, ['run', 'deco_comment.mojo']);
+		expect(r.ok, r.out).toBe(true);
+		expect(r.out).toContain('kept 5');
+
+		// CONTROL: the pre-fix residue - the decorator and its comment left above a
+		// `struct` - is what the compiler rejects, which is what makes the assertion
+		// above load-bearing for this shape rather than passing vacuously.
+		writeFileSync(
+			join(dir, 'deco_comment_broken.mojo'),
+			`@parameter\n# why this one is parameterised\n${MAIN_DROPPED_COMMENT}\n\nstruct Pair(Copyable, Movable):\n    var a: Int\n    var b: Int\n    def __init__(out self, a: Int, b: Int):\n        self.a = a\n        self.b = b\n`
+		);
+		expect(mojo(dir, ['doc', 'deco_comment_broken.mojo', '-o', '/dev/null']).ok).toBe(false);
+	});
+
+	it('a MULTI-LINE decorator is absorbed whole, fragment and all', () => {
+		// Here the fixed-module assertion is itself the proof: any partial absorption
+		// leaves `@always_inline(`, its argument or a bare `)` at file scope, and the
+		// compiler rejects every one of those.
+		const cells = [
+			'@always_inline(\n    "nodebug"\n)\ndef main():\n    print("dropped")\n\ndef twice(x: Int) -> Int:\n    return x * 2\n',
+			'def main():\n    print("kept", twice(21))\n'
+		];
+		writeFileSync(join(dir, 'deco_multiline.mojo'), generateModule(mojoModuleSources(cells).sources, 'dm.ipynb', 'mojo'));
+		const r = mojo(dir, ['run', 'deco_multiline.mojo']);
+		expect(r.ok, r.out).toBe(true);
+		expect(r.out).toContain('kept 42');
+	});
+
+	it('a bracket continuation dedented to column 0 stays inside the dropped block', () => {
+		const cells = [
+			'def add(a: Int, b: Int) -> Int:\n    return a + b\n\ndef main():\n    var x = add(\n1,\n2,\n)\n    print("dropped", x)\n',
+			'def main():\n    print("kept", add(20, 22))\n'
+		];
+		// The INPUT is legitimate Mojo - inside brackets indentation carries no meaning -
+		// so nothing about it justified generating a broken module.
+		writeFileSync(join(dir, 'cont_input.mojo'), cells[0]);
+		const input = mojo(dir, ['run', 'cont_input.mojo']);
+		expect(input.ok, input.out).toBe(true);
+
+		writeFileSync(join(dir, 'cont.mojo'), generateModule(mojoModuleSources(cells).sources, 'ct.ipynb', 'mojo'));
+		const r = mojo(dir, ['run', 'cont.mojo']);
+		expect(r.ok, r.out).toBe(true);
+		expect(r.out).toContain('kept 42');
+
+		// CONTROL: the pre-fix residue - the body cut at `1,` - orphans the rest of the
+		// statement, and the indented line after it, at file scope.
+		writeFileSync(
+			join(dir, 'cont_broken.mojo'),
+			`def add(a: Int, b: Int) -> Int:\n    return a + b\n\n${MAIN_DROPPED_COMMENT}\n1,\n2,\n)\n    print("dropped", x)\n`
+		);
+		expect(mojo(dir, ['doc', 'cont_broken.mojo', '-o', '/dev/null']).ok).toBe(false);
 	});
 
 	it('CONTROL: the Python generator output fails on __all__ AND on duplicate main', () => {
