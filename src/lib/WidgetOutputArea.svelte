@@ -6,7 +6,7 @@
 	// the store, and this repaints. A deliberately compact subset of the full cell
 	// output renderer — enough for `interact` (print/repr/HTML/image) — recursing
 	// into nested widget views. Both themes handled by daisyUI semantic classes.
-	import DOMPurify from 'dompurify';
+	import { sanitizeHtml } from '$lib/sanitizeHtml';
 	import { browser } from '$app/environment';
 	import WidgetOutput from '$lib/WidgetOutput.svelte';
 
@@ -54,7 +54,7 @@
 			const imgMime = IMG_MIMES.find((m) => d[m] != null) ?? (d['image/svg+xml'] != null ? 'image/svg+xml' : null);
 			if (imgMime) return { kind: 'image', src: imageSrc(imgMime, d[imgMime]) };
 			if (d['text/html'] != null) {
-				const html = browser ? DOMPurify.sanitize(asText(d['text/html'])) : '';
+				const html = browser ? sanitizeHtml(asText(d['text/html'])) : '';
 				return { kind: 'html', html };
 			}
 			if (d['text/plain'] != null) return { kind: 'text', text: asText(d['text/plain']) };
