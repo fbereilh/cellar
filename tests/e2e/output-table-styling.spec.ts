@@ -18,10 +18,20 @@ import { horizontallyOverflowingBoxes, isCellMounted, paneMetric, setScrollTop }
  * only exist once something lays the table out.
  *
  * It deliberately uses `IPython.display.HTML` with hand-written markup rather
- * than pandas: the markup below IS the shape pandas emits (a Styler's
- * `<style>#T_x td{…}</style><table id="T_x">` with `col_heading`/`row_heading`
- * cells; `_repr_html_`'s `<table border="1" class="dataframe">`), so the cascade
- * under test is identical while the workspace venv needs only `ipykernel`.
+ * than pandas: the markup below IS the shape pandas emits
+ * (`<style>#T_x td{…}</style><table id="T_x">`; `_repr_html_`'s
+ * `<table border="1" class="dataframe">`), so the cascade under test is identical
+ * while the workspace venv needs only `ipykernel`.
+ *
+ * NOTE the routing: `dataframeHtml.ts` now reads a pandas *Styler* too and hands
+ * it to `DataFrameGrid`, so the tables below deliberately carry NO
+ * `col_heading`/`row_heading`/`data` classes - that is the Styler token, and with
+ * it they would render as a grid and never reach this stylesheet at all. What
+ * still reaches it is every other rich table: statsmodels' `simpletable`, folium
+ * and Bokeh chrome, a hand-written `<table>`, and a Styler the grid refuses
+ * (MultiIndex columns, or one past its size ceiling). The two `#T_…`-scoped
+ * fixtures keep those ids because the CASCADE is what is under test, and an
+ * id-scoped rule is exactly what `set_table_styles` emits.
  *
  * Boots the REAL launcher against a throwaway workspace (see ./harness); SKIPS
  * when the kernel runtime is absent (local-only, like smoke.spec).
@@ -59,8 +69,8 @@ const DATAFRAME_REPR = `<table border="1" class="dataframe">
 
 /** Many numeric columns - wide enough that it cannot fit the output width. */
 const WIDE_TABLE = `<table id="T_wide"><caption>Wide numeric table</caption>
-<thead><tr><th class="blank"></th>${Array.from({ length: 18 }, (_, i) => `<th class="col_heading">metric_${i}</th>`).join('')}</tr></thead>
-<tbody><tr><th class="row_heading">0</th>${Array.from({ length: 18 }, (_, i) => `<td class="data">${(i * 1111.25).toFixed(6)}</td>`).join('')}</tr></tbody></table>`;
+<thead><tr><th></th>${Array.from({ length: 18 }, (_, i) => `<th>metric_${i}</th>`).join('')}</tr></thead>
+<tbody><tr><th>0</th>${Array.from({ length: 18 }, (_, i) => `<td>${(i * 1111.25).toFixed(6)}</td>`).join('')}</tr></tbody></table>`;
 
 /**
  * A long text column, as bare text in the `<td>` - deliberately NOT wrapped in a
@@ -84,29 +94,30 @@ const TEXT_TABLE = `<table id="T_text">
 ).join('')}</tbody></table>`;
 
 /**
- * A Styler that aligns the WHOLE table - `set_table_styles([{'selector': '', …}])`
- * emits its rule on the table element, and `text-align` reaches the cells only by
- * inheritance. Cellar's default therefore has to be declared on `table` too, or a
- * cell-level default would silently outrank this.
+ * A rich table that aligns the WHOLE table -
+ * `set_table_styles([{'selector': '', …}])` emits its rule on the table element,
+ * and `text-align` reaches the cells only by inheritance. Cellar's default
+ * therefore has to be declared on `table` too, or a cell-level default would
+ * silently outrank this.
  */
 const TABLE_LEVEL_STYLED = `<style type="text/css">
 #T_tablelevel { text-align: left; }
 </style>
 <table id="T_tablelevel"><caption>Table-level align</caption>
-<thead><tr><th class="blank"></th><th class="col_heading">alpha</th></tr></thead>
-<tbody><tr><th class="row_heading">0</th><td class="data">1.5</td></tr></tbody></table>`;
+<thead><tr><th></th><th>alpha</th></tr></thead>
+<tbody><tr><th>0</th><td>1.5</td></tr></tbody></table>`;
 
 /**
- * A Styler that states its own padding/alignment - exactly what `set_table_styles`
- * emits. Cellar's defaults must lose to every one of these.
+ * A rich table that states its own padding/alignment - exactly what
+ * `set_table_styles` emits. Cellar's defaults must lose to every one of these.
  */
 const STYLED_TABLE = `<style type="text/css">
 #T_user td { padding: 2px 4px; text-align: center; color: rgb(185, 28, 28); }
 #T_user caption { font-size: 20px; }
 </style>
 <table id="T_user"><caption>User styled</caption>
-<thead><tr><th class="blank"></th><th class="col_heading">alpha</th></tr></thead>
-<tbody><tr><th class="row_heading">0</th><td class="data">1.5</td></tr></tbody></table>`;
+<thead><tr><th></th><th>alpha</th></tr></thead>
+<tbody><tr><th>0</th><td>1.5</td></tr></tbody></table>`;
 
 /** A `<table>` used for two-column LAYOUT - prose in block-level cells. */
 const LAYOUT_TABLE = `<table><tr>
@@ -352,7 +363,7 @@ test('a wide table stays a real table and overflows into the output document', a
 	if (EVIDENCE) await wide.screenshot({ path: join(EVIDENCE, 'output-table-wide.png') });
 });
 
-test("an explicit Styler's own rules still beat cellar's defaults", async ({ page }) => {
+test("a rich table's own id-scoped rules still beat cellar's defaults", async ({ page }) => {
 	await page.goto(`${baseURL}/?ws=${encodeURIComponent(workspace)}`);
 	await openNotebook(page);
 	const frame = await runForIframe(await cellById(page, 'c-styled'));
@@ -440,7 +451,7 @@ test('a long text column wraps into view instead of scrolling away', async ({ pa
 	if (EVIDENCE) await text.screenshot({ path: join(EVIDENCE, 'output-table-text.png') });
 });
 
-test("a Styler's TABLE-level alignment beats cellar's default", async ({ page }) => {
+test("a TABLE-level alignment rule beats cellar's default", async ({ page }) => {
 	await page.goto(`${baseURL}/?ws=${encodeURIComponent(workspace)}`);
 	await openNotebook(page);
 	const frame = await runForIframe(await cellById(page, 'c-tablelevel'));

@@ -160,11 +160,15 @@
  * index column - and, like the misfires above, cosmetic and fully overridable
  * under rule 1, so it is documented rather than worked around.
  *
- * Surface note: this block only reaches *rich `text/html`* outputs. A plain
- * DataFrame renders through the native `DataFrameGrid` (structured
+ * Surface note: this block only reaches *rich `text/html`* outputs. A DataFrame
+ * renders through the native `DataFrameGrid` (structured
  * `application/vnd.cellar.dataframe+json` mime, or `dataframeHtml.ts`'s parse of
  * a saved `_repr_html_`), and markdown-cell tables are styled by `.cellar-md
- * table` in `app.css` - both are separate surfaces, untouched by this.
+ * table` in `app.css` - both are separate surfaces, untouched by this. A pandas
+ * *Styler* is now read by that same parser and routed to the grid too, so what
+ * this stylesheet still serves is every OTHER rich table: statsmodels'
+ * `simpletable`, folium and Bokeh chrome, hand-written markup, and a Styler the
+ * grid refuses (MultiIndex columns, or one past its size ceiling).
  */
 export const OUTPUT_HTML_CSS = `
 html,body{margin:0;padding:8px;background:#ffffff;color:#1f2937;font-family:system-ui,-apple-system,sans-serif;font-size:14px;}

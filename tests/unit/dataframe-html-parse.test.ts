@@ -219,6 +219,70 @@ describe('pandas is untouched', () => {
 	});
 });
 
+describe('pandas Styler: the FORMATTED values, the caption, and the layout it declares', () => {
+	it("renders as a grid at all - it used to miss both gates and stay a static table", () => {
+		expect(parseDataFrameHtml(F.styler_bare)).not.toBeNull();
+	});
+
+	it('keeps the formatted values, which is the whole reason `.style` was written', () => {
+		const p = parseDataFrameHtml(F.styler_plain)!;
+		expect(p.columns).toEqual(['rev', 'share']);
+		// `{:,.2f}` and `{:.1%}` as the user asked for them - `styler.data`, the only
+		// public handle a kernel-side formatter would have, holds 1234.5 and 0.1234.
+		expect(p.data).toEqual([
+			['1,234.50', '12.3%'],
+			['98,765.25', '87.7%']
+		]);
+		expect(p.index).toEqual(['a', 'b']);
+	});
+
+	it('carries `set_caption` through to the payload', () => {
+		expect(parseDataFrameHtml(F.styler_plain)!.caption).toBe('Revenue by arm');
+		// A plain frame has none, and the field stays absent rather than empty.
+		expect(parseDataFrameHtml(F.pandas_plain)!.caption).toBeUndefined();
+	});
+
+	it("honours `.hide(axis='index')` - the captain's own call shape", () => {
+		const p = parseDataFrameHtml(F.styler_hide_index)!;
+		expect(p.columns).toEqual(['rev', 'share']);
+		expect(p.has_index).toBe(false);
+		expect(p.caption).toBe('Floors');
+		expect(p.data[0]).toEqual(['1,234.50', '12.3%']);
+	});
+
+	it('reads a Styler index NAME from its own `index_name` row', () => {
+		const p = parseDataFrameHtml(F.styler_named_index)!;
+		expect(p.columns).toEqual(['v']);
+		expect(p.index_name).toBe('k');
+		expect(p.index).toEqual(['a', 'b']);
+	});
+
+	it('renders a gradient Styler as a grid too - the colours are what is dropped', () => {
+		const p = parseDataFrameHtml(F.styler_gradient)!;
+		expect(p.columns).toEqual(['rev', 'share']);
+		expect(p.data).toEqual([
+			[1234.5, 0.1234],
+			[98765.25, 0.8766]
+		]);
+	});
+
+	it('is admitted by its own cheap token, and only under the size ceiling', () => {
+		// Nothing that never says `col_heading` reaches the DOM parser at all.
+		expect(parseDataFrameHtml('<table id="T_x"><tbody><tr><td>1</td></tr></tbody></table>')).toBeNull();
+		// Past 2 MiB it keeps the sandboxed iframe rather than being walked cell by cell.
+		const padded = F.styler_plain + `<!--${'x'.repeat(2 * 1024 * 1024)}-->`;
+		expect(parseDataFrameHtml(padded)).toBeNull();
+		// The `class="dataframe"` path is bounded by pandas' display options, so the
+		// ceiling deliberately does not apply to it.
+		const bigPandas = F.pandas_plain + `<!--${'x'.repeat(2 * 1024 * 1024)}-->`;
+		expect(parseDataFrameHtml(bigPandas)).not.toBeNull();
+	});
+
+	it('still refuses a MultiIndex-column Styler', () => {
+		expect(parseDataFrameHtml(F.styler_multiindex_cols)).toBeNull();
+	});
+});
+
 describe('DataFrameGrid source guard: the index column follows has_index', () => {
 	// vitest deliberately runs without the SvelteKit plugin (see vitest.config.ts),
 	// so the component cannot be mounted here; the behavioural proof is in

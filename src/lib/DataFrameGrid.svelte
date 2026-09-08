@@ -31,6 +31,8 @@
 		 * exists, plus a sort control over nothing.
 		 */
 		has_index?: boolean;
+		/** A pandas Styler's `set_caption(...)`. Usually absent. */
+		caption?: string;
 	}
 
 	let { payload }: { payload: DataFramePayload | null | undefined } = $props();
@@ -39,6 +41,7 @@
 	const dtypes = $derived(payload?.dtypes ?? []);
 	const indexName = $derived(payload?.index_name ?? '');
 	const hasIndex = $derived(payload?.has_index !== false);
+	const caption = $derived(payload?.caption ?? '');
 	const index = $derived(payload?.index ?? []);
 	const rawData = $derived(payload?.data ?? []);
 
@@ -147,6 +150,9 @@
 	<div class="flex flex-wrap items-center justify-between gap-2 border-b border-base-300 bg-base-200/60 px-3 py-1.5">
 		<div class="flex items-center gap-2 text-[11px] text-base-content/70">
 			<span class="badge badge-xs badge-primary badge-soft font-medium" data-testid="df-badge">DataFrame</span>
+				{#if caption}
+					<span class="font-semibold text-base-content" data-testid="df-caption">{caption}</span>
+				{/if}
 			<span data-testid="df-counts">
 				{payload?.total_rows?.toLocaleString?.() ?? payload?.total_rows} rows ×
 				{payload?.total_cols} cols

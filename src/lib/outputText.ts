@@ -73,4 +73,6 @@ export interface DataFramePayload {
 	 * rest, so a reader compares against `false` rather than trusting a boolean.
 	 */
 	has_index?: unknown;
+	/** A pandas Styler's `set_caption(...)`, when the source carried one. */
+	caption?: unknown;
 }

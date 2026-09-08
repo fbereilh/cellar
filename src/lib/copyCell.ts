@@ -186,6 +186,9 @@ function dataframeTable(df: DataFramePayload): string {
 	// payload predating the field keeps its index column.
 	const hasIndex = df.has_index !== false;
 	const lines: string[] = [];
+	// A caption is part of what the cell SHOWS (the grid renders it), so it comes
+	// along - as its own leading line, above the header row.
+	if (typeof df.caption === 'string' && df.caption !== '') lines.push(df.caption);
 	lines.push([...(hasIndex ? [cellStr(df.index_name)] : []), ...cols].join('\t'));
 	for (let i = 0; i < rows.length; i++) {
 		const row = Array.isArray(rows[i]) ? rows[i] : [];

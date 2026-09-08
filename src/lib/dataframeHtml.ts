@@ -5,7 +5,7 @@
 // output carrying `text/html` and no structured MIME reaches it, which is the only
 // grid a producer that emits no Cellar MIME at all (polars) ever gets.
 //
-// TWO dialects, told apart STRUCTURALLY rather than by a producer name:
+// THREE dialects, told apart STRUCTURALLY rather than by a producer name:
 //
 //   pandas  `<table border="1" class="dataframe">`, a `<thead>` header row whose
 //           FIRST `<th>` is the index placeholder, `<tbody>` rows of
@@ -15,6 +15,20 @@
 //           first `<th>` is a real column, the second header row is `<td>` dtypes,
 //           body rows are pure `<td>`, and the frame's true shape is declared
 //           beside the table as `<small>shape: (rows, cols)</small>`.
+//   Styler  `<table id="T_…">` with NO `dataframe` class at all, semantically
+//           labelled instead: `th.col_heading`, `th.row_heading`, `th.index_name`,
+//           `td.data`, and the caption in a `<caption>`.
+//
+// A pandas Styler is not a DataFrame, so the kernel-side formatter never fires for
+// it and it used to miss both gates and render as a static table - live and
+// reopened. It is read HERE rather than by teaching that formatter about `Styler`,
+// because this is where MORE of it survives: the values in this HTML are the
+// FORMATTED ones (`{:,.2f}` -> `1,234.50`) and the caption is right there, while
+// the only PUBLIC handle the formatter would have is `styler.data`, the raw frame
+// underneath - so that route would silently discard exactly the number formatting
+// the user wrote `.style` to get (`_translate`/`_display_funcs`, which hold the
+// rendered values, are private). What the grid structurally cannot express is the
+// CSS: a background gradient, per-cell colours, bars. Those are dropped.
 //
 // THE LAYOUT IS READ, NEVER ASSUMED, and that is this module's central rule.
 // It used to hardcode pandas' leading index cell (`firstThs.slice(1)`), so every
@@ -69,6 +83,12 @@ export interface DataFramePayload {
 	 * exist.
 	 */
 	has_index?: boolean;
+	/**
+	 * The table's own title, when it has one: a pandas Styler's
+	 * `set_caption(...)`. OPTIONAL and usually absent - a plain `_repr_html_` has
+	 * no caption - so a payload without it renders exactly as before.
+	 */
+	caption?: string;
 }
 
 // pandas' string tokens for missing values, mapped to null (the grid renders
@@ -86,6 +106,20 @@ const POLARS_NULL = 'null';
 // 1.44: `str`, `cat` and `enum` are quoted; `binary` renders `b"ab"` and is left
 // alone (stripping a prefixed form is fiddly and the dtype is rare).
 const POLARS_QUOTED_DTYPES = new Set(['str', 'cat', 'enum']);
+
+/**
+ * Ceiling on the HTML of a Styler this parser will DOM-parse.
+ *
+ * The `class="dataframe"` path is bounded by pandas' own display options (60 rows
+ * x 20 columns in a repr), so it needs none. A Styler's `_repr_html_` is not: it
+ * renders every cell until pandas' `styler.render.max_elements` (262144) trips,
+ * which measured at 21 MB of HTML for a 60000-row frame. Parsing that into a DOM
+ * on the main thread - the thread also carrying the kernel websockets and the SSE
+ * fan-out - to build a payload the grid then paginates is not worth it, so past
+ * this the output keeps the sandboxed iframe it gets today. 2 MiB comfortably
+ * admits any Styler a human is reading (~30k cells).
+ */
+const MAX_STYLER_HTML_CHARS = 2 * 1024 * 1024;
 
 // pandas' truncation marker, as a literal "..." (or a unicode ellipsis).
 function isEllipsis(s: string): boolean {
@@ -198,7 +232,11 @@ export function parseDataFrameHtml(html: string | null | undefined): DataFramePa
 	// Case-insensitively, and with a regex (never `toLowerCase()`, which would copy
 	// that whole bundle) because a fragment parsed without a doctype lands in quirks
 	// mode, where class matching is case-insensitive.
-	if (!/dataframe/i.test(html)) return null;
+	// A Styler carries no `dataframe` class at all, so it is admitted by its own
+	// cheap token - and only under a size ceiling, because unlike a `_repr_html_`
+	// its HTML is not bounded by pandas' display options.
+	const styled = !/dataframe/i.test(html);
+	if (styled && !(/col_heading/.test(html) && html.length <= MAX_STYLER_HTML_CHARS)) return null;
 	let doc: Document;
 	try {
 		doc = new DOMParser().parseFromString(html, 'text/html');
@@ -206,7 +244,13 @@ export function parseDataFrameHtml(html: string | null | undefined): DataFramePa
 		return null;
 	}
 
-	const table = doc.querySelector('table.dataframe');
+	// `table.dataframe` first (pandas/polars), then the Styler shape: the first
+	// table carrying pandas' own semantic header class. Never keyed on the
+	// `id="T_<hex>"`, which is a per-render uuid and settable by the user.
+	const table =
+		doc.querySelector('table.dataframe') ??
+		Array.from(doc.querySelectorAll('table')).find((t) => t.querySelector('th.col_heading')) ??
+		null;
 	if (!table) return null;
 	const thead = table.querySelector('thead');
 	const tbody = table.querySelector('tbody');
@@ -347,6 +391,12 @@ export function parseDataFrameHtml(html: string | null | undefined): DataFramePa
 		totalCols = Math.max(totalCols, shape.cols);
 	}
 
+	// A Styler's `set_caption(...)` is the one piece of its presentation the grid
+	// can carry, so it does. `:scope >` keeps it this table's own caption rather
+	// than a nested one's.
+	const captionEl = table.querySelector(':scope > caption');
+	const caption = captionEl ? cellText(captionEl) : '';
+
 	return {
 		columns,
 		dtypes: dtypes ?? columns.map((_, ci) => inferDtype(data, ci)),
@@ -359,6 +409,7 @@ export function parseDataFrameHtml(html: string | null | undefined): DataFramePa
 		shown_cols: columns.length,
 		truncated_rows: totalRows > data.length,
 		truncated_cols: totalCols > columns.length,
-		has_index: hasIndex
+		has_index: hasIndex,
+		...(caption ? { caption } : {})
 	};
 }
