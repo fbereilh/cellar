@@ -66,4 +66,11 @@ export interface DataFramePayload {
 	total_cols?: unknown;
 	truncated_rows?: unknown;
 	truncated_cols?: unknown;
+	/**
+	 * Whether the frame has a row index at all - ABSENT MEANS TRUE, so the kernel
+	 * formatter's payload (which never sets it) keeps its index column. Only a
+	 * literal `false` (polars, `to_html(index=False)`) drops it. Untyped like the
+	 * rest, so a reader compares against `false` rather than trusting a boolean.
+	 */
+	has_index?: unknown;
 }

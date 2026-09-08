@@ -21,7 +21,7 @@
 	import StaticCode from '$lib/StaticCode.svelte';
 	import type { StaticLang } from '$lib/staticHighlight';
 	import DataFrameGrid from '$lib/DataFrameGrid.svelte';
-	import { parsePandasDataFrameHtml } from '$lib/dataframeHtml';
+	import { parseDataFrameHtml } from '$lib/dataframeHtml';
 	import PlotlyOutput from '$lib/PlotlyOutput.svelte';
 	import HtmlOutput from '$lib/HtmlOutput.svelte';
 	import WidgetOutput from '$lib/WidgetOutput.svelte';
@@ -772,7 +772,7 @@
 				// structured payload was present (checked above); any non-dataframe
 				// HTML parses to null and falls through to the sandboxed iframe.
 				if (d['text/html']) {
-					const parsed = parsePandasDataFrameHtml(asText(d['text/html']));
+					const parsed = parseDataFrameHtml(asText(d['text/html']));
 					if (parsed) {
 						return { tone: 'result', dataframe: parsed, segments: null };
 					}

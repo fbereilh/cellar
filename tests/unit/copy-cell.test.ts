@@ -10,7 +10,7 @@
  * a silent no-op. The suite therefore asserts the SKIPS as hard as the hits.
  *
  * It runs under jsdom rather than the suite's default `node` environment because
- * a SAVED DataFrame is recognized through `parsePandasDataFrameHtml`, which is
+ * a SAVED DataFrame is recognized through `parseDataFrameHtml`, which is
  * browser-only (it uses DOMParser and returns null with no DOM). Under `node`
  * those cases would silently take the text/plain fallback and pass for the wrong
  * reason; the node behavior is pinned separately, in its own block below.
@@ -378,6 +378,37 @@ describe('copyOutputText - a whole cell', () => {
 		expect(copyOutputText(null)).toBe('');
 	});
 });
+
+describe('outputCopyText - a frame with NO index (polars, `to_html(index=False)`)', () => {
+	// polars marks its repr `class="dataframe"` like pandas but has no index column
+	// at all. Copy must not emit a leading empty column for one: pasted into a
+	// spreadsheet that is a real, empty column, and it is the same phantom the grid
+	// stopped drawing. Verbatim polars 1.44 output.
+	const POLARS_HTML =
+		'<div><small>shape: (2, 2)</small><table border="1" class="dataframe"><thead>' +
+		'<tr><th>a</th><th>b</th></tr><tr><td>i64</td><td>str</td></tr></thead><tbody>' +
+		'<tr><td>1</td><td>&quot;x&quot;</td></tr>' +
+		'<tr><td>2</td><td>&quot;y&quot;</td></tr>' +
+		'</tbody></table></div>';
+
+	it('copies exactly the columns the frame has, with no index column and no quotes', () => {
+		const text = copyOutputText([display({ 'text/html': POLARS_HTML })]);
+		expect(text).toBe(['a\tb', '1\tx', '2\ty'].join('\n'));
+	});
+
+	it('a pandas frame still keeps its index column (has_index absent means true)', () => {
+		const text = copyOutputText([display({ 'text/html': PANDAS_HTML_WITH_INDEX })]);
+		expect(text).toBe(['\ta\tb', '0\t1\tx', '1\t2\ty'].join('\n'));
+	});
+});
+
+/** pandas' own repr, shared by the two describes below. */
+const PANDAS_HTML_WITH_INDEX =
+	'<div><table border="1" class="dataframe"><thead>' +
+	'<tr style="text-align: right;"><th></th><th>a</th><th>b</th></tr></thead><tbody>' +
+	'<tr><th>0</th><td>1</td><td>x</td></tr>' +
+	'<tr><th>1</th><td>2</td><td>y</td></tr>' +
+	'</tbody></table></div>';
 
 describe('outputCopyText - a SAVED DataFrame (structured MIME stripped by clean-on-save)', () => {
 	// pandas' own `_repr_html_`, which is all a re-opened notebook carries. It is

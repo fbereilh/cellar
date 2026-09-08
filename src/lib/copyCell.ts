@@ -93,7 +93,7 @@
 
 import type { CellOutput } from '$lib/server/types';
 import { asText, stripAnsi, type DataFramePayload } from '$lib/outputText';
-import { parsePandasDataFrameHtml } from '$lib/dataframeHtml';
+import { parseDataFrameHtml } from '$lib/dataframeHtml';
 
 /**
  * Trailing whitespace goes, EXCEPT a trailing tab: that tab is the separator of a
@@ -180,11 +180,16 @@ function dataframeTable(df: DataFramePayload): string {
 	const cols = Array.isArray(df.columns) ? df.columns.map(cellStr) : [];
 	const index = Array.isArray(df.index) ? df.index : [];
 	const rows = Array.isArray(df.data) ? df.data : [];
+	// A frame with no index (polars, `to_html(index=False)`) contributes no index
+	// COLUMN either, exactly as the grid draws it - a leading empty column would
+	// paste into a spreadsheet as a real, empty one. ABSENT means true, so every
+	// payload predating the field keeps its index column.
+	const hasIndex = df.has_index !== false;
 	const lines: string[] = [];
-	lines.push([cellStr(df.index_name), ...cols].join('\t'));
+	lines.push([...(hasIndex ? [cellStr(df.index_name)] : []), ...cols].join('\t'));
 	for (let i = 0; i < rows.length; i++) {
 		const row = Array.isArray(rows[i]) ? rows[i] : [];
-		lines.push([cellStr(index[i]), ...row.map(cellStr)].join('\t'));
+		lines.push([...(hasIndex ? [cellStr(index[i])] : []), ...row.map(cellStr)].join('\t'));
 	}
 	if (df.truncated_rows || df.truncated_cols) {
 		lines.push(`[${totalOr(df.total_rows, rows.length)} rows x ${totalOr(df.total_cols, cols.length)} columns]`);
@@ -377,7 +382,7 @@ export function outputCopyText(o: CellOutput): string {
 				// A SAVED DataFrame: clean-on-save stripped the structured MIME, so this
 				// pandas repr is what renderOutput itself re-parses back into the grid.
 				// Same parser, same table - never a second one.
-				const parsed = parsePandasDataFrameHtml(html);
+				const parsed = parseDataFrameHtml(html);
 				if (parsed) return dataframeTable(parsed);
 				return htmlToPlainText(html);
 			}

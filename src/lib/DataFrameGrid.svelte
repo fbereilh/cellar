@@ -23,6 +23,14 @@
 		shown_cols: number;
 		truncated_rows: boolean;
 		truncated_cols: boolean;
+		/**
+		 * Whether the frame has a row index at all. ABSENT MEANS TRUE - the kernel
+		 * formatter's pandas payload carries no such field and must keep its index
+		 * column - so only a literal `false` hides it. A frame with no index (polars,
+		 * `to_html(index=False)`) would otherwise get a blank column claiming one
+		 * exists, plus a sort control over nothing.
+		 */
+		has_index?: boolean;
 	}
 
 	let { payload }: { payload: DataFramePayload | null | undefined } = $props();
@@ -30,6 +38,7 @@
 	const columns = $derived(payload?.columns ?? []);
 	const dtypes = $derived(payload?.dtypes ?? []);
 	const indexName = $derived(payload?.index_name ?? '');
+	const hasIndex = $derived(payload?.has_index !== false);
 	const index = $derived(payload?.index ?? []);
 	const rawData = $derived(payload?.data ?? []);
 
@@ -165,8 +174,8 @@
 		<table class="cellar-df-table w-full border-collapse text-xs">
 			<thead class="sticky top-0 z-10">
 				<tr class="bg-base-200 text-base-content">
-					<!-- index column -->
-					<th
+					<!-- index column - omitted entirely for a frame that has none -->
+					{#if hasIndex}<th
 						class="cursor-pointer select-none border-b border-base-300 px-2 py-1 text-left font-semibold whitespace-nowrap hover:bg-base-300/70"
 						onclick={() => toggleSort(-1)}
 						data-testid="df-th-index"
@@ -176,7 +185,7 @@
 							<span class="text-base-content/50">{indexName || ''}</span>
 							{#if sortCol === -1}<span class="text-primary">{sortDir === 'asc' ? '▲' : '▼'}</span>{/if}
 						</span>
-					</th>
+					</th>{/if}
 					{#each columns as col, ci}
 						<th
 							class="cursor-pointer select-none border-b border-l border-base-300 px-2 py-1 text-left align-top whitespace-nowrap hover:bg-base-300/70"
@@ -196,7 +205,7 @@
 			<tbody>
 				{#each pageRows as row (row.key)}
 					<tr class="odd:bg-base-100 even:bg-base-200/40 hover:bg-primary/5">
-						<td class="border-b border-base-300 px-2 py-1 font-mono text-base-content/50 whitespace-nowrap" data-testid="df-index-cell">{fmt(row.idx)}</td>
+						{#if hasIndex}<td class="border-b border-base-300 px-2 py-1 font-mono text-base-content/50 whitespace-nowrap" data-testid="df-index-cell">{fmt(row.idx)}</td>{/if}
 						{#each row.cells as cell, ci}
 							<td
 								class="border-b border-l border-base-300 px-2 py-1 whitespace-nowrap {typeof cell === 'number' ? 'text-right font-mono tabular-nums' : ''} {isNull(cell) ? 'text-base-content/30 italic' : ''}"
@@ -209,7 +218,7 @@
 				{/each}
 				{#if pageRows.length === 0}
 					<tr>
-						<td class="px-3 py-4 text-center text-base-content/50" colspan={columns.length + 1} data-testid="df-empty">
+						<td class="px-3 py-4 text-center text-base-content/50" colspan={columns.length + (hasIndex ? 1 : 0)} data-testid="df-empty">
 							No rows match “{query}”.
 						</td>
 					</tr>
