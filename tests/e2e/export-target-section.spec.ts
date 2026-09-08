@@ -660,20 +660,13 @@ test('a save leaves the module alone; the button exports, and reports a refusal 
 	});
 	expect(target.ok(), await target.text()).toBeTruthy();
 
-	// Marking is explicit, so the module lands now, holding the first source.
-	// SOURCE FIRST, THEN THE MARK - two calls, the shape every shipped caller uses.
-	// The PATCH route deliberately applies `export` ABOVE `source` (see its header:
-	// a refused export must persist none of the fields after it), so ONE call
-	// carrying both regenerates the module from the source the cell had BEFORE this
-	// request - which under explicit-export-only is never corrected, because a save
-	// no longer exports. That combination is documented there as one no shipped
-	// caller sends, and this test is about the module landing on a MARK, not about
-	// field ordering inside a request.
-	const wrote = await request.patch(`${baseURL}/api/cells/${cellId}`, {
-		data: { source: 'def first():\n    return 1', nb }
+	// Marking is explicit, so the module lands now, holding the first source. ONE
+	// PATCH carrying both: the route applies `source` BEFORE `export` precisely so
+	// the mark regenerates the module from the source this request just wrote (see
+	// its header), and this is the shape that witnesses it end to end.
+	const marked = await request.patch(`${baseURL}/api/cells/${cellId}`, {
+		data: { source: 'def first():\n    return 1', export: true, nb }
 	});
-	expect(wrote.ok(), await wrote.text()).toBeTruthy();
-	const marked = await request.patch(`${baseURL}/api/cells/${cellId}`, { data: { export: true, nb } });
 	expect(marked.ok(), await marked.text()).toBeTruthy();
 	await expect.poll(() => existsSync(modulePath)).toBe(true);
 	expect(readFileSync(modulePath, 'utf8')).toContain('def first():');
@@ -970,20 +963,12 @@ test('an unsaved edit refuses the export only when that cell is IN the module', 
 		data: { op: 'set-target', target: 'lib/scope.py', path: nb }
 	});
 	expect(target.ok(), await target.text()).toBeTruthy();
-	// Only the FIRST cell is in the module; the second is an ordinary cell.
-	// SOURCE FIRST, THEN THE MARK - two calls, the shape every shipped caller uses.
-	// The PATCH route deliberately applies `export` ABOVE `source` (see its header:
-	// a refused export must persist none of the fields after it), so ONE call
-	// carrying both regenerates the module from the source the cell had BEFORE this
-	// request - which under explicit-export-only is never corrected, because a save
-	// no longer exports. That combination is documented there as one no shipped
-	// caller sends, and this test is about the module landing on a MARK, not about
-	// field ordering inside a request.
-	const wrote = await request.patch(`${baseURL}/api/cells/${markedId}`, {
-		data: { source: 'def kept():\n    return 1', nb }
+	// Only the FIRST cell is in the module; the second is an ordinary cell. ONE PATCH
+	// carrying both, as above: the route applies `source` BEFORE `export`, so the
+	// mark builds the module from the source this request just wrote.
+	const marked = await request.patch(`${baseURL}/api/cells/${markedId}`, {
+		data: { source: 'def kept():\n    return 1', export: true, nb }
 	});
-	expect(wrote.ok(), await wrote.text()).toBeTruthy();
-	const marked = await request.patch(`${baseURL}/api/cells/${markedId}`, { data: { export: true, nb } });
 	expect(marked.ok(), await marked.text()).toBeTruthy();
 	await expect.poll(() => existsSync(modulePath)).toBe(true);
 	expect(readFileSync(modulePath, 'utf8')).toContain('def kept():');

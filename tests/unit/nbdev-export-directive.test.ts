@@ -208,11 +208,38 @@ describe('a directive-marked cell cannot be unmarked from Cellar', () => {
 			alsoFlagged: false
 		});
 
-		// The scope stays exactly where it was: a missing cell and an ineligible one are
-		// still silent, because widening the sibling setters is a separate change.
+		// The scope is the TWO refusals a client applied an optimistic mark for; a
+		// missing cell is still silent, because widening the sibling setters is a
+		// separate change. An eligible cell is an ordinary success.
 		expect((await patch('no-such-cell', { export: true, nb: NB })).status).toBe(200);
 		expect((await patch('b', { export: true, nb: NB })).status).toBe(200);
 		expect(role.isExportCell(nbmod.listCells(NB)[1])).toBe(true);
+	});
+
+	it('an INELIGIBLE mark is reported too, so the browser can put its toggle back', async () => {
+		// Reachable from the UI once eligibility became a NOTEBOOK-level fact the tab
+		// mirrors over SSE: with a `.mojo` target in flight elsewhere this tab still
+		// renders the toggle for a Python cell, marks it optimistically and sends a
+		// mark the document refuses. Answered `{ok:true}` the phantom flag survived
+		// until the next refetch and the export bar counted it as marked, for a mark
+		// that exists in no file.
+		writeNb(NB, [{ id: 'a', source: 'def m(): pass' }], { export_target: 'lib/k.mojo' });
+		const refused = await patch('a', { export: true, nb: NB });
+		expect(refused.status).toBe(409);
+		expect(await refused.json()).toEqual({ ok: false, reason: 'not-code', alsoFlagged: false });
+		// ...and nothing was written, so the revert the client performs matches the file.
+		expect(nbmod.listCells(NB)[0].metadata?.cellar?.export).toBeUndefined();
+	});
+
+	it('UNMARKING an ineligible cell is never refused, so a stranded mark stays clearable', async () => {
+		// `setCellExport` gates only a MARK on eligibility. The stranded-toggle contract
+		// depends on that: the greyed toggle sends `false`, and a 409 there would leave
+		// the user no way to retire a mark a target change stranded.
+		writeNb(NB, [{ id: 'a', source: 'def m(): pass', cellar: { export: true } }], {
+			export_target: 'lib/k.mojo'
+		});
+		expect((await patch('a', { export: false, nb: NB })).status).toBe(200);
+		expect(nbmod.listCells(NB)[0].metadata?.cellar?.export).toBeUndefined();
 	});
 
 	it('MCP refuses all-or-nothing, naming the handle the agent supplied', () => {

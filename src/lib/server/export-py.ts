@@ -27,7 +27,7 @@ import { resolveInWorkspace, workspaceRoot } from './fstree';
 import { gitRootOf } from './git';
 import { logicalLines, stripComments, splitSimpleStatements } from './imports';
 import { isExportCell, exportTargetLanguage, type ExportLanguage } from '../exportRole';
-import { mojoModuleSources, planMojoMains, stripMojoMagicHeader } from '../mojoExport';
+import { MAIN_KEPT_COMMENT, mojoModuleSources, planMojoMains, stripMojoMagicHeader } from '../mojoExport';
 import { nbdevDirective, nbdevDirectiveOutsideBlock } from '../nbdevDirectives';
 import { nbdevLibPath } from './nbdev';
 import { isExportBase, type ExportBase } from '../exportTarget';
@@ -592,14 +592,23 @@ function spliceLines(src: string, cuts: Array<[number, number]>): string {
  * `$lib/mojoExport` so the notebook's per-cell badge is derived from exactly the
  * rule that writes this file.
  *
+ * ADDED, and ONLY when a `main` really survives: `MAIN_KEPT_COMMENT`, on the
+ * header block. A module that keeps a `main` cannot be imported from Python, and
+ * the file itself is the only place a reader of a shared `.mojo` would ever learn
+ * that; a library module with no `main` IS importable, so the note would be a
+ * false claim there and is not emitted. It rides the header rather than a drop
+ * site because it is a fact about the whole module, and `isGeneratedModule` reads
+ * the FIRST line only, so the clobber guard is untouched.
+ *
  * Leading blank lines are dropped from each block as well as trailing ones -
  * stripping a header or a `main` block can leave one, and the "single blank line
  * between blocks, no incidental whitespace" contract is what makes a re-export
  * byte-identical.
  */
 function generateMojoModule(exportedSources: string[], sourceName: string): string {
-	const { sources } = mojoModuleSources(exportedSources);
-	const blocks: string[] = [`${HEADER}\n# Source notebook: ${sourceName}`];
+	const { sources, keep } = mojoModuleSources(exportedSources);
+	const head = keep === null ? '' : `\n${MAIN_KEPT_COMMENT}`;
+	const blocks: string[] = [`${HEADER}\n# Source notebook: ${sourceName}${head}`];
 	for (const src of sources) {
 		const trimmed = src.replace(/^(?:[ \t]*\n)+/, '').replace(/\s+$/, '');
 		if (trimmed) blocks.push(trimmed);

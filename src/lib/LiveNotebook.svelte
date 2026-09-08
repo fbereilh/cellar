@@ -33,6 +33,7 @@
 	import {
 		exportCellCount,
 		exportDirectiveOwnsCell,
+		exportLanguageOf,
 		exportMarkedTwice,
 		exportStrandedSummary,
 		exportTargetLanguage,
@@ -2577,6 +2578,28 @@
 	}
 
 	/**
+	 * What to say when the server refuses a MARK because the cell is not eligible.
+	 *
+	 * Reachable only through a stale reading: this tab renders the toggle from
+	 * `exportLanguage`, which it mirrors over SSE, so another tab's or an agent's
+	 * target change in flight lets it offer a mark the document then refuses. The
+	 * cell it read is looked up again, so the sentence describes what is on screen
+	 * now rather than what was clicked.
+	 *
+	 * It states only what is OBSERVED about the cell, the split
+	 * `exportStrandedExplanation` already makes for the notebook: a cell that
+	 * contributes no module source in ANY language cannot be marked whatever the
+	 * target is, while a cell WITH a language simply does not match this notebook's
+	 * module. Naming an extension would assert a target this tab may have wrong -
+	 * which is the very staleness that produced the refusal.
+	 */
+	function exportIneligibleNotice(id: string): string {
+		return exportLanguageOf(findCell(id)) === null
+			? 'That cell contributes no module source, so it cannot be marked for export.'
+			: "That cell does not match this notebook's export module, so the mark was not applied.";
+	}
+
+	/**
 	 * Mark (or unmark) a code cell for nbdev-style export to the `.py` module.
 	 * Applied optimistically here (reassign metadata so the badge/menu react) and
 	 * persisted server-side, which ALSO regenerates the module - not because a save
@@ -2645,7 +2668,15 @@
 			.json()
 			.then((b) => (b as { reason?: string; alsoFlagged?: boolean } | null) ?? null)
 			.catch(() => null);
-		if (verdict?.reason !== 'export-directive-owns-cell') return;
+		// TWO refusals revert, and `not-code` is the one this tab could not predict at
+		// all: eligibility is a NOTEBOOK-level fact mirrored over SSE, so a target
+		// change still in flight lets this tab offer a mark the document refuses.
+		// Left as `{ok:true}` the phantom flag survived until the next `load()`, and
+		// the export bar counted it as marked for a mark that exists in no file. The
+		// revert is purely local - the stale language heals on its own when the
+		// `notebook:export-target` event lands - so no cross-tab coordination is
+		// involved.
+		if (verdict?.reason !== 'export-directive-owns-cell' && verdict?.reason !== 'not-code') return;
 		// Looked up AGAIN, because a `load()` refetch replaces `cells` and the object
 		// the click read may no longer be the one on screen.
 		const c = findCell(id);
@@ -2655,7 +2686,11 @@
 			else delete cellar.export;
 			c.metadata = { ...(c.metadata ?? {}), cellar };
 		}
-		onNotice?.(exportDirectiveNotice(verdict.alsoFlagged === true));
+		onNotice?.(
+			verdict.reason === 'not-code'
+				? exportIneligibleNotice(id)
+				: exportDirectiveNotice(verdict.alsoFlagged === true)
+		);
 	}
 
 	/**

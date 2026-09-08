@@ -98,6 +98,28 @@ export const MAIN_DROPPED_COMMENT =
 	"# CELLAR: this cell's `def main()` was NOT exported - a later exported cell\n" +
 	'# defines main, and a Mojo module can hold only one.';
 
+/**
+ * The note the generated module carries when a `def main()` SURVIVES into it.
+ *
+ * Emitted once, in the header, because it is a fact about the whole MODULE rather
+ * than about any one drop site, and the header is where a reader of an unfamiliar
+ * `.mojo` looks first. It is the only place that reader will ever see it: the
+ * matching agent-surface warning reaches an MCP caller, not someone opening the
+ * file.
+ *
+ * MEASURED against Mojo 1.0.0: a Python `import` of a `.mojo` module compiles it
+ * with `mojo build --emit shared-lib`, and that command refuses a module defining
+ * `main` with exactly the quoted sentence. The module is still perfectly good Mojo,
+ * so the note states the consequence and stops rather than reading as a defect.
+ *
+ * A pure function of the cells - no timestamp, no per-run value - so the exporter
+ * stays byte-for-byte idempotent and a re-export is still a zero git diff.
+ */
+export const MAIN_KEPT_COMMENT =
+	'# CELLAR: this module defines main(), so Python cannot import it - a Python import\n' +
+	'# builds it with `mojo build --emit shared-lib`, which refuses a module defining\n' +
+	'# main ("shared library should not contain a \'main\' function").';
+
 /** The visible label of the per-cell badge (kept here so UI and tests share it). */
 export const MAIN_DROPPED_BADGE = 'main not exported';
 
@@ -411,15 +433,19 @@ export function planMojoMains(sources: readonly string[]): { keep: number | null
  * from - the plan is computed on the ALREADY-stripped sources, since a `%%mojo`
  * header does not change whether a cell defines `main` but a future transform
  * might.
+ *
+ * `keep` rides along so the generator can decide the header note (`MAIN_KEPT_COMMENT`)
+ * from the SAME plan that wrote the sources, rather than asking a second time.
  */
 export function mojoModuleSources(exportedSources: readonly string[]): {
 	sources: string[];
 	dropped: number[];
+	keep: number | null;
 } {
 	const stripped = exportedSources.map((s) => stripMojoMagicHeader(s));
-	const { dropped } = planMojoMains(stripped);
+	const { keep, dropped } = planMojoMains(stripped);
 	const drop = new Set(dropped);
-	return { sources: stripped.map((s, i) => (drop.has(i) ? dropMainBlock(s) : s)), dropped };
+	return { sources: stripped.map((s, i) => (drop.has(i) ? dropMainBlock(s) : s)), dropped, keep };
 }
 
 /**
