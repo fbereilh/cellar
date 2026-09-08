@@ -26,7 +26,9 @@ import { describe, it, expect, beforeAll, beforeEach, vi } from 'vitest';
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { readFileSync } from 'node:fs';
 import { pagePayloadOutputs } from '../../src/lib/server/execPayload';
+import { isPageOutput } from '../../src/lib/pageOutput';
 import { DEFAULT_CAPS } from '../../src/lib/server/output-accumulator';
 
 const ESC = String.fromCharCode(27);
@@ -58,7 +60,7 @@ function pageReply(text: string): Record<string, unknown> {
 describe('pagePayloadOutputs: what a page payload becomes', () => {
 	it('turns `len?` into one display_data with the ANSI stripped', () => {
 		expect(pagePayloadOutputs(pageReply(LEN_DOC_RAW))).toEqual([
-			{ output_type: 'display_data', data: { 'text/plain': LEN_DOC_CLEAN }, metadata: {} }
+			{ output_type: 'display_data', data: { 'text/plain': LEN_DOC_CLEAN }, metadata: { cellar: { page: true } } }
 		]);
 	});
 
@@ -314,7 +316,8 @@ describe('the wiring: a page payload reaches the cell', () => {
 
 		expect(res.status).toBe('ok');
 		expect(persisted).toHaveLength(1);
-		expect(persisted[0]).toMatchObject({ output_type: 'display_data', metadata: {} });
+		expect(persisted[0]).toMatchObject({ output_type: 'display_data' });
+		expect(isPageOutput(persisted[0]), 'the tone marker survived the save').toBe(true);
 		expect((persisted[0] as { data: Record<string, unknown> }).data['text/plain']).toBe(LEN_DOC_CLEAN);
 	});
 
@@ -434,5 +437,37 @@ describe('a non-Python cell is untouched BY CONSTRUCTION', () => {
 		expect(sent).toContain('spark.sql');
 		const persisted = nbmod.listCells(NB).find((c) => c.id === cellId)?.outputs ?? [];
 		expect(persisted.some((o) => o.output_type === 'display_data')).toBe(false);
+	});
+});
+
+describe('the tone marker: documentation is INFORMATION, not the cell`s value', () => {
+	it('marks every documentation output, and nothing else', () => {
+		const [doc] = pagePayloadOutputs(pageReply(LEN_DOC_RAW));
+		expect(isPageOutput(doc)).toBe(true);
+		// An ordinary display_data - `display(...)`, a DataFrame repr, an image - is
+		// untouched, so the plain tone can only ever reach a doc output.
+		expect(isPageOutput({ output_type: 'display_data', data: {}, metadata: {} })).toBe(false);
+	});
+
+	it('reads a foreign or malformed metadata shape as NOT a doc', () => {
+		// The marker rides a persisted `.ipynb`, so it arrives from untrusted bytes.
+		// Nothing here may throw, and only the exact shape counts - a forged one can
+		// change a colour and nothing more, which is why that is the whole defence.
+		for (const metadata of [undefined, null, 'cellar', 7, {}, { cellar: null }, { cellar: 'page' }, { cellar: { page: 'true' } }, { cellar: { page: 1 } }]) {
+			expect(isPageOutput({ metadata } as { metadata?: unknown })).toBe(false);
+		}
+		expect(isPageOutput(null)).toBe(false);
+		expect(isPageOutput(undefined)).toBe(false);
+	});
+
+	it('is what `Cell.svelte` picks the tone from', () => {
+		// A SOURCE guard: vitest runs without the SvelteKit plugin so the component
+		// cannot be mounted here, and e2e is absent from CI and the no-mistakes gate -
+		// so without this, the one line that stops a page of docs rendering in the
+		// green `result` tone could be deleted and merge green. The rendered COLOUR
+		// itself is pinned in `tests/e2e/question-mark-docs.spec.ts`.
+		const src = readFileSync(new URL('../../src/lib/Cell.svelte', import.meta.url), 'utf8');
+		expect(src, 'Cell.svelte no longer imports the shared rule').toContain("import { isPageOutput } from '$lib/pageOutput'");
+		expect(src, 'the text/plain tone is no longer decided by isPageOutput').toContain("tone = isPageOutput(o) ? 'stdout' : 'result';");
 	});
 });

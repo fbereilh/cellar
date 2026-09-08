@@ -57,6 +57,7 @@
  */
 
 import { stripAnsi } from '../outputText';
+import { PAGE_OUTPUT_METADATA } from '../pageOutput';
 import type { DisplayDataOutput, MimeBundle } from './types';
 
 /** The one payload source this renders. Everything else is ignored. */
@@ -119,7 +120,10 @@ export function pagePayloadOutputs(content: unknown): DisplayDataOutput[] {
 			data[mime] = cleanMimeValue(mime, value);
 		}
 		if (!hasContent(data)) continue;
-		outputs.push({ output_type: 'display_data', data, metadata: {} });
+		// Marked so `Cell.svelte` renders it as INFORMATION rather than as the cell's
+		// value - see `$lib/pageOutput` for why an untagged display_data would be
+		// green semibold, and why the marker has to persist.
+		outputs.push({ output_type: 'display_data', data, metadata: { ...PAGE_OUTPUT_METADATA } });
 	}
 	return outputs;
 }

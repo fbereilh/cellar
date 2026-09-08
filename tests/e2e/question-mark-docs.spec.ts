@@ -68,6 +68,11 @@ function notebookJson(): string {
 			codeCell('qmark-scratch-4000000', ''),
 			codeCell('qmark-scratch-5000000', ''),
 			codeCell('qmark-scratch-6000000', ''),
+			// The tone trio, kept ADJACENT so one scroll mounts all three and their
+			// colours can be read in a single pass - see that test.
+			codeCell('qmark-tone-docs-00000', ''),
+			codeCell('qmark-tone-value-0000', ''),
+			codeCell('qmark-tone-print-0000', ''),
 			// Non-Python cells for the requirement-5 cases. Appended rather than
 			// converted from a scratch cell, so a failure cannot retarget one.
 			{ cell_type: 'markdown', id: 'qmark-markdown-000000', metadata: {}, source: ['`len?` in prose'] },
@@ -367,4 +372,49 @@ test('the documentation survives a reload, and a restart leaves it alone', async
 
 	await runCellById(page, 'qmark-scratch-6000000', 'dict?');
 	await expect(cell().getByTestId('output')).toContainText('dict', { timeout: 90_000 });
+});
+
+test('documentation reads as INFORMATION, not as the cell`s value', async ({ page }) => {
+	await openNotebook(page);
+	// Three ADJACENT outputs, so the comparison is between real renders of the real
+	// tones rather than against a hardcoded colour: the docs, the green `result`
+	// tone a returned VALUE gets, and the plain tone a `print` gets. Adjacent
+	// because all three must be MOUNTED at once - a computed style read off a cell
+	// windowing has since unmounted comes back empty.
+	await runCellById(page, 'qmark-tone-docs-00000', 'len?');
+	await runCellById(page, 'qmark-tone-value-0000', '41 + 1');
+	await runCellById(page, 'qmark-tone-print-0000', 'print("plain")');
+
+	for (const id of ['qmark-tone-docs-00000', 'qmark-tone-value-0000', 'qmark-tone-print-0000']) {
+		await showCell(page, id);
+		await expect(cellById(page, id).getByTestId('output').locator('pre').first()).toBeVisible({ timeout: 90_000 });
+	}
+
+	const painted = await page.evaluate((ids) => {
+		const read = (id: string) => {
+			const cell = document.querySelector(`[data-cell-id="${CSS.escape(id)}"]`);
+			const pre = cell?.querySelector('[data-testid="output"] pre') as HTMLElement | null;
+			if (!pre) return null;
+			const s = getComputedStyle(pre);
+			return { text: pre.textContent ?? '', color: s.color, weight: s.fontWeight };
+		};
+		return ids.map(read);
+	}, ['qmark-tone-docs-00000', 'qmark-tone-value-0000', 'qmark-tone-print-0000']);
+
+	const [docs, value, print] = painted;
+	expect(docs, 'the docs output was not mounted').not.toBeNull();
+	expect(value).not.toBeNull();
+	expect(print).not.toBeNull();
+	// Guard against reading the wrong three nodes.
+	expect(docs!.text).toContain('Signature:');
+	expect(value!.text).toContain('42');
+	expect(print!.text).toContain('plain');
+
+	// A page of documentation is not the cell's value: it must not wear the tone
+	// that says so, which at `??` length is several KB of bold green source.
+	expect(docs!.color, 'documentation is painted as a result').not.toBe(value!.color);
+	expect(docs!.weight).not.toBe(value!.weight);
+	// It reads exactly like any other informational text the cell printed.
+	expect(docs!.color).toBe(print!.color);
+	expect(docs!.weight).toBe(print!.weight);
 });
