@@ -127,6 +127,30 @@ out["styler_cell_img"] = (
     .format({"spark": lambda v: f'<img src="data:image/gif;base64,R0lGOD{v}" />'})
     ._repr_html_()
 )
+# `set_table_attributes('class="dataframe"')` is a documented Styler idiom, so the
+# SAME markup-bearing Styler can be resolved by the `table.dataframe` lookup rather
+# than by the `col_heading` one. Still a Styler; must still fall back.
+out["styler_dataframe_class_cell_link"] = (
+    _links.style.set_uuid("fx")
+    .set_table_attributes('class="dataframe"')
+    .format({"url": lambda u: f'<a href="{u}">link</a>'})
+    ._repr_html_()
+)
+out["styler_dataframe_class_cell_img"] = (
+    _sparks.style.set_uuid("fx")
+    .set_table_attributes('class="dataframe"')
+    .format({"spark": lambda v: f'<img src="data:image/gif;base64,R0lGOD{v}" />'})
+    ._repr_html_()
+)
+# The same idiom with TEXT cells, which must still reach the grid - so the refusal
+# above is attributable to the markup rather than to the class.
+out["styler_dataframe_class_plain"] = (
+    t.style.set_uuid("fx")
+    .set_table_attributes('class="dataframe"')
+    .set_caption("Revenue by arm")
+    .format(fmt)
+    ._repr_html_()
+)
 
 out["_versions"] = {"pandas": pd.__version__, "polars": pl.__version__}
 with open(sys.argv[1], "w") as fh:

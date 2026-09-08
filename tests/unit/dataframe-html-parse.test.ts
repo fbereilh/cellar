@@ -172,6 +172,23 @@ describe('the refusal: a parsed shape that disagrees with the declared one', () 
 		expect(parseDataFrameHtml(F.pandas_plain.replace('<th>a</th>', spanned))).toBeNull();
 	});
 
+	it('refuses a `<thead>` past the header-ROW ceiling, the other allocation axis', () => {
+		// The label loop reads every level at every column position, so it is
+		// O(width x rows) and the width ceiling alone leaves the row axis open;
+		// unbounded, ~130k empty `<tr>` is about 1.2 MB of arbitrary output html
+		// inside the deliberately uncapped `class="dataframe"` admission.
+		const padded = F.pandas_plain.replace('<thead>', '<thead>' + '<tr></tr>'.repeat(300));
+		expect(parseDataFrameHtml(padded)).toBeNull();
+		// A MultiIndex's levels are the only thing that adds header rows, and a real
+		// frame's handful is nowhere near the ceiling.
+		expect(parseDataFrameHtml(F.pandas_multiindex_cols)!.columns).toEqual([
+			'A / x',
+			'A / y',
+			'B / x',
+			'B / y'
+		]);
+	});
+
 	it('refuses a body row whose cell count disagrees with the header', () => {
 		const short = F.pandas_plain.replace('<td>x</td>', '');
 		expect(parseDataFrameHtml(short)).toBeNull();
@@ -398,6 +415,21 @@ describe('pandas Styler: the FORMATTED values, the caption, and the layout it de
 		// A plain formatted Styler - text cells - still reaches the grid, so the
 		// refusal is scoped to markup rather than to Stylers.
 		expect(parseDataFrameHtml(F.styler_plain)!.data[0]).toEqual(['1,234.50', '12.3%']);
+	});
+
+	it('still refuses one carrying `class="dataframe"` - the idiom that routed around it', () => {
+		// `set_table_attributes('class="dataframe"')` is documented, so the very same
+		// Styler is resolved by the `table.dataframe` lookup instead of the
+		// `col_heading` one. Deciding the dialect from WHICH selector answered skipped
+		// the refusal here, so the link flattened to unlinked text and the image cell
+		// rendered EMPTY - the accepted refusal reached around by another route.
+		expect(parseDataFrameHtml(F.styler_dataframe_class_cell_link)).toBeNull();
+		expect(parseDataFrameHtml(F.styler_dataframe_class_cell_img)).toBeNull();
+		// The same idiom with TEXT cells still reaches the grid, so the refusal is
+		// attributable to the markup and not to the class.
+		const p = parseDataFrameHtml(F.styler_dataframe_class_plain)!;
+		expect(p.data[0]).toEqual(['1,234.50', '12.3%']);
+		expect(p.caption).toBe('Revenue by arm');
 	});
 
 	it('flattens a MultiIndex-column Styler like any other', () => {

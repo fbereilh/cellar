@@ -38,9 +38,12 @@
 // `td.textContent` - which flattens the link to bare text and renders the image
 // cell as the EMPTY STRING. That is content loss rather than a lost decoration, so
 // such a Styler REFUSES and keeps the sandboxed iframe with its markup intact. The
-// test is the cell's own CONTENT, never a guess about intent, and it is scoped to
-// the Styler branch: `to_html(escape=False)` on the `class="dataframe"` path has
-// always flattened the same way, and changing that is not this module's business.
+// test is the cell's own CONTENT, never a guess about intent, and it is scoped by
+// what the table IS - `th.col_heading`, which a Styler always emits - never by
+// which selector resolved it: `set_table_attributes('class="dataframe"')` is a
+// documented Styler idiom, so a Styler can be found by the `table.dataframe` lookup
+// too. A plain `to_html(escape=False)` frame emits no `col_heading`, so the
+// `class="dataframe"` path has always flattened the same way and is left alone.
 //
 // THE LAYOUT IS READ, NEVER ASSUMED, and that is this module's central rule.
 // It used to hardcode pandas' leading index cell (`firstThs.slice(1)`), so every
@@ -157,6 +160,20 @@ const MAX_STYLER_HTML_CHARS = 2 * 1024 * 1024;
 
 /** The HTML spec's own ceiling on `colspan`. */
 const MAX_COLSPAN = 1000;
+
+/**
+ * Ceiling on how many `<tr>` a `<thead>` may hold.
+ *
+ * The sibling of `MAX_HEADER_COLUMNS` on the OTHER axis, and an allocation bound
+ * over arbitrary output html rather than a claim about real frames: a MultiIndex's
+ * levels are the only thing that adds header rows and a real one has a handful, so
+ * this is orders of magnitude beyond anything a human reads. Unbounded, the
+ * per-position `levels.map(...)` in the label loop is O(width x rows), so a
+ * `<thead>` of ~130k empty `<tr>` (about 1.2 MB of html, well inside the
+ * deliberately uncapped `class="dataframe"` admission) walked millions of positions
+ * on the render path.
+ */
+const MAX_HEADER_ROWS = 256;
 
 /**
  * Ceiling on how many column positions a header may expand to.
@@ -384,20 +401,24 @@ export function parseDataFrameHtml(html: string | null | undefined): DataFramePa
 	// `table.dataframe` first (pandas/polars), then the Styler shape: the first
 	// table carrying pandas' own semantic header class. Never keyed on the
 	// `id="T_<hex>"`, which is a per-render uuid and settable by the user.
-	const dataframeTable = doc.querySelector('table.dataframe');
 	const table =
-		dataframeTable ??
+		doc.querySelector('table.dataframe') ??
 		Array.from(doc.querySelectorAll('table')).find((t) => t.querySelector('th.col_heading')) ??
 		null;
 	if (!table) return null;
-	// Which branch answered, so the markup refusal below stays scoped to the Styler.
-	const isStyler = table !== dataframeTable;
+	// What the table IS, never which selector answered: `set_table_attributes('class="dataframe"')`
+	// is a documented Styler idiom, so a Styler can be resolved by the FIRST selector
+	// and would then have skipped the markup refusal below. `col_heading` is pandas'
+	// own semantic header class, which a Styler always emits and a plain
+	// `to_html(escape=False)` frame never does - so the scoping the refusal needs is
+	// a property of the markup rather than of the lookup order.
+	const isStyler = table.querySelector('th.col_heading') !== null;
 	const thead = table.querySelector('thead');
 	const tbody = table.querySelector('tbody');
 	if (!thead || !tbody) return null;
 
 	const headerRows = Array.from(thead.querySelectorAll(':scope > tr'));
-	if (headerRows.length === 0) return null;
+	if (headerRows.length === 0 || headerRows.length > MAX_HEADER_ROWS) return null;
 
 	const shape = declaredShape(doc);
 
@@ -437,7 +458,7 @@ export function parseDataFrameHtml(html: string | null | undefined): DataFramePa
 		(tr) => tr.querySelectorAll('td').length > 0
 	);
 
-	// Scoped to the Styler branch deliberately: `to_html(escape=False)` on the
+	// Scoped by `isStyler` deliberately: `to_html(escape=False)` on the
 	// `class="dataframe"` path has flattened markup this way since long before this
 	// parser, and changing that is a separate decision nobody asked for.
 	if (isStyler && holdsCellMarkup(bodyRows)) return null;
@@ -452,7 +473,10 @@ export function parseDataFrameHtml(html: string | null | undefined): DataFramePa
 	// `rowspan` above it. With no body to read at all, `emptyBodyIndexCols` decides -
 	// and REFUSES rather than guessing.
 	const levels = levelRows.map(expandRow);
-	const width = Math.max(...levels.map((l) => l.length));
+	// Reduced rather than spread: one argument per header row would throw a
+	// `RangeError` past the engine's call-argument limit, out of a module whose
+	// contract is that it never throws.
+	const width = levels.reduce((m, l) => (l.length > m ? l.length : m), 0);
 	// Past the allocation bound nothing below may run: `rawColumns`, `keepCol` and
 	// `columns` are each O(width) and the only refusal that would otherwise stop
 	// them - the per-row width check - comes after all three.
