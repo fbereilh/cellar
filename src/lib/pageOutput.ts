@@ -1,10 +1,13 @@
 /**
  * Cellar - the marker on a `func?` / `func??` documentation output.
  *
- * ONE rule, read by the two halves that would otherwise drift: `execPayload.ts`
- * WRITES it when it turns IPython's `page` payload into an nbformat output, and
- * `Cell.svelte` READS it to pick that output's tone. Browser-safe and pure so both
- * can import it (the `$lib/hideInput` / `$lib/agentVisibility` precedent).
+ * ONE rule, read by every half that would otherwise drift: `execPayload.ts` WRITES
+ * it when it turns IPython's `page` payload into an nbformat output, and BOTH
+ * render surfaces READ it to pick that output's tone - `Cell.svelte` in the app
+ * and `server/export-html.ts` in the exported report. Browser-safe and pure so all
+ * three can import it (the `$lib/hideInput` / `$lib/agentVisibility` precedent).
+ * A second copy of the predicate at either surface is how a report comes to
+ * contradict the notebook it was rendered from; there is exactly one.
  *
  * WHY A MARKER AT ALL. `Cell.svelte` picks an output's tone from its nbformat
  * TYPE, and `display_data` means `result` - green, semibold, with a green rail -
@@ -14,7 +17,8 @@
  * both a miscue and hard to read. So a doc output takes the PLAIN tone instead:
  * body text, no rail, the same treatment a `print` gets - which is also what
  * classic Jupyter's pager looks like, and what the kernel's own "Object `x` not
- * found." answer already renders as, so the found and not-found cases match.
+ * found." answer already renders as, so the found and not-found cases match - in
+ * the exported HTML report as much as in the app, since both read this rule.
  *
  * That is deliberately NOT a fifth tone invented for this feature: nothing is
  * added to the palette, an existing one is chosen.

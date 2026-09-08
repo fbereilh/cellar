@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { renderNotebookHtml, exportFilename } from '../../src/lib/server/export-html';
+import { pagePayloadOutputs } from '../../src/lib/server/execPayload';
 import type { CellView, CellOutput } from '../../src/lib/server/types';
 
 // Minimal CellView builders for the render tests.
@@ -128,6 +129,79 @@ describe('renderNotebookHtml - raw cells', () => {
 			'<section class="cell raw-cell">'
 		);
 		expect(renderNotebookHtml({ cells: [raw('   \n')] })).not.toContain('<section class="cell raw-cell">');
+	});
+});
+
+// --- `func?` / `func??` documentation tone ----------------------------------
+
+const ESC = String.fromCharCode(27);
+
+/**
+ * VERBATIM from a live ipykernel (`len?`) - the SGR-coloured pager text IPython
+ * really returns on `execute_reply`'s `content.payload`.
+ */
+const LEN_PAGE_REPLY = {
+	status: 'ok',
+	execution_count: 1,
+	payload: [
+		{
+			source: 'page',
+			data: {
+				'text/plain':
+					`${ESC}[31mSignature:${ESC}[39m len(obj, /)\n` +
+					`${ESC}[31mDocstring:${ESC}[39m Return the number of items in a container.`
+			},
+			start: 0
+		}
+	]
+};
+
+/**
+ * The tone class the export gave the `<pre>` whose text contains `needle`, read
+ * back out of the emitted HTML. Returns the tone alone, so a test can compare two
+ * outputs' tones without naming either.
+ */
+function toneOf(html: string, needle: string): string {
+	const matches = [...html.matchAll(/<pre class="output-text tone-([a-z]+)">([\s\S]*?)<\/pre>/g)];
+	const hit = matches.filter((m) => m[2].includes(needle));
+	expect(hit, `no single output-text block contains ${JSON.stringify(needle)}`).toHaveLength(1);
+	return hit[0][1];
+}
+
+describe('renderNotebookHtml - documentation tone', () => {
+	// The export is a second render surface for the SAME outputs, so it has to pick
+	// tones by the same rule `Cell.svelte` does: documentation reads as INFORMATION
+	// (the plain treatment a `print` gets), never as the green semibold value tone.
+	// Asserted as a RELATIONSHIP between three outputs rendered in one document, so
+	// it states "the report agrees with the app" and cannot drift back by renaming
+	// a class.
+	it('gives a `func?` doc output the stream tone, not the value tone', () => {
+		const [doc] = pagePayloadOutputs(LEN_PAGE_REPLY);
+		const html = renderNotebookHtml({
+			cells: [
+				code('len?', { outputs: [doc] }),
+				code('print("hello")', { outputs: [streamOut('hello\n')] }),
+				code('42', {
+					outputs: [{ output_type: 'display_data', data: { 'text/plain': 'the value 42' }, metadata: {} }]
+				})
+			]
+		});
+
+		const docTone = toneOf(html, 'Return the number of items');
+		const streamTone = toneOf(html, 'hello');
+		const valueTone = toneOf(html, 'the value 42');
+
+		expect(docTone).toBe(streamTone);
+		expect(docTone).not.toBe(valueTone);
+	});
+
+	// The ANSI strip is the server's, so the report carries the clean text a
+	// terminal-less reader can actually read - never raw escapes.
+	it('exports the documentation text with its terminal escapes already gone', () => {
+		const [doc] = pagePayloadOutputs(LEN_PAGE_REPLY);
+		const html = renderNotebookHtml({ cells: [code('len?', { outputs: [doc] })] });
+		expect(html).toContain('Signature: len(obj, /)');
+		expect(html).not.toContain(ESC);
 	});
 });
 

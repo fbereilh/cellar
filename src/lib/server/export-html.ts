@@ -40,6 +40,7 @@ import MarkdownIt from 'markdown-it';
 import type { CellView, CellOutput } from './types';
 import { listCells, getHideAllCode, resolveNotebookPath } from './notebook';
 import { isCodeHidden } from '$lib/hideInput';
+import { isPageOutput } from '$lib/pageOutput';
 import { noFetchImages } from '$lib/markdownNoFetch';
 
 /** The minimal markdown-it surface this module uses. */
@@ -329,7 +330,13 @@ function renderOutput(o: CellOutput): string {
 			if (d['text/markdown']) {
 				return `<div class="output-markdown cellar-md">${mdOutput.render(asText(d['text/markdown']))}</div>`;
 			}
-			if (d['text/plain']) return renderOutputText('result', asText(d['text/plain']));
+			// A `func?` / `func??` documentation output is INFORMATION, not the cell's
+			// value, so it takes the plain tone a stdout stream gets rather than the green
+			// semibold `result` one - the SAME rule `Cell.svelte` reads, through the SAME
+			// shared predicate, so a report cannot disagree with the app about it. See
+			// `$lib/pageOutput`. Every other mime's priority here is unchanged.
+			if (d['text/plain'])
+				return renderOutputText(isPageOutput(o) ? 'stdout' : 'result', asText(d['text/plain']));
 			return `<pre class="output-text tone-result">[rich output]</pre>`;
 		}
 		case 'error':
