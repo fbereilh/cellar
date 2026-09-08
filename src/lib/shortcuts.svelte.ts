@@ -383,6 +383,41 @@ export const DEFAULT_SHORTCUTS: Shortcut[] = [
 		category: 'Editing',
 		description: 'Split the cell at the cursor'
 	},
+
+	// ---- Kernel introspection ----------------------------------------------
+	// Both are EDIT-mode by construction - they act on the caret in a cell's
+	// editor - and both are declared here rather than as a CodeMirror keymap
+	// because that is this repo's one rule for notebook keys (see the header, and
+	// the "no keymap here on purpose" note in `Cell.svelte`'s `buildEditor`).
+	//
+	// Neither shadows a typable character (`typesACharacter` is false for a key
+	// name longer than one character), so Settings raises no hazard for them.
+	{
+		// Jupyter's completion key. Cellar bound nothing to Tab before, so the
+		// keystroke fell through to the browser and moved focus out of the editor -
+		// and it STILL does wherever completion does not apply, because the action
+		// returns NOT HANDLED there rather than swallowing the key. It declines on
+		// BOTH counts: a cell with no live-kernel completion (anything but a plain
+		// Python code cell - markdown, raw, chat, SQL and mojo offer no Python names
+		// to complete), and a caret with nothing before it on its line. That is what
+		// keeps a keyboard user's way out of the editor intact, and it is the only
+		// reason this can be bound at all without also adding an indent binding.
+		id: 'kernel-complete',
+		keys: ['Tab'],
+		mode: 'edit',
+		category: 'Kernel',
+		description: 'Complete at the cursor (accepts the open suggestion)'
+	},
+	{
+		// Jupyter's docs key: signature + docstring, then the full documentation on a
+		// second press. Escape dismisses it, handled by the editor itself exactly as
+		// it dismisses the completion popup.
+		id: 'kernel-docs',
+		keys: ['Shift-Tab'],
+		mode: 'edit',
+		category: 'Kernel',
+		description: 'Show documentation for the object at the cursor'
+	},
 	{
 		// TWO entries, one action, deliberately - a binding carries a single `mode`
 		// and these differ, so this cannot be one entry with two chords.
@@ -429,7 +464,35 @@ export const DEFAULT_SHORTCUTS: Shortcut[] = [
 	)
 ];
 
-export const CATEGORIES = ['Application', 'Modes', 'Running', 'Navigation', 'Structure', 'Editing', 'Headings'];
+/**
+ * The DISPLAY ORDER Settings groups the shortcut list by.
+ *
+ * It is a hand-written order rather than a derived one because the order is a
+ * judgement (Application first, Headings last), not a fact about the data - but it
+ * must never be the thing that decides WHETHER a shortcut is listed. Read directly,
+ * a category absent from here was silently dropped from Settings, which is how a
+ * whole group of shortcuts became unlistable AND unrebindable while the keys
+ * themselves worked. `shortcutCategories()` is what every reader must use.
+ */
+export const CATEGORY_ORDER = ['Application', 'Modes', 'Running', 'Kernel', 'Navigation', 'Structure', 'Editing', 'Headings'];
+
+/**
+ * Every category present in `shortcuts`, in `CATEGORY_ORDER` where that names one
+ * and appended in first-seen order where it does not.
+ *
+ * Fail-safe by construction: adding a shortcut in a NEW category lists it (at the
+ * end) instead of hiding it, so forgetting to touch the order above costs
+ * placement rather than the whole group. The invariant is pinned by test, which is
+ * what keeps "at the end" from quietly becoming the permanent home of a group that
+ * deserves a place in the order.
+ */
+export function shortcutCategories(list: readonly Shortcut[]): string[] {
+	const present = new Set(list.map((s) => s.category));
+	const ordered = CATEGORY_ORDER.filter((c) => present.has(c));
+	const rest = [...present].filter((c) => !CATEGORY_ORDER.includes(c));
+	return [...ordered, ...rest];
+}
+
 
 export const MODE_LABEL: Record<ShortcutMode, string> = {
 	command: 'Command mode',

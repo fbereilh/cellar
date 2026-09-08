@@ -2,7 +2,7 @@
 	// Settings panel (modal): theme toggle, the windowed-rendering opt-out, the
 	// project-venv (Python kernel) control, and the keyboard-shortcut registry
 	// (view + rebind).
-	import { shortcuts, chordFromEvent, chordTokens, formatChord, typesACharacter, typingHazards, CATEGORIES, MODE_LABEL } from '$lib/shortcuts.svelte';
+	import { shortcuts, chordFromEvent, chordTokens, formatChord, typesACharacter, typingHazards, shortcutCategories, MODE_LABEL } from '$lib/shortcuts.svelte';
 	import type { VenvInfo } from '$lib/server/venv-bind';
 	import { getUserSettingFlag, getUserSettingText, setUserSetting, setUserSettingNow } from '$lib/userSettings';
 	import { CHAT_LEARNING_MODE_KEY, CHAT_MODEL_KEY, CHAT_MODELS, CHAT_OTHER_NOTEBOOKS_KEY, CHAT_WEB_SEARCH_KEY, CHAT_WORKSPACE_READS_KEY, normalizeChatModel } from '$lib/chatCell';
@@ -385,7 +385,14 @@
 	// ---- Keyboard shortcuts --------------------------------------------------
 	// Rendered straight from the registry, so this list can never drift from what
 	// the notebook actually listens for.
-	const grouped = $derived(CATEGORIES.map((c) => ({ category: c, items: shortcuts.list.filter((s) => s.category === c) })).filter((g) => g.items.length));
+	// Grouped from the LIVE list rather than from a fixed category array: a shortcut
+	// whose category is not in the display order is appended rather than dropped, so
+	// a new group can never be silently unlistable (and therefore unrebindable).
+	const grouped = $derived(
+		shortcutCategories(shortcuts.list)
+			.map((c) => ({ category: c, items: shortcuts.list.filter((s) => s.category === c) }))
+			.filter((g) => g.items.length)
+	);
 	const conflicts = $derived(shortcuts.conflicts);
 	const customized = $derived(shortcuts.list.some((s) => s.customized));
 

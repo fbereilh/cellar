@@ -116,7 +116,31 @@ const cellarEditorTheme = EditorView.theme({
 		color: c('autocomplete-selected-fg')
 	},
 	'.cm-tooltip-autocomplete-disabled > ul > li[aria-selected]': { backgroundColor: c('autocomplete-disabled-bg') },
-	'.cm-snippetField': { backgroundColor: c('snippet-field') }
+	'.cm-snippetField': { backgroundColor: c('snippet-field') },
+
+	// The Shift+Tab kernel-documentation tooltip (`$lib/kernelDocTooltip`). It sits
+	// inside `.cm-tooltip`, so it inherits that rule's background, ink and border and
+	// declares only what is its own: a bound on how much of a long docstring it may
+	// take over the editor, and a scroll box for the rest. `pre-wrap` rather than a
+	// horizontal scroll - a wrapped signature still reads, a clipped one does not.
+	'.cm-cellar-doc': { maxWidth: '46em', maxHeight: '22em', overflow: 'auto', padding: '6px 9px' },
+	'.cm-cellar-doc-body': {
+		margin: '0',
+		whiteSpace: 'pre-wrap',
+		fontFamily: 'ui-monospace, "SF Mono", Menlo, monospace',
+		fontSize: '12px',
+		lineHeight: '1.45'
+	},
+	// The "press again" hint is secondary to the docs above it, so it takes the
+	// gutter's muted ink rather than the tooltip's own - the one place in this
+	// tooltip where a second colour is warranted.
+	'.cm-cellar-doc-more': {
+		marginTop: '5px',
+		paddingTop: '4px',
+		borderTop: `1px solid ${c('tooltip-border')}`,
+		color: c('gutter-fg'),
+		fontSize: '11px'
+	}
 });
 
 // One highlight style for both schemes. Where the two palettes group tags

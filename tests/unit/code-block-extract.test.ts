@@ -16,7 +16,7 @@
 // markers, the second only if nothing re-renders the extracted text.
 
 import { describe, it, expect, beforeEach } from 'vitest';
-import { DEFAULT_SHORTCUTS, CATEGORIES, bindingsCollide, modesOverlap, shortcuts, typingHazards } from '$lib/shortcuts.svelte';
+import { DEFAULT_SHORTCUTS, CATEGORY_ORDER, bindingsCollide, modesOverlap, shortcuts, typingHazards } from '$lib/shortcuts.svelte';
 import { renderChatReply, renderMarkdown, renderOutputMarkdown } from '$lib/markdown';
 import {
 	CODE_BLOCK_ATTR,
@@ -416,9 +416,10 @@ describe('BOTH keyboard routes are first-class registry entries', () => {
 
 	it('gives each a listable category and its own description', () => {
 		for (const e of both()) {
-			// Settings renders only the categories in CATEGORIES, so one outside that
-			// list would silently not appear at all.
-			expect(CATEGORIES).toContain(e.category);
+			// A category outside `CATEGORY_ORDER` is still LISTED (Settings appends it),
+			// but nobody has decided where it belongs - see the registry-wide invariant
+			// in shortcuts-registry.test.ts.
+			expect(CATEGORY_ORDER).toContain(e.category);
 			expect(e.description.length).toBeGreaterThan(0);
 		}
 		// Distinguishable rows: two identically-worded ones would read as a duplicate.
