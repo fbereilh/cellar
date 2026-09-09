@@ -12,9 +12,15 @@ import { defineConfig, devices } from '@playwright/test';
  * This E2E requires the full runtime (uv + python3 + the cached host-venv), so it
  * is a LOCAL, best-effort check — the vitest unit suite is the must-pass CI gate.
  * When the runtime is absent the spec skips itself gracefully.
+ *
+ * `globalSetup` is what makes the missing `webServer` safe: with no server for
+ * Playwright to own, nothing else would verify the build every spec is about to
+ * boot, and a bare `npx playwright test <spec>` would silently run against a
+ * stale, absent or incomplete one. See tests/e2e/global-setup.ts.
  */
 export default defineConfig({
 	testDir: './tests/e2e',
+	globalSetup: './tests/e2e/global-setup.ts',
 	// Kernel boot + cell execution is inherently slower than a pure-web test.
 	timeout: 120_000,
 	expect: { timeout: 30_000 },

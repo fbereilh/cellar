@@ -74,9 +74,13 @@ npx playwright install chromium   # once
 npm run test:e2e
 ```
 
-`npm run test:e2e` **builds first** (the `pretest:e2e` hook, `scripts/ensure-build.js`)
-and rebuilds only when `build/` is older than `src/`, so a re-run against an
-already-fresh build pays nothing. This matters: the specs boot the real launcher
+**Never run a bare `npx playwright test`** - use `npm run test:e2e`. Both build
+first in practice, because the guard lives in Playwright's own `globalSetup`
+(`tests/e2e/global-setup.ts` -> `scripts/ensure-build.js`) rather than in an npm
+hook, so it covers a single-spec `npx playwright test <spec>` too; `npm run
+test:e2e` is still the command to type, since it is the one that stays correct if
+that wiring ever moves. It rebuilds only when `build/` is older than `src/` (or
+incomplete), so a re-run against an already-fresh build pays nothing. This matters: the specs boot the real launcher
 *without* `--dev`, so they run the production build - and a stale one used to be
 served silently, testing code that was never compiled. That produced 11 false
 failures burning ~18 minutes of expect-timeouts on results that were meaningless

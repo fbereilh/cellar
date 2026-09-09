@@ -11,8 +11,9 @@
  *
  * So this is the single staleness rule, shared by the two callers that must agree:
  *   - `bin/cellar.js` — refuses to serve a stale build (with a clear rebuild hint);
- *   - `scripts/ensure-build.js` — the `pretest:e2e` hook, which rebuilds when stale
- *     and is a no-op when fresh (so a fresh e2e run pays nothing).
+ *   - `scripts/ensure-build.js` — the e2e build guard (Playwright's `globalSetup`,
+ *     and `make run`), which rebuilds when stale and is a no-op when fresh (so a
+ *     fresh e2e run pays nothing).
  *
  * mtime-based, deliberately: it needs no build system, no hashing pass, and no
  * state file, and every way the sources legitimately change (an edit, a
@@ -32,6 +33,21 @@ const CONFIG_FILES = ['package.json', 'vite.config.js', 'svelte.config.js', 'tsc
 
 /** Never walked: not inputs, and huge. */
 const SKIP_DIRS = new Set(['node_modules', '.git', '.svelte-kit', 'build']);
+
+/**
+ * What `vite build` must have produced for `build/index.js` to be SERVABLE.
+ *
+ * `index.js` alone is not enough: adapter-node serves the client bundle out of
+ * `build/client`, so a build interrupted part-way (or one whose `client/` was
+ * removed by hand) leaves an entry point that starts, answers, and renders a
+ * broken page. That case is worse than a stale build, because it passes the mtime
+ * comparison: every e2e spec then boots happily and fails on its assertions
+ * instead — MEASURED at ~35s of timeouts per test (a 3-test spec: 104s all-fail,
+ * versus 8.8s all-pass against a complete build), with nothing in the failure
+ * naming the build. So an incomplete build classifies as `missing`, i.e. "rebuild
+ * this", which is exactly what it needs.
+ */
+const REQUIRED_BUILD_ARTIFACTS = ['index.js', 'client'];
 
 /** Escape hatch for anyone who knowingly wants the stale build served anyway. */
 export const SKIP_ENV = 'CELLAR_SKIP_BUILD_CHECK';
@@ -116,7 +132,10 @@ function isSourceCheckout(repo) {
  *
  * @param {string} repo absolute path to the cellar checkout / install root
  * @returns {{ state: 'missing'|'stale'|'fresh'|'unknown', buildEntry: string,
- *             newest?: string, buildMs?: number, newestMs?: number }}
+ *             missing?: string, newest?: string, buildMs?: number, newestMs?: number }}
+ *
+ * `missing` covers an ABSENT build and an INCOMPLETE one alike (see
+ * REQUIRED_BUILD_ARTIFACTS); `missing` names the first artifact that is absent.
  *
  * `unknown` means there is nothing meaningful to compare against — a packaged
  * install (npm/brew/Docker), where "stale" is not answerable and must never block
@@ -124,7 +143,12 @@ function isSourceCheckout(repo) {
  */
 export function buildFreshness(repo) {
 	const buildEntry = join(repo, 'build', 'index.js');
-	if (!existsSync(buildEntry)) return { state: 'missing', buildEntry };
+	for (const artifact of REQUIRED_BUILD_ARTIFACTS) {
+		const full = join(repo, 'build', artifact);
+		if (!existsSync(full)) {
+			return { state: 'missing', buildEntry, missing: full };
+		}
+	}
 
 	let buildMs;
 	try {
@@ -159,6 +183,14 @@ export function buildFreshness(repo) {
 		return { state: 'fresh', buildEntry, newest: newest.path, buildMs, newestMs: newest.mtimeMs };
 	}
 	return { state: 'stale', buildEntry, newest: newest.path, buildMs, newestMs: newest.mtimeMs };
+}
+
+/** Human-readable "what is absent", with the repo-relative missing artifact. */
+export function missingReason(repo, result) {
+	const rel = result.missing ? relative(repo, result.missing) || result.missing : 'build/index.js';
+	return rel === 'build/index.js'
+		? 'no production build found (build/index.js is absent)'
+		: `the production build is incomplete — ${rel} is absent`;
 }
 
 /** Human-readable "why is this stale", with the repo-relative offending file. */

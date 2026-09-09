@@ -3,6 +3,7 @@ import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
 import { mkdirSync, writeFileSync, existsSync, chmodSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { buildFreshness, missingReason, stalenessReason } from '../../src/lib/server/build-freshness.js';
 
 /**
  * Shared launcher harness for cellar's Playwright E2E specs. Each spec boots the
@@ -22,6 +23,41 @@ export function runtimeAvailable(): boolean {
 	const has = (cmd: string) => spawnSync(cmd, ['--version'], { stdio: 'ignore' }).status === 0;
 	const hostVenv = join(process.env.HOME || '', '.cellar', 'host-venv', 'bin', 'python');
 	return has('uv') && has('python3') && existsSync(hostVenv);
+}
+
+/**
+ * How long a launcher gets to print its URL before the boot is called dead.
+ *
+ * 60s, down from 90s. A warm boot here is ~5s (uv resolves the throwaway
+ * workspace's venv from cache), so this is over 10x the measured cost and still
+ * bounds a wedged launcher at a minute per spec rather than a minute and a half -
+ * which matters at `workers: 2` across ~50 spec files, where a systemic boot
+ * failure is paid once per file. `CELLAR_E2E_BOOT_TIMEOUT_MS` raises it for a
+ * genuinely cold uv cache, which is a one-time per-machine cost.
+ */
+const BOOT_TIMEOUT_MS = Number(process.env.CELLAR_E2E_BOOT_TIMEOUT_MS) || 60_000;
+
+/**
+ * Say WHY a boot failed, at the assertion, not only in interleaved stdout.
+ *
+ * `launcher exited early (1)` on its own sends you reading the launcher's source;
+ * the launcher had already printed the real reason, but Playwright reports the
+ * rejection and nothing else. So the failure carries the build verdict (the
+ * commonest cause by far - see tests/e2e/global-setup.ts) plus the tail of what
+ * the launcher actually said.
+ */
+function bootDiagnostic(output: string): string {
+	const parts: string[] = [];
+	const freshness = buildFreshness(REPO);
+	if (freshness.state === 'missing') parts.push(missingReason(REPO, freshness));
+	else if (freshness.state === 'stale')
+		parts.push(`the production build is STALE (${stalenessReason(REPO, freshness)})`);
+	if (parts.length) parts.push('run `npm run build`');
+	const tail = output.trim().split('\n').slice(-8).join('\n');
+	return (
+		(parts.length ? `\n  build: ${parts.join('; ')}.` : '') +
+		(tail ? `\n  last launcher output:\n${tail.replace(/^/gm, '    ')}` : '')
+	);
 }
 
 /**
@@ -79,8 +115,19 @@ export function bootCellar(
 	);
 
 	return new Promise((resolvePromise, reject) => {
-		const timer = setTimeout(() => reject(new Error('launcher did not become ready in time')), 90_000);
 		let buf = '';
+		const fail = (what: string) => {
+			clearTimeout(timer);
+			reject(new Error(`${what}${bootDiagnostic(buf)}`));
+		};
+		const timer = setTimeout(
+			() =>
+				fail(
+					`launcher did not print its URL within ${BOOT_TIMEOUT_MS}ms ` +
+						`(raise CELLAR_E2E_BOOT_TIMEOUT_MS if this machine is genuinely slower)`
+				),
+			BOOT_TIMEOUT_MS
+		);
 		const scan = (chunk: Buffer) => {
 			const s = chunk.toString();
 			buf += s;
@@ -93,10 +140,7 @@ export function bootCellar(
 		};
 		proc.stdout?.on('data', scan);
 		proc.stderr?.on('data', scan);
-		proc.on('exit', (code) => {
-			clearTimeout(timer);
-			reject(new Error(`launcher exited early (${code})`));
-		});
+		proc.on('exit', (code) => fail(`launcher exited early (${code})`));
 	});
 }
 
