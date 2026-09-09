@@ -22,8 +22,19 @@ export default defineConfig({
 	testDir: './tests/e2e',
 	globalSetup: './tests/e2e/global-setup.ts',
 	// Kernel boot + cell execution is inherently slower than a pure-web test.
-	timeout: 120_000,
-	expect: { timeout: 30_000 },
+	//
+	// Both budgets were chosen on a 15-core M5 Pro, and `ubuntu-latest` measures
+	// **2.3-3x slower** on this repo's own build and unit steps - so a 30s wait
+	// there is 10-13s of this machine's headroom, and MEASURED, that is where the
+	// e2e gate's failures land: on the first Linux runs, three of the four
+	// timing-sensitive real-kernel failures (`kernel-status-ui`,
+	// `virtualization-pinning`, `notebook-column-width`) died at ~28-33s, i.e. at
+	// the assertion budget rather than at anything the code did. Scaling them on
+	// the runner is not slack for a flaky suite - it keeps the SAME real headroom
+	// the numbers were picked to give. `retries` stays 0, so a genuine regression
+	// is still a red check; it just takes longer to say so.
+	timeout: Number(process.env.CELLAR_E2E_TIMEOUT_MS) || 120_000,
+	expect: { timeout: Number(process.env.CELLAR_E2E_EXPECT_TIMEOUT_MS) || 30_000 },
 	// Keep `fullyParallel: false`: tests INSIDE a file share one booted launcher, one
 	// workspace and one kernel, so they must stay ordered. `workers` is file-level
 	// concurrency, which IS safe here — every spec gets its own mkdtemp workspace,

@@ -87,7 +87,19 @@ async function openNotebook(page: Page): Promise<void> {
 	// open notebook, and reading `isVisible()` before either arrives reports the
 	// button invisible, turns the click into a no-op, and then times out for 30s on
 	// a notebook nothing ever opened (see the openNotebook rule in AGENTS.md).
-	await expect(empty.or(page.getByTestId('cell').first())).toBeVisible({ timeout: 30_000 });
+	//
+	// `loading…` is the THIRD settled state, and it is this spec's own doing: the
+	// pre-render test HOLDS `/api/notebooks`, so when the server-owned tab session
+	// already has this notebook open (which is what the earlier test in this file
+	// leaves behind) the shell restores it and goes straight to the held load -
+	// no empty-state button, and no cell that can ever arrive. Waiting on only the
+	// first two then burns the full 30s on a notebook that IS open. It reproduced
+	// on every Linux CI run and never locally, because it turns on whether the
+	// session was already populated; accepting the loading state makes it
+	// order-independent rather than lucky.
+	await expect(
+		empty.or(page.getByTestId('cell').first()).or(page.getByText('loading…'))
+	).toBeVisible({ timeout: 30_000 });
 	if (await empty.isVisible().catch(() => false)) await empty.click();
 }
 

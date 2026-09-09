@@ -101,7 +101,12 @@ jobs:
       # See the WORKERS note above. Raise or lower HERE, not in the config —
       # and only with a measurement, because the failures it causes look like
       # unrelated flakiness rather than like overload.
-      CELLAR_E2E_WORKERS: '1'
+      CELLAR_E2E_WORKERS: '2'
+      # The runner is 2.3-3x slower than the machine these budgets were tuned
+      # on, so they are scaled to keep the SAME real headroom rather than to
+      # paper over a flaky suite - see the note in playwright.config.ts.
+      CELLAR_E2E_EXPECT_TIMEOUT_MS: '75000'
+      CELLAR_E2E_TIMEOUT_MS: '300000'
 
     steps:
       - uses: actions/checkout@v5

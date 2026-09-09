@@ -68,7 +68,19 @@ function provisionVenv(ws: string): boolean {
 	if (mk.status !== 0) return false;
 	const py = join(venv, 'bin', 'python');
 	const install = spawnSync('uv', ['pip', 'install', '--python', py, 'ipykernel', 'matplotlib'], { stdio: 'ignore', timeout: 300_000 });
-	return install.status === 0 && existsSync(py);
+	if (install.status !== 0 || !existsSync(py)) return false;
+	// WARM matplotlib's font cache here, outside anything timed. The first
+	// `import matplotlib.pyplot` in a fresh venv builds it, and left to happen
+	// inside the run it is charged to the MCP call - whose client timeout is 60s.
+	// MEASURED on CI: both tests here failed with `MCP error -32001: Request
+	// timed out` on a 4-vCPU runner, where the cache build is far slower than on
+	// a dev machine. Best-effort: a failure here just leaves the old behaviour,
+	// so it can never turn a working machine into a skipped spec.
+	spawnSync(py, ['-c', 'import matplotlib; matplotlib.use("Agg"); import matplotlib.pyplot'], {
+		stdio: 'ignore',
+		timeout: 300_000
+	});
+	return true;
 }
 
 test.beforeAll(async () => {
