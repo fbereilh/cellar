@@ -324,7 +324,19 @@ test('a Mojo notebook shows NO staleness chip, and never goes stale', async ({ p
 	test.setTimeout(180_000);
 	await openFresh(page, 'lang-stale.ipynb');
 	const cell = cellBy(page, PY_ID);
+
+	// FIRST make the notebook produce a verdict as PYTHON: run the cell, then edit it
+	// so it goes visibly stale. Flipping the language must then clear that chip
+	// WITHOUT any further interaction - this tab suppresses its own `notebook:language`
+	// echo, so nothing else would recompute the verdicts.
+	await typeInto(page, cell, 'x = 1');
+	await cell.getByTestId('run').click();
+	await expect(cell.getByTestId('run-meta')).toBeVisible({ timeout: 120_000 });
+	await typeInto(page, cell, 'x = 2');
+	await expect(cell.getByTestId('stale-badge')).toBeVisible({ timeout: 30_000 });
+
 	await chooseLanguage(page, 'mojo');
+	await expect(cell.getByTestId('stale-badge')).toHaveCount(0, { timeout: 30_000 });
 	// `def main()` is valid Python too - which is exactly what made the probe
 	// fabricate `defines: ['main']` before the language axis existed.
 	await typeInto(page, cell, 'def main():\n    print("hi")');

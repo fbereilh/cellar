@@ -682,18 +682,21 @@
 	// picker either - it stores no notebook metadata, so it can only ever be Python
 	// and a control offering otherwise would be refused on click.
 	const showLanguageBar = $derived(!isPy);
-	// The select is DRIVEN by the settled `notebookLanguage`, never by the click: a
-	// refusal (a `.py` notebook reached through a stale tab) must leave the control
-	// showing what the document really holds, which is the same non-optimistic rule
-	// the export BASE select follows.
-	let languageSelectEl = $state<HTMLSelectElement | null>(null);
+	// The select KEEPS the user's pick while the change is in flight and RESYNCS to
+	// what the document holds the moment it settles - the export BASE select's idiom
+	// exactly, and for the same reason: the write is non-optimistic (it can be
+	// REFUSED on a `.py` notebook reached through a stale tab), so the control must
+	// end up showing what the document really holds whichever way the attempt went,
+	// without snapping back and forth while it is on the wire.
+	let selectedLanguage = $state<NotebookLanguage>('python');
+	$effect(() => {
+		const settled = notebookLanguage;
+		if (languageBusy) return;
+		selectedLanguage = settled;
+	});
 	function onLanguageSelect(e: Event) {
 		const next = (e.currentTarget as HTMLSelectElement).value;
-		// Put the control back on the settled value straight away; `notebookLanguage`
-		// re-renders it the moment the server answers.
-		if (languageSelectEl) languageSelectEl.value = notebookLanguage;
-		if (!isNotebookLanguage(next) || next === notebookLanguage || languageBusy) return;
-		onSetLanguage(next);
+		if (isNotebookLanguage(next)) onSetLanguage(next);
 	}
 	// The base select is DRIVEN by `exportBase`, never by the click (the
 	// `selectedRoot` idiom below): with a stored target a base change is applied
@@ -1268,9 +1271,8 @@
 					Language
 				</span>
 				<select
-					bind:this={languageSelectEl}
 					class="select select-bordered select-xs w-auto pr-7"
-					value={notebookLanguage}
+					bind:value={selectedLanguage}
 					onchange={onLanguageSelect}
 					disabled={languageBusy}
 					data-testid="language-select"
@@ -1289,7 +1291,7 @@
 				<span class="text-xs text-base-content/55">
 					every code cell runs as {NOTEBOOK_LANGUAGE_LABELS[notebookLanguage]}; markdown, raw,
 					SQL and chat cells are unaffected. The export target's extension follows it. No
-					kernel restart - variables are kept.
+					kernel restart - the Python kernel keeps its variables.
 				</span>
 				{#if languageFeedback}
 					<span class="text-xs text-base-content/70" data-testid="language-feedback"

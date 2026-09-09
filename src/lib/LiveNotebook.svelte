@@ -3069,6 +3069,12 @@
 				exportResolveError = t.resolveError ?? null;
 				exportTarget = t.target ?? null;
 			}
+			// The language decides which cells the Python dataflow graph even contains, so
+			// every verdict in the notebook has just changed - and this tab suppresses its
+			// OWN `notebook:language` echo (originId), so nothing else would recompute
+			// them. (Another tab's change goes through `applyStructuralEvent`, which
+			// schedules this for the same reason.)
+			scheduleStaleness();
 			showLanguageFeedback(
 				`Applied - code cells now run as ${next === 'mojo' ? 'Mojo' : 'Python'}.`
 			);

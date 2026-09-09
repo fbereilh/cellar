@@ -58,14 +58,20 @@ export function exportTargetLanguage(target: string | null | undefined): ExportL
 
 /**
  * The file extension a module of this language is written to - the INVERSE of
- * `exportTargetLanguage`, and the ONE place the pairing is spelled.
+ * `exportTargetLanguage`.
  *
- * It matters more than it looks now that the notebook's language DECIDES the
- * extension rather than the other way round: the setter validates against it, a
- * language switch re-expresses the stored target through it, the `#|default_exp`
- * directive builds a path with it, and four surfaces NAME it to the user. Those
- * were five separate `lang === 'mojo' ? '.mojo' : '.py'` ternaries agreeing by
- * coincidence.
+ * It exists because the notebook's language now DECIDES the extension rather than
+ * the other way round, so several RULES have to produce one: `setExportTarget`
+ * validates against it, `setNotebookLanguage` re-expresses the stored target
+ * through it, `resolveExportTarget` words its mismatch refusal with it, and the
+ * `#|default_exp` directive builds its path with it. Every rule that DERIVES an
+ * extension goes through here.
+ *
+ * The DISPLAY ternaries that merely NAME the extension to a reader
+ * (`Cell.svelte`'s toggle label, `Notebook.svelte`'s export button, MCP's
+ * `moduleExt`) are deliberately left alone: each sits inside a larger sentence
+ * with its own null branch, and several are pinned by source guards, so folding
+ * them in would be churn for no correctness gain.
  */
 export function moduleExtension(lang: ExportLanguage): string {
 	return lang === 'mojo' ? '.mojo' : '.py';
@@ -397,7 +403,7 @@ export function exportStrandedExplanation(
 		return `${subject}, but ${count === 1 ? 'contributes' : 'contribute'} no module source, so ${them} exported nowhere whatever the target is. To resolve it, ${clear}.`;
 	if (moduleLanguage === null)
 		return `${subject}, but this notebook has no target module, so ${them} exported nowhere. Set a target path above, or ${clear}.`;
-	const ext = moduleLanguage === 'mojo' ? '.mojo' : '.py';
+	const ext = moduleExtension(moduleLanguage);
 	return `${subject}, but cannot go in a ${ext} module, so ${them} exported nowhere. Point the target at a module that takes them, or ${clear}.`;
 }
 
