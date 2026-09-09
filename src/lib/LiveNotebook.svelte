@@ -170,6 +170,7 @@
 				hazards?: ExportHazard[];
 				resolved?: string | null;
 				resolveError?: string | null;
+				orphanedModule?: string | null;
 		  }
 		| { type: 'notebook:root'; root: string | null }
 		| { type: 'notebook:header-numbering'; levels: number[] }
@@ -329,6 +330,12 @@
 	// a save no longer exports; the push is what lets the bar say so BEFORE the
 	// user presses Export.
 	let exportHazards = $state<ExportHazard[]>([]);
+	// A module Cellar generated from this notebook that its target no longer names -
+	// what a LANGUAGE switch leaves on disk, since re-expressing the target's
+	// extension renames nothing. Server-derived (it is a fact about a FILE, so only
+	// the server can see it), seeded on load and kept live by the same
+	// `notebook:export-derived` push as the three fields above.
+	let exportOrphanedModule = $state<string | null>(null);
 	let exportBaseBusy = $state(false);
 	// Code root: the workspace-relative directory THIS notebook's kernel runs in and
 	// imports from (null = the workspace root, the default and today's behavior).
@@ -1641,6 +1648,7 @@
 			exportResolved = body.notebook.exportResolved ?? null; // its workspace-relative resolution
 			exportResolveError = body.notebook.exportResolveError ?? null; // or why it cannot resolve
 			exportHazards = body.notebook.exportHazards ?? []; // why the generated module would not import
+			exportOrphanedModule = body.notebook.exportOrphanedModule ?? null; // a generated module this notebook stopped writing
 			headerNumbering = body.notebook.headerNumbering ?? []; // display-only heading numbering
 			hideAllCode = !!body.notebook.hideAllCode; // notebook-wide hide-code (report view)
 			// The notebook's language, read back through the shared guard so a hand-edited
@@ -1803,6 +1811,7 @@
 			exportResolved = ev.resolved ?? null;
 			exportResolveError = ev.resolveError ?? null;
 			exportHazards = (ev.hazards ?? []) as ExportHazard[];
+			exportOrphanedModule = ev.orphanedModule ?? null;
 		} else if (ev.type === 'notebook:root') {
 			// The code root changed in another tab or from an agent (this tab's own
 			// change is echo-suppressed by originId and refreshes the list itself). The
@@ -2517,7 +2526,7 @@
 	function applyCellTypeLocally(id: string, cellType: LogicalCellType) {
 		const cell = findCell(id);
 		if (!cell) return;
-		// 'sql'/'chat'/'mojo' are code cells tagged cellar.language
+		// 'sql'/'chat' are code cells tagged cellar.language
 		// ($lib/cellLanguage.js's `languageTagFor`, the ONE tag rule); 'code' clears
 		// the tag. Reassign metadata (the cell may have had no cellar namespace) so
 		// the grammar switch in Cell.svelte reacts.
@@ -3042,6 +3051,16 @@
 	 * both this state and the target field are settled from. Nothing per-cell is
 	 * written by either side, which is why switching costs no kernel and no cell
 	 * rewrite - see `setNotebookLanguage`.
+	 *
+	 * THREE outcomes, never two, and the third is why the reply carries the HELD
+	 * language on every path. A REFUSAL (a `.py` text notebook, an unknown value)
+	 * changed nothing, so the select goes back to what the server holds and says
+	 * why. A FAILED WRITE (`writeFailed`) is the opposite: the live document HOLDS
+	 * the new language - so `run.ts` compiles every code cell in it from now on -
+	 * and only the save failed, so the select must ADOPT it and say only that it
+	 * could not be saved. Told apart by the FLAG the route sets, never by the
+	 * status code: any other 5xx (a proxy 502/503, an HTML error page) landed no
+	 * verdict at all and may not be reported as accepted.
 	 */
 	async function setLanguageValue(next: NotebookLanguage) {
 		if (next === notebookLanguage || languageBusy) return;
@@ -3054,7 +3073,9 @@
 				body: JSON.stringify({ language: next, path, originId })
 			});
 			const body = await res.json().catch(() => ({}));
-			if (!res.ok || !body?.ok)
+			const applied = res.ok && body?.ok === true;
+			const writeFailed = !applied && typeof body?.writeFailed === 'string';
+			if (!applied && !writeFailed)
 				throw new Error(body?.message || 'could not set the notebook language');
 			notebookLanguage = isNotebookLanguage(body.language) ? body.language : notebookLanguage;
 			// The stored target's extension may have MOVED with the language, and this
@@ -3076,7 +3097,9 @@
 			// schedules this for the same reason.)
 			scheduleStaleness();
 			showLanguageFeedback(
-				`Applied - code cells now run as ${next === 'mojo' ? 'Mojo' : 'Python'}.`
+				writeFailed
+					? `Applied to this session - code cells now run as ${notebookLanguage === 'mojo' ? 'Mojo' : 'Python'}, but the notebook could not be saved: ${body.writeFailed}`
+					: `Applied - code cells now run as ${notebookLanguage === 'mojo' ? 'Mojo' : 'Python'}.`
 			);
 		} catch (err) {
 			showLanguageFeedback(String((err as Error)?.message ?? err));
@@ -3579,7 +3602,7 @@
 	 *  nbformat type + the tagged `cellar` namespace, an add affordance that NAMES a
 	 *  type (`markdown`/`chat`) passes it through, and a plain `code` request is
 	 *  RESOLVED first through `codeTypeAt`/`codeTypeAfter` - so it may arrive here as
-	 *  `sql` or `mojo` (see `$lib/cellInherit`). */
+	 *  `sql` (see `$lib/cellInherit`). */
 	interface InsertSpec {
 		cell_type: LogicalCellType;
 		source: string;
@@ -3724,9 +3747,8 @@
 	 *
 	 * The types a fence can ask for are `code`/`sql`/`markdown`, which EVERY
 	 * notebook format can hold, so there is no `refuseUnsupportedType` gate here:
-	 * `chat`, `raw` and `mojo` - i.e. exactly the types a `.py` notebook refuses -
-	 * are all unreachable, `mojo` because no fence tag maps onto it (see
-	 * `fenceCellType`, whose header owns that decision).
+	 * `chat` and `raw` - i.e. exactly the types a `.py` notebook refuses - are both
+	 * unreachable (see `fenceCellType`, whose header owns that decision).
 	 */
 	async function extractCodeBlock(sourceId: string, block: ExtractedCodeBlock): Promise<boolean> {
 		// The whole read-modify-write of the anchor runs inside the lock, the
@@ -3875,8 +3897,8 @@
 		// silently dropping the rest is the degrade this refusal exists to prevent.
 		//
 		// Asked of the LOGICAL type through the shared `offersCellType`, never of
-		// `cell_type`: now that the entry carries `cellar.language`, a chat or mojo
-		// cell really does arrive as an nbformat `code` cell that the document cannot
+		// `cell_type`: now that the entry carries `cellar.language`, a chat cell
+		// really does arrive as an nbformat `code` cell that the document cannot
 		// hold, and `assertCanHoldCell` refuses it server-side - so a `cell_type ===
 		// 'raw'` test would leave the user a thrown insert where every other surface
 		// gives a named notice.
@@ -4795,6 +4817,7 @@
 			exportResolved={exportResolved}
 			exportResolveError={exportResolveError}
 			exportHazards={exportHazards}
+			exportOrphanedModule={exportOrphanedModule}
 			exportBaseBusy={exportBaseBusy}
 			onSetExportBase={setExportBaseValue}
 			root={root}

@@ -35,9 +35,9 @@
 // it while a CUT one does.
 //
 // `cell_type` is the nbformat type, so `raw` is covered by the type itself, and
-// the LOGICAL type - which a `cellar.language` tag can make `sql`, `chat` or
-// - is read back through `clipboardCellType` rather than guessed from
-// `cell_type` alone.
+// the LOGICAL type - which a `cellar.language` tag can make `sql` or `chat` - is
+// read back through `clipboardCellType` rather than guessed from `cell_type`
+// alone.
 
 import { logicalCellType } from '$lib/cellLanguage';
 import type { CellarNamespace, CellMetadata, CellType, LogicalCellType } from '$lib/server/types';

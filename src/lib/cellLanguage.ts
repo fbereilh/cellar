@@ -332,6 +332,26 @@ export function textNotebookLanguageError(): TextNotebookLanguageError {
 }
 
 /**
+ * The notebook language asked for is not one Cellar has (`python`/`mojo`).
+ *
+ * A TYPED refusal rather than a bare `Error` for the `InvalidExportTargetError`
+ * reason, and it is load-bearing rather than tidiness: `setNotebookLanguage`
+ * VALIDATES before it mutates, so once past this its only other throw is the
+ * `persist` - a disk failure over a language the live document already HOLDS.
+ * The route has to tell those two apart BY TYPE, never by matching the message
+ * text, or a write failure is reported as a refusal and the browser is left
+ * saying Python over a document `run.ts` now compiles as Mojo.
+ */
+export class InvalidNotebookLanguageError extends Error {
+	/** The route-facing code, beside `TextNotebookLanguageError.reason`. */
+	readonly reason = 'bad-language';
+	constructor(message: string) {
+		super(message);
+		this.name = 'InvalidNotebookLanguageError';
+	}
+}
+
+/**
  * Message + refusal code per unsupported type, in ONE record rather than a pair
  * of ternaries: with two types a `x === 'chat' ? … : …` reads as exhaustive, and
  * with a third it SILENTLY reports the raw message for the other's refusal.
@@ -404,10 +424,9 @@ export function textNotebookTypeForReason(reason: unknown): PyUnsupportedType | 
  * markdown|code (`jupytext.ts`) - and coerces again on read, carrying no
  * `cellar` metadata and no outputs. So the declaration would live only in memory
  * while disk held a `code` cell: after a reload the frontmatter sits in a cell
- * with a Run button (raw), the question does while its REPLY is gone (chat), or
- * or the question does while its REPLY is gone (chat) - the exact silent degrade
- * each type exists to prevent, and worse from MARKDOWN, whose prose would lose its
- * markers on the way too.
+ * with a Run button (raw), and the question sits there while its REPLY is gone
+ * (chat) - the exact silent degrade each type exists to prevent, and worse from
+ * MARKDOWN, whose prose would lose its markers on the way too.
  *
  * Refused by name instead, at the doc-layer writers, so no surface can route
  * around it - the `textNotebookRootError` precedent, for the identical

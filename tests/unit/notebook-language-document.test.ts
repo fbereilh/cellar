@@ -29,6 +29,29 @@ import {
 	TextNotebookLanguageError
 } from '../../src/lib/cellLanguage';
 
+const { writeGate } = vi.hoisted(() => ({ writeGate: { failAt: null as string | null } }));
+
+/**
+ * The one thing that can throw out of `setNotebookLanguage` AFTER it has mutated
+ * the live document: the `persist`. It is a disk failure (EACCES/ENOSPC, a
+ * read-only checkout), so it is induced at the atomic writer rather than by
+ * chmod'ing a directory - which is silently a no-op for root and so would report
+ * a safety that does not exist in a container.
+ */
+vi.mock('../../src/lib/server/atomic-write', async () => {
+	const actual = await vi.importActual<typeof import('../../src/lib/server/atomic-write')>(
+		'../../src/lib/server/atomic-write'
+	);
+	return {
+		...actual,
+		atomicWriteFileSync: (path: string, data: string) => {
+			if (writeGate.failAt && path === writeGate.failAt)
+				throw new Error("EACCES: permission denied, open '" + path + "'");
+			return actual.atomicWriteFileSync(path, data);
+		}
+	};
+});
+
 vi.mock('../../src/lib/server/run', () => ({
 	executeCellRun: vi.fn(async () => ({
 		outputs: [],
@@ -323,5 +346,145 @@ describe('the REST route reports the language refusal in the shape the browser r
 		});
 		expect(res.status).toBe(400);
 		expect((await res.json()).reason).toBe('bad-language');
+	});
+});
+
+describe('the SYMBOL tools ask the notebook language too, so no fabricated symbol reaches an agent', () => {
+	// The real `ast`/`symtable` probe (python3, stdlib only) - a fixture cannot show
+	// this, because the whole point is that the probe answers CONFIDENTLY for Mojo
+	// that happens to parse as Python.
+	it('find_symbol reports NO definer for a Mojo `main`, while a Python notebook still resolves one', async () => {
+		const svc = await import('../../src/lib/server/mcp/service');
+		const mojoNb = makeNotebook(
+			'symbols-mojo.ipynb',
+			[{ source: 'def main():\n    print("hi")\n' }, { source: 'main()' }],
+			MOJO_LANGUAGE
+		);
+		const found = await svc.findSymbol('main', mojoNb);
+		expect(found.defined_in).toEqual([]);
+		expect(found.used_in).toEqual([]);
+
+		// CONTROL: the identical source in a PYTHON notebook still resolves, so the
+		// empty answer above is the notebook's language and not a broken probe.
+		const pyNb = makeNotebook('symbols-py.ipynb', [
+			{ source: 'def main():\n    print("hi")\n' },
+			{ source: 'main()' }
+		]);
+		const pyFound = await svc.findSymbol('main', pyNb);
+		expect(pyFound.defined_in.length).toBe(1);
+		expect(pyFound.used_in.length).toBe(1);
+	});
+
+	it('cell_impact reports NO dependents in a Mojo notebook, and still does in a Python one', async () => {
+		const svc = await import('../../src/lib/server/mcp/service');
+		const mojoNb = makeNotebook(
+			'impact-mojo.ipynb',
+			[{ source: 'def main():\n    print("hi")\n' }, { source: 'main()' }],
+			MOJO_LANGUAGE
+		);
+		const cells = nbmod.listCells(mojoNb);
+		const impact = await svc.cellImpact(cells[0].id, mojoNb);
+		expect(impact.dependents).toEqual([]);
+		expect(impact.depends_on).toEqual([]);
+
+		const pyNb = makeNotebook('impact-py.ipynb', [
+			{ source: 'def main():\n    print("hi")\n' },
+			{ source: 'main()' }
+		]);
+		const pyCells = nbmod.listCells(pyNb);
+		const pyImpact = await svc.cellImpact(pyCells[0].id, pyNb);
+		expect(pyImpact.dependents.length).toBe(1);
+	});
+});
+
+describe('the FIRST notebook-level setting a notebook ever takes keeps its kernelspec', () => {
+	it('materializes the default metadata, so the canonical notebook is not silently stripped', () => {
+		// `loadDoc` materializes the canonical notebook IN MEMORY with `metadata:
+		// undefined` when the file does not exist, and `serialize` writes `doc.metadata
+		// ?? defaultMetadata()` - so a setter that seeded a bare `{}` made that fallback
+		// stop applying and the first setting a user ever chose deleted the kernelspec
+		// from the file it created.
+		const canonical = join(WS, 'notebook.ipynb');
+		expect(nbmod.setNotebookLanguage('mojo', canonical)).toBe('mojo');
+		const onDisk = JSON.parse(readFileSync(canonical, 'utf8')) as {
+			metadata: { kernelspec?: { name?: string }; cellar?: { language?: string } };
+		};
+		expect(onDisk.metadata.kernelspec?.name).toBe('python3');
+		expect(onDisk.metadata.cellar?.language).toBe('mojo');
+
+		// ...and clearing back to python prunes the namespace WITHOUT taking the
+		// kernelspec with it: the two halves of `notebookCellar` are independent.
+		nbmod.setNotebookLanguage('python', canonical);
+		const cleared = JSON.parse(readFileSync(canonical, 'utf8')) as {
+			metadata: { kernelspec?: { name?: string }; cellar?: unknown };
+		};
+		expect(cleared.metadata.kernelspec?.name).toBe('python3');
+		expect(cleared.metadata.cellar).toBeUndefined();
+	});
+});
+
+describe('the route tells a REFUSED language from a FAILED WRITE, so the UI can never say Python over a Mojo document', () => {
+	let POST: (evt: { request: Request }) => Promise<Response>;
+
+	beforeAll(async () => {
+		POST = (await import('../../src/routes/api/notebooks/language/+server.js')).POST as unknown as typeof POST;
+	});
+
+	const post = (body: unknown) =>
+		POST({
+			request: new Request('http://x/api/notebooks/language', {
+				method: 'POST',
+				body: JSON.stringify(body)
+			})
+		});
+
+	it('answers 500 + writeFailed + the HELD language when only the SAVE failed', async () => {
+		const nb = join(WS, 'writefail.ipynb');
+		nbmod.createNotebook('writefail.ipynb');
+		nbmod.addCell(null, 'code', nb, null, 'x = 1');
+		const before = readFileSync(nb, 'utf8');
+
+		writeGate.failAt = nb;
+		let payload: Record<string, unknown>;
+		let status: number;
+		try {
+			const res = await post({ language: 'mojo', path: nb });
+			status = res.status;
+			payload = await res.json();
+		} finally {
+			writeGate.failAt = null;
+		}
+
+		// NOT the refusal shape: the live document ACCEPTED the language (every code
+		// cell in it now compiles as Mojo), and only the save failed.
+		expect(status).toBe(500);
+		expect(payload.ok).toBe(false);
+		expect(payload.reason).toBeUndefined();
+		expect(typeof payload.writeFailed).toBe('string');
+		// The HELD value, so the select adopts what the document really holds rather
+		// than reverting to a Python it no longer is.
+		expect(payload.language).toBe('mojo');
+		expect(nbmod.getNotebookLanguage(nb)).toBe('mojo');
+		// Disk really did not take it - which is what makes the two facts different.
+		expect(readFileSync(nb, 'utf8')).toBe(before);
+	});
+
+	it('still answers the 400 REFUSAL shape when nothing was mutated', async () => {
+		// The control: same route, same failure-looking outcome, opposite meaning -
+		// the document is untouched and the select must go back to what it holds.
+		const res = await post({ language: 'zig', path: join(WS, 'writefail.ipynb') });
+		expect(res.status).toBe(400);
+		const payload = await res.json();
+		expect(payload.reason).toBe('bad-language');
+		expect(payload.writeFailed).toBeUndefined();
+		expect(payload.language).toBe('mojo'); // unchanged by the refusal
+	});
+
+	it('reports the held language on the .py refusal too, so every reply settles the select', async () => {
+		const res = await post({ language: 'mojo', path: PY });
+		expect(res.status).toBe(400);
+		const payload = await res.json();
+		expect(payload.reason).toBe('mojo-in-py-notebook');
+		expect(payload.language).toBe('python');
 	});
 });

@@ -802,7 +802,11 @@ export async function cellsDefiningNames(names: readonly string[], nb?: string |
 	const wanted = new Set(names);
 	if (wanted.size === 0) return [];
 	const cells = listCells(nb);
-	const dataflow = await analyzeDataflow(cells);
+	// Threaded, never defaulted: in a Mojo notebook no cell holds Python, so the
+	// probe must not be handed one (the `getNotebookStaleness` rule - a defaulted
+	// `python` there reports fabricated `defines` and would attribute a wiped
+	// variable to a cell that never bound it).
+	const dataflow = await analyzeDataflow(cells, getNotebookLanguage(nb));
 	return cells
 		.filter((c) => c.cell_type === 'code' && (dataflow[c.id]?.defines ?? []).some((d) => wanted.has(d)))
 		.map((c) => c.id);

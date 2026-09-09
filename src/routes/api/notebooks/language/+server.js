@@ -1,6 +1,6 @@
 import { json } from '@sveltejs/kit';
-import { setNotebookLanguage, getExportTargetState } from '$lib/server/notebook';
-import { TextNotebookLanguageError } from '$lib/cellLanguage';
+import { setNotebookLanguage, getExportTargetState, getNotebookLanguage } from '$lib/server/notebook';
+import { InvalidNotebookLanguageError, TextNotebookLanguageError } from '$lib/cellLanguage';
 
 /**
  * Set the notebook's LANGUAGE - the ONE authority for python-vs-mojo. Every plain
@@ -14,19 +14,48 @@ import { TextNotebookLanguageError } from '$lib/cellLanguage';
  * the only thing that can settle its target field.
  * `path` is the workspace-relative notebook (defaults to the active one).
  *
- * A refusal is the `{ok:false, reason, message}` 400 the cell routes already
- * answer in, rather than a bare `error()` string: the browser reverts an
- * optimistic switch on it and SAYS why, and it must tell the two apart WITHOUT
- * matching message text (the `InvalidExportTargetError` rule). The reason for a
- * `.py` text notebook rides on the error TYPE, so it is never re-derived here.
+ * EVERY reply carries the language the document HOLDS once the call is done, so
+ * the select adopts it on any outcome rather than keeping a locally remembered
+ * baseline the two then have to be kept agreeing about (the `set-target` reply
+ * contract).
+ *
+ * A REFUSED language and a FAILED WRITE answer differently, told apart BY TYPE
+ * exactly as `/api/notebooks/export-py` does and never by matching message text:
+ * `setNotebookLanguage` VALIDATES before it mutates (an unknown language, or
+ * `mojo` on a `.py` text notebook - both typed), so its one other throw is the
+ * `persist`, a disk failure (EACCES/ENOSPC, a read-only checkout) over a language
+ * the live document already HOLDS and that its next successful save will write.
+ * Reported as the same 400, the tab took the refusal branch and left the select
+ * saying Python while `run.ts` compiled every code cell as Mojo, with nothing
+ * left to correct it (no event is emitted on that path, and this tab would
+ * echo-suppress it anyway). So a write failure keeps its own 5xx the client tells
+ * apart BY THE `writeFailed` FLAG - never by the status code, since any other 5xx
+ * (a proxy 502/503, an HTML error page) landed no verdict at all and must not be
+ * reported as accepted.
  */
 export async function POST({ request }) {
 	const body = await request.json().catch(() => ({}));
+	// What the document holds NOW - read after the attempt, so a refusal reports the
+	// unchanged value and a failed write reports the one it really took.
+	const held = () => {
+		try {
+			return { language: getNotebookLanguage(body.path), exportTarget: getExportTargetState(body.path) };
+		} catch {
+			return { language: 'python', exportTarget: null };
+		}
+	};
 	try {
 		const language = setNotebookLanguage(String(body.language ?? ''), body.path, body.originId);
 		return json({ ok: true, language, exportTarget: getExportTargetState(body.path) });
 	} catch (err) {
-		const reason = err instanceof TextNotebookLanguageError ? err.reason : 'bad-language';
-		return json({ ok: false, reason, message: String(err?.message ?? err) }, { status: 400 });
+		if (err instanceof TextNotebookLanguageError || err instanceof InvalidNotebookLanguageError)
+			return json(
+				{ ok: false, reason: err.reason, message: String(err.message ?? err), ...held() },
+				{ status: 400 }
+			);
+		// The language was ACCEPTED and the live document holds it, so `held()` reports
+		// the NEW one: the select keeps it, and the notebook's next successful save
+		// writes it.
+		return json({ ok: false, writeFailed: String(err?.message ?? err), ...held() }, { status: 500 });
 	}
 }

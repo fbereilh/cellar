@@ -40,7 +40,8 @@ import {
 	workspaceRelative,
 	createNotebook as createNotebookDoc,
 	notebookExists,
-	getNotebookRoot
+	getNotebookRoot,
+	getNotebookLanguage
 } from '../notebook';
 import { setNotebookRootAndRestart, listWorkspaceRoots } from '../notebook-root-actions';
 import { resolveRootDir } from '../notebookRoot';
@@ -808,8 +809,10 @@ function staleFields(
 
 /**
  * The `language` field an agent-facing cell projection carries: the `cellar.language`
- * tag for a tagged code cell (`sql`, `chat`, `mojo`), and NOTHING for a plain code,
- * markdown or raw cell - whose type field already says what they are.
+ * tag for a tagged code cell (`sql`, `chat`), and NOTHING for a plain code,
+ * markdown or raw cell - whose type field already says what they are. A plain code
+ * cell's LANGUAGE is the NOTEBOOK's (`get_notebook_map`'s `display.language`), so
+ * nothing per-cell reports it.
  *
  * Read through `languageTagFor` rather than as a ternary per projection: the two
  * projections that report it (`readForm` and `getNotebookMap`'s `leaf`) each carried
@@ -1258,7 +1261,16 @@ async function liveKernelNames(nb?: string | null): Promise<Set<string> | null> 
  */
 export async function findSymbol(name: string, nb?: string | null) {
 	const cells = listCells(nb); // ALL cells (incl. hidden) so a hidden definer still counts
-	const [dataflow, kernelNames] = await Promise.all([analyzeDataflow(cells), liveKernelNames(nb)]);
+	// The NOTEBOOK's language decides which cells hold Python at all, exactly as it
+	// does for staleness (`getNotebookStaleness`) - it is not a default this caller
+	// may leave to `analyzeDataflow`. In a Mojo notebook every plain code cell would
+	// otherwise be handed to the `ast`/`symtable` probe, which parses `def main():
+	// print(...)` happily and reports `defines: ['main']` with the batch marked ok:
+	// this tool would then tell an agent a Mojo `main` is a defined Python symbol.
+	const [dataflow, kernelNames] = await Promise.all([
+		analyzeDataflow(cells, getNotebookLanguage(nb)),
+		liveKernelNames(nb)
+	]);
 	return resolveSymbol({
 		name,
 		cells: cells.map((c) => ({
@@ -1301,7 +1313,10 @@ export async function findSymbol(name: string, nb?: string | null) {
  */
 export async function cellImpact(id: string, nb?: string | null) {
 	const cells = listCells(nb); // ALL cells (incl. hidden) so the graph stays complete
-	const dataflow = await analyzeDataflow(cells);
+	// The notebook's language, for the reason `findSymbol` states: left to the
+	// default, a Mojo notebook's cells reach the Python probe and this tool reports
+	// fabricated dependents off names no Python cell ever defined.
+	const dataflow = await analyzeDataflow(cells, getNotebookLanguage(nb));
 	return resolveImpact({
 		id: asFullId(nb, id),
 		cells: cells.map((c) => ({ id: c.id, cell_type: c.cell_type, hidden: isHidden(c) })),
@@ -1537,7 +1552,7 @@ export function exportHtml({
  * cell: its imports are in the imports cell, and an empty cell beside them is
  * litter. An explicitly empty source still creates its empty cell.
  *
- * A spec of a type a `.py` TEXT notebook cannot hold ('raw', 'chat', 'mojo')
+ * A spec of a type a `.py` TEXT notebook cannot hold ('raw', 'chat')
  * throws `TextNotebookCellTypeError` for the WHOLE batch before anything is
  * written - `addCell` would throw on it anyway (the doc layer owns the rule),
  * but only once routing had already merged the earlier specs' imports into the
@@ -1941,7 +1956,7 @@ export function moveCell(id: string, dest: MoveDest, nb?: string | null) {
 
 /**
  * MCP `set_cell_type`. A `.py` TEXT notebook REFUSES the types it cannot hold
- * ('raw', 'chat', 'mojo') - the doc layer's rule (`assertCanHoldType`), looked
+ * ('raw', 'chat') - the doc layer's rule (`assertCanHoldType`), looked
  * up here through the SAME `isPyTextNotebook` predicate the export tools use
  * so the agent gets a refusal NAMING the cause rather than a throw, and so
  * nothing is written: checked BEFORE the pre-action checkpoint, because a

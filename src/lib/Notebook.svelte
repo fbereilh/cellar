@@ -20,6 +20,7 @@
 	import { hazardSummaryClause, humanExportHazards, type ExportHazard } from '$lib/exportHazard';
 	import {
 		exportStrandedExplanation,
+		orphanedModuleExplanation,
 		type ExportLanguage,
 		type ExportStrandedSummary
 	} from '$lib/exportRole';
@@ -179,6 +180,12 @@
 		 *  than "a module that fails `compile`" - so the copy names the construct it
 		 *  found and no surface may word an empty list as "this module compiles". */
 		exportHazards?: ExportHazard[];
+		/** A module Cellar generated from THIS notebook that its target no longer names,
+		 *  workspace-relative, else null. What a LANGUAGE switch leaves behind: it
+		 *  re-expresses `utils.py` as `utils.mojo` and renames nothing on disk, so the
+		 *  old file stays - git-tracked in an nbdev repo, still importable, and no
+		 *  longer written. Named once for the notebook so the user can delete it. */
+		exportOrphanedModule?: string | null;
 		/** True while a base re-expression is in flight (the base select is disabled). */
 		exportBaseBusy?: boolean;
 		/** Re-express the stored target under a new base (or record a pre-target choice). */
@@ -322,6 +329,7 @@
 		exportResolved = null,
 		exportResolveError = null,
 		exportHazards = [],
+		exportOrphanedModule = null,
 		exportBaseBusy = false,
 		onSetExportBase,
 		notebookLanguage = 'python',
@@ -739,6 +747,13 @@
 	// nothing" are different facts and only the nullable value can tell them apart.
 	const strandedExplanation = $derived(
 		exportStranded.count > 0 ? exportStrandedExplanation(exportStranded, exportLanguage) : null
+	);
+	// A module this notebook generated and no longer writes - see the prop. The
+	// wording is shared (`$lib/exportRole`) like the stranded one beside it, and it
+	// NAMES both paths, since "a stale module may exist" is not something anyone can
+	// act on. Null on every ordinary notebook, so it costs no chrome.
+	const orphanExplanation = $derived(
+		exportOrphanedModule ? orphanedModuleExplanation(exportOrphanedModule, exportResolved) : null
 	);
 	// Whether the notebook has any runnable (code) cell — gates the "Run all" button.
 	const hasCodeCell = $derived(cells.some((c) => c.cell_type === 'code'));
@@ -1467,6 +1482,22 @@
 					<span class="flex items-center gap-1 text-xs text-base-content/70" data-testid="export-stranded">
 						<svg class="h-3.5 w-3.5 shrink-0 text-warning" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3" /><path d="M12 9v4" /><path d="M12 17h.01" /></svg>
 						{strandedExplanation}
+					</span>
+				{/if}
+				{#if orphanExplanation}
+					<!-- A module Cellar generated from this notebook that its target no
+					     longer names: the leftover a LANGUAGE switch creates, since
+					     re-expressing the extension renames nothing on disk. Said ONCE for
+					     the notebook, in the same line family as the stranded explanation
+					     above and OUTSIDE the warning chain, because it is a fact about a
+					     FILE rather than about the module these marks build - both can be
+					     true at once. Cellar never deletes a generated module the user's
+					     repository holds, so the path is named and the decision is theirs.
+					     Warning tint on the ICON, `base-content` copy (the GitNotebooks
+					     contrast rule). -->
+					<span class="flex items-center gap-1 text-xs text-base-content/70" data-testid="export-orphan">
+						<svg class="h-3.5 w-3.5 shrink-0 text-warning" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3" /><path d="M12 9v4" /><path d="M12 17h.01" /></svg>
+						{orphanExplanation}
 					</span>
 				{/if}
 				{#if exportFeedback}

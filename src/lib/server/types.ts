@@ -246,6 +246,14 @@ export interface NotebookView {
 	 */
 	exportHazards: ExportHazard[];
 	/**
+	 * A module Cellar generated from THIS notebook that its target no longer names -
+	 * the leftover a LANGUAGE switch creates, since re-expressing `utils.py` as
+	 * `utils.mojo` renames nothing on disk. Workspace-relative, or null (every
+	 * ordinary notebook). Provenance-checked, so a hand-written module or one
+	 * another notebook generated is never reported (`orphanedGeneratedModule`).
+	 */
+	exportOrphanedModule: string | null;
+	/**
 	 * Declared code root: the workspace-relative directory this notebook's KERNEL
 	 * resolves code from (cwd + `sys.path`), or null for the workspace root.
 	 */

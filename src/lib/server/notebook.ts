@@ -43,6 +43,7 @@ import {
 	docHumanExportHazards,
 	docExportLanguage,
 	docExportTargetInfo,
+	orphanedGeneratedModule,
 	type ExportResult,
 	type ExportTargetLanguageInfo,
 	type ResolvedExportTarget
@@ -61,6 +62,7 @@ import { isExportBase, type ExportBase } from '../exportTarget';
 import { gitRootOf } from './git';
 import { resolveInWorkspace } from './fstree';
 import {
+	InvalidNotebookLanguageError,
 	isLogicalCellType,
 	isNotebookLanguage,
 	isPyUnsupportedType,
@@ -160,10 +162,11 @@ function starterCell(): Cell {
 }
 
 function newCell(cellType: LogicalCellType = 'code', source = ''): CellWithCellar {
-	// 'sql'/'chat'/'mojo' are LOGICAL types: an nbformat `code` cell tagged
+	// 'sql'/'chat' are LOGICAL types: an nbformat `code` cell tagged
 	// cellar.language (see $lib/cellLanguage.js, whose `languageTagFor` is the ONE
 	// tag rule). code/markdown/raw are nbformat types of their own, and
-	// `nbCellType` is the ONE mapping.
+	// `nbCellType` is the ONE mapping. Mojo is deliberately NOT among them: it is
+	// the NOTEBOOK's language, not a cell type.
 	const lang = languageTagFor(cellType);
 	const cell: CellWithCellar = {
 		id: mintId(),
@@ -378,10 +381,17 @@ function publishExportDerived(doc: NotebookDoc): void {
 	// `docHumanExportHazards` rather than filtered afterwards, so the agent-only
 	// kinds cost this path no file read.
 	const hazards = docHumanExportHazards(doc, info);
-	const key = [resolved ?? '', resolveError ?? '', ...hazards.map((h) => h.message)].join('\u0000');
+	// Rides this event rather than one of its own: it is derived from the same
+	// resolution, it CHANGES on the same acts (a language switch, a retargeting, the
+	// file being deleted and the next save noticing), and two events carrying
+	// overlapping derived state is how the halves come to describe one notebook
+	// differently. It is in the key too, so a leftover appearing or being deleted is
+	// itself a change worth one event.
+	const orphanedModule = orphanedGeneratedModule(doc, info);
+	const key = [resolved ?? '', resolveError ?? '', orphanedModule ?? '', ...hazards.map((h) => h.message)].join('\u0000');
 	if (key === doc.lastExportDerivedKey) return;
 	doc.lastExportDerivedKey = key;
-	emit(doc, 'notebook:export-derived', { resolved, resolveError, hazards });
+	emit(doc, 'notebook:export-derived', { resolved, resolveError, hazards, orphanedModule });
 }
 
 /**
@@ -536,6 +546,7 @@ function exportTargetView(doc: NotebookDoc): {
 	exportResolved: string | null;
 	exportResolveError: string | null;
 	exportHazards: ExportHazard[];
+	exportOrphanedModule: string | null;
 } {
 	const info = resolveExportTarget(doc);
 	return {
@@ -553,7 +564,13 @@ function exportTargetView(doc: NotebookDoc): {
 		// The SAME `info` is threaded in rather than resolved a second time here, and
 		// narrowed through the ONE human-surface rule: this field feeds the export bar,
 		// where an agent-only kind may not appear (`$lib/exportHazard`).
-		exportHazards: docHumanExportHazards(doc, info)
+		exportHazards: docHumanExportHazards(doc, info),
+		// A module Cellar generated at the path this target USED to name, left on disk
+		// when the language moved its extension - nothing is renamed there, so the file
+		// stays and this notebook stops writing it. Threaded the SAME `info` rather than
+		// resolved again, and narrowed before it touches the filesystem, so an ordinary
+		// notebook pays nothing (`orphanedGeneratedModule`).
+		exportOrphanedModule: orphanedGeneratedModule(doc, info)
 	};
 }
 
@@ -1756,12 +1773,20 @@ export function getNotebookLanguage(nb?: string | null): NotebookLanguage {
  *
  * THE EXPORT TARGET FOLLOWS. The module's language is the notebook's
  * (`docExportLanguage`), so a stored target's extension is re-expressed here -
- * `utils.py` becomes `utils.mojo` and back. It is the same file being renamed to
- * match the language it is now written in, and it is what keeps the two from ever
+ * `utils.py` becomes `utils.mojo` and back. That is what keeps the two from ever
  * disagreeing; the alternative (leaving a `.py` target on a Mojo notebook) is
  * precisely the second contradicting setting the captain ruled out. A target
  * naming no module Cellar builds is left exactly as it is - there is no extension
  * to follow, and `resolveExportTarget` already refuses it by name.
+ *
+ * NOTHING ON DISK IS RENAMED, MOVED OR DELETED - only the stored SETTING is
+ * re-expressed. So a module already generated at the old path stays exactly where
+ * it is, and in an nbdev repository it is git-TRACKED and still importable while
+ * this notebook has stopped writing it. That is deliberate (Cellar never deletes
+ * or truncates a generated module the user's repository holds), so it is
+ * SURFACED instead of being silently left: `orphanedGeneratedModule` derives it
+ * from the sibling path, and the export bar names that path once for the notebook
+ * so the user can delete it themselves.
  */
 export function setNotebookLanguage(
 	language: string,
@@ -1770,7 +1795,7 @@ export function setNotebookLanguage(
 ): NotebookLanguage {
 	const wanted = (language ?? '').trim();
 	if (!isNotebookLanguage(wanted))
-		throw new Error(
+		throw new InvalidNotebookLanguageError(
 			`unknown notebook language ${JSON.stringify(wanted)}: expected ${NOTEBOOK_LANGUAGES.map((l) => JSON.stringify(l)).join(' or ')}`
 		);
 	const doc = docFor(nb);
@@ -2047,21 +2072,22 @@ export function addCell(
 }
 
 /**
- * Switch a cell's LOGICAL type ('code' | 'sql' | 'mojo' | 'chat' | 'markdown' |
- * 'raw'). 'sql', 'mojo' and 'chat' are code cells tagged `cellar.language`
+ * Switch a cell's LOGICAL type ('code' | 'sql' | 'chat' | 'markdown' | 'raw').
+ * 'sql' and 'chat' are code cells tagged `cellar.language`
  * ($lib/cellLanguage.js's `languageTagFor`, the ONE tag rule), so they share the
- * nbformat `code` type on disk; 'code' clears that tag back to Python.
+ * nbformat `code` type on disk; 'code' clears that tag. There is no `mojo` type:
+ * a code cell's LANGUAGE is the notebook's, so nothing per-cell says it.
  *
  * Markdown cells carry no outputs - nor the imports role: a markdown cell cannot
  * run, so leaving the designation on one would strand every future routed import
- * in a cell the kernel never sees. A SQL, Mojo or chat cell likewise can't hold
+ * in a cell the kernel never sees. A SQL or chat cell likewise can't hold
  * Python imports, so converting to one of those drops the imports role too.
  *
  * The `cell:type` event carries the new `language` so live sync updates the
  * editor's syntax highlighting (SQL ↔ Python) without a reload; the browser
  * rebuilds the logical type from that pair through `logicalTypeFor`.
  *
- * A `.py` text notebook REFUSES 'raw'/'chat'/'mojo' here - see `assertCanHoldType`;
+ * A `.py` text notebook REFUSES 'raw'/'chat' here - see `assertCanHoldType`;
  * every other conversion stays allowed on one.
  */
 export function setCellType(id: string, cellType: LogicalCellType, nb?: string | null, originId?: string | null): void {

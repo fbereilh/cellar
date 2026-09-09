@@ -407,6 +407,26 @@ export function exportStrandedExplanation(
 	return `${subject}, but cannot go in a ${ext} module, so ${them} exported nowhere. Point the target at a module that takes them, or ${clear}.`;
 }
 
+/**
+ * The one sentence naming a generated module this notebook no longer writes -
+ * left behind when the notebook's LANGUAGE moved the target's extension
+ * (`utils.py` -> `utils.mojo`), which renames nothing on disk.
+ *
+ * Stated ONCE for the notebook, in the export bar, beside its sibling
+ * `exportStrandedExplanation` and for the same reason: this is a notebook-wide
+ * fact about one file, so a per-cell copy would repeat it on every marked row.
+ *
+ * It NAMES both paths, because "a stale module may exist somewhere" is not
+ * something anyone can act on, and it claims only what was observed - Cellar
+ * generated that file from this notebook, and this notebook has stopped writing
+ * it. It does not claim the file is unused (something else may import it), so the
+ * remedy is offered rather than asserted: delete it when nothing needs it.
+ */
+export function orphanedModuleExplanation(orphan: string, current: string | null): string {
+	const now = current ? ` This notebook now exports to ${current}.` : '';
+	return `${orphan} is a module Cellar generated from this notebook and no longer writes.${now} Delete it when nothing imports it - Cellar will not remove it for you.`;
+}
+
 /** Count of cells currently marked for export to a module of this language. */
 export function exportCellCount(
 	cells: readonly ExportCell[] | null | undefined,
