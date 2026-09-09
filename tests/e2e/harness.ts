@@ -96,6 +96,23 @@ export function bootDiagnostic(output: string, repo: string = REPO): string {
 }
 
 /**
+ * How long an MCP tool call gets before the client gives up.
+ *
+ * The SDK's own default is 60s, and these calls are not RPC pings - they RUN
+ * CELLS (`add_and_run`, `clear_outputs` over a notebook full of output), so the
+ * budget is really "how long may a kernel take". It was set on a 15-core M5 Pro
+ * and `ubuntu-latest` measures 2.3-3x slower, so 60s there is 20-26s of the same
+ * headroom. MEASURED: `mcp-ergonomics` and both `mcp-agent-sees-figures` tests
+ * failed with `MCP error -32001: Request timed out` on the runner.
+ *
+ * Same reasoning as `CELLAR_E2E_EXPECT_TIMEOUT_MS` in playwright.config.ts, and
+ * the same limit: it scales a HARNESS budget to the hardware, never a product
+ * one, so it cannot hide a slow tool from a user - only from a test that was
+ * measuring the runner rather than the code.
+ */
+export const MCP_CALL_TIMEOUT_MS = Number(process.env.CELLAR_E2E_MCP_TIMEOUT_MS) || 60_000;
+
+/**
  * Remove a spec's throwaway workspace, tolerating the teardown race.
  *
  * Every spec's `afterAll` kills its launcher and then deletes the workspace, and

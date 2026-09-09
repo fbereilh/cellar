@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
-import { runtimeAvailable, bootCellar, killCellar, REPO, removeWorkspace } from './harness';
+import { runtimeAvailable, bootCellar, killCellar, REPO, removeWorkspace, MCP_CALL_TIMEOUT_MS } from './harness';
 
 /**
  * The agent learns what the HUMAN changed - over the wire an agent really uses.
@@ -38,7 +38,7 @@ const NB = 'story.ipynb';
 type Raw = { content: Array<{ type: string; text?: string }>; isError?: boolean };
 
 const callRaw = (name: string, args: Record<string, unknown>) =>
-	client!.callTool({ name, arguments: args }) as Promise<Raw>;
+	client!.callTool({ name, arguments: args }, undefined, { timeout: MCP_CALL_TIMEOUT_MS }) as Promise<Raw>;
 
 const blocks = (r: Raw) => r.content.filter((c) => c.type === 'text').map((c) => c.text ?? '');
 /** The user-activity block, when the result carries one. */

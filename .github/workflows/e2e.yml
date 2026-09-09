@@ -107,6 +107,11 @@ jobs:
       # paper over a flaky suite - see the note in playwright.config.ts.
       CELLAR_E2E_EXPECT_TIMEOUT_MS: '75000'
       CELLAR_E2E_TIMEOUT_MS: '300000'
+      # The MCP client's own request budget. Its calls RUN CELLS, so this is
+      # really "how long may a kernel take" — same scaling, same limit: these
+      # are HARNESS budgets, never product ones, so they cannot hide a slow
+      # tool from a user, only from a test measuring the runner.
+      CELLAR_E2E_MCP_TIMEOUT_MS: '150000'
 
     steps:
       - uses: actions/checkout@v5

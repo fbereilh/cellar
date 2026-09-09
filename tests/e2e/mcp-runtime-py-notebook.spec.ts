@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
-import { runtimeAvailable, bootCellar, killCellar, REPO, openSidebarSection, removeWorkspace } from './harness';
+import { runtimeAvailable, bootCellar, killCellar, REPO, openSidebarSection, removeWorkspace, MCP_CALL_TIMEOUT_MS } from './harness';
 
 /**
  * The agent-facing Databricks-runtime surface and `.py` notebook pinning, over the
@@ -45,7 +45,7 @@ let baseURL = '';
 
 /** A tool call's JSON payload, as the agent receives it. */
 async function call(name: string, args: Record<string, unknown>): Promise<any> {
-	const r = (await client!.callTool({ name, arguments: args })) as {
+	const r = (await client!.callTool({ name, arguments: args }, undefined, { timeout: MCP_CALL_TIMEOUT_MS })) as {
 		content: Array<{ text: string }>;
 		isError?: boolean;
 	};
@@ -56,7 +56,7 @@ async function call(name: string, args: Record<string, unknown>): Promise<any> {
 
 /** A tool call expected to FAIL: its text is the error message, not JSON. */
 async function callRaw(name: string, args: Record<string, unknown>) {
-	const r = (await client!.callTool({ name, arguments: args })) as {
+	const r = (await client!.callTool({ name, arguments: args }, undefined, { timeout: MCP_CALL_TIMEOUT_MS })) as {
 		content: Array<{ text: string }>;
 		isError?: boolean;
 	};

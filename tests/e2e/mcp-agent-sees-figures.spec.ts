@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
-import { runtimeAvailable, bootCellar, killCellar, REPO, removeWorkspace } from './harness';
+import { runtimeAvailable, bootCellar, killCellar, REPO, removeWorkspace, MCP_CALL_TIMEOUT_MS } from './harness';
 
 /**
  * The agent can SEE the figures it draws — end to end over the real wire an agent
@@ -42,7 +42,7 @@ const shot = async (page: import('@playwright/test').Page, name: string) => {
 type ToolResult = { content: Array<{ type: string; text?: string; data?: string; mimeType?: string }> };
 
 /** Raw tool result — the content BLOCKS, which is what this spec is about. */
-const callRaw = (name: string, args: Record<string, unknown>) => client!.callTool({ name, arguments: args }) as Promise<ToolResult>;
+const callRaw = (name: string, args: Record<string, unknown>) => client!.callTool({ name, arguments: args }, undefined, { timeout: MCP_CALL_TIMEOUT_MS }) as Promise<ToolResult>;
 
 /** The JSON payload a tool result carries in its text block. */
 const payloadOf = (r: ToolResult) => JSON.parse(r.content.find((c) => c.type === 'text')!.text!);

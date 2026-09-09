@@ -98,7 +98,7 @@ async function openNotebook(page: Page): Promise<void> {
 	// session was already populated; accepting the loading state makes it
 	// order-independent rather than lucky.
 	await expect(
-		empty.or(page.getByTestId('cell').first()).or(page.getByText('loading…'))
+		empty.or(page.getByTestId('cell').first()).or(page.getByText('loading…').first())
 	).toBeVisible({ timeout: 30_000 });
 	if (await empty.isVisible().catch(() => false)) await empty.click();
 }
@@ -233,7 +233,10 @@ test('the pre-render loading state is laid out like the notebook it becomes', as
 	await page.goto(`${baseURL}/?ws=${encodeURIComponent(workspace)}`);
 	await openNotebook(page);
 
-	await expect(page.getByText('loading…')).toBeVisible();
+	// `.first()`: the shell keeps every open notebook tab mounted, so a restored
+	// session renders one `loading…` per held tab and a bare locator is a strict-mode
+	// violation. The claim is "the loading view is on screen", which first() makes.
+	await expect(page.getByText('loading…').first()).toBeVisible();
 	await settle(page);
 	const pre = await measure(page);
 

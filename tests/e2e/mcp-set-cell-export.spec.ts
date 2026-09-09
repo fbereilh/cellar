@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
-import { runtimeAvailable, bootCellar, killCellar, REPO, removeWorkspace } from './harness';
+import { runtimeAvailable, bootCellar, killCellar, REPO, removeWorkspace, MCP_CALL_TIMEOUT_MS } from './harness';
 
 /**
  * The nbdev-style export flow END TO END over the wire an agent really uses: a
@@ -41,7 +41,7 @@ const record = (call: string, args: unknown, result: unknown) => transcript.push
 
 /** A tool call's JSON payload, as the agent receives it. */
 async function call(name: string, args: Record<string, unknown>): Promise<any> {
-	const r = (await client!.callTool({ name, arguments: args })) as {
+	const r = (await client!.callTool({ name, arguments: args }, undefined, { timeout: MCP_CALL_TIMEOUT_MS })) as {
 		content: Array<{ text: string }>;
 		isError?: boolean;
 	};
