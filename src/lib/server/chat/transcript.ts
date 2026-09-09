@@ -17,13 +17,13 @@
  *    **Its SCOPE, stated precisely, because a reads-on run has file reach.** The
  *    filter below bounds the TRANSCRIPT; on its own that would leave a hidden
  *    cell one `Read('<ws>/notebook.ipynb')` away, since the notebook file (and
- *    `.cellar/checkpoints.json`, which snapshots cells WITH outputs) sits inside
- *    the confinement root. So the two halves are paired: this filter bounds what
- *    is SENT, and `server/chat/claude-cli.ts`'s `denialPatterns` denies, at the
- *    tool layer on EVERY reads-on run and never optionally, the current notebook,
- *    the artifacts Cellar names after it (`<stem>.py`, `<stem>.html`, the
- *    `.ipynb_checkpoints` copy - none of those writers filters hidden cells), and
- *    `.cellar/` whole.
+ *    `.cellar/`'s checkpoint store, which snapshots cells WITH outputs) sits
+ *    inside the confinement root. So the two halves are paired: this filter
+ *    bounds what is SENT, and `server/chat/claude-cli.ts`'s `denialPatterns`
+ *    denies, at the tool layer on EVERY reads-on run and never optionally, the
+ *    current notebook, the artifacts Cellar names after it (`<stem>.py`,
+ *    `<stem>.html`, the `.ipynb_checkpoints` copy - none of those writers filters
+ *    hidden cells), and `.cellar/` whole.
  *
  *    **The claim that supports, exactly, and its two residuals.** What holds is
  *    the narrow statement: a hidden cell in THIS notebook is unreachable through
