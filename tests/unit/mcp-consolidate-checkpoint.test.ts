@@ -200,18 +200,71 @@ describe('a sweep that deletes nothing stays on the throttled tier', () => {
 	});
 });
 
+/**
+ * An in-memory MCP client over the SHIPPED `createCellarMcpServer()` - the same
+ * factory `startMcpServer` mints a session with - so what is asserted is what an
+ * agent is really handed at connect and on a call, never the registration's source
+ * text (a reformat cannot break it, dead code cannot satisfy it).
+ */
+async function connectAgent(): Promise<{ desc?: string; call: (args: Record<string, unknown>) => Promise<{ isError: boolean; payload: Record<string, unknown> }> }> {
+	const srv = await import('../../src/lib/server/mcp/server');
+	const server = srv.createCellarMcpServer();
+	const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+	const client = new Client({ name: 'test-agent', version: '0.0.0' });
+	await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+	const desc = (await client.listTools()).tools.find((t) => t.name === 'consolidate_imports')?.description;
+	return {
+		desc,
+		call: async (args) => {
+			const res = await client.callTool({ name: 'consolidate_imports', arguments: args });
+			const first = (res.content as { type: string; text: string }[])[0];
+			return { isError: res.isError === true, payload: res.isError ? { text: first.text } : JSON.parse(first.text) };
+		}
+	};
+}
+
+describe('what the AGENT is handed - the shipped registration, not the service function', () => {
+	/**
+	 * A tool result reaches an agent through its HANDLER, so a handler that answers
+	 * with its own success literal rather than forwarding the service result drops
+	 * whatever the service added, invisibly to any assertion made on the service.
+	 * The waived-path `undo` warning is therefore pinned at this layer too.
+	 */
+	it.skipIf(!chmodBlocksWrites)('carries the waived-path undo warning on the wire', async () => {
+		const nb = 'sweep-wire-waived.ipynb';
+		const { target } = notebookWithDisposableImportsCell(nb);
+		cpmod.createCheckpoint(target, { trigger: 'manual' });
+		const { call } = await connectAgent();
+		const dir = join(WS, '.cellar', 'checkpoints');
+		chmodSync(dir, 0o500);
+		let r: { isError: boolean; payload: Record<string, unknown> };
+		try {
+			r = await call({ allow_unrecoverable: true, notebook: nb });
+		} finally {
+			chmodSync(dir, 0o700);
+		}
+		expect(r.isError, 'the waived sweep should have proceeded').toBe(false);
+		expect(r.payload.undo).toMatchObject({ outputs_recoverable: false });
+	});
+
+	it('says nothing about undo on an ordinary sweep', async () => {
+		const nb = 'sweep-wire-ordinary.ipynb';
+		notebookWithDisposableImportsCell(nb);
+		const { call } = await connectAgent();
+		const r = await call({ notebook: nb });
+		expect(r.isError).toBe(false);
+		// Conditional, so an ordinary sweep pays no tokens for it.
+		expect('undo' in r.payload).toBe(false);
+	});
+});
+
 describe('the description an agent is billed for says what the sweep now guarantees', () => {
 	it('names the delete, the undo it now backs, and the one case it refuses', async () => {
 		// The description is the only thing most agents ever read about this tool, and
 		// it never said the sweep DELETES cells at all - so it has to say that, what now
 		// happens to their outputs, and that the call can be refused. Read off the string
 		// the SHIPPED server EMITS at connect, not off the registration's source text.
-		const srv = await import('../../src/lib/server/mcp/server');
-		const server = srv.createCellarMcpServer();
-		const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
-		const client = new Client({ name: 'test-agent', version: '0.0.0' });
-		await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
-		const desc = (await client.listTools()).tools.find((t) => t.name === 'consolidate_imports')?.description;
+		const desc = (await connectAgent()).desc;
 		expect(desc, 'consolidate_imports must be registered with a description').toBeTruthy();
 
 		expect(desc).toMatch(/EMPTIES is deleted/);

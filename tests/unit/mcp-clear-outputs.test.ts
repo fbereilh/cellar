@@ -666,8 +666,8 @@ describe('set_cell_type is on the destructive tier exactly when it drops outputs
 		// description the SHIPPED server really EMITS at connect (the delivered
 		// contract), not off the registration's source text.
 		const desc = await emittedDescription('set_cell_type');
-		expect(desc).toMatch(/undo brings them back/);
-		expect(desc).toMatch(/REFUSED before converting/);
+		expect(desc).toMatch(/unthrottled checkpoint stores them for undo/);
+		expect(desc).toMatch(/REFUSED/);
 		expect(desc).toMatch(/allow_unrecoverable/);
 	});
 });
@@ -727,5 +727,116 @@ describe('a .py (jupytext) notebook clears in memory without a jupytext write', 
 		expect(py.writes).toEqual([]);
 		expect(seen).toEqual(cells.map((c) => c.id));
 		expect(withOutputs(target)).toEqual([]);
+	});
+});
+
+describe('the destructive surface as an AGENT receives it, over the shipped registration', () => {
+	/**
+	 * A tool result reaches an agent through its HANDLER, and a handler that answers
+	 * with its own success literal instead of forwarding the service result drops
+	 * whatever the service added - silently, and invisibly to any assertion made on
+	 * the service function. That is exactly how `set_cell_type` came to answer the
+	 * wire with `{"ok":true}` over destroyed outputs while its three siblings
+	 * reported the loss, so the `undo` warning is pinned HERE, at the layer an agent
+	 * actually reads, for every destructive tool that can produce one.
+	 */
+	async function callTool(name: string, args: Record<string, unknown>): Promise<{ isError: boolean; payload: Record<string, unknown> }> {
+		const srv = await import('../../src/lib/server/mcp/server');
+		const server = srv.createCellarMcpServer();
+		const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+		const client = new Client({ name: 'test-agent', version: '0.0.0' });
+		await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+		const res = await client.callTool({ name, arguments: args });
+		const first = (res.content as { type: string; text: string }[])[0];
+		return { isError: res.isError === true, payload: res.isError ? { text: first.text } : JSON.parse(first.text) };
+	}
+
+	/** Two code cells carrying saved output, built through the notebook api. */
+	function seed(name: string): { target: string; ids: string[] } {
+		const target = abs(name);
+		nbmod.createNotebook(name);
+		const ids: string[] = [];
+		for (let i = 0; i < 2; i++) {
+			const cell = nbmod.addCell(null, 'code', target, null, `a = ${i}`);
+			nbmod.setOutputs(cell.id, out('gone\n'), target);
+			ids.push(cell.id);
+		}
+		return { target, ids };
+	}
+
+	/** `withUnwritableSidecars`, for a call that has to be awaited. */
+	async function unwritable<T>(target: string, fn: () => Promise<T>): Promise<T> {
+		cpmod.createCheckpoint(target, { trigger: 'manual' });
+		const dir = join(WS, '.cellar', 'checkpoints');
+		chmodSync(dir, 0o500);
+		try {
+			return await fn();
+		} finally {
+			chmodSync(dir, 0o700);
+		}
+	}
+
+	/**
+	 * The three destructive tools this file owns, each addressed the way it destroys
+	 * outputs; `consolidate_imports` is pinned the same way in
+	 * `mcp-consolidate-checkpoint.test.ts`, which owns its sweep fixture.
+	 */
+	const TOOLS = ['clear_outputs', 'delete_cells', 'set_cell_type'];
+	const argsFor = (name: string, ids: string[]): Record<string, unknown> =>
+		name === 'delete_cells'
+			? { ids: [ids[0]] }
+			: name === 'set_cell_type'
+				? { id: ids[0], cell_type: 'markdown' }
+				: {};
+
+	it.skipIf(!chmodBlocksWrites)('carries the waived-path undo warning on EVERY destructive tool result', async () => {
+		for (const name of TOOLS) {
+			const nb = `wire-waived-${name}.ipynb`;
+			const { target, ids } = seed(nb);
+			const r = await unwritable(target, () =>
+				callTool(name, { ...argsFor(name, ids), allow_unrecoverable: true, notebook: nb })
+			);
+			expect(r.isError, `${name} should have proceeded`).toBe(false);
+			expect(r.payload.undo, `${name} must report the loss it was allowed to cause`).toMatchObject({
+				outputs_recoverable: false
+			});
+		}
+	});
+
+	it('says nothing about undo when the checkpoint really holds the outputs', async () => {
+		for (const name of TOOLS) {
+			const nb = `wire-ordinary-${name}.ipynb`;
+			const { ids } = seed(nb);
+			const r = await callTool(name, { ...argsFor(name, ids), notebook: nb });
+			expect(r.isError, `${name} should have succeeded`).toBe(false);
+			// Conditional, so an ordinary call pays no tokens for it.
+			expect('undo' in r.payload, `${name} must not warn about an undo that works`).toBe(false);
+		}
+	});
+});
+
+describe('every destructive tool description holds the four honesty facts inside the bound', () => {
+	/**
+	 * A description is billed on EVERY session, so an honesty correction has to be
+	 * paid for by cutting words rather than by growing the string (AGENTS.md's own
+	 * rule). The four destructive tools each have to say that the checkpoint stores
+	 * the outputs, that it is never throttled away, that the call is REFUSED if it
+	 * cannot, and that `allow_unrecoverable:true` proceeds knowingly - and say it
+	 * under 700 chars. The bound is pinned per tool here so the rule is enforced
+	 * where it was previously only stated; the wire half lives in
+	 * `tests/e2e/mcp-ergonomics.spec.ts`, which CI and the gate never run.
+	 */
+	for (const name of ['clear_outputs', 'delete_cells', 'set_cell_type', 'consolidate_imports']) {
+		it(`${name} stays under the 700-char bound`, async () => {
+			expect((await emittedDescription(name)).length).toBeLessThan(700);
+		});
+	}
+
+	it('keeps delete_cells naming the guarantee and its exception', async () => {
+		const desc = await emittedDescription('delete_cells');
+		expect(desc).toMatch(/never throttled away/);
+		expect(desc).toMatch(/undo restores the cells WITH their outputs/);
+		expect(desc).toMatch(/REFUSED before deleting anything/);
+		expect(desc).toMatch(/allow_unrecoverable/);
 	});
 });
