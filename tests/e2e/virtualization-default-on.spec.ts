@@ -164,7 +164,14 @@ test('with NO url param a large notebook is windowed (P5 default-on)', async ({ 
 	test.setTimeout(120_000);
 	await page.goto(`${baseURL}/?ws=${encodeURIComponent(workspace)}`);
 	const openBtn = page.getByTestId('empty-open-notebook');
-	if (await openBtn.isVisible({ timeout: 10_000 }).catch(() => false)) await openBtn.click();
+	// SETTLE before probing: the shell paints either the empty state or an already
+	// open notebook, and reading `isVisible()` before either arrives reports the
+	// button invisible, turns the click into a no-op, and then times out on a
+	// notebook nothing ever opened. The 10s here was papering over that - it is a
+	// race, not a slow machine, so a longer probe only moves the threshold. See the
+	// openNotebook rule in AGENTS.md.
+	await expect(openBtn.or(page.getByTestId('cell').first())).toBeVisible();
+	if (await openBtn.isVisible().catch(() => false)) await openBtn.click();
 	await expect.poll(() => cells(page), { timeout: 30_000 }).toBeGreaterThan(0);
 
 	// Windowing engaged with nothing in the URL: off-screen cells are spacers.
