@@ -3052,38 +3052,83 @@
 	 * written by either side, which is why switching costs no kernel and no cell
 	 * rewrite - see `setNotebookLanguage`.
 	 *
-	 * THREE outcomes, never two, and the third is why the reply carries the HELD
-	 * language on every path. A REFUSAL (a `.py` text notebook, an unknown value)
-	 * changed nothing, so the select goes back to what the server holds and says
-	 * why. A FAILED WRITE (`writeFailed`) is the opposite: the live document HOLDS
-	 * the new language - so `run.ts` compiles every code cell in it from now on -
-	 * and only the save failed, so the select must ADOPT it and say only that it
-	 * could not be saved. Told apart by the FLAG the route sets, never by the
-	 * status code: any other 5xx (a proxy 502/503, an HTML error page) landed no
-	 * verdict at all and may not be reported as accepted.
+	 * FOUR outcomes - the `TargetCommit` / `VisibilityCommit` vocabulary this file
+	 * already uses, member for member, because they answer the same question and a
+	 * second spelling of it is how one of them quietly loses a case:
+	 *
+	 * - `committed`   the server stored it; adopt what the reply says it HOLDS
+	 * - `refused`     a `.py` text notebook, or an unknown value: nothing changed,
+	 *                 so the select goes back to what the server holds and says why
+	 * - `writeFailed` the opposite of a refusal - the live document HOLDS the new
+	 *                 language, so `run.ts` compiles every code cell in it from now
+	 *                 on, and only the save failed; ADOPT it and say only that it
+	 *                 could not be SAVED
+	 * - `unreachable` the request landed no verdict we can read; CLAIM NOTHING
+	 *
+	 * `unreachable` is the one that must not revert, and it is why this is not the
+	 * three-way split it started as. A rejected fetch does NOT mean the write did
+	 * not happen: the server can have applied it, PERSISTED it, published
+	 * `notebook:language` carrying this tab's own `originId` (so this tab suppresses
+	 * its own echo) and lost only the response on the way back. Reverting there is
+	 * what MANUFACTURES the divergence this whole axis exists to prevent - a select
+	 * reading Python over a document every code cell of which now compiles as
+	 * `%%mojo` - under a sentence asserting the opposite. So the applied value is
+	 * left standing (which `Notebook.svelte`'s resync effect then keeps, since it
+	 * reads `notebookLanguage` once `languageBusy` clears), the notice says only
+	 * that the change could not be CONFIRMED, and the ordinary refetch paths settle
+	 * it; there is deliberately no bespoke `load()` here.
+	 *
+	 * A verdict is READABLE only from the reply BODY carrying this route's own
+	 * shape - `{ok:true}`, `{ok:false, reason}` or `{writeFailed}`. NEVER from the
+	 * status code: a proxy 502/503 or an HTML error page is a 5xx that landed no
+	 * verdict at all, and reading a status as one would report it as accepted.
+	 *
+	 * There is no `superseded` member: `languageBusy` gates the whole function, so
+	 * exactly one language change is ever in flight and there is no second writer
+	 * of this value in this tab to be superseded BY.
 	 */
-	async function setLanguageValue(next: NotebookLanguage) {
-		if (next === notebookLanguage || languageBusy) return;
+	async function setLanguageValue(next: NotebookLanguage): Promise<LanguageCommit> {
+		if (next === notebookLanguage || languageBusy) return 'superseded';
 		languageBusy = true;
 		showLanguageFeedback('');
+		const was = notebookLanguage;
 		try {
 			const res = await fetch('/api/notebooks/language', {
 				method: 'POST',
 				headers: { 'content-type': 'application/json' },
 				body: JSON.stringify({ language: next, path, originId })
-			});
-			const body = await res.json().catch(() => ({}));
-			const applied = res.ok && body?.ok === true;
-			const writeFailed = !applied && typeof body?.writeFailed === 'string';
-			if (!applied && !writeFailed)
-				throw new Error(body?.message || 'could not set the notebook language');
+			}).catch(() => null);
+			// Read ONCE, and only this route's own shape counts as a verdict.
+			const body = res
+				? await res
+						.json()
+						.then((b) => (b && typeof b === 'object' ? (b as Record<string, unknown>) : null))
+						.catch(() => null)
+				: null;
+			const writeFailed = typeof body?.writeFailed === 'string' ? body.writeFailed : null;
+			const refused =
+				body?.ok === false && writeFailed === null && typeof body?.message === 'string' && typeof body?.reason === 'string'
+					? body.message
+					: null;
+			if (!body || (body.ok !== true && writeFailed === null && refused === null)) {
+				// NO VERDICT. Keep the value the user asked for - the write may well have
+				// landed - and claim nothing about it.
+				notebookLanguage = next;
+				scheduleStaleness();
+				showLanguageFeedback(
+					`Not confirmed - the server did not answer. This notebook is showing ${next === 'mojo' ? 'Mojo' : 'Python'}; reload to see what it really holds.`
+				);
+				return 'unreachable';
+			}
 			notebookLanguage = isNotebookLanguage(body.language) ? body.language : notebookLanguage;
 			// The stored target's extension may have MOVED with the language, and this
 			// tab suppresses its own `notebook:export-target` echo (originId), so the
 			// reply is the only thing that can settle its field. Adopted as one snapshot,
 			// in the same order the SSE branch uses (`exportTarget` LAST), rather than
 			// re-deriving an extension here - the server is what stored it.
-			const t = body.exportTarget;
+			const t = body.exportTarget as
+				| { base?: string; resolved?: string | null; resolveError?: string | null; target?: string | null }
+				| undefined;
 			if (t) {
 				exportBase = t.base ?? 'workspace';
 				exportResolved = t.resolved ?? null;
@@ -3095,18 +3140,30 @@
 			// OWN `notebook:language` echo (originId), so nothing else would recompute
 			// them. (Another tab's change goes through `applyStructuralEvent`, which
 			// schedules this for the same reason.)
-			scheduleStaleness();
+			if (notebookLanguage !== was) scheduleStaleness();
+			if (refused !== null) {
+				showLanguageFeedback(refused);
+				return 'refused';
+			}
 			showLanguageFeedback(
-				writeFailed
-					? `Applied to this session - code cells now run as ${notebookLanguage === 'mojo' ? 'Mojo' : 'Python'}, but the notebook could not be saved: ${body.writeFailed}`
+				writeFailed !== null
+					? `Applied to this session - code cells now run as ${notebookLanguage === 'mojo' ? 'Mojo' : 'Python'}, but the notebook could not be saved: ${writeFailed}`
 					: `Applied - code cells now run as ${notebookLanguage === 'mojo' ? 'Mojo' : 'Python'}.`
 			);
-		} catch (err) {
-			showLanguageFeedback(String((err as Error)?.message ?? err));
+			return writeFailed !== null ? 'writeFailed' : 'committed';
 		} finally {
 			languageBusy = false;
 		}
 	}
+
+	/**
+	 * What became of a notebook-language write - the `TargetCommit` shape, because
+	 * the two answer the same question. See `setLanguageValue`'s header for what each
+	 * outcome licenses; the one that matters is that `unreachable` claims NOTHING and
+	 * therefore may not revert the select. `superseded` is only ever the early return
+	 * for a no-op or a change already in flight - nothing was sent.
+	 */
+	type LanguageCommit = TargetCommit;
 
 	/**
 	 * Declare (or clear, with '') this notebook's code root, then let the server's

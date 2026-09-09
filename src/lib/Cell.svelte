@@ -110,14 +110,15 @@
 		staleState?: StalenessEntry | null;
 		/**
 		 * The MODULE LANGUAGE the notebook's export target names (`$lib/exportRole`),
-		 * or **null when no target is configured at all**. A cell is eligible for the
-		 * export toggle only when its own language matches, so this is what decides
-		 * whether the toggle is drawn at all.
+		 * or **null when no target is configured at all**.
 		 *
-		 * NULLABLE on purpose: eligibility falls back to `python` with nothing
-		 * configured, so a bare language cannot tell a `.py` target from no target,
-		 * and copy built on it named a module that does not exist. The fallback is
-		 * applied to ELIGIBILITY only; every sentence reads the nullable value.
+		 * FOR SENTENCES THAT NAME A MODULE, and for nothing else. ELIGIBILITY is judged
+		 * by the NOTEBOOK's language (`notebookLanguage`, below) through the shared
+		 * `exportEligibilityLanguage`, whose header owns the reason - reading THIS
+		 * nullable value for eligibility is the defect, not the rule.
+		 *
+		 * NULLABLE on purpose: a bare language cannot tell a `.py` target from no
+		 * target, and copy built on it named a module that does not exist.
 		 */
 		exportLanguage?: ExportLanguage | null;
 		/**

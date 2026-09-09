@@ -282,8 +282,14 @@ describe('the schemas and the doctrine an agent is billed for', () => {
 		expect(instructions).toContain('A notebook is Python or Mojo, never both');
 		expect(instructions).toContain('there is NO mojo cell_type');
 		expect(instructions).toContain('set_notebook_language');
-		// And the facts about what a Mojo notebook is NOT.
-		expect(instructions).toContain('no cell shows a staleness verdict');
+		// And the facts about what a Mojo notebook is NOT - narrowed to its CODE cells,
+		// because `hasPythonDataflow` is `isPythonCodeCell || isSqlCell` and `isSqlCell`
+		// is language-independent, so a SQL cell in a Mojo notebook really does keep a
+		// fresh/stale verdict (pinned behaviourally in `notebook-language.test.ts`). The
+		// unqualified claim told an agent the opposite of what the code does.
+		expect(instructions).toContain(
+			'Its CODE cells have no Python dataflow: none shows a staleness verdict (a SQL cell still does)'
+		);
 		expect(instructions).toContain('none can be the imports cell');
 		// The EXPORT claim, which must agree with clause 5 rather than reading as an
 		// enumeration of Mojo limitations: such a notebook's cells ARE exportable, to a

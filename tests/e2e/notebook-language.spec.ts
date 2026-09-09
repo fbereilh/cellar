@@ -368,3 +368,83 @@ test('a .py TEXT notebook offers no selector - it can only ever be Python', asyn
 	await expect(page.getByTestId('language-bar')).toHaveCount(0);
 	await expect(page.getByTestId('language-select')).toHaveCount(0);
 });
+
+/**
+ * A reply that lands NO VERDICT must not revert the select.
+ *
+ * The switch is non-optimistic, so the browser waits for the server - but a
+ * reply that never arrives, or one that is not this route's own shape (a proxy
+ * 502, an HTML error page), establishes NOTHING about the write. The server may
+ * well have persisted it and lost only the response, and reverting there
+ * MANUFACTURES the divergence: the select reads Python while `run.ts` compiles
+ * every plain code cell as `%%mojo`, with nothing left to correct it (the
+ * success event is never emitted, and this tab would echo-suppress it anyway).
+ *
+ * So the applied language is KEPT and the feedback claims only that it was not
+ * confirmed. The CONTROL below is what keeps that from being a blanket
+ * never-revert: a refusal the server really made still reverts and still says
+ * why.
+ */
+test('a reply that lands no verdict KEEPS the applied language and says it is unconfirmed', async ({ page }) => {
+	test.setTimeout(120_000);
+	await openFresh(page, 'lang-noverdict.ipynb');
+
+	// The reachable shape: the request REALLY reaches the server (so the document
+	// really does switch and really is persisted) and only the response dies on the
+	// way back - a reaped instance, a proxy, a transient socket error.
+	await page.route('**/api/notebooks/language', async (route) => {
+		await route.fetch();
+		await route.fulfill({
+			status: 502,
+			contentType: 'text/html',
+			body: '<html><body><h1>502 Bad Gateway</h1></body></html>'
+		});
+	});
+	await page.getByTestId('language-select').selectOption('mojo');
+
+	// The select KEEPS what the user asked for, the cells read as Mojo, and the
+	// sentence claims nothing beyond what was observed.
+	await expect(page.getByTestId('language-feedback')).toContainText(/not confirmed/i, { timeout: 15_000 });
+	await expect(page.getByTestId('language-feedback')).toContainText(/reload/i);
+	await expect(page.getByTestId('language-select')).toHaveValue('mojo');
+	await expect(cellBy(page, PY_ID).getByTestId('mojo-badge')).toBeVisible();
+
+	// ...and it was RIGHT to keep it: the write really landed. A revert here would
+	// have shown Python over a document that is Mojo on disk.
+	await expect.poll(() => nbMeta('lang-noverdict.ipynb').language, { timeout: 15_000 }).toBe('mojo');
+	// The remedy the sentence names really does resolve it - the document was Mojo
+	// all along, so a reload simply confirms it.
+	await page.unroute('**/api/notebooks/language');
+	await page.goto(`${baseURL}/?ws=${encodeURIComponent(workspace)}`);
+	await page.locator('[data-testid="tree-file"][data-path="lang-noverdict.ipynb"]').click();
+	await expect(cellBy(page, PY_ID)).toBeVisible({ timeout: 30_000 });
+	await expect(page.getByTestId('language-select')).toHaveValue('mojo');
+	await expect(page.getByTestId('language-feedback')).toHaveCount(0);
+});
+
+test('a REFUSAL the server really made still reverts the select and reports it', async ({ page }) => {
+	test.setTimeout(120_000);
+	await openFresh(page, 'lang-refused.ipynb');
+
+	// The route's OWN refusal shape (`{ok:false, reason, message}` at 400) - the one
+	// thing that IS a verdict. Fulfilled rather than provoked, because the selector
+	// offers only the two languages the server accepts, so no click can produce a
+	// genuine refusal on an `.ipynb`; the SHAPE is what the client keys on and is
+	// pinned against the real route in `notebook-language-document.test.ts`.
+	await page.route('**/api/notebooks/language', (route) =>
+		route.fulfill({
+			status: 400,
+			contentType: 'application/json',
+			body: JSON.stringify({ ok: false, reason: 'bad-language', message: 'unsupported notebook language' })
+		})
+	);
+	await page.getByTestId('language-select').selectOption('mojo');
+
+	await expect(page.getByTestId('language-feedback')).toContainText('unsupported notebook language', {
+		timeout: 15_000
+	});
+	await expect(page.getByTestId('language-select')).toHaveValue('python');
+	await expect(mojoCards(page)).toHaveCount(0);
+	expect(nbMeta('lang-refused.ipynb').language).toBeUndefined();
+	await page.unroute('**/api/notebooks/language');
+});

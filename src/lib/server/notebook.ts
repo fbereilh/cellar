@@ -554,11 +554,9 @@ function exportTargetView(doc: NotebookDoc): {
 		// The MODULE language, which is the NOTEBOOK's - reported only once a target
 		// names a module at all, so `null` still means "no module for a sentence to be
 		// about" and no surface invents a `.py` one. Read through the shared
-		// `docExportTargetInfo` (which is handed this same `info`) rather than off the
-		// extension: the extension follows the language now, not the other way round.
-		exportLanguage: info && exportTargetLanguage(info.ok ? info.target : info.path) !== null
-			? notebookLanguageOf(doc.metadata)
-			: null,
+		// `docExportTargetInfo`, HANDED this same `info` so the rule has one spelling
+		// and this hot path still resolves once.
+		exportLanguage: docExportTargetInfo(doc, info).language,
 		exportResolved: info && info.ok ? info.target : null,
 		exportResolveError: info && !info.ok ? info.error : null,
 		// The SAME `info` is threaded in rather than resolved a second time here, and

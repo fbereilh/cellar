@@ -1613,9 +1613,11 @@ export async function editCell(id: string, source: string, { routeImports: route
 	if (!cell) return null;
 	autoCheckpointBeforeAgentAction(nb);
 	// A SQL cell is a `code` cell on disk, but its source is SQL - never route
-	// "imports" out of it, and the same holds for a mojo cell's Mojo source and a
-	// raw cell's verbatim text. Pass the LOGICAL type so routeOne's `!== 'code'`
-	// guard skips all three.
+	// "imports" out of it, and the same holds for a raw cell's verbatim text. Pass
+	// the LOGICAL type so routeOne's `!== 'code'` guard skips both. A MOJO
+	// notebook's cells are skipped a level up instead - there is no mojo logical
+	// type to test, so `routeImports` refuses on the NOTEBOOK's language at its own
+	// entry (`imports-cell.ts`).
 	const logicalType = logicalCellType(cell);
 	const routed = routeOne(source, nb, { routeEnabled, cellType: logicalType, skipCellId: id });
 	setSource(id, routed ? routed.source : source, nb);

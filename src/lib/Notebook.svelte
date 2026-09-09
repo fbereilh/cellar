@@ -121,21 +121,24 @@
 		exportTarget?: string | null;
 		/**
 		 * The MODULE LANGUAGE this notebook's target names (`.py` -> python, `.mojo`
-		 * -> mojo), or **null when no target is configured at all**. It decides which
-		 * cells may be marked, so each Cell needs it to draw its export toggle.
+		 * -> mojo), or **null when no target is configured at all**.
 		 *
-		 * NULLABLE on purpose: eligibility falls back to `python` with nothing
-		 * configured (the legacy default), so a bare language cannot tell "this
-		 * notebook targets a `.py` module" from "this notebook targets nothing", and
-		 * any copy that says the first over the second names a file that does not
-		 * exist. The fallback is applied where ELIGIBILITY is asked and nowhere else.
+		 * FOR SENTENCES THAT NAME A MODULE, and for nothing else - the export button's
+		 * label, the stranded explanation, the unsaved-edit notice. ELIGIBILITY is
+		 * judged by the NOTEBOOK's language through the shared
+		 * `exportEligibilityLanguage`, whose header owns the reason; reading THIS
+		 * nullable value for eligibility is the defect it exists to name.
+		 *
+		 * NULLABLE on purpose: a bare language cannot tell "this notebook targets a
+		 * `.py` module" from "this notebook targets nothing", and any copy that says
+		 * the first over the second names a file that does not exist.
 		 */
 		exportLanguage?: ExportLanguage | null;
 		/**
 		 * The cells whose top-level `def main()` a `.mojo` export will DROP, because a
 		 * later exported cell defines one too and a Mojo module can hold only one
-		 * (`$lib/mojoExport`). Always empty for a `.py` target. Read per cell rather
-		 * than pinned, like `selectedIds`.
+		 * (`$lib/mojoExport`). Always empty in a PYTHON notebook, whose module is a
+		 * `.py` one. Read per cell rather than pinned, like `selectedIds`.
 		 */
 		mojoMainDropped?: ReadonlySet<string>;
 		/** How many cells are currently marked for export. */

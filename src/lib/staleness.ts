@@ -224,8 +224,8 @@ export function computeStaleness(
 	// nothing and read nothing the graph can see (their "inputs" are prose), so
 	// they are excluded here and fall to the n/a loop below - a chat reply is
 	// nondeterministic, and a staleness verdict over it would claim a re-run
-	// restores something no re-run can. A MOJO NOTEBOOK's cells are excluded for the
-	// sibling reason: each one is a whole program compiled to a `%%mojo` magic that
+	// restores something no re-run can. A MOJO NOTEBOOK's CODE cells are excluded for
+	// the sibling reason: each one is a whole program compiled to a `%%mojo` magic that
 	// runs in a SUBPROCESS, so it binds nothing any later cell can read and a
 	// fresh/stale verdict over it would be a claim about state that never existed.
 	// That is decided by `nbLang`, the notebook's own language, not per cell - which

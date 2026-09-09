@@ -71,10 +71,21 @@ vi.mock('../../src/lib/server/export-py', async () => {
 		resolves.n++;
 		return fn(...args);
 	};
+	// `docExportTargetInfo` is the one that can be HANDED an already-resolved answer
+	// (`exportTargetView` does exactly that), so it is counted only when it would
+	// really resolve - otherwise the counter would report a resolution that never
+	// happened and the budgets below would stop meaning what they say.
+	const info = (
+		doc: Parameters<typeof actual.docExportTargetInfo>[0],
+		resolved?: Parameters<typeof actual.docExportTargetInfo>[1]
+	) => {
+		if (resolved === undefined) resolves.n++;
+		return actual.docExportTargetInfo(doc, resolved);
+	};
 	return {
 		...actual,
 		resolveExportTarget: counted(actual.resolveExportTarget),
-		docExportTargetInfo: counted(actual.docExportTargetInfo),
+		docExportTargetInfo: info,
 		docExportTargetLanguage: counted(actual.docExportTargetLanguage),
 		docExportLanguage: counted(actual.docExportLanguage)
 	};
@@ -206,6 +217,25 @@ describe('get_notebook_map adds no export-target resolution of its own', () => {
 		expect(nbmod.getExportTarget(nb)).toBe('lib/map-lang.py');
 		expect(nbmod.getNotebook(nb).exportLanguage).toBe('python');
 		expect(leaves((await svc.getNotebookMap(nb)).sections).filter((l) => l.export === true)).toHaveLength(1);
+	});
+
+	it('getNotebook resolves the target ONCE, language included', async () => {
+		// `exportTargetView` reports FOUR things off one resolution - the base, the
+		// module language, the hazards and the orphaned module - and it reads the
+		// language through the shared `docExportTargetInfo` rather than re-deriving the
+		// rule inline, HANDING it the `info` it already has. This is the half the map
+		// budget above cannot see: it measures `getNotebook` as a baseline, so a second
+		// sweep added here would simply raise the baseline and pass.
+		const { nb, id } = await notebook('view-cost.ipynb', 'python', 'def one():\n    return 1');
+		nbmod.setExportTarget('lib/view-cost.py', nb);
+		nbmod.setCellExports([id], true, nb);
+
+		resolves.n = 0;
+		const view = nbmod.getNotebook(nb);
+		expect(resolves.n).toBe(1);
+		// ...and the value that one resolution produced is the right one.
+		expect(view.exportLanguage).toBe('python');
+		expect(view.exportResolved).toBe('lib/view-cost.py');
 	});
 
 	it('a notebook with NO target reports the language as null, never as python', async () => {

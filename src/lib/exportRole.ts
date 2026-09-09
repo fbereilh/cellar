@@ -402,10 +402,11 @@ export function exportStrandedCount(
  *
  * `moduleLanguage` is the language the CONFIGURED target names, or **null when no
  * target is configured at all** - and the two are different facts that may not be
- * worded as one. `canExportCell` falls back to `python` with nothing configured,
- * so a language alone cannot tell "this notebook targets a `.py` module" from
- * "this notebook targets nothing", and asserting the first over the second names a
- * file that does not exist.
+ * worded as one. It is read HERE because this sentence NAMES a module; eligibility
+ * is judged by the notebook's language instead (`exportEligibilityLanguage`). A
+ * language alone cannot tell "this notebook targets a `.py` module" from "this
+ * notebook targets nothing", and asserting the first over the second names a file
+ * that does not exist.
  *
  * ## THE REMEDY MAY NOT NAME AN ACTION THAT CANNOT HELP
  *

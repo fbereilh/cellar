@@ -571,16 +571,16 @@ Follow this house style:
    notebook is Python or Mojo, never both: get_notebook_map's display block reports
    \`language\`, set_notebook_language switches it, and there is NO mojo cell_type -
    every code cell is written in the notebook's language. In a MOJO notebook Cellar
-   compiles each code cell to Modular's own "%%mojo" cell magic, which writes the
-   body to a temp file and runs \`mojo run\` in a SUBPROCESS — there is no Mojo
+   compiles each code cell to Modular's own "%%mojo" cell magic, which runs
+   \`mojo run\` on the body in a SUBPROCESS — there is no Mojo
    kernel, and NOTHING carries from one cell to the next: no variables, no imports,
    no structs, no functions. So each cell MUST be a complete program with its own
    \`def main():\` and its own imports, and you must never write a "define here, use
    there" pair across two cells — it cannot work. Never write Python into a Mojo
-   notebook or Mojo into a Python one; switch the notebook instead. A Mojo
-   notebook has no Python dataflow, so no cell shows a staleness verdict, none can
-   be the imports cell, and imports are never routed; its cells ARE exportable, to
-   the .mojo module its target names (clause 5). Output is stdout only (buffered
+   notebook or Mojo into a Python one; switch the notebook instead. Its CODE cells
+   have no Python dataflow: none shows a staleness verdict (a SQL cell still does),
+   none can be the imports cell, and imports are never routed; its cells ARE
+   exportable, to the .mojo module its target names (clause 5). Output is stdout only (buffered
    until the cell finishes), and a compile error comes back as a
    MojoCompilationError naming a temp path. If the Mojo toolchain is missing the
    cell fails with the exact install command — relay it; Cellar never installs it

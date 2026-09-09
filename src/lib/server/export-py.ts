@@ -418,14 +418,23 @@ export interface ExportTargetLanguageInfo {
 	language: ExportLanguage | null;
 }
 
-export function docExportTargetInfo(doc: NotebookDoc): ExportTargetLanguageInfo {
-	const info = resolveExportTarget(doc);
+export function docExportTargetInfo(
+	doc: NotebookDoc,
+	resolved: ResolvedExportTarget | null | undefined = resolveExportTarget(doc)
+): ExportTargetLanguageInfo {
 	// The language is the NOTEBOOK's, reported only once a target names a module at
 	// all: the two facts are still separate (a target naming `notes.txt` is
 	// configured and names no module), but WHICH language a named module is in is no
 	// longer read off the extension - see `docExportLanguage`.
-	return info
-		? { configured: true, language: targetNamesModule(info) ? docExportLanguage(doc) : null }
+	//
+	// `resolved` lets a caller that has ALREADY resolved this document hand its own
+	// answer in rather than pay a second `resolveExportTarget`. That matters on the
+	// hot read: `exportTargetView` runs on every `getNotebook` AND every
+	// persist-driven publish, and with no notebook-level target stored the resolution
+	// sweeps EVERY cell for a `#|default_exp` directive. Defaulted, so every other
+	// caller is unchanged.
+	return resolved
+		? { configured: true, language: targetNamesModule(resolved) ? docExportLanguage(doc) : null }
 		: { configured: false, language: null };
 }
 
@@ -744,7 +753,31 @@ function storedExportTarget(
 		// contradict the notebook (`docExportLanguage`). For a Python notebook - nbdev's
 		// own vocabulary, and the only kind that carries these directives today - this
 		// expression is byte-identical to the `.py` it replaced.
-		const ext = moduleExtension(notebookLanguageOf(doc.metadata));
+		const nbLang = notebookLanguageOf(doc.metadata);
+		const ext = moduleExtension(nbLang);
+		// REFUSE a directive that NAMES THE OTHER language's module extension, the same
+		// way `resolveExportTarget` refuses a stored target that does - and for a
+		// stronger reason, because here the dotting would INVENT a path rather than
+		// merely describe a file the export never writes. `utils.py` in a Mojo notebook
+		// does not end with `.mojo`, so it fell through to `'utils.py'.replace(/\./g,'/')
+		// + '.mojo'` = `utils/py.mojo`: a directory the user never chose and a module
+		// named after a file extension, which `regenerateExportModule` would then
+		// CREATE. That is exactly the stray-module write the directive-root refusal
+		// above exists to stop, so this refuses in both directions rather than guessing
+		// which half of the spelling the author meant.
+		//
+		// The ordinary Python vocabulary is untouched and stays byte-identical
+		// (`core`, `pkg.utils`, `core.py`, `pkg.core.py` all resolve exactly as before,
+		// the `endsWith` early return included); the ONE spelling this changes is the
+		// contradicting one, whose previous answer was that stray path.
+		const namedByDirective = exportTargetLanguage(mod);
+		if (namedByDirective && namedByDirective !== nbLang)
+			return {
+				path: mod,
+				base: 'workspace',
+				source: 'default_exp',
+				error: `the #|default_exp directive names ${mod}, a ${moduleExtension(namedByDirective)} module, but this notebook's language is ${nbLang === 'mojo' ? 'Mojo' : 'Python'} - drop the extension (nbdev writes a dotted module name, not a file name), or change the notebook's language`
+			};
 		const rel = mod.endsWith(ext) ? mod : mod.replace(/\./g, '/') + ext;
 		return { ...directiveBase(rel), source: 'default_exp' };
 	}

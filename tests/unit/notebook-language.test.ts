@@ -274,7 +274,7 @@ describe('THE STALENESS REGRESSION: a mojo cell has no verdict, so it shows no c
 			nbLang
 		);
 
-	it('reports n/a for EVERY cell of a Mojo notebook - not fresh, and never stale', () => {
+	it('reports n/a for EVERY CODE cell of a Mojo notebook - not fresh, and never stale', () => {
 		const cells = [mojo('m', MOJO_MAIN), cell('p', 'x = 1')];
 		const out = stale(cells, { p: { defines: ['x'], uses: [] } }, MOJO);
 		expect(out.m.state).toBe(STALE_STATE.NA);
@@ -282,6 +282,29 @@ describe('THE STALENESS REGRESSION: a mojo cell has no verdict, so it shows no c
 		// The SAME cells in a Python notebook keep their ordinary verdicts.
 		const py = stale(cells, { p: { defines: ['x'], uses: [] } });
 		expect(py.p.state).toBe(STALE_STATE.FRESH);
+	});
+
+	it('a SQL cell KEEPS its verdict in a Mojo notebook - the exclusion is by cell, not by notebook', () => {
+		// `hasPythonDataflow` is `isPythonCodeCell(cell, nbLang) || isSqlCell(cell)` and
+		// `isSqlCell` is language-INDEPENDENT, because a SQL cell is an orthogonal cell
+		// KIND that deliberately coexists in either notebook: it compiles to a wrapper
+		// binding `_sql_df` whatever the notebook's language is. So "a Mojo notebook
+		// shows no staleness verdict" is true of its CODE cells only, and MCP doctrine
+		// clause 12 says exactly that - this is the behaviour that claim rests on.
+		const sqlCell = {
+			...cell('s', 'select 1', { language: 'sql' }),
+			metadata: { cellar: { language: 'sql', lastRun: { ...RAN, at: 2000 } } }
+		} as unknown as CellView;
+		const codeCell = { ...cell('m', MOJO_MAIN), metadata: { cellar: { lastRun: RAN } } } as unknown as CellView;
+		const out = computeStaleness(
+			[sqlCell, codeCell] as never,
+			{ s: { defines: ['_sql_df'], uses: [] } },
+			7,
+			null,
+			MOJO
+		);
+		expect(out.s.state).toBe(STALE_STATE.FRESH);
+		expect(out.m.state).toBe(STALE_STATE.NA);
 	});
 
 	it('keeps SQL cells in the graph, which is why the predicate is not just isPythonCodeCell', () => {
