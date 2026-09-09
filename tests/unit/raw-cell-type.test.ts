@@ -203,7 +203,7 @@ describe('authoring', () => {
 		expect(cell.metadata?.cellar?.importBindings).toBeUndefined();
 	});
 
-	it('drops the imports role and the export flag on conversion to raw, but KEEPS hide_input', () => {
+	it('drops the imports role on conversion to raw, but KEEPS the export mark and hide_input', () => {
 		const nb = makeRawNotebook('raw-convert.ipynb');
 		const codeId = nbmod.listCells(nb)[1].id;
 		nbmod.setCellRole(codeId, 'imports', nb);
@@ -215,7 +215,10 @@ describe('authoring', () => {
 		const asRaw = nbmod.listCells(nb).find((c) => c.id === codeId)!;
 		expect(asRaw.cell_type).toBe('raw');
 		expect(asRaw.metadata?.cellar?.role).toBeUndefined();
-		expect(asRaw.metadata?.cellar?.export).toBeUndefined();
+		// KEPT: a conversion may not silently delete a mark from the user's committed
+		// notebook. It is inert here (`isExportCell` gates on eligibility, so nothing
+		// reaches the module) and the greyed row toggle is what clears it.
+		expect(asRaw.metadata?.cellar?.export).toBe(true);
 		expect(asRaw.outputs).toEqual([]);
 		// KEPT: `$lib/hideInput` reads it only for a code cell, so it is already inert
 		// here - dropping it would silently lose the choice across a round trip.
@@ -228,6 +231,7 @@ describe('authoring', () => {
 		expect(back.cell_type).toBe('code');
 		expect(back.metadata?.cellar?.language).toBeUndefined();
 		expect(back.metadata?.cellar?.hide_input).toBe(true);
+		expect(back.metadata?.cellar?.export).toBe(true);
 	});
 });
 

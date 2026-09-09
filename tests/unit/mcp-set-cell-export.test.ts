@@ -186,7 +186,15 @@ describe('only code cells can be exported', () => {
 		const { target, code, md } = await makeNotebook('mark-md.ipynb');
 		const r = svc.setCellExport([code[0], md], true, target);
 
-		expect(r).toEqual({ ok: false, notCode: md });
+		// The refusal carries the language the cell WOULD contribute, which for markdown
+		// is none at all - that is what lets `server.ts` say so instead of reporting a
+		// language mismatch nothing compared. `targetLanguage` is the HONEST nullable
+		// fact and not the `python` ELIGIBILITY fallback: this notebook names no target,
+		// so a record claiming one would let the tool word a mismatch with a module that
+		// does not exist.
+		// `targetConfigured` rides along so the two causes of a null language stay
+		// apart: this notebook names no target at all.
+		expect(r).toEqual({ ok: false, notCode: md, cellLanguage: null, targetLanguage: null, targetConfigured: false });
 		// All-or-nothing: the code cell listed BEFORE the offender is untouched, so a
 		// half-marked module can never be built from a refused call.
 		expect(marked(target, code[0])).toBe(false);
@@ -201,7 +209,7 @@ describe('only code cells can be exported', () => {
 		// nbformat-type test admits one and its raw SQL is concatenated into a module
 		// git tracks - invalid Python in a committed file.
 		const r = svc.setCellExport([code[1]], true, target);
-		expect(r).toEqual({ ok: false, notCode: code[1] });
+		expect(r).toEqual({ ok: false, notCode: code[1], cellLanguage: null, targetLanguage: 'python', targetConfigured: true });
 		expect(marked(target, code[1])).toBe(false);
 
 		svc.setCellExport([code[0]], true, target);
@@ -228,7 +236,9 @@ describe('only code cells can be exported', () => {
 		const cells = nbmod.listCells(target);
 		expect(cells[1].cell_type).toBe('raw');
 
-		expect(svc.setCellExport([cells[1].id], true, target)).toEqual({ ok: false, notCode: cells[1].id });
+		// No target configured here either, so `targetLanguage` is null rather than the
+		// eligibility fallback (see the markdown case above).
+		expect(svc.setCellExport([cells[1].id], true, target)).toEqual({ ok: false, notCode: cells[1].id, cellLanguage: null, targetLanguage: null, targetConfigured: false });
 		expect(nbmod.getCell(cells[1].id, target)?.metadata?.cellar?.export).toBeUndefined();
 	});
 
@@ -597,7 +607,7 @@ describe('a regeneration that FAILED is reported, never read as a success', () =
 
 		const r = svc.setExportTarget('precious.ts', target);
 		expect('invalid' in r && r.ok).toBe(false);
-		expect('invalid' in r ? r.invalid : '').toMatch(/not a \.py file/);
+		expect('invalid' in r ? r.invalid : '').toMatch(/not a \.py or \.mojo file/);
 		expect(nbmod.getExportTarget(target)).toBe(null);
 
 		// And the chain the refusal breaks: marking a cell cannot reach that file.
@@ -1028,7 +1038,161 @@ describe('at the wire: the tool is really callable', () => {
 			arguments: { ids: [md], export: true, notebook: rel }
 		})) as CallResult;
 		expect(bad.isError).toBe(true);
-		expect(body(bad)).toContain('not a Python code cell');
+		// A markdown cell is refused for the fact that was OBSERVED - it has no module
+		// source - and NOT as a language mismatch: nothing was compared, and no target
+		// extension could ever admit it, so pointing at one would send an agent to
+		// change the target when the cell is the problem.
+		expect(body(bad)).toContain('is not a code cell, so it has no module source to export');
+		expect(body(bad)).not.toContain('.mojo target');
+	});
+
+	it('names NO TARGET as its own fact, never as a mismatch with a .py module', async () => {
+		// `docExportLanguage` falls back to `python` so that ELIGIBILITY on an
+		// unconfigured notebook behaves as it always has - but that fallback is not a
+		// fact about the notebook. Reported as one, this refusal named a `.py` module
+		// over a notebook whose export target is null and sent the agent to change an
+		// extension that does not exist. It is the same assert-more-than-was-observed
+		// defect the browser's `exportStrandedExplanation` carries a null branch for.
+		const rel = 'wire-notarget.ipynb';
+		const target = abs(rel);
+		svc.useNotebook('sess-wire-notarget', rel);
+		const { ids } = await svc.addCells(
+			[{ cell_type: 'mojo', source: 'def mojo_one() -> Int:\n    return 1' }],
+			null,
+			{ nb: target, routeImports: false }
+		);
+		// No `setExportTarget` call at all: this notebook targets nothing, and the doc
+		// layer reports the ABSENCE rather than the eligibility fallback.
+		expect(nbmod.getExportTarget(target)).toBeNull();
+		expect(nbmod.exportTargetInfoFor(target)).toEqual({ configured: false, language: null });
+		// The record carries the absent case explicitly rather than the fallback, so
+		// `server.ts` cannot word one as the other.
+		expect(svc.setCellExport([ids[0]], true, target)).toMatchObject({
+			ok: false,
+			cellLanguage: 'mojo',
+			targetLanguage: null
+		});
+
+		const client = await connect();
+		const bad = (await client.callTool({
+			name: 'set_cell_export',
+			arguments: { ids: [ids[0]], export: true, notebook: rel }
+		})) as CallResult;
+		expect(bad.isError).toBe(true);
+		expect(body(bad)).toContain('has no export target');
+		expect(body(bad)).toContain('set_export_target');
+		// It may NOT name a module the notebook does not have...
+		expect(body(bad)).not.toContain('export target is a .py module');
+		// ...and it names the extension that WOULD admit this cell, which is the action.
+		expect(body(bad)).toContain('.mojo path takes Mojo cells');
+
+		// The mirror: once a target exists, the SAME cell gets the mismatch sentence
+		// instead, so neither wording can regress into the other.
+		svc.setExportTarget('lib/wire-notarget.py', target);
+		const mismatched = (await client.callTool({
+			name: 'set_cell_export',
+			arguments: { ids: [ids[0]], export: true, notebook: rel }
+		})) as CallResult;
+		expect(mismatched.isError).toBe(true);
+		expect(body(mismatched)).toContain('is Mojo code but this notebook\'s export target is a .py module');
+		expect(body(mismatched)).not.toContain('has no export target');
+	});
+
+	it('names a CONFIGURED-but-unbuildable target as its own fact, never as "no target" and never as a mismatch', async () => {
+		// The THIRD state, and the one that borrowed a neighbour's sentence: a target
+		// IS configured, and it names no module Cellar can build. Reached without any
+		// hand-editing - a marked Python cell plus a `#|default_exp` line sitting after
+		// code takes `storedExportTarget`'s misplaced-directive branch, which resolves
+		// to `{path:'', error}` - so the language reads null with a target in hand.
+		// "Name one with set_export_target" is false (there IS one) and "the target is a
+		// .py module" is false (it names none), so this state gets its own wording.
+		const rel = 'wire-unbuildable.ipynb';
+		const target = abs(rel);
+		svc.useNotebook('sess-wire-unbuildable', rel);
+		const { ids } = await svc.addCells(
+			[
+				{ cell_type: 'code', source: 'def py_one():\n    return 1' },
+				{ cell_type: 'code', source: 'x = 1\n#|default_exp late' },
+				{ cell_type: 'mojo', source: 'def mojo_one() -> Int:\n    return 1' }
+			],
+			null,
+			{ nb: target, routeImports: false }
+		);
+		// The misplaced-directive report needs a MARKED cell before it may speak, so
+		// mark the Python one first - eligible, since with nothing resolved yet the
+		// ELIGIBILITY language is the legacy `python`.
+		expect(svc.setCellExport([ids[0]], true, target)).toMatchObject({ ok: true });
+
+		// A target IS configured and it resolves to nothing buildable: the two facts
+		// the refusal must be able to tell apart, from one resolution.
+		expect(nbmod.exportTargetInfoFor(target)).toEqual({ configured: true, language: null });
+		expect(nbmod.getNotebook(target).exportResolveError).toContain('#|default_exp late');
+		// ELIGIBILITY is unchanged by the nullable accessor: the `python` default moved
+		// to the call site that decides it, so a Python cell is still markable here
+		// exactly as it was before `.mojo` targets existed.
+		expect(svc.setCellExport([ids[1]], true, target)).toMatchObject({ ok: true });
+
+		expect(svc.setCellExport([ids[2]], true, target)).toMatchObject({
+			ok: false,
+			cellLanguage: 'mojo',
+			targetLanguage: null,
+			targetConfigured: true
+		});
+
+		const client = await connect();
+		const bad = (await client.callTool({
+			name: 'set_cell_export',
+			arguments: { ids: [ids[2]], export: true, notebook: rel }
+		})) as CallResult;
+		expect(bad.isError).toBe(true);
+		expect(body(bad)).toContain('names no module Cellar can build');
+		// It points at the error that explains WHY, and at fixing the target that is
+		// there...
+		expect(body(bad)).toContain('export_target_error');
+		expect(body(bad)).toContain('set_export_target');
+		// ...and it borrows neither neighbour: this notebook HAS a target, and that
+		// target is not a `.py` module for a Mojo cell to mismatch.
+		expect(body(bad)).not.toContain('has no export target');
+		expect(body(bad)).not.toContain('export target is a .py module');
+	});
+
+	it('a WRONG-LANGUAGE code cell is refused as a mismatch, naming both languages', async () => {
+		// The other half of the one eligibility test, and the only one that IS a
+		// comparison: this cell has module source, it is just in the other language.
+		// It must NOT borrow the markdown sentence - "no module source" is false of a
+		// cell whose source is a perfectly good Mojo function - and it names the two
+		// extensions because changing the target IS the action available here.
+		const rel = 'wire-lang.ipynb';
+		const target = abs(rel);
+		svc.useNotebook('sess-wire-lang', rel);
+		const { ids } = await svc.addCells(
+			[
+				{ cell_type: 'code', source: 'def py_one():\n    return 1' },
+				{ cell_type: 'mojo', source: 'def mojo_one() -> Int:\n    return 1' }
+			],
+			null,
+			{ nb: target, routeImports: false }
+		);
+		svc.setExportTarget('lib/wire-lang.py', target);
+		const client = await connect();
+
+		const bad = (await client.callTool({
+			name: 'set_cell_export',
+			arguments: { ids: [ids[1]], export: true, notebook: rel }
+		})) as CallResult;
+		expect(bad.isError).toBe(true);
+		expect(body(bad)).toContain('is Mojo code but this notebook\'s export target is a .py module');
+		expect(body(bad)).toContain('a .mojo target Mojo cells');
+		expect(body(bad)).not.toContain('has no module source');
+
+		// And the mirror, so the sentence is not hardcoded to one direction.
+		svc.setExportTarget('lib/wire-lang.mojo', target);
+		const mirrored = (await client.callTool({
+			name: 'set_cell_export',
+			arguments: { ids: [ids[0]], export: true, notebook: rel }
+		})) as CallResult;
+		expect(mirrored.isError).toBe(true);
+		expect(body(mirrored)).toContain('is Python code but this notebook\'s export target is a .mojo module');
 	});
 
 	it('names the handle the agent supplied, not the UUID it resolved to', async () => {
@@ -1044,7 +1208,7 @@ describe('at the wire: the tool is really callable', () => {
 		// An id the model cannot find anywhere in its own call reads as the tool
 		// answering about some other cell (`set_hide_input`/`delete_cells` echo the ref).
 		expect(bad.isError).toBe(true);
-		expect(body(bad)).toContain(`cell ${short} is not a Python code cell`);
+		expect(body(bad)).toContain(`cell ${short} is not a code cell`);
 	});
 
 	it('tells a doubly-marked cell apart from a directive-only one, and promises neither wrongly', async () => {
@@ -1117,7 +1281,7 @@ describe('the tool registration', () => {
 		// cells qualify (a silent no-op would be the damaging alternative), and that
 		// the module is regenerated.
 		expect(line).toMatch(/ONE OR SEVERAL/);
-		expect(line).toMatch(/[Cc]ode cells? can be exported|Only CODE cells/);
+		expect(line).toMatch(/matching the target.{0,3}s language|[Cc]ode cells? can be exported/);
 		expect(line).toMatch(/[Rr]egenerates/);
 		expect(line).toMatch(/set_export_target/);
 		// The regeneration claim must stay CONDITIONAL: unmarking the last marked cell
@@ -1131,6 +1295,10 @@ describe('the tool registration', () => {
 		expect(line).toMatch(/module/);
 		expect(line).toMatch(/NOT written/);
 		expect(line).toMatch(/will not import/);
+		// ...and the `.mojo` half of that second thing, which is a DIFFERENT claim: a
+		// Mojo module compiles precisely BECAUSE a `def main()` was dropped from it
+		// ($lib/exportHazard). "will not import" alone would be false for it.
+		expect(line).toMatch(/lost main\(\)/);
 		// `cells` names the ADDRESSED cells, which on export:false are the ones NOT
 		// in the module, so the description has to say which direction it means.
 		expect(line).toMatch(/REQUESTED value/);

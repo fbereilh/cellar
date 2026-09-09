@@ -26,6 +26,7 @@ import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { applyMovePlan } from '../../src/lib/cellSelection';
+import { isExportCell } from '../../src/lib/exportRole';
 
 // Count every `.ipynb` write, so "one user action, one document write" is a
 // PINNED property rather than an incidental one. Hoisted (vitest lifts `vi.mock`
@@ -345,14 +346,23 @@ describe('setCellTypes - bulk change type', () => {
 		expect(cells[0].outputs).toEqual([]);
 	});
 
-	it('drops the imports role and the export flag from a cell leaving Python', () => {
+	it('drops the imports role from a cell leaving Python, and KEEPS the export mark', () => {
 		const { nb, ids } = makeNotebook('bulk-type-roles.ipynb', 3);
 		nbmod.setCellRole(ids[0], 'imports', nb);
 		nbmod.setCellExport(ids[1], true, nb);
 		nbmod.setCellTypes([ids[0], ids[1]], 'markdown', nb);
 		const cells = nbmod.listCells(nb);
+		// The imports role still goes: an imports cell must hold Python, and the role is
+		// one-per-notebook state a non-Python cell cannot own.
 		expect(cells[0].metadata?.cellar?.role).toBeUndefined();
-		expect(cells[1].metadata?.cellar?.export).toBeUndefined();
+		// The EXPORT mark deliberately SURVIVES. Silently clearing it on a type change is
+		// the same silent loss that was rejected for a target-language change: the user
+		// cannot tell the two apart, both are them editing their notebook and finding a
+		// mark quietly gone. An ineligible marked cell STRANDS instead - visible through
+		// the greyed-out toggle and clearable there - and `isExportCell` still ignores it,
+		// so nothing reaches the generated module.
+		expect(cells[1].metadata?.cellar?.export).toBe(true);
+		expect(isExportCell(cells[1], 'python')).toBe(false);
 	});
 
 	it('round-trips to SQL and back, and skips cells already of that type', () => {

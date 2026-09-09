@@ -162,6 +162,10 @@ describe('set_export_target', () => {
 		expect(line).toMatch(/module/);
 		expect(line).toMatch(/failed/);
 		expect(line).toMatch(/will not import/);
+		// ...and the `.mojo` half of that second thing, which is a DIFFERENT claim: a
+		// Mojo module compiles precisely BECAUSE a `def main()` was dropped from it
+		// ($lib/exportHazard). "will not import" alone would be false for it.
+		expect(line).toMatch(/lost main\(\)/);
 		expect(line).toMatch(/outside the workspace/);
 		expect(line).toMatch(/text notebook/);
 		expect(line).toMatch(/export_target_source/);
@@ -401,7 +405,7 @@ describe('a .py text notebook is refused, like its pair set_cell_export', () => 
 		expect(await refused.json()).toMatchObject({
 			ok: false,
 			target: 'lib/held.py',
-			message: expect.stringMatching(/not a \.py file/)
+			message: expect.stringMatching(/not a \.py or \.mojo file/)
 		});
 		expect(nbmod.getExportTarget(nb)).toBe('lib/held.py');
 	});
@@ -656,7 +660,7 @@ describe('a refused path and a failed write are told apart', () => {
 		expect(escaping).not.toHaveProperty('writeFailed');
 
 		const notPy = svc.setExportTarget('src/app.ts', nb);
-		expect(notPy).toMatchObject({ ok: false, invalid: expect.stringMatching(/not a \.py file/) });
+		expect(notPy).toMatchObject({ ok: false, invalid: expect.stringMatching(/not a \.py or \.mojo file/) });
 		expect(notPy).not.toHaveProperty('writeFailed');
 
 		// Validation runs before the mutation, so a refusal changes nothing.

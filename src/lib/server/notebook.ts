@@ -32,11 +32,21 @@ import {
 	exportNotebookToPy,
 	resolveExportTarget,
 	docExportHazards,
+	docHumanExportHazards,
+	docExportLanguage,
+	docExportTargetInfo,
 	type ExportResult,
+	type ExportTargetLanguageInfo,
 	type ResolvedExportTarget
 } from './export-py';
 import type { ExportHazard } from '../exportHazard';
-import { canExportCell, exportDirectiveOwnsCell, exportMarkedTwice } from '../exportRole';
+import {
+	canExportCell,
+	exportDirectiveOwnsCell,
+	exportMarkedTwice,
+	exportTargetLanguage,
+	type ExportLanguage
+} from '../exportRole';
 import { isHiddenFromAgent } from '../agentVisibility';
 import { isExportBase, type ExportBase } from '../exportTarget';
 import { gitRootOf } from './git';
@@ -340,7 +350,12 @@ function publishExportDerived(doc: NotebookDoc): void {
 	const info = resolveExportTarget(doc);
 	const resolved = info && info.ok ? info.target : null;
 	const resolveError = info && !info.ok ? info.error : null;
-	const hazards = docExportHazards(doc, info);
+	// Narrowed through the ONE human-surface rule (`$lib/exportHazard`), so a kind
+	// this bar may not show cannot reach it - and cannot churn the change-only key
+	// either, which would publish an event no surface renders. Asked as
+	// `docHumanExportHazards` rather than filtered afterwards, so the agent-only
+	// kinds cost this path no file read.
+	const hazards = docHumanExportHazards(doc, info);
 	const key = [resolved ?? '', resolveError ?? '', ...hazards.map((h) => h.message)].join('\u0000');
 	if (key === doc.lastExportDerivedKey) return;
 	doc.lastExportDerivedKey = key;
@@ -494,6 +509,7 @@ function notebookView(doc: NotebookDoc): NotebookView {
  */
 function exportTargetView(doc: NotebookDoc): {
 	exportBase: string;
+	exportLanguage: ExportLanguage | null;
 	exportResolved: string | null;
 	exportResolveError: string | null;
 	exportHazards: ExportHazard[];
@@ -501,10 +517,17 @@ function exportTargetView(doc: NotebookDoc): {
 	const info = resolveExportTarget(doc);
 	return {
 		exportBase: readExportBase(doc),
+		// The language THIS resolution named, carried rather than re-derived by the
+		// reader: `getNotebookMap` is the most frequently called agent read tool and
+		// `resolveExportTarget` sweeps every cell for a `#|default_exp` directive when
+		// no target is stored, so asking a second time doubles that sweep on it.
+		exportLanguage: info ? exportTargetLanguage(info.ok ? info.target : info.path) : null,
 		exportResolved: info && info.ok ? info.target : null,
 		exportResolveError: info && !info.ok ? info.error : null,
-		// The SAME `info` is threaded in rather than resolved a second time here.
-		exportHazards: docExportHazards(doc, info)
+		// The SAME `info` is threaded in rather than resolved a second time here, and
+		// narrowed through the ONE human-surface rule: this field feeds the export bar,
+		// where an agent-only kind may not appear (`$lib/exportHazard`).
+		exportHazards: docHumanExportHazards(doc, info)
 	};
 }
 
@@ -1081,10 +1104,11 @@ export type SetCellExportResult =
 
 /**
  * Mark (or unmark) a code cell for nbdev-style export in the allowlisted `cellar`
- * namespace, so the flag round-trips through clean-on-save. Only a code cell can
- * carry it (a markdown/SQL cell has no module source). Choosing what is IN the
- * module is one of the three EXPLICIT export actions, so it regenerates the `.py`
- * (see `regenerateExportModule`) - via `setCellExports`, which owns that call.
+ * namespace, so the flag round-trips through clean-on-save. Only a code cell whose
+ * language matches the export target's can carry it (a markdown/SQL cell has no
+ * module source). Choosing what is IN the module is one of the three EXPLICIT
+ * export actions, so it regenerates the module (see `regenerateExportModule`) -
+ * via `setCellExports`, which owns that call.
  *
  * This IS `setCellExports` of one - one implementation, one rule - so the UI's
  * per-cell toggle and MCP's batch tool cannot drift about what marking means.
@@ -1103,17 +1127,21 @@ export function setCellExport(
 	const doc = docFor(nb);
 	const cell = find(doc, id);
 	if (!cell) return { ok: false, reason: 'no-such-cell' };
-	if (exported && !canExportCell(cell)) return { ok: false, reason: 'not-code' };
+	// The export target's extension names the module's LANGUAGE, and eligibility is
+	// a match against it (`exportRole`'s `canExportCell`): a Mojo cell has no place
+	// in a `.py` module and a Python cell none in a `.mojo` one.
+	const lang = docExportLanguage(doc);
+	if (exported && !canExportCell(cell, lang)) return { ok: false, reason: 'not-code' };
 	// The source owns the mark (see `setCellExports`). A MARK request is already
 	// satisfied - the cell really is exported - so it is an honest no-op; an UNMARK
 	// is refused, because nothing Cellar may write would take the mark away.
 	//
 	// `alsoFlagged` rides the refusal because the REMEDY differs and only this side
 	// can see it - see `SetCellExportResult`.
-	if (exportDirectiveOwnsCell(cell))
+	if (exportDirectiveOwnsCell(cell, lang))
 		return exported
 			? { ok: true }
-			: { ok: false, reason: 'export-directive-owns-cell', alsoFlagged: exportMarkedTwice(cell) };
+			: { ok: false, reason: 'export-directive-owns-cell', alsoFlagged: exportMarkedTwice(cell, lang) };
 	setCellExports([id], exported, nb, originId);
 	return { ok: true };
 }
@@ -1126,11 +1154,12 @@ export function setCellExport(
  * `.py` module once per cell, walking both files through every intermediate state.
  *
  * Only cells that actually CHANGE are touched, so a re-mark of an
- * already-marked cell writes nothing and emits nothing (zero git diff, no `.py`
- * mtime churn). Marking requires a PYTHON code cell (`canExportCell`, the shared
- * eligibility half of `isExportCell` itself - a markdown or SQL cell has no module
- * source, so setting the flag there would be a lie the exporter ignores) while
- * UNMARKING clears the flag wherever
+ * already-marked cell writes nothing and emits nothing (zero git diff, no module
+ * mtime churn). Marking requires a code cell whose LANGUAGE matches the export
+ * target's (`canExportCell`, the shared eligibility half of `isExportCell` itself
+ * - a markdown or SQL cell has no module source at all, and a Mojo cell has none
+ * a `.py` module could hold, so setting the flag there would be a lie the exporter
+ * ignores) while UNMARKING clears the flag wherever
  * it is found, which is also how a stale flag on a hand-edited `.ipynb` is
  * cleared. Returns the ids actually changed.
  *
@@ -1152,6 +1181,7 @@ export function setCellExports(
 	originId?: string | null
 ): string[] {
 	const doc = docFor(nb);
+	const lang = docExportLanguage(doc); // which module language these marks describe
 	const changed: Cell[] = [];
 	const seen = new Set<string>();
 	for (const id of ids) {
@@ -1174,9 +1204,9 @@ export function setCellExports(
 		// `isExportCell` itself applies: on a markdown/SQL/raw cell the exporter ignores
 		// the directive entirely, so such a cell is NOT exported and skipping it here
 		// would refuse to clear a stale hand-edited flag it really does carry.
-		if (exportDirectiveOwnsCell(cell)) continue;
+		if (exportDirectiveOwnsCell(cell, lang)) continue;
 		if (exported) {
-			if (!canExportCell(cell) || marked) continue;
+			if (!canExportCell(cell, lang) || marked) continue;
 			cell.metadata = cell.metadata ?? {};
 			cell.metadata.cellar = cell.metadata.cellar ?? {};
 			cell.metadata.cellar.export = true;
@@ -1265,11 +1295,13 @@ export class InvalidExportTargetError extends Error {
  * would sit in the metadata generating nothing on every later export. Refusing it
  * at the point it is set is the honest moment - the caller has a value to correct.
  *
- * A target that is not a `.py` file is refused for a sharper reason: the exporter
- * WRITES the generated module to this path, so a target naming an ordinary source
- * file would have that file overwritten the moment a cell is marked. The field is
- * documented (here, in both tool descriptions and in nbdev itself) as the module
- * path, so this rejects nothing legitimate. `exportNotebookToPy` carries the
+ * A target that is not a `.py` or `.mojo` file is refused for a sharper reason:
+ * the exporter WRITES the generated module to this path, so a target naming an
+ * ordinary source file would have that file overwritten the moment a cell is
+ * marked. The field is documented (here, in both tool descriptions and in nbdev
+ * itself) as the module path, so this rejects nothing legitimate. The extension
+ * ALSO names the module's language, and therefore which cells may go in it - see
+ * `exportTargetLanguage`. `exportNotebookToPy` carries the
  * second half of that guard - it refuses to overwrite a file it did not generate -
  * because a `#|default_exp` directive reaches it without passing here.
  *
@@ -1344,9 +1376,13 @@ export function setExportTarget(
 			throw new InvalidExportTargetError(
 				`unknown export base ${JSON.stringify(wanted)}: expected "workspace", "notebook" or "git" - clear the export target to reset the base, then set the path again`
 			);
-		if (!/\.py$/i.test(raw))
+		// The extension is not decoration: it names the module's LANGUAGE, which decides
+		// which cells go in it (`exportRole`'s `canExportCell`) and how it is assembled
+		// (no `__all__` and one `main` for Mojo - `$lib/mojoExport`). Anything else is
+		// refused for the sharper reason above: the exporter WRITES this path.
+		if (!exportTargetLanguage(raw))
 			throw new InvalidExportTargetError(
-				`export target ${raw} is not a .py file: the generated module is written to this path, so it must name a .py module`
+				`export target ${raw} is not a .py or .mojo file: the generated module is written to this path, so it must name a .py or .mojo module`
 			);
 		const baseDir = exportBaseDir(doc, wanted); // refuses `git` with no repository
 		let abs: string;
@@ -1381,6 +1417,24 @@ export function setExportTarget(
 	const state = exportTargetState(doc);
 	emit(doc, 'notebook:export-target', { ...state }, originId);
 	return state;
+}
+
+/**
+ * BOTH facts about a notebook's export target, from ONE resolution: whether one
+ * is configured at all, and the module language it names. The agent layer reads
+ * this where a refusal has to distinguish "no target" from "a target that names
+ * no module Cellar can build" - see `ExportTargetLanguageInfo`.
+ *
+ * The ONE notebook-addressed accessor, and deliberately not a pair: a
+ * language-only sibling existed briefly and was superseded the moment a refusal
+ * had to tell the two nulls apart, since one resolution answers both questions
+ * and a second accessor only invites a second resolution on a hot read path.
+ * `language` is nullable on purpose - `docExportLanguage`'s `python` fallback is
+ * the ELIGIBILITY answer and must never be read as a fact about the notebook, or
+ * a refusal names a `.py` module over a notebook that targets nothing.
+ */
+export function exportTargetInfoFor(nb?: string | null): ExportTargetLanguageInfo {
+	return docExportTargetInfo(docFor(nb));
 }
 
 /** What a set-target/set-base caller reports back: the stored form + its resolution. */
@@ -1905,11 +1959,25 @@ function applyCellType(cell: Cell, cellType: LogicalCellType): void {
 	// Only a code cell holds outputs - markdown and raw carry none, and
 	// `serialize` would drop them anyway.
 	if (cell.cell_type !== 'code') cell.outputs = [];
-	// Neither the imports role nor the nbdev export flag may sit on a cell holding
-	// no Python: the kernel never sees a markdown or raw cell, and a SQL, Mojo or
-	// chat cell's source is not Python.
+	// The imports role may not sit on a cell holding no Python: the kernel never sees
+	// a markdown or raw cell, and a SQL, Mojo or chat cell's source is not Python, so
+	// every import routed into it would be stranded with nothing to run them.
 	if (!runnable && cell.metadata.cellar.role === IMPORTS_ROLE) delete cell.metadata.cellar.role;
-	if (!runnable && cell.metadata.cellar.export) delete cell.metadata.cellar.export;
+	// The EXPORT flag is deliberately NOT dropped, and `runnable` is the wrong
+	// question for it in any case: a Mojo cell is the ONLY eligible kind under a
+	// `.mojo` target, so clearing on conversion destroyed the mark on this feature's
+	// own happy path - paste a Modular example into a `code` cell (its `%%mojo`
+	// header makes it eligible), mark it, then convert it to the `mojo` type, which
+	// the agent doctrine tells agents to do.
+	//
+	// It is not dropped for an INELIGIBLE cell either. That is the same rule a target
+	// change already follows: a mark the current target cannot honour STRANDS
+	// (`exportMarkStranded`) and is shown by the greyed row toggle plus the export
+	// bar's one explanation, so the user clears it if they want to. Silently editing
+	// the user's committed `.ipynb` because they converted a cell is the loss that
+	// stance exists to prevent, and they cannot tell it apart from a target change -
+	// both are them editing their notebook and finding a mark quietly gone. Nothing
+	// reaches the module either way: `isExportCell` gates on eligibility.
 	// `hide_input` is deliberately KEPT: `$lib/hideInput` reads it only for a code
 	// cell, so it is already inert on a markdown or raw one, and dropping it would
 	// silently lose a report-view choice across a there-and-back conversion.

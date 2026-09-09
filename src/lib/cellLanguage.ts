@@ -62,10 +62,11 @@
  * IT ALSO OWNS THE TWO "WHOSE SOURCE IS PYTHON" PREDICATES every Python-semantics
  * engine asks (`isPythonCodeCell`, `hasPythonDataflow`). They are stated
  * POSITIVELY - a language is in the set only by being named - so a SEVENTH
- * language is excluded from the dataflow probe, the staleness graph, the imports
- * sweep and the nbdev export BY CONSTRUCTION rather than by four new
+ * language is excluded from the dataflow probe, the staleness graph and the
+ * imports sweep BY CONSTRUCTION rather than by three new
  * `&& !isWhateverCell(c)` clauses that a future language would have to remember
- * to add in four places.
+ * to add in three places. (The nbdev export asks a target-aware question of its
+ * own instead - see `isPythonCodeCell` below.)
  */
 
 import type { CellMetadata, CellType, LogicalCellType } from '$lib/server/types';
@@ -415,10 +416,17 @@ export function isLogicalCellType(cell: LanguageCell, cellType: LogicalCellType)
 /**
  * Does this cell's SOURCE hold module-level PYTHON? The ONE rule every
  * Python-semantics engine asks before touching a cell: the `ast`/`symtable`
- * dataflow probe (`server/dataflow.ts`), the imports sweep and agent import
- * routing (`server/imports-cell.ts`), and the nbdev export
- * (`exportRole.ts`'s `canExportCell`, which is this same test under its own
- * name because it is also the export ELIGIBILITY rule).
+ * dataflow probe (`server/dataflow.ts`), and the imports sweep and agent import
+ * routing (`server/imports-cell.ts`).
+ *
+ * The nbdev export asks a DIFFERENT question of its own and is deliberately not a
+ * caller: `exportRole.ts`'s `canExportCell` is TARGET-AWARE (a cell is eligible
+ * iff its language matches the target's extension), so it reads
+ * `exportLanguageOf`, which is this test plus the `%%mojo` magic header - a
+ * `code` cell pasted out of Modular's docs is Mojo while every type-based test
+ * calls it Python. Keep the two apart: widening this predicate to admit Mojo
+ * would hand Mojo source to the Python dataflow probe and the imports sweep,
+ * which is the exact failure the paragraph below measures.
  *
  * Stated POSITIVELY - `isLogicalCellType(cell, 'code')` - and that is the whole
  * point. Written as the negations it replaced (`cell_type === 'code' &&

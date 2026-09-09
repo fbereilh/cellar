@@ -507,11 +507,11 @@
 					<button
 						onclick={onExportPy}
 						disabled={!canExportPy}
-						title="Write the cells marked for export to the notebook's .py module (nbdev-style). Mark cells and set the target from the bar at the top of the notebook."
+						title="Write the cells marked for export to the notebook's generated module (nbdev-style; a .py or .mojo file, whichever the target names). Mark cells and set the target from the bar at the top of the notebook."
 						data-testid="export-py-menu"
 					>
 						<svg class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v12" /><path d="m8 11 4 4 4-4" /><path d="M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2" /></svg>
-						Export to .py
+						Export to module
 					</button>
 				</li>
 				<div class="divider my-1"></div>

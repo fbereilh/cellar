@@ -456,10 +456,7 @@ function attributeValue(tag: string, name: string, label: string): string {
  * tail, anything after a variant, and the whole OFF branch. Throws rather than
  * returning a partial answer if the ternary is not in the expected shape.
  */
-function stateClassParts(
-	tag: string,
-	label: string
-): { staticPrefix: string; whenOn: string; whenOff: string } {
+function stateClassParts(tag: string, label: string): { staticPrefix: string; branches: string[] } {
 	const value = attributeValue(tag, 'class', label);
 	const brace = value.indexOf('{');
 	expect(brace, `${label}: expected a {state ? on : off} class expression`).toBeGreaterThan(0);
@@ -467,26 +464,31 @@ function stateClassParts(
 	expect(close, `${label}: the class expression never closes`).toBeGreaterThan(brace);
 	const expr = value.slice(brace + 1, close);
 
+	// EVERY branch, not exactly two: a control with a third state (the export
+	// toggle's stranded mark) is a NESTED ternary, and the invariant being guarded -
+	// geometry sits outside the conditional - is about all of them.
 	const branches: string[] = [];
-	let qmark = -1;
-	let colon = -1;
+	let sawQuestion = false;
+	let sawSeparator = false;
 	for (let i = 0; i < expr.length; i++) {
 		const c = expr[i];
 		if (c === "'" || c === '"' || c === '`') {
 			let j = i + 1;
 			for (; j < expr.length && expr[j] !== c; j++) if (expr[j] === '\\') j++;
 			expect(j, `${label}: unterminated string in the class expression`).toBeLessThan(expr.length);
+			if (branches.length === 0)
+				expect(sawQuestion, `${label}: expected the first branch after a "?"`).toBe(true);
+			else expect(sawSeparator, `${label}: expected every later branch after a "?" or ":"`).toBe(true);
 			branches.push(expr.slice(i + 1, j));
-			if (branches.length === 1)
-				expect(qmark, `${label}: expected the ON branch after a "?"`).toBeGreaterThanOrEqual(0);
-			if (branches.length === 2)
-				expect(colon, `${label}: expected the OFF branch after a ":"`).toBeGreaterThan(qmark);
+			sawSeparator = false;
 			i = j;
-		} else if (c === '?' && qmark < 0) qmark = i;
-		else if (c === ':' && qmark >= 0 && colon < 0) colon = i;
+		} else if (c === '?') {
+			sawQuestion = true;
+			sawSeparator = true;
+		} else if (c === ':') sawSeparator = true;
 	}
-	expect(branches, `${label}: expected exactly two branch strings`).toHaveLength(2);
-	return { staticPrefix: value.slice(0, brace), whenOn: branches[0], whenOff: branches[1] };
+	expect(branches.length, `${label}: expected at least two branch strings`).toBeGreaterThanOrEqual(2);
+	return { staticPrefix: value.slice(0, brace), branches };
 }
 
 /** Class names that change a control's BOX. Whole-token, so `text-base-content/60`
@@ -581,11 +583,31 @@ describe('the source-guard helper itself', () => {
 			'>'
 		].join('\n');
 
-	it('splits the class attribute into its static prefix and both branches', () => {
+	it('splits the class attribute into its static prefix and every branch', () => {
 		const cls = stateClassParts(classTag(ON, OFF), 'unmutated');
 		expect(cls.staticPrefix).toContain('btn btn-ghost btn-xs btn-square');
-		expect(cls.whenOn).toBe(ON);
-		expect(cls.whenOff).toBe(OFF);
+		expect(cls.branches).toEqual([ON, OFF]);
+	});
+
+	it('reads a NESTED ternary as three branches, not two', () => {
+		// The export toggle grew a third state (a mark the target's language stranded),
+		// so a helper that insisted on exactly two branches would refuse the very
+		// control it guards - and refuse it in a way that reads as a geometry failure.
+		const STRANDED = 'bg-base-content/5 text-base-content/35';
+		const nestedTag = [
+			'<button',
+			'\tclass="btn btn-ghost btn-xs btn-square {exportStranded',
+			`\t\t? '${STRANDED}'`,
+			'\t\t: isExport',
+			`\t\t\t? '${ON}'`,
+			`\t\t\t: '${OFF}'}"`,
+			'\taria-pressed={isExport}',
+			'\tdata-testid="c"',
+			'>'
+		].join('\n');
+		const cls = stateClassParts(nestedTag, 'nested');
+		expect(cls.branches).toEqual([STRANDED, ON, OFF]);
+		expect(cls.branches.flatMap(geometryTokens)).toEqual([]);
 	});
 
 	it('finds a geometry class ANYWHERE in either branch', () => {
@@ -598,15 +620,13 @@ describe('the source-guard helper itself', () => {
 		];
 		for (const [where, on, off] of mutations) {
 			const cls = stateClassParts(classTag(on, off), where);
-			const found = [...geometryTokens(cls.whenOn), ...geometryTokens(cls.whenOff)];
-			expect(found, where).not.toEqual([]);
+			expect(cls.branches.flatMap(geometryTokens), where).not.toEqual([]);
 		}
 	});
 
 	it('reads a variant or a colour as neither geometry nor a branch separator', () => {
 		const cls = stateClassParts(classTag(ON, OFF), 'unmutated');
-		expect(geometryTokens(cls.whenOn)).toEqual([]);
-		expect(geometryTokens(cls.whenOff)).toEqual([]);
+		expect(cls.branches.flatMap(geometryTokens)).toEqual([]);
 		// `text-base-content/60` is a colour; only the exact `text-base` is a size
 		expect(geometryTokens('text-base-content/60 hover:text-base-content/90')).toEqual([]);
 		expect(geometryTokens('bg-(--cellar-agent-hidden-soft) hover:bg-(--cellar-agent-hidden-strong)')).toEqual([]);
@@ -651,35 +671,55 @@ describe('the wiring the browser ships (source guards - see the file header)', (
 	// WHICH rule the gate asks is checked BEHAVIOURALLY above; what only source can
 	// say is that the rendered gate is that derived rather than a second, looser one.
 	it('export is gated on the export eligibility rule; hide-from-agent is ungated', () => {
-		expect(openGates(cell, 'data-testid="toggle-export"')).toEqual(['{#if canExport}']);
-		expect(cell).toContain('const canExport = $derived(canExportCell(cell));');
+		// The ONE exception to "presence follows the cell TYPE" is a flag that is
+		// already there: a mark the target's language stranded renders the toggle so
+		// the key stays visible and clearable, instead of leaving it invisible in the
+		// user's committed `.ipynb`. Both halves are shared predicates, never a second,
+		// looser rule derived here.
+		expect(openGates(cell, 'data-testid="toggle-export"')).toEqual(['{#if canExport || exportStranded}']);
+		expect(cell).toContain('const canExport = $derived(canExportCell(cell, exportCellLanguage));');
+		expect(cell).toContain('const exportStranded = $derived(exportMarkStranded(cell, exportCellLanguage));');
+		// ELIGIBILITY applies the legacy `python` default; every SENTENCE reads the
+		// nullable prop, so none of them can name a module the notebook does not have.
+		expect(cell).toContain("const exportCellLanguage = $derived(exportLanguage ?? 'python');");
 		expect(openGates(cell, 'data-testid="toggle-agent-hidden"')).toEqual([]);
 	});
 
 	// WHY SOURCE: this is the no-shift invariant at its root. The e2e measures the
 	// consequence in a real browser; here we pin the CAUSE - the geometry classes
 	// sit OUTSIDE the state conditional, so only colour can move.
-	it('both toggles keep identical geometry in both states', () => {
+	it('both toggles keep identical geometry in EVERY state', () => {
 		for (const t of ['toggle-export', 'toggle-agent-hidden']) {
 			const cls = stateClassParts(toggleButtonTag(cell, `data-testid="${t}"`), t);
 			// the sizing classes are unconditional; only the colour half is a ternary
 			expect(cls.staticPrefix, t).toContain('btn btn-ghost btn-xs btn-square');
-			expect(geometryTokens(cls.whenOn), `${t}: the ON branch`).toEqual([]);
-			expect(geometryTokens(cls.whenOff), `${t}: the OFF branch`).toEqual([]);
+			for (const [i, branch] of cls.branches.entries())
+				expect(geometryTokens(branch), `${t}: branch ${i}`).toEqual([]);
 		}
 	});
 
 	// WHY SOURCE: `aria-pressed` IS the state for a screen reader; without it the
 	// toggles announce as plain buttons and the state is sighted-only.
-	it('both are toggle buttons with a stable accessible name', () => {
+	it('both are toggle buttons with a name that is stable across PRESSED state', () => {
 		for (const [t, name] of [
-			['toggle-export', 'aria-label="Export this cell to the notebook\'s .py module"'],
+			// The export toggle's name describes what the control DOES, which depends on
+			// the notebook's target (and on whether the mark is stranded), so it is built
+			// in the script as `exportToggleName` and the markup reads that. It may still
+			// never branch on the PRESSED state here: that is `aria-pressed`'s job, and a
+			// name that moves with it announces one fact twice.
+			['toggle-export', 'aria-label={exportToggleName}'],
 			['toggle-agent-hidden', 'aria-label="Hide this cell from AI agents"']
 		]) {
 			const btn = toggleButtonTag(cell, `data-testid="${t}"`);
 			expect(btn, t).toMatch(/aria-pressed=\{/);
 			expect(btn, t).toContain(name);
+			const label = btn.slice(btn.indexOf('aria-label='));
+			for (const state of ['isExport', 'agentHidden'])
+				expect(label.slice(0, label.indexOf('\n')), `${t}: the name reads ${state}`).not.toContain(state);
 		}
+		// ...and the derived it reads is likewise free of the pressed state.
+		const derived = cell.slice(cell.indexOf('const exportToggleName = $derived('));
+		expect(derived.slice(0, derived.indexOf('\n\t//'))).not.toContain('isExport');
 	});
 
 	// WHY SOURCE: the flag is a DISCLOSURE rule with one owner; a second inline

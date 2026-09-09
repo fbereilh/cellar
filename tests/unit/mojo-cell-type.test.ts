@@ -313,8 +313,17 @@ describe('the exclusions are shaped so the NEXT language inherits them', () => {
 	// the next tagged language would then be broken in four places at once. These
 	// guards pin the SHAPE: each engine asks the shared positive predicate, and none
 	// of them names mojo at all.
+	// `exportRole.ts` is deliberately NOT in this list any more. Export eligibility
+	// became TARGET-AWARE when `.mojo` targets landed (`exportTargetLanguage` /
+	// `exportLanguageOf`), so it names both languages BY CONSTRUCTION - which is the
+	// shape this whole block argues for, not a regression of it: the rule is still
+	// one positive predicate, and it is still a MATCH rather than an exclusion.
+	// `tests/unit/mojo-export.test.ts` pins that distinction BEHAVIOURALLY, with a
+	// truth table over the imported module answering both target languages for every
+	// cell language - a flat exclusion cannot produce it, having no `.mojo` target to
+	// answer for.
 	it('no Python-semantics engine mentions mojo', () => {
-		for (const f of ['server/dataflow.ts', 'staleness.ts', 'server/imports-cell.ts', 'exportRole.ts']) {
+		for (const f of ['server/dataflow.ts', 'staleness.ts', 'server/imports-cell.ts']) {
 			const src = read(f);
 			expect(src, `${f} must not special-case mojo`).not.toMatch(/isMojoCell|MOJO_LANGUAGE|'mojo'/);
 		}

@@ -20,7 +20,7 @@
 //                         strip it from the new cell anyway).
 //   - `export`            a per-cell designation the user made about the ORIGINAL
 //                         cell; inheriting it silently doubles what the nbdev
-//                         `.py` module exports.
+//                         module exports (`.py` or `.mojo` alike).
 //   - the runtime-only stamps (`lastRun`, `editedAt`, `importBindings`), which the
 //     server strips from any seeded namespace regardless - the new half has run
 //     nothing, so it must not claim otherwise.

@@ -196,22 +196,28 @@ describe('a mojo cell survives clean-on-save byte-sane, and stays a plain nbform
 		expect(readFileSync(nb, 'utf8')).toBe(first);
 	});
 
-	it('converting AWAY from mojo drops the tag, the imports role and the export flag', () => {
+	it('converting AWAY from mojo drops the tag and the imports role, and KEEPS the export mark', () => {
 		const nb = join(WS, 'convert.ipynb');
 		nbmod.createNotebook('convert.ipynb');
 		const created = nbmod.addCell(null, 'code', nb, null, 'x = 1');
 		nbmod.setCellRole(created.id, 'imports', nb);
 		nbmod.setCellExports([created.id], true, nb);
 		expect(nbmod.listCells(nb).find((c) => c.id === created.id)?.metadata?.cellar?.export).toBe(true);
-		// Becoming mojo strips both: neither may sit on a cell holding no Python.
+		// The imports ROLE goes: the kernel never runs Mojo as Python, so every import
+		// routed into it would be stranded with nothing to execute them.
 		nbmod.setCellType(created.id, 'mojo', nb);
 		const asMojo = nbmod.listCells(nb).find((c) => c.id === created.id);
 		expect(asMojo?.metadata?.cellar?.language).toBe(MOJO_LANGUAGE);
 		expect(asMojo?.metadata?.cellar?.role).toBeUndefined();
-		expect(asMojo?.metadata?.cellar?.export).toBeUndefined();
-		// ...and back to code clears the tag entirely.
+		// The export MARK stays. A conversion is the user editing their notebook, and
+		// deleting a mark from their committed `.ipynb` for it is the silent loss the
+		// stranded toggle exists to prevent - the same rule a target change follows.
+		expect(asMojo?.metadata?.cellar?.export).toBe(true);
+		// ...and back to code clears the tag entirely, mark still intact.
 		nbmod.setCellType(created.id, 'code', nb);
-		expect(nbmod.listCells(nb).find((c) => c.id === created.id)?.metadata?.cellar?.language).toBeUndefined();
+		const back = nbmod.listCells(nb).find((c) => c.id === created.id);
+		expect(back?.metadata?.cellar?.language).toBeUndefined();
+		expect(back?.metadata?.cellar?.export).toBe(true);
 	});
 });
 

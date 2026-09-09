@@ -158,7 +158,15 @@ describe('the schemas and the doctrine an agent is billed for', () => {
 		expect(instructions).toContain('complete program with its own');
 		// And the two facts about what a Mojo cell is NOT.
 		expect(instructions).toContain('never shows a staleness verdict');
-		expect(instructions).toContain('cannot be exported to');
+		expect(instructions).toContain('cannot be the imports cell');
+		// The EXPORT claim, which must agree with clause 5 rather than reading as an
+		// enumeration of Mojo limitations: a mojo cell IS exportable, to a `.mojo`
+		// target. Worded the other way an agent in a Mojo notebook concludes the export
+		// path is unavailable, which is the opposite of what Cellar ships.
+		expect(instructions).toContain('it IS exportable, to a .mojo target');
+		expect(instructions).not.toContain('cannot be exported to');
+		// ...and clause 5 is where the rule itself lives, so the two agree.
+		expect(instructions).toContain('.py takes Python cells, .mojo Mojo ones');
 		// Detect-and-instruct reaches the agent too: it must relay the command.
 		expect(instructions).toContain('Cellar never installs it for the user');
 	});

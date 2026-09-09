@@ -30,6 +30,7 @@
  * the server setter, the MCP surface and the UI select, so the three cannot
  * drift) and the importability rule the export section renders.
  */
+import { exportTargetLanguage } from './exportRole';
 import { classifyRootPath, type RootShape } from './notebookRoot';
 
 /** Where an export target's path is measured from. */
@@ -68,6 +69,17 @@ export const EXPORT_BASE_LABELS: Record<ExportBase, string> = {
  * same namespace, so a boundary-aware prefix test decides containment.
  *
  * The rule, stated so it warns ONLY when it applies:
+ *  - a `.mojo` target → null, ALWAYS. Every clause of this warning is about
+ *    PYTHON import: the kernel's `sys.path` carries the code root
+ *    (`projectRootAddCode`), which is why a module outside it is unreachable
+ *    from a code cell. A `%%mojo` cell reaches the Mojo compiler through a
+ *    SUBPROCESS instead, so the kernel's `sys.path` governs nothing there and
+ *    the code root does not decide whether a `.mojo` module can be imported -
+ *    it cannot be, from a mojo cell, wherever it lands. Warning only for the
+ *    outside case would therefore imply that moving the module under the root
+ *    fixes it, which is a remedy that cannot work; and warning for BOTH cases
+ *    would be standing chrome on every Mojo notebook, which is exactly what
+ *    `mojo-main-kept` was demoted for. So the honest answer is silence.
  *  - no resolved target, or no declared root → null. With the default root the
  *    kernel runs at the workspace root, and a workspace-contained module is
  *    always under it - the everyday case costs no chrome.
@@ -89,6 +101,7 @@ export const EXPORT_BASE_LABELS: Record<ExportBase, string> = {
  */
 export function exportImportWarning(resolved: string | null, root: string | null): string | null {
 	if (!resolved || !root) return null;
+	if (exportTargetLanguage(resolved) === 'mojo') return null;
 	let shape: RootShape;
 	try {
 		shape = classifyRootPath(root);

@@ -11,7 +11,12 @@
 	import type { ExtractedCodeBlock } from '$lib/codeBlockExtract';
 	import type { WorkspaceRootOption } from '$lib/notebookRoot';
 	import { EXPORT_BASES, EXPORT_BASE_LABELS, exportImportWarning } from '$lib/exportTarget';
-	import type { ExportHazard } from '$lib/exportHazard';
+	import { hazardSummaryClause, humanExportHazards, type ExportHazard } from '$lib/exportHazard';
+	import {
+		exportStrandedExplanation,
+		type ExportLanguage,
+		type ExportStrandedSummary
+	} from '$lib/exportRole';
 	import { reservedFailureHeight, failureDetail } from '$lib/cellRenderFailure';
 	import type { ExportPyResult } from '$lib/types';
 	import {
@@ -27,6 +32,7 @@
 	const EMPTY_PLAN: PlanItem[] = [];
 	const EMPTY_IDS: string[] = [];
 	const EMPTY_SELECTION: ReadonlySet<string> = new Set();
+	const EMPTY_MAIN_DROPPED: ReadonlySet<string> = new Set();
 
 	interface Props {
 		cells: UICell[];
@@ -104,10 +110,39 @@
 		onSetRole: (id: string, role: string | null) => void;
 		/** Mark this code cell for nbdev-style `.py` export, or unmark it. */
 		onSetExport?: (id: string, exported: boolean) => void;
-		/** The notebook's `.py` export target (module path), or null when unset. */
+		/** The notebook's export target (module path), or null when unset. */
 		exportTarget?: string | null;
+		/**
+		 * The MODULE LANGUAGE this notebook's target names (`.py` -> python, `.mojo`
+		 * -> mojo), or **null when no target is configured at all**. It decides which
+		 * cells may be marked, so each Cell needs it to draw its export toggle.
+		 *
+		 * NULLABLE on purpose: eligibility falls back to `python` with nothing
+		 * configured (the legacy default), so a bare language cannot tell "this
+		 * notebook targets a `.py` module" from "this notebook targets nothing", and
+		 * any copy that says the first over the second names a file that does not
+		 * exist. The fallback is applied where ELIGIBILITY is asked and nowhere else.
+		 */
+		exportLanguage?: ExportLanguage | null;
+		/**
+		 * The cells whose top-level `def main()` a `.mojo` export will DROP, because a
+		 * later exported cell defines one too and a Mojo module can hold only one
+		 * (`$lib/mojoExport`). Always empty for a `.py` target. Read per cell rather
+		 * than pinned, like `selectedIds`.
+		 */
+		mojoMainDropped?: ReadonlySet<string>;
 		/** How many cells are currently marked for export. */
 		exportCount?: number;
+		/**
+		 * The cells carrying an export flag the current target cannot honour - the
+		 * target's extension moved under a mark nothing rewrites, the cell was
+		 * converted to a type that contributes no module source, or there is no target
+		 * at all. Reported ONCE here, since it is a notebook-wide fact; each affected
+		 * cell carries only a short marker (`EXPORT_STRANDED_BADGE`). It is a SUMMARY
+		 * rather than a count because the remedy turns on how many of those cells have
+		 * a module language at all (`$lib/exportRole`).
+		 */
+		exportStranded?: ExportStrandedSummary;
 		/**
 		 * Set (or clear, with '') the notebook's `.py` export target. Called ONCE PER
 		 * EDIT, from the input's `change` (a blur after typing, or Enter) - never per
@@ -231,6 +266,8 @@
 		selectedIds = EMPTY_SELECTION,
 		keyMode = 'command',
 		staleness = {},
+		exportLanguage = null,
+		mojoMainDropped = EMPTY_MAIN_DROPPED,
 		hidden = new Set(),
 		foldedIds = new Set(),
 		hiddenSegs = new Map(),
@@ -258,6 +295,7 @@
 		onSetExport,
 		exportTarget = null,
 		exportCount = 0,
+		exportStranded = { count: 0, withLanguage: 0 },
 		onSetExportTarget,
 		onExportPy,
 		exportBase = 'workspace',
@@ -638,6 +676,23 @@
 	// so the everyday case pays no chrome (the root bar's kernel-restart warning
 	// is the model: accurate, and only where it applies).
 	const importWarning = $derived(exportImportWarning(exportResolved, root));
+	// The button names the file it writes, so it has to track the target's language:
+	// "Export to .py" over a `.mojo` target names a file that will never exist - and
+	// with NO target configured it names none at all, since a bare "Export to .py"
+	// there told the user something its own click handler then contradicted ("Set a
+	// target module path first"). The nullable language is what tells the two apart,
+	// the same null branch `Cell.svelte`'s `exportModuleLabel`, the stranded
+	// explanation and the MCP refusal already carry.
+	const exportButtonLabel = $derived(
+		exportLanguage === null ? 'Export' : `Export to ${exportLanguage === 'mojo' ? '.mojo' : '.py'}`
+	);
+	// The notebook-wide stranded-mark explanation, stated ONCE (`$lib/exportRole`
+	// owns the wording, so the bar and each cell's short marker cannot drift). It
+	// takes the NULLABLE language, because "targets a .py module" and "targets
+	// nothing" are different facts and only the nullable value can tell them apart.
+	const strandedExplanation = $derived(
+		exportStranded.count > 0 ? exportStrandedExplanation(exportStranded, exportLanguage) : null
+	);
 	// Whether the notebook has any runnable (code) cell — gates the "Run all" button.
 	const hasCodeCell = $derived(cells.some((c) => c.cell_type === 'code'));
 	// Whether THIS notebook's kernel is executing or has work waiting — gates
@@ -792,7 +847,11 @@
 		// carrying the server's own reason; a bare "Export failed." here would be a
 		// second, less informative surface for the same event.
 		if (!r) return;
-		if (r.reason === 'no-target') exportFeedback = 'Set a target .py path first.';
+		// Narrowed by the ONE human-surface rule before anything is worded: an
+		// agent-only kind may neither raise the warning branch nor word it
+		// (`$lib/exportHazard`).
+		const shown = humanExportHazards(r.hazards ?? []);
+		if (r.reason === 'no-target') exportFeedback = 'Set a target module path first (.py or .mojo).';
 		else if (r.reason === 'no-cells') exportFeedback = 'No cells are marked for export.';
 		// Nothing was written and that is deliberate, so the button may not read as a
 		// dead control: Cellar never overwrites a file it did not generate.
@@ -802,8 +861,16 @@
 		// success. The standing warning below already carries the full sentence
 		// (this reply and it come from one server-side rule), so the feedback says
 		// what happened and points at it rather than repeating it in the same bar.
-		else if (r.hazards?.length)
-			exportFeedback = `Wrote ${r.count} ${r.count === 1 ? 'cell' : 'cells'} → ${r.target}, but it will not import - see the warning.`;
+		// ...and WHICH warning is read off the hazard KINDS through the shared
+		// `hazardSummaryClause`, never assumed here: the kinds make different claims
+		// (`$lib/exportHazard`) - a `.py` module that will not import, and a `.mojo`
+		// one that compiles precisely BECAUSE code was dropped from it - and a set can
+		// carry more than one, so `hazards[0]` is not the question either. `shown` is
+		// already narrowed, so an agent-only kind can neither raise this branch nor
+		// word it; without that, the commonest `.mojo` export read as having gone
+		// slightly wrong.
+		else if (shown.length)
+			exportFeedback = `Wrote ${r.count} ${r.count === 1 ? 'cell' : 'cells'} → ${r.target}, but ${hazardSummaryClause(shown)} - see the warning.`;
 		else exportFeedback = `Exported ${r.count} ${r.count === 1 ? 'cell' : 'cells'} → ${r.target}`;
 	}
 </script>
@@ -1012,6 +1079,8 @@
 				onEdit={onEdit}
 				onSetType={onSetType}
 				onSetRole={onSetRole}
+				{exportLanguage}
+				mainDropped={mojoMainDropped.has(cell.id)}
 				onSetExport={onSetExport}
 				onSetScrolled={onSetScrolled}
 				{hideAllCode}
@@ -1227,7 +1296,7 @@
 					value={exportTarget ?? ''}
 					onchange={onExportTargetCommit}
 					data-testid="export-target-input"
-					aria-label="Export target .py module path"
+					aria-label="Export target module path"
 				/>
 				<span class="text-xs text-base-content/55" data-testid="export-count">
 					{exportCount} {exportCount === 1 ? 'cell' : 'cells'} marked
@@ -1238,7 +1307,7 @@
 					disabled={exporting}
 					data-testid="export-run"
 				>
-					{exporting ? 'Exporting…' : 'Export to .py'}
+					{exporting ? 'Exporting…' : exportButtonLabel}
 				</button>
 				{#if exportResolveError}
 					<!-- A CONFIGURED target that resolves to no writable file: the module is
@@ -1250,17 +1319,36 @@
 						{exportResolveError}
 					</span>
 				{:else if exportHazards.length}
-					<!-- The module these marks describe will not import - said in the
-					     future tense on purpose, since under explicit export there may
-					     be no such file yet (the shared wording in `$lib/exportHazard`
-					     already reads that way). Ranked above the code-root warning:
-					     that one says the kernel cannot reach the module, this says
-					     nothing can. Below `exportResolveError`, which means no module
-					     can be written at all. -->
-					<span class="flex items-center gap-1 text-xs text-base-content/70" data-testid="export-hazard">
-						<svg class="h-3.5 w-3.5 shrink-0 text-warning" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3" /><path d="M12 9v4" /><path d="M12 17h.01" /></svg>
-						{exportHazards[0].message}
-					</span>
+					<!-- What the module these marks describe carries - said in the future
+					     tense on purpose, since under explicit export there may be no
+					     such file yet (the shared wording in `$lib/exportHazard` already
+					     reads that way). The MESSAGE is the shared one, never a sentence
+					     built here: the kinds make DIFFERENT claims (a `.py` module that
+					     will not import; a `.mojo` one that compiles because a `def
+					     main()` was dropped; one that keeps a main and so cannot be
+					     imported by a Python cell), and no single wording can make all
+					     three. EVERY hazard is rendered, not just the first: a set can
+					     carry more than one (a `.py` export reports one per offending
+					     line), and one of them silently going unsaid is the reporting
+					     defect this channel exists to fix. The set is already narrowed
+					     server-side by the ONE human-surface rule, so an agent-only kind
+					     never reaches this bar (`$lib/exportHazard`).
+					     KEYED BY POSITION, which is unique by construction: the list is
+					     built with no dedupe, so two marked cells holding the SAME
+					     offending line yield two hazards with identical `kind` and
+					     identical `statement` - a duplicate key throws during render, and
+					     with no error boundary anywhere in `src/` that takes down the
+					     whole notebook (the DataFrame-grid defect class).
+					     Ranked above the code-root warning: that one says the kernel
+					     cannot reach the module, these say what the module itself is.
+					     Below `exportResolveError`, which means no module can be written
+					     at all. -->
+					{#each exportHazards as hazard, i (i)}
+						<span class="flex items-center gap-1 text-xs text-base-content/70" data-testid="export-hazard">
+							<svg class="h-3.5 w-3.5 shrink-0 text-warning" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3" /><path d="M12 9v4" /><path d="M12 17h.01" /></svg>
+							{hazard.message}
+						</span>
+					{/each}
 				{:else if importWarning}
 					<span class="flex items-center gap-1 text-xs text-base-content/70" data-testid="export-import-warning">
 						<svg class="h-3.5 w-3.5 shrink-0 text-warning" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3" /><path d="M12 9v4" /><path d="M12 17h.01" /></svg>
@@ -1271,6 +1359,22 @@
 					     workspace file it names (under the workspace base they are the same
 					     string, and the echo would be noise). -->
 					<span class="font-mono text-xs text-base-content/55" data-testid="export-resolved">→ {exportResolved}</span>
+				{/if}
+				{#if strandedExplanation}
+					<!-- Marks the current target cannot honour, explained ONCE for the
+					     notebook. Each affected cell carries only a short "not exported"
+					     marker beside its greyed toggle: this is a notebook-wide fact, and
+					     repeating a sentence per cell would wrap fifteen toolbar rows to
+					     say one thing (the Databricks runtime card renders its reason once
+					     on the card, not once per control). Rendered OUTSIDE the warning
+					     chain above rather than as another arm of it - a hazard describes
+					     the module these marks build, this describes marks the module
+					     leaves out, and both can be true at once. Warning tint on the ICON,
+					     `base-content` copy (the GitNotebooks contrast rule). -->
+					<span class="flex items-center gap-1 text-xs text-base-content/70" data-testid="export-stranded">
+						<svg class="h-3.5 w-3.5 shrink-0 text-warning" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3" /><path d="M12 9v4" /><path d="M12 17h.01" /></svg>
+						{strandedExplanation}
+					</span>
 				{/if}
 				{#if exportFeedback}
 					<span class="text-xs text-base-content/70" data-testid="export-feedback">{exportFeedback}</span>

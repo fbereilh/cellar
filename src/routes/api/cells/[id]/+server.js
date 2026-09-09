@@ -61,13 +61,24 @@ export async function PATCH({ params, request }) {
 		}
 	}
 	// REPORTED, unlike its `source`/`role`/`scrolled`/`hideInput` siblings, and for
-	// exactly ONE of its refusals - the scope is deliberate: `no-such-cell` and
-	// `not-code` stay silent exactly as they always were (widening the sibling setters
-	// is a separate change - see `hiddenFromAgent` below). What cannot stay silent is
-	// a cell whose SOURCE carries nbdev's `#| export`: the directive keeps it exported
-	// and Cellar never writes one, so there is no metadata to clear and `{ok:true}`
-	// would leave the row showing an unticked toggle over a cell the exporter still
-	// writes. The client reverts and says why.
+	// exactly TWO of its refusals - the scope is deliberate: `no-such-cell` stays
+	// silent exactly as it always was (widening the sibling setters is a separate
+	// change - see `hiddenFromAgent` below). What cannot stay silent is a refusal the
+	// browser applied a mark for and cannot see:
+	//
+	//   - `export-directive-owns-cell` - the cell's SOURCE carries nbdev's `#| export`,
+	//     the directive keeps it exported and Cellar never writes one, so there is no
+	//     metadata to clear and `{ok:true}` would leave the row showing an unticked
+	//     toggle over a cell the exporter still writes.
+	//   - `not-code` - the cell's language does not match the module's. This became
+	//     reachable from the browser once eligibility turned into a NOTEBOOK-level
+	//     fact the tab mirrors over SSE: while another tab's or an agent's
+	//     `set_export_target` is in flight this tab still derives the old language,
+	//     renders the toggle, writes `cellar.export` optimistically and sends a mark
+	//     the document refuses - so `{ok:true}` left a phantom flag the export bar
+	//     then counted as marked, for a mark that exists in no file.
+	//
+	// Either way the client reverts its optimistic write and says why.
 	//
 	// `alsoFlagged` travels WITH the reason because the remedy differs and the client
 	// cannot work it out: it only sends this once it believed the cell was NOT
@@ -79,7 +90,7 @@ export async function PATCH({ params, request }) {
 	if (typeof body.source === 'string') setSource(params.id, body.source, body.nb, body.originId);
 	if ('export' in body) {
 		const r = setCellExport(params.id, !!body.export, body.nb, body.originId);
-		if (!r.ok && r.reason === 'export-directive-owns-cell')
+		if (!r.ok && (r.reason === 'export-directive-owns-cell' || r.reason === 'not-code'))
 			return json({ ok: false, reason: r.reason, alsoFlagged: !!r.alsoFlagged }, { status: 409 });
 	}
 	if ('scrolled' in body) setOutputScrolled(params.id, body.scrolled, body.nb);

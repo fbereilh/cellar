@@ -27,7 +27,17 @@
 	import WidgetOutput from '$lib/WidgetOutput.svelte';
 	import { foldKey, numberHeadingLine, splitHeadingSegments } from '$lib/headings';
 	import { isImportsCell } from '$lib/importsRole';
-	import { canExportCell, isExportCell, exportDirectiveOwnsCell, exportMarkedTwice } from '$lib/exportRole';
+	import {
+		canExportCell,
+		isExportCell,
+		exportDirectiveOwnsCell,
+		exportMarkStranded,
+		exportMarkedTwice,
+		EXPORT_STRANDED_BADGE,
+		EXPORT_STRANDED_CELL_TITLE,
+		type ExportLanguage
+	} from '$lib/exportRole';
+	import { MAIN_DROPPED_BADGE, MAIN_DROPPED_REASON } from '$lib/mojoExport';
 	import { isHiddenFromAgent } from '$lib/agentVisibility';
 	import { isPageOutput } from '$lib/pageOutput';
 	import { isCodeHidden } from '$lib/hideInput';
@@ -96,6 +106,26 @@
 		keyMode?: KeyMode;
 		/** Staleness verdict ($lib/staleness), or null. */
 		staleState?: StalenessEntry | null;
+		/**
+		 * The MODULE LANGUAGE the notebook's export target names (`$lib/exportRole`),
+		 * or **null when no target is configured at all**. A cell is eligible for the
+		 * export toggle only when its own language matches, so this is what decides
+		 * whether the toggle is drawn at all.
+		 *
+		 * NULLABLE on purpose: eligibility falls back to `python` with nothing
+		 * configured, so a bare language cannot tell a `.py` target from no target,
+		 * and copy built on it named a module that does not exist. The fallback is
+		 * applied to ELIGIBILITY only; every sentence reads the nullable value.
+		 */
+		exportLanguage?: ExportLanguage | null;
+		/**
+		 * This cell is marked for a `.mojo` export AND a LATER exported cell also
+		 * defines a top-level `def main()`, so this one's `main` will not be written
+		 * to the module (a Mojo module can hold one). Decided for the notebook in
+		 * `LiveNotebook` from the same rule the exporter applies; the cell only draws
+		 * the warning.
+		 */
+		mainDropped?: boolean;
 		dragging?: boolean;
 		/** Fold keys of every collapsed heading in the notebook. */
 		foldedIds?: Set<string>;
@@ -185,6 +215,8 @@
 		selected = false,
 		keyMode = 'command',
 		staleState = null,
+		exportLanguage = null,
+		mainDropped = false,
 		dragging = false,
 		foldedIds = new Set(),
 		segHidden = NO_SEGS_HIDDEN,
@@ -322,8 +354,42 @@
 	// is the strict test, so such a cell got a toggle whose `aria-pressed` could
 	// never move and whose setter always skipped it. An always-visible control that
 	// can never apply is worse than one behind a menu, so it is GATED, not disabled.
-	const canExport = $derived(canExportCell(cell));
-	const isExport = $derived(isExportCell(cell));
+	// The legacy default, applied to ELIGIBILITY and nowhere else: with no target
+	// configured a Python code cell is still markable, exactly as it always was.
+	// Every SENTENCE below reads the nullable prop instead, so none of them claims a
+	// module the notebook does not have.
+	const exportCellLanguage = $derived(exportLanguage ?? 'python');
+	const canExport = $derived(canExportCell(cell, exportCellLanguage));
+	const isExport = $derived(isExportCell(cell, exportCellLanguage));
+	// How this control NAMES the module it writes to. With a target it is that
+	// target's own extension (the bar's `Export to .mojo` button is derived the same
+	// way); with none there is no file to name, so it says only "module" rather than
+	// inventing a `.py` one.
+	const exportModuleLabel = $derived(
+		exportLanguage === null ? 'module' : `${exportLanguage === 'mojo' ? '.mojo' : '.py'} module`
+	);
+	// Cellar's own flag is set, but this cell can go in no module the notebook
+	// currently names - the target's extension moved under a mark nothing rewrites,
+	// or the target was cleared (`exportMarkStranded`). The toggle is RENDERED for
+	// such a cell rather than omitted, greyed, and it still CLEARS the flag: the
+	// server gates marking on eligibility and unmarking on nothing, so this is the
+	// one surface that can retire an otherwise invisible key from the user's
+	// committed `.ipynb`. Scoped to the MARKED case - an ineligible cell with no flag
+	// has no state to clear, so it keeps the omitted toggle.
+	//
+	// What it SAYS here is deliberately a short marker, not a sentence: the reason is
+	// a NOTEBOOK-WIDE fact, so it is stated once in the export bar
+	// (`exportStrandedExplanation`) and a per-cell copy would repeat one sentence on
+	// every previously marked cell, wrapping each toolbar row to say the same thing.
+	const exportStranded = $derived(exportMarkStranded(cell, exportCellLanguage));
+	// The accessible NAME. It tracks what the control DOES - clear a stale mark, or
+	// write this cell to the notebook's module - and never the pressed state, which
+	// is `aria-pressed`'s job.
+	const exportToggleName = $derived(
+		exportStranded
+			? "Clear this cell's stale export mark"
+			: `Export this cell to the notebook's ${exportModuleLabel}`
+	);
 	// Marked by nbdev's `#| export` in the cell's own SOURCE rather than by
 	// `metadata.cellar.export`. The toggle then shows ON (it IS exported - showing an
 	// unticked control over a cell the exporter writes is the lie this exists to
@@ -337,12 +403,12 @@
 	// every state (the state is `aria-pressed`'s job - a label that moves announces
 	// the same fact twice), and a browser exposes `title` as the accessible
 	// DESCRIPTION beside that name, which is exactly the right split for a reason.
-	const exportByDirective = $derived(exportDirectiveOwnsCell(cell));
+	const exportByDirective = $derived(exportDirectiveOwnsCell(cell, exportCellLanguage));
 	// ...and marked by Cellar's own flag AS WELL, in which case the title may not
 	// promise that removing the line stops the export: the flag would still mark it.
 	// The shared rule (`exportMarkedTwice`) is what keeps this tooltip, the shell's
 	// refusal notice and MCP's saying the same true thing about the same cell.
-	const exportMarkedBoth = $derived(exportMarkedTwice(cell));
+	const exportMarkedBoth = $derived(exportMarkedTwice(cell, exportCellLanguage));
 	// Withheld from every agent surface (`cellar.hidden_from_agent`, the shared
 	// predicate MCP filters every read through). Deliberately UNGATED: unlike export
 	// and hide-code this applies to every cell type - a markdown cell's prose is as
@@ -1135,7 +1201,10 @@
 	// The two ROW toggles. No `hidePopover` - unlike their neighbours in the "⋮"
 	// menu these are in the row itself, so there is no popover to dismiss.
 	function toggleExport() {
-		onSetExport?.(cell.id, !isExport);
+		// A STRANDED mark reads `isExport === false` (the cell is eligible for no
+		// module), so the plain negation would try to MARK it again - the one thing
+		// the server refuses. The only honest action there is to clear the flag.
+		onSetExport?.(cell.id, exportStranded ? false : !isExport);
 	}
 	function toggleAgentHidden() {
 		onSetHiddenFromAgent?.(cell.id, !agentHidden);
@@ -2138,32 +2207,54 @@
 				     the other end of the row. The export marker used to be a separate `badge`
 				     here saying what this toggle now says; two controls for one fact meant the
 				     row RE-LAID OUT on every mark, so they are one control. -->
-				{#if canExport}
-					<!-- nbdev-style export. Gated on a plain Python code cell (`canExportCell`
-					     is the rule, asked directly; a markdown/SQL/raw cell - or one carrying
-					     a foreign nbformat `cell_type` - has no module source), so the control
-					     is ABSENT where it cannot apply rather than permanently disabled.
-					     Presence follows the cell TYPE, never the flag, so toggling can never
-					     add or remove it. -->
+				{#if canExport || exportStranded}
+					<!-- nbdev-style export. Gated on a code cell whose LANGUAGE matches the
+					     target's (`canExportCell` is the rule, asked directly; a
+					     markdown/SQL/raw cell - or one carrying a foreign nbformat
+					     `cell_type` - has no module source at all), so the control is ABSENT
+					     where it cannot apply rather than permanently disabled. Presence
+					     follows the cell TYPE, never the flag - with ONE exception, which is
+					     about a flag that is already there: a STRANDED mark (`exportStranded`,
+					     the target's extension moved under it, or the target cleared) renders
+					     the toggle greyed beside a SHORT marker, so the key is visible in the
+					     notebook and clearable in place instead of sitting invisible in the
+					     committed `.ipynb`. The reason itself is a notebook-wide fact and is
+					     stated once in the export bar, never once per cell. Every label names
+					     the target's real module, and none names one when there is none. -->
 					<button
-						class="btn btn-ghost btn-xs btn-square {isExport
-							? 'bg-accent/15 text-accent hover:bg-accent/25'
-							: 'text-base-content/60 hover:text-base-content/90'}"
+						class="btn btn-ghost btn-xs btn-square {exportStranded
+							? 'bg-base-content/5 text-base-content/35 hover:text-base-content/60'
+							: isExport
+								? 'bg-accent/15 text-accent hover:bg-accent/25'
+								: 'text-base-content/60 hover:text-base-content/90'}"
 						onclick={toggleExport}
-						aria-pressed={isExport}
-						title={exportMarkedBoth
-							? 'Exported twice - by the "#| export" line in this cell AND by Cellar\'s own flag. Remove that line, then unmark it here to clear the flag'
-							: exportByDirective
-								? 'Exported by the "#| export" line in this cell - remove that line to stop exporting it'
-								: isExport
-									? "Exported to the notebook's .py module - click to unmark"
-									: "Mark for export to the notebook's .py module"}
-						aria-label="Export this cell to the notebook's .py module"
+						aria-pressed={isExport || exportStranded}
+						title={exportStranded
+							? EXPORT_STRANDED_CELL_TITLE
+							: exportMarkedBoth
+								? 'Exported twice - by the "#| export" line in this cell AND by Cellar\'s own flag. Remove that line, then unmark it here to clear the flag'
+								: exportByDirective
+									? 'Exported by the "#| export" line in this cell - remove that line to stop exporting it'
+									: isExport
+										? `Exported to the notebook's ${exportModuleLabel} - click to unmark`
+										: `Mark for export to the notebook's ${exportModuleLabel}`}
+						aria-label={exportToggleName}
 						data-directive-export={exportByDirective ? 'true' : undefined}
+						data-export-stranded={exportStranded ? 'true' : undefined}
 						data-testid="toggle-export"
 					>
 						<svg class="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v12" /><path d="m8 11 4 4 4-4" /><path d="M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2" /></svg>
 					</button>
+					{#if exportStranded}
+						<!-- A SHORT marker beside the greyed control, so the stale mark is
+						     visible on the cell without hovering. The WHY is a notebook-wide
+						     fact and lives once in the export bar; a sentence here would be
+						     reproduced on every previously marked cell, wrapping each toolbar
+						     row to say the same thing (the Databricks runtime card renders its
+						     reason once on the card, not once per control). Weight matched to
+						     the sibling `main not exported` badge. -->
+						<span class="text-xs text-base-content/50" data-testid="export-stranded-badge">{EXPORT_STRANDED_BADGE}</span>
+					{/if}
 				{/if}
 				<!-- Withhold this cell from every agent surface. The sparkle is Cellar's own
 				     agent glyph (the `run-actor` badge uses it), struck through when hidden - so
@@ -2317,6 +2408,29 @@
 					>
 						<svg class="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9" /><path d="M12 8v4" /><path d="M12 16h.01" /></svg>
 						not run
+					</span>
+				{/if}
+				{#if mainDropped}
+					<!-- A `.mojo` export drops every exported cell's top-level `def main()`
+					     but the LAST one's, because a Mojo module can define main only once
+					     ($lib/mojoExport). The user has to see that on the CELL, while
+					     editing - not only after opening the generated file - so this rides
+					     the same always-visible toolbar row the stale chip does, which is
+					     also the one thing a fully collapsed cell keeps on screen.
+
+					     Warning-hued ICON, `base-content` copy: `text-warning` as body text
+					     measures ~2:1 on the light card, so the hue carries the signal and
+					     the words stay readable (the Git panel's own rule). The visible text
+					     states WHAT, the title states WHY - the stale chip's split, and the
+					     one wording ($lib/mojoExport's MAIN_DROPPED_REASON) that the
+					     notebook-level hazard and any future surface also read. -->
+					<span
+						class="ml-2 inline-flex items-center gap-1 rounded bg-warning/15 px-1.5 py-0.5 text-[11px] font-medium text-base-content/80"
+						data-testid="main-dropped-badge"
+						title={MAIN_DROPPED_REASON}
+					>
+						<svg class="h-3 w-3 text-warning" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z" /><path d="M12 9v4" /><path d="M12 17h.01" /></svg>
+						{MAIN_DROPPED_BADGE}
 					</span>
 				{/if}
 			</div>

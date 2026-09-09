@@ -23,6 +23,31 @@ describe('cellMagicName', () => {
 		expect(isCellMagicCell('%%html\n<b>hi</b>')).toBe(true);
 		expect(isCellMagicCell('x = 1')).toBe(false);
 	});
+
+	it('answers the same for every line shape, walking rather than splitting', () => {
+		// It runs once per CODE CELL on the export-eligibility path (`hasMojoHeader`),
+		// which `getNotebook` and `persist` both sweep, so it reads the first non-blank
+		// line without allocating an array of every line. The rewrite must be
+		// behaviour-identical, including at the source edges a walk has and a split
+		// does not: no trailing newline, ONLY blank lines, an empty source, and a source
+		// that is a single unterminated line.
+		expect(cellMagicName('%%mojo')).toBe('mojo');
+		expect(cellMagicName('%%mojo\n')).toBe('mojo');
+		expect(cellMagicName('\n \t \n%%mojo build -o m.so\nbody')).toBe('mojo');
+		expect(cellMagicName('')).toBeNull();
+		expect(cellMagicName('\n')).toBeNull();
+		expect(cellMagicName('\n\n   \n')).toBeNull();
+		expect(cellMagicName(null)).toBeNull();
+		expect(cellMagicName(undefined)).toBeNull();
+		expect(cellMagicName('x = 1')).toBeNull();
+		// A CRLF source: the `\r` rides the line's tail, which `trimStart` never sees,
+		// so the name is read exactly as it was before.
+		expect(cellMagicName('\r\n%%time\r\nx = 1')).toBe('time');
+		// The first non-blank line settles it however long the rest of the cell is, and
+		// a magic further down is not one.
+		expect(cellMagicName(`%%bash\n${'echo hi\n'.repeat(500)}`)).toBe('bash');
+		expect(cellMagicName(`${'x = 1\n'.repeat(500)}%%bash`)).toBeNull();
+	});
 });
 
 describe('scanMagics - every magic question in one pass', () => {

@@ -14,6 +14,7 @@
 
 import type { ImportChangeStamps } from './importBindings';
 import type { ExportHazard } from '../exportHazard';
+import type { ExportLanguage } from '../exportRole';
 
 export type { ImportChangeStamps };
 
@@ -84,9 +85,10 @@ export interface CellarNamespace {
 	/** Cell role, e.g. the pinned imports cell ('imports'). */
 	role?: string | null;
 	/**
-	 * nbdev-style export flag: include this cell in the `.py` module. Only a PYTHON
-	 * code cell may carry it - a SQL cell is an nbformat `code` cell too, so the
-	 * eligibility test lives in `exportRole.ts` (`canExportCell`/`isExportCell`),
+	 * nbdev-style export flag: include this cell in the generated module. Which cells
+	 * MAY carry it is TARGET-AWARE - the target's extension names the module language
+	 * (`.py` or `.mojo`) and a code cell is eligible iff its own language matches - so
+	 * the eligibility test lives in `exportRole.ts` (`canExportCell`/`isExportCell`),
 	 * which every surface reads; a stale or hand-edited flag anywhere else is inert.
 	 */
 	export?: boolean;
@@ -213,6 +215,15 @@ export interface NotebookView {
 	 * cannot resolve. What the importability warning is decided from.
 	 */
 	exportResolved: string | null;
+	/**
+	 * The MODULE LANGUAGE the effective target names (`.py` -> python, `.mojo` ->
+	 * mojo), or **null when no target is configured at all**. Resolved once, on the
+	 * server, and carried rather than re-derived: eligibility falls back to `python`
+	 * with nothing configured, so a reader that re-derives a bare language cannot
+	 * tell a `.py` target from no target and any sentence built on it names a module
+	 * that does not exist.
+	 */
+	exportLanguage: ExportLanguage | null;
 	/** Why a CONFIGURED target cannot resolve (base `git` with no repo, an escape, an unknown base), else null. */
 	exportResolveError: string | null;
 	/**
@@ -254,12 +265,15 @@ export interface KernelSpec {
 /** Notebook-level `cellar` metadata namespace (round-trips through clean-on-save). */
 export interface NotebookCellarNamespace {
 	/**
-	 * nbdev-style export target: a `.py` module path, relative to the recorded
-	 * `export_base` (workspace-relative when that key is absent - the permanent
-	 * legacy meaning). Always STORED relative to its base, whatever a caller
-	 * passed - `setExportTarget` validates the path (resolving inside the
-	 * workspace, and a `.py` file, since the exporter WRITES it) and normalizes
-	 * it there, so the committed `.ipynb` stays portable.
+	 * nbdev-style export target: the generated module's path, relative to the
+	 * recorded `export_base` (workspace-relative when that key is absent - the
+	 * permanent legacy meaning). Its EXTENSION names the module's language and
+	 * therefore which cells may go in it (`.py` or `.mojo`, see
+	 * `exportTargetLanguage`). Always STORED relative to its base, whatever a
+	 * caller passed - `setExportTarget` validates the path (resolving inside the
+	 * workspace, and naming one of those two extensions, since the exporter
+	 * WRITES it) and normalizes it there, so the committed `.ipynb` stays
+	 * portable.
 	 */
 	export_target?: string;
 	/**

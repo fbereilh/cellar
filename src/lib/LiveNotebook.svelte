@@ -30,7 +30,16 @@
 		selectionAfterRemoval,
 		stepFromUnwalkableHead
 	} from '$lib/cellSelection';
-	import { exportCellCount, exportDirectiveOwnsCell, exportMarkedTwice, isExportCell } from '$lib/exportRole';
+	import {
+		exportCellCount,
+		exportDirectiveOwnsCell,
+		exportLanguageOf,
+		exportMarkedTwice,
+		exportStrandedSummary,
+		exportTargetLanguage,
+		isExportCell
+	} from '$lib/exportRole';
+	import { mojoMainDroppedIds } from '$lib/mojoExport';
 	import { isExportBase } from '$lib/exportTarget';
 	import type { ExportHazard } from '$lib/exportHazard';
 	import type { ExportPyResult } from '$lib/types';
@@ -243,7 +252,6 @@
 	// count derives from the live cell flags. Rendered as an always-present section
 	// at the top of the notebook (Notebook.svelte), directly below the root bar.
 	let exportTarget = $state<string | null>(null);
-	const exportCount = $derived(exportCellCount(cells));
 	// The stored target's BASE (`$lib/exportTarget`: workspace / notebook / git;
 	// `workspace` = the absent-key legacy default) plus the server's resolution of
 	// the effective target - the workspace-relative file the module IS, or why a
@@ -256,6 +264,33 @@
 	let exportBase = $state<string>('workspace');
 	let exportResolved = $state<string | null>(null);
 	let exportResolveError = $state<string | null>(null);
+	// Which MODULE LANGUAGE this notebook's target names (`.py` -> python, `.mojo` ->
+	// mojo), which is what decides which cells are eligible for it. Read off the
+	// server's RESOLUTION where there is one and the stored form otherwise, so a
+	// target expressed under a non-workspace base still answers; `python` when no
+	// target is configured, the same legacy default the server applies, so the
+	// toggle on an unconfigured notebook behaves exactly as it always has.
+	const exportModuleLanguage = $derived(exportTargetLanguage(exportResolved ?? exportTarget));
+	const exportLanguage = $derived(exportModuleLanguage ?? 'python');
+	const exportCount = $derived(exportCellCount(cells, exportLanguage));
+	// Cells whose export FLAG is set but which no longer match the target's language
+	// (or which have no target to match at all). Summarised here beside `exportCount`,
+	// so the bar states the notebook-wide fact ONCE from the same cell list the
+	// count comes from - and it carries how many of them have a module language of
+	// their own, since that is what decides which remedy the bar may name.
+	const exportStranded = $derived(exportStrandedSummary(cells, exportLanguage));
+	/**
+	 * The cells whose top-level `def main()` the next `.mojo` export will DROP - a
+	 * Mojo module can define main only once, so the LAST exported cell that defines
+	 * one keeps it (`$lib/mojoExport`).
+	 *
+	 * Derived HERE, from the cells this tab already holds, rather than fetched: the
+	 * warning has to appear the moment a later cell gains a `main` and clear the
+	 * moment it loses one, and it is the SAME rule the exporter applies, so the
+	 * badge can never disagree with the file. Empty for any non-`.mojo` target, so
+	 * an ordinary notebook derives one `!== 'mojo'` comparison and stops.
+	 */
+	const mojoMainDropped = $derived(mojoMainDroppedIds(cells, exportLanguage));
 	// Constructs in the MARKED cells that make the generated module uncompilable
 	// (`$lib/exportHazard`). Server-derived like the three fields above - the rule
 	// needs the Python line tokenizer, which is server-only - seeded on load and
@@ -2345,7 +2380,7 @@
 	 */
 	function moduleSourceIds(addressed: readonly string[] = []): string[] {
 		const ids = new Set(addressed);
-		for (const c of cells) if (isExportCell(c)) ids.add(c.id);
+		for (const c of cells) if (isExportCell(c, exportLanguage)) ids.add(c.id);
 		return [...ids];
 	}
 
@@ -2375,11 +2410,14 @@
 	 * the export ABORTS (the module is its whole product), while a mark and a target
 	 * are the user's document intent and are still written.
 	 */
-	const UNSAVED_EXPORT_EDIT = 'a cell edit that belongs in the .py module could not be saved';
+	const unsavedExportEdit = $derived(
+		`a cell edit that belongs in the ${exportModuleLanguage === null ? 'module' : `${exportModuleLanguage === 'mojo' ? '.mojo' : '.py'} module`} could not be saved`
+	);
 	function unsavedExportEditNotice(outcome: 'skipped' | 'proceeding'): string {
+		const said = unsavedExportEdit;
 		return outcome === 'skipped'
-			? `Export skipped: ${UNSAVED_EXPORT_EDIT}, so the module would not have matched the notebook. Fix the edit and export again.`
-			: `${UNSAVED_EXPORT_EDIT[0].toUpperCase()}${UNSAVED_EXPORT_EDIT.slice(1)}, so the module may not include it. Fix the edit and export again.`;
+			? `Export skipped: ${said}, so the module would not have matched the notebook. Fix the edit and export again.`
+			: `${said[0].toUpperCase()}${said.slice(1)}, so the module may not include it. Fix the edit and export again.`;
 	}
 
 	async function editCell(id: string, source: string, { keepalive = false }: { keepalive?: boolean } = {}) {
@@ -2444,17 +2482,16 @@
 		const cellar = { ...(cell.metadata?.cellar ?? {}) };
 		if (lang) cellar.language = lang;
 		else delete cellar.language;
-		// The same drops the server's `applyCellType` makes - neither the imports role
-		// nor the export flag may sit on a cell holding no Python - mirrored here for
-		// the `clampMoveIndex` reason: `cell:type` carries no metadata, so a client
-		// half that skipped them would keep drawing the imports/export badge over a
-		// cell the server has already stripped, with no event able to correct it
-		// before reload. `hide_input` is KEPT, exactly as the server keeps it.
+		// The same drop the server's `applyCellType` makes - the imports role may not
+		// sit on a cell holding no Python - mirrored here for the `clampMoveIndex`
+		// reason: `cell:type` carries no metadata, so a client half that skipped it
+		// would keep drawing the imports badge over a cell the server has already
+		// stripped, with no event able to correct it before reload. The EXPORT flag is
+		// KEPT, exactly as the server keeps it: a mark the current target cannot honour
+		// STRANDS and stays visible and clearable rather than being silently deleted
+		// from the user's committed notebook. `hide_input` is KEPT for its own reason.
 		const runnable = cell.cell_type === 'code' && !lang;
-		if (!runnable) {
-			if (cellar.role === IMPORTS_ROLE) delete cellar.role;
-			if (cellar.export) delete cellar.export;
-		}
+		if (!runnable && cellar.role === IMPORTS_ROLE) delete cellar.role;
 		cell.metadata = { ...(cell.metadata ?? {}), cellar };
 		if (cell.cell_type !== 'code') cell.outputs = [];
 	}
@@ -2541,6 +2578,28 @@
 	}
 
 	/**
+	 * What to say when the server refuses a MARK because the cell is not eligible.
+	 *
+	 * Reachable only through a stale reading: this tab renders the toggle from
+	 * `exportLanguage`, which it mirrors over SSE, so another tab's or an agent's
+	 * target change in flight lets it offer a mark the document then refuses. The
+	 * cell it read is looked up again, so the sentence describes what is on screen
+	 * now rather than what was clicked.
+	 *
+	 * It states only what is OBSERVED about the cell, the split
+	 * `exportStrandedExplanation` already makes for the notebook: a cell that
+	 * contributes no module source in ANY language cannot be marked whatever the
+	 * target is, while a cell WITH a language simply does not match this notebook's
+	 * module. Naming an extension would assert a target this tab may have wrong -
+	 * which is the very staleness that produced the refusal.
+	 */
+	function exportIneligibleNotice(id: string): string {
+		return exportLanguageOf(findCell(id)) === null
+			? 'That cell contributes no module source, so it cannot be marked for export.'
+			: "That cell does not match this notebook's export module, so the mark was not applied.";
+	}
+
+	/**
 	 * Mark (or unmark) a code cell for nbdev-style export to the `.py` module.
 	 * Applied optimistically here (reassign metadata so the badge/menu react) and
 	 * persisted server-side, which ALSO regenerates the module - not because a save
@@ -2575,8 +2634,8 @@
 		// refreshed for a MOUNTED cell whose remote edit is stashed behind the "changed
 		// on server" banner. In that window the directive is on the server's copy and
 		// not on ours, so the server's own refusal below is what keeps the promise.
-		if (!exported && exportDirectiveOwnsCell(cell)) {
-			onNotice?.(exportDirectiveNotice(exportMarkedTwice(cell)));
+		if (!exported && exportDirectiveOwnsCell(cell, exportLanguage)) {
+			onNotice?.(exportDirectiveNotice(exportMarkedTwice(cell, exportLanguage)));
 			return;
 		}
 		// Only whether THIS key was there, and what it held - never a snapshot of the
@@ -2609,7 +2668,15 @@
 			.json()
 			.then((b) => (b as { reason?: string; alsoFlagged?: boolean } | null) ?? null)
 			.catch(() => null);
-		if (verdict?.reason !== 'export-directive-owns-cell') return;
+		// TWO refusals revert, and `not-code` is the one this tab could not predict at
+		// all: eligibility is a NOTEBOOK-level fact mirrored over SSE, so a target
+		// change still in flight lets this tab offer a mark the document refuses.
+		// Left as `{ok:true}` the phantom flag survived until the next `load()`, and
+		// the export bar counted it as marked for a mark that exists in no file. The
+		// revert is purely local - the stale language heals on its own when the
+		// `notebook:export-target` event lands - so no cross-tab coordination is
+		// involved.
+		if (verdict?.reason !== 'export-directive-owns-cell' && verdict?.reason !== 'not-code') return;
 		// Looked up AGAIN, because a `load()` refetch replaces `cells` and the object
 		// the click read may no longer be the one on screen.
 		const c = findCell(id);
@@ -2619,7 +2686,11 @@
 			else delete cellar.export;
 			c.metadata = { ...(c.metadata ?? {}), cellar };
 		}
-		onNotice?.(exportDirectiveNotice(verdict.alsoFlagged === true));
+		onNotice?.(
+			verdict.reason === 'not-code'
+				? exportIneligibleNotice(id)
+				: exportDirectiveNotice(verdict.alsoFlagged === true)
+		);
 	}
 
 	/**
@@ -2997,7 +3068,8 @@
 	 * accepted price of having no skip-check to get wrong.
 	 *
 	 * The route refuses a `.py` text notebook (which stores no cellar metadata), a
-	 * target escaping the workspace and one that is not a `.py` module, and it emits
+	 * target escaping the workspace and one that names no module Cellar can generate
+	 * (anything but `.py` or `.mojo`), and it emits
 	 * `notebook:export-target` only on success, which this tab would echo-suppress
 	 * anyway. So without reading the response the input kept showing a rejected path
 	 * and the export bar read as configured over metadata holding nothing, reverting
@@ -4604,6 +4676,9 @@
 			onSetExport={setExport}
 			exportTarget={exportTarget}
 			exportCount={exportCount}
+			exportStranded={exportStranded}
+			exportLanguage={exportModuleLanguage}
+			{mojoMainDropped}
 			onSetExportTarget={setExportTargetValue}
 			onExportPy={exportPy}
 			exportBase={exportBase}

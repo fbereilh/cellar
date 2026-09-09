@@ -36,6 +36,10 @@ const notFound = (msg: string) => ({ content: [{ type: 'text' as const, text: ms
 const pyNotebookRefusal = (what: string) =>
 	`refused: this is a .py text notebook (jupytext/Databricks source). It carries no per-cell metadata and generates no module, so ${what} - convert it to .ipynb first.`;
 
+/** How an export language is NAMED to an agent: the source it holds, and the module it goes in. */
+const cellLang = (lang: 'python' | 'mojo') => (lang === 'mojo' ? 'Mojo' : 'Python');
+const moduleExt = (lang: 'python' | 'mojo') => (lang === 'mojo' ? '.mojo' : '.py');
+
 /**
  * Run an ADD handler, turning the doc layer's `.py`-notebook type refusal
  * (`raw`, `chat`) into a tool error that NAMES the cause instead of an
@@ -388,23 +392,23 @@ Follow this house style:
    one), so you can see - even with report view on - which cells the user chose to
    keep shown; do not "fix" such a cell back to hidden.
 
-   EXPORT TARGET is the notebook's nbdev-style module: the .py file the cells
-   marked for export are written to (its #|default_exp). Its stored path is
-   measured from a BASE - workspace (the default), notebook (its own folder), or
-   git (its enclosing repo). get_notebook_map's display block reports
-   export_target = the RESOLVED workspace-relative file, plus export_base and
-   export_path (the stored spelling) whenever the base is not workspace, and each
-   marked cell as export:true. export_target is null BOTH when unset and when a
-   configured target cannot resolve; export_target_error tells those apart. To
-   build a module: set_export_target(path, base) names the file (path:null clears
-   it) and set_cell_export(ids, export:true|false) marks/unmarks the PYTHON code
-   cells that go in it (markdown/SQL are refused). Pass a path back in the base it
-   was reported under, never the resolved one; an omitted base keeps the current
-   one. Both persist in metadata, and THOSE TWO CALLS are what rewrite the module
-   (while a target is set AND a cell stays marked); editing or running one does
-   NOT, so after changing a marked cell's source call set_export_target with the
-   SAME path and base to rewrite it - that call always regenerates, where
-   re-marking an already-marked cell writes nothing. Unmark the last marked cell
+   EXPORT TARGET is the notebook's nbdev-style module: the file the marked cells
+   are written to (its #|default_exp), at a path measured from a BASE - workspace
+   (default), notebook (its folder), or git (its repo). get_notebook_map's display
+   block reports export_target (RESOLVED workspace-relative), export_base and
+   export_path (the stored spelling) when the base is not workspace, and each
+   marked cell as export:true. export_target is null both when unset and when it
+   cannot resolve; export_target_error tells those apart. To build one:
+   set_export_target(path, base) names the file (path:null clears it) and
+   set_cell_export(ids, export:true|false) marks the cells in it. The EXTENSION
+   picks the language: .py takes Python cells, .mojo Mojo ones; a mismatch is
+   refused. A .mojo module defines main once, so only the LAST marked cell with
+   one keeps it - the rest lose that block (reported in module). Pass a path back
+   in the base it was reported under, never the resolved one; an omitted base
+   keeps the current. THOSE TWO CALLS are what rewrite the module (while a target
+   is set AND a cell stays marked); editing or running one does NOT - after
+   changing a marked cell's source, call set_export_target with the SAME path and
+   base, which always regenerates (re-marking writes nothing). Unmark the last one
    and the old file stays as it was. Never hand-write an #|export line: nbdev's
    directive ALSO marks the cell, and set_cell_export then cannot unmark it - only
    deleting that line can.
@@ -571,8 +575,9 @@ Follow this house style:
    own \`def main():\` and its own imports, and you must never write a "define here,
    use there" pair across two Mojo cells — it cannot work. Never put Mojo in a
    python cell or Python in a mojo cell. A mojo cell has no dataflow, so it never
-   shows a staleness verdict, cannot be the imports cell, and cannot be exported to
-   the .py module. Output is stdout only (buffered until the cell finishes), and a
+   shows a staleness verdict and cannot be the imports cell; it IS exportable, to a
+   .mojo target (clause 5), never to a .py one. Output is stdout only (buffered
+   until the cell finishes), and a
    compile error comes back as a MojoCompilationError naming a temp path. If the
    Mojo toolchain is missing the cell fails with the exact install command — relay
    it; Cellar never installs it for the user.
@@ -684,7 +689,7 @@ export function registerTools(server: McpServer) {
 	server.registerTool('current_notebook', { description: 'Report THIS session\'s working notebook (where your edits land) and whether it is a genuine pin or the fallback to the user\'s active tab. When unpinned, your target follows the user\'s tab switches — call use_notebook to pin your own.', inputSchema: {} }, async (_args, extra: ToolExtra) => text(svc.currentNotebook(extra?.sessionId)));
 
 	// --- read ---
-	server.registerTool('get_notebook_map', { description: 'Compact hierarchical section tree (from markdown headers), NOT full content: per cell id, type, header level/title, one-line summary, run status, staleness, has_output, visibility. Plus a `kernel` header {started, session_id, execs_this_session} and a `display` header {header_numbering, report_view, export_target}. header_numbering = the heading levels Cellar auto-numbers ([] = off); a numbered section also carries the `number` it renders with — that number is NOT in the cell source, so never write one yourself (set_header_numbering). report_view:true = every code cell is displayed output-only; a code cell carries code_hidden:true when its input is EFFECTIVELY hidden, and hide_input only when it EXPLICITLY overrides report_view — so hide_input:false with no code_hidden is a cell the user deliberately keeps shown; leave it (set_hide_input). export_target = the EFFECTIVE nbdev .py path, RESOLVED workspace-relative (set_export_target); a non-workspace base adds export_base + export_path, the stored spelling to pass back. It is null both when unset and when a configured target cannot resolve - export_target_error carries the reason and tells those apart. export_target_source:\'default_exp\' marks one from a cell directive, which that setter cannot clear; a cell written into it carries export:true (set_cell_export). run_status separates LIVE from SAVED: ok_session/error_session ran in the CURRENT kernel session (ran_this_session:true); ok_persisted/error_persisted are LEFTOVERS loaded from the .ipynb (ran_this_session:false — nothing they define exists in the kernel); error_kernel_unavailable = the run never reached a kernel, so that failure is live, not leftover. A CHAT cell answers in its own words instead (ok_chat_reply/error_chat_reply = this server ran it, chat_reply_persisted = a saved reply), which say nothing about the kernel - never re-run one to refresh state. stale_state = not_run|fresh|stale|n/a; stale:true (+ stale_reason, stale_upstream) = it ran this session but an upstream has changed since, so its output is OUT OF DATE — re-run before trusting it. stale_state is a FLOOR: static dataflow plus run timestamps, never a kernel check, so a dependency through a conditional bind or exec/globals() leaves a cell reported fresh while it is already out of date (see cell_impact). has_output means saved output, never that the cell ran — kernel_state is the live truth.', inputSchema: { ...notebookParam } }, async ({ notebook }, extra: ToolExtra) => text(await svc.getNotebookMap(targetOf(extra, notebook))));
+	server.registerTool('get_notebook_map', { description: 'Compact hierarchical section tree (from markdown headers), NOT full content: per cell id, type, header level/title, one-line summary, run status, staleness, has_output, visibility. Plus a `kernel` header {started, session_id, execs_this_session} and a `display` header {header_numbering, report_view, export_target}. header_numbering = the heading levels Cellar auto-numbers ([] = off); a numbered section also carries the `number` it renders with — that number is NOT in the cell source, so never write one yourself (set_header_numbering). report_view:true = every code cell is displayed output-only; a code cell carries code_hidden:true when its input is EFFECTIVELY hidden, and hide_input only when it EXPLICITLY overrides report_view — so hide_input:false with no code_hidden is a cell the user deliberately keeps shown; leave it (set_hide_input). export_target = the EFFECTIVE nbdev module path, RESOLVED workspace-relative (set_export_target); a non-workspace base adds export_base + export_path, the stored spelling to pass back. It is null both when unset and when a configured target cannot resolve - export_target_error carries the reason and tells those apart. export_target_source:\'default_exp\' marks one from a cell directive, which that setter cannot clear; a cell written into it carries export:true (set_cell_export). run_status separates LIVE from SAVED: ok_session/error_session ran in the CURRENT kernel session (ran_this_session:true); ok_persisted/error_persisted are LEFTOVERS loaded from the .ipynb (ran_this_session:false — nothing they define exists in the kernel); error_kernel_unavailable = the run never reached a kernel, so that failure is live, not leftover. A CHAT cell answers in its own words instead (ok_chat_reply/error_chat_reply = this server ran it, chat_reply_persisted = a saved reply), which say nothing about the kernel - never re-run one to refresh state. stale_state = not_run|fresh|stale|n/a; stale:true (+ stale_reason, stale_upstream) = it ran this session but an upstream has changed since, so its output is OUT OF DATE — re-run before trusting it. stale_state is a FLOOR: static dataflow plus run timestamps, never a kernel check, so a dependency through a conditional bind or exec/globals() leaves a cell reported fresh while it is already out of date (see cell_impact). has_output means saved output, never that the cell ran — kernel_state is the live truth.', inputSchema: { ...notebookParam } }, async ({ notebook }, extra: ToolExtra) => text(await svc.getNotebookMap(targetOf(extra, notebook))));
 	server.registerTool('kernel_state', { description: 'THE LIVE TRUTH about what is defined right now in YOUR working notebook\'s kernel (each notebook has its own, isolated): imports already loaded, user-defined functions/classes, variables (types, shapes, dataframe columns), a `databricks` block (whether a Connect session is bound, and to which profile/cluster), and `stale_cells` ([{id, reason, upstream}]) whose output is now OUT OF DATE because an upstream changed since they ran. Returns {started:false} if no kernel is running (never boots one); stale:true means the kernel restarted while reading, so the namespace below belongs to session_id and is already gone. Call it BEFORE writing code (do not re-import or redefine what already exists) and BEFORE depending on a variable an earlier cell defines — a cell can show saved outputs yet never have run in this session. If a name is missing here, re-run the cell that defines it; re-run everything in stale_cells before relying on it. If databricks.connected, `spark` and `w` are live: use them, never re-create them.', inputSchema: { ...notebookParam } }, async ({ notebook }, extra: ToolExtra) => text(await svc.getKernelState(targetOf(extra, notebook))));
 	server.registerTool('list_variables', { description: 'YOUR working notebook\'s kernel namespace as structured data: every user DATA variable (modules/functions/classes/dunders filtered out) with {name, type, repr_short, size}, plus the SCHEMA for pandas/spark DataFrames {shape, columns:[{name, dtype}]}, pandas Series {dtype, shape} and numpy arrays {dtype, shape}. Read-only — runs NO user code and does not inflate execs_this_session. Use it to SEE the data instead of guessing, or adding a throwaway df.head() cell. Reflects only the LIVE session: {started:false} if your kernel is not running (never boots one); stale:true means it restarted while reading, so nothing listed exists any more.', inputSchema: { ...notebookParam } }, async ({ notebook }, extra: ToolExtra) => text(await svc.getVariables(targetOf(extra, notebook))));
 	server.registerTool('inspect_variable', { description: `Detailed view of ONE live variable by name in YOUR working notebook's kernel: full type, shape/len, and kind-specific detail — a DataFrame's columns+dtypes plus a head sample, a Series' dtype+head, a numpy array's dtype/shape/stats+head, a dict's keys, a sequence's first items. A Spark DataFrame returns its schema only (never collected, so no job is triggered). Read-only — runs NO user code, exec count unaffected. Prefer it over adding a df.head() cell just to look. BOUNDED, and it says so: normally ${INSPECT_HEAD_ROWS} rows, but when the values are ARRAYS (an embedding column, a list-of-lists frame) the sample drops to ${INSPECT_ARRAY_HEAD_ROWS} rows, each array to its first ${INSPECT_ARRAY_ITEMS} items ("… N more (M total)"), each string to ${INSPECT_STR_CHARS} chars, and the head as a whole to ${INSPECT_HEAD_BUDGET} chars; head_truncated + head_note then name the bounds that applied. Every column stays present ("…" marks a dropped value), so read full values in a cell when you need them. {found:false} when the name is undefined, {started:false} when your kernel is not running. LIVE session only.`, inputSchema: { name: z.string(), ...notebookParam } }, async ({ name, notebook }, extra: ToolExtra) => text(await svc.inspectVariable(name, targetOf(extra, notebook))));
@@ -779,13 +784,13 @@ export function registerTools(server: McpServer) {
 						: `cell ${id} not found`
 		);
 	});
-	server.registerTool('set_cell_type', { description: 'Set a cell type to code, sql, mojo, markdown, or raw. sql tags the code cell as a SQL query (runs against the connected Databricks spark session); mojo tags it as Mojo (doctrine clause 12); code reverts it to Python. raw is verbatim text (frontmatter/directives): never executed, never rendered. raw, mojo and chat are all refused on a .py text notebook, which cannot store the tag. Converting away from code drops that cell\'s outputs, imports role and export flag.', inputSchema: { id: z.string(), cell_type: z.enum(['code', 'sql', 'mojo', 'markdown', 'raw']), ...notebookParam } }, async ({ id, cell_type, notebook }, extra: ToolExtra) => { const target = targetOf(extra, notebook); const res = resolveOne(target, id, extra?.sessionId); if ('error' in res) return res.error; const r = svc.setType(res.id, cell_type, target); return r.ok ? text({ ok: true }) : notFound(r.refused ?? `cell ${id} not found`); });
+	server.registerTool('set_cell_type', { description: 'Set a cell type to code, sql, mojo, markdown, or raw. sql tags the code cell as a SQL query (runs against the connected Databricks spark session); mojo tags it as Mojo (doctrine clause 12); code reverts it to Python. raw is verbatim text (frontmatter/directives): never executed, never rendered. raw, mojo and chat are all refused on a .py text notebook, which cannot store the tag. Converting away from code drops that cell\'s outputs and imports role. Its nbdev export mark is KEPT: a mark the new type cannot honour strands rather than being silently deleted, and is cleared from the cell toolbar.', inputSchema: { id: z.string(), cell_type: z.enum(['code', 'sql', 'mojo', 'markdown', 'raw']), ...notebookParam } }, async ({ id, cell_type, notebook }, extra: ToolExtra) => { const target = targetOf(extra, notebook); const res = resolveOne(target, id, extra?.sessionId); if ('error' in res) return res.error; const r = svc.setType(res.id, cell_type, target); return r.ok ? text({ ok: true }) : notFound(r.refused ?? `cell ${id} not found`); });
 	server.registerTool('set_cell_visibility', { description: 'Show/hide a cell from the agent (cellar.hidden_from_agent).', inputSchema: { id: z.string(), hidden: z.boolean(), ...notebookParam } }, async ({ id, hidden, notebook }, extra: ToolExtra) => { const target = targetOf(extra, notebook); const res = resolveOne(target, id, extra?.sessionId); if ('error' in res) return res.error; return svc.setCellVisibility(res.id, hidden, target) ? text({ ok: true, id: svc.handleFor(target, res.id), hidden }) : notFound(`cell ${id} not found`); });
 
 	server.registerTool('set_header_numbering', { description: 'Set WHICH markdown heading levels render with an automatic number (levels:[2] numbers every H2 "1.", "2."; levels:[1,2] numbers hierarchically "1.", "1.1"; levels:[] turns it off). Notebook-level and DISPLAY-ONLY: numbers are computed at render time and no cell source is ever edited, so never type one into a header yourself. Returns the sanitized levels stored (deduped, 1-6, ascending) and how many headings now carry a number.', inputSchema: { levels: z.array(z.number().int().min(1).max(6)), ...notebookParam } }, async ({ levels, notebook }, extra: ToolExtra) => text(svc.setHeaderNumbering(levels, targetOf(extra, notebook))));
 	server.registerTool('set_report_view', { description: 'Turn the notebook-wide report view on/off: enabled:true renders every code cell OUTPUT-only, so a human reads results and markdown without the code; enabled:false shows code again. Display-only — no source is touched and cells still run. A per-cell set_hide_input override beats it in either direction. Returns the resulting report_view.', inputSchema: { enabled: z.boolean(), ...notebookParam } }, async ({ enabled, notebook }, extra: ToolExtra) => text(svc.setReportView(enabled, targetOf(extra, notebook))));
 	server.registerTool('set_hide_input', { description: 'Show or hide ONE code cell\'s input, overriding report view for that cell: hidden:true forces its code hidden, hidden:false forces it shown even under report view, hidden:null clears the choice so it follows the notebook-wide report_view again. The per-cell value ALWAYS wins over set_report_view, so this is how you keep one cell visible in a report, or hide a single cell without one. Display-only — no source is touched and the cell still runs; code cells only. Returns {hide_input (explicit value or null), code_hidden (effective), report_view (notebook default)}.', inputSchema: { id: z.string(), hidden: z.boolean().nullable(), ...notebookParam } }, async ({ id, hidden, notebook }, extra: ToolExtra) => { const target = targetOf(extra, notebook); const res = resolveOne(target, id, extra?.sessionId); if ('error' in res) return res.error; const r = svc.setHideInput(res.id, hidden, target); return r.ok ? text({ id: svc.handleFor(target, res.id), ...r }) : notFound(`cell ${id} is not a code cell (only a code cell can hide its input)`); });
-	server.registerTool('set_cell_export', { description: 'Mark or unmark ONE OR SEVERAL cells for export to the nbdev-style `.py` module. Only Python code cells can be exported; markdown/SQL refused. An `#| export` line in a cell source also marks it and cannot be unmarked here - remove the line. Nothing is written unless every id resolves. Regenerates the `.py` when set_export_target is set AND a cell stays marked; module says when it was NOT written (nothing marked, write failed, wrote nothing) or WAS but will not import. Refused on a `.py` text notebook. Returns {ok, cells, count, export_target}: cells = the addressed cells now carrying the REQUESTED value (on export:false, now OUT); export_target = where they land, #|default_exp included.', inputSchema: { ids: z.array(z.string()), export: z.boolean(), ...notebookParam } }, async ({ ids, export: exported, notebook }, extra: ToolExtra) => {
+	server.registerTool('set_cell_export', { description: 'Mark/unmark ONE OR SEVERAL cells for export to the nbdev-style module. Only cells matching the target\'s language go in (.py=Python, .mojo=Mojo); others refused. An `#| export` line in the source also marks it and cannot be unmarked here - remove it. All-or-nothing on ids. Regenerates the module when set_export_target is set AND a cell stays marked; module says when it was NOT written (nothing marked, write failed, wrote nothing) or WAS but will not import / lost main(). Refused on a `.py` text notebook. Returns {ok, cells, count, export_target}: cells = the addressed cells now carrying the REQUESTED value (on export:false, now OUT); export_target = where they land, #|default_exp included.', inputSchema: { ids: z.array(z.string()), export: z.boolean(), ...notebookParam } }, async ({ ids, export: exported, notebook }, extra: ToolExtra) => {
 		const target = targetOf(extra, notebook);
 		const res = resolveMany(target, ids, extra?.sessionId);
 		if ('error' in res) return res.error;
@@ -796,7 +801,29 @@ export function registerTools(server: McpServer) {
 		// resolveMany expanded it to: an id the model cannot find anywhere in its own
 		// call reads as the tool answering about some other cell.
 		const asGiven = (full: string | undefined) => (full == null ? full : (ids[res.ids.indexOf(full)] ?? full));
-		if ('notCode' in r) return notFound(`cell ${asGiven(r.notCode)} is not a Python code cell (only a Python code cell can be exported to the .py module)`);
+		// FOUR facts share this refusal and each gets its OWN sentence, because each
+		// names a different thing to change. A cell with no module source at all
+		// (markdown/SQL/raw) is not a language MISMATCH - nothing was compared - so it
+		// says what it is. A code cell in the other language IS a comparison, so it
+		// names both languages and the extension that would admit it. A code cell under
+		// NO target has nothing to be compared against: `targetLanguage` is null there,
+		// and wording it as a mismatch would name a `.py` module this notebook does not
+		// have and send the caller to change an extension that does not exist (the
+		// browser's `exportStrandedExplanation` carries the same null branch). And a
+		// target that IS configured yet names no module Cellar can build is a THIRD
+		// state, not either of those: naming one is not the remedy (there is one) and
+		// changing an extension is not either (there is no module to compare against),
+		// so it says what was seen and points at the error `get_notebook_map` reports.
+		if ('notCode' in r)
+			return notFound(
+				r.cellLanguage == null
+					? `cell ${asGiven(r.notCode)} is not a code cell, so it has no module source to export`
+					: r.targetLanguage != null
+						? `cell ${asGiven(r.notCode)} is ${cellLang(r.cellLanguage)} code but this notebook's export target is a ${moduleExt(r.targetLanguage)} module (a .py target takes Python code cells, a .mojo target Mojo cells)`
+						: r.targetConfigured
+							? `cell ${asGiven(r.notCode)} is ${cellLang(r.cellLanguage)} code and this notebook's export target names no module Cellar can build, so nothing is exported: read export_target_error from get_notebook_map, then fix the target with set_export_target (a ${moduleExt(r.cellLanguage)} path takes ${cellLang(r.cellLanguage)} cells)`
+							: `cell ${asGiven(r.notCode)} is ${cellLang(r.cellLanguage)} code and this notebook has no export target, so there is no module to mark it for: name one with set_export_target (a ${moduleExt(r.cellLanguage)} path takes ${cellLang(r.cellLanguage)} cells)`
+			);
 		// The one refusal that is not about the cell TYPE: nbdev's `#| export` in the
 		// source marks it, and Cellar never writes a directive, so there is no metadata
 		// this tool could clear that would take the mark away. Name the line to edit
@@ -811,10 +838,10 @@ export function registerTools(server: McpServer) {
 			);
 		return notFound(r.missing ? `cell ${asGiven(r.missing)} not found` : 'ids must not be empty');
 	});
-	server.registerTool('set_export_target', { description: 'Set (or clear) your notebook\'s EXPORT TARGET: the `.py` module export-marked cells go to. `base` = what `path` is measured from: workspace, notebook (its folder), git (repo root); OMIT it to KEEP the stored base (workspace when none). path:null or "" clears the SETTING (a `#|default_exp` directive in a cell is NOT). Rewritten while a cell stays marked (set_cell_export); module = that write failed, or it will not import. Refused: a path outside the workspace or not `.py` (the module is WRITTEN there), git with no repo, a `.py` text notebook. Returns export_target (RESOLVED workspace-relative; a directive flagged export_target_source) + export_base/export_path for non-workspace bases.', inputSchema: { path: z.string().nullable(), base: z.enum(['workspace', 'notebook', 'git']).optional(), ...notebookParam } }, async ({ path, base, notebook }, extra: ToolExtra) => {
+	server.registerTool('set_export_target', { description: 'Set (or clear) your notebook\'s EXPORT TARGET: the `.py`/`.mojo` module export-marked cells go to. `base` = what `path` is measured from: workspace, notebook (its folder), git (repo root); OMIT to KEEP the stored (workspace when none). path:null or "" clears the SETTING (a `#|default_exp` directive in a cell is NOT). Rewritten while a cell stays marked (set_cell_export); module = the write failed, or it will not import / lost main(). Refused: a path outside the workspace or not `.py`/`.mojo` (it is WRITTEN there), git with no repo, a `.py` text notebook. Returns export_target (RESOLVED workspace-relative; a directive flags export_target_source) + export_base/export_path for other bases.', inputSchema: { path: z.string().nullable(), base: z.enum(['workspace', 'notebook', 'git']).optional(), ...notebookParam } }, async ({ path, base, notebook }, extra: ToolExtra) => {
 		const r = svc.setExportTarget(path, targetOf(extra, notebook), base);
 		if ('refused' in r) return notFound(pyNotebookRefusal('an export target cannot be stored'));
-		if ('invalid' in r) return notFound(`refused: ${r.invalid} - the export target must be a .py path that resolves inside the workspace`);
+		if ('invalid' in r) return notFound(`refused: ${r.invalid} - the export target must be a .py or .mojo path that resolves inside the workspace`);
 		// A valid path the notebook write could not save: say what happened, and do NOT
 		// hand back the invalid-path remedy above - the path is fine, and the notebook
 		// in memory already carries it, so retrying the same call once the write can

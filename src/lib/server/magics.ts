@@ -38,6 +38,7 @@
  * so it is unit-testable without a kernel, a subprocess, or a document.
  */
 import { logicalLines, type LogicalLine } from './imports';
+import { cellMagicName } from '../cellMagic';
 
 /**
  * Cell magics whose BODY is Python and therefore contributes defines/uses. Every
@@ -48,23 +49,14 @@ import { logicalLines, type LogicalLine } from './imports';
 const PYTHON_BODY_CELL_MAGICS = new Set(['time', 'timeit', 'capture', 'prun', 'debug', 'pypy']);
 
 /**
- * The name of a leading `%%name` cell magic, or null when the cell is not a cell
- * magic. IPython requires a cell magic to be the cell's first line; leading blank
- * lines are tolerated. The name decides how the body is (or is not) analyzed.
+ * The leading-`%%name` rule itself lives in the browser-safe `$lib/cellMagic`,
+ * because the EXPORT eligibility rule (`exportRole.ts`, read by `Cell.svelte`)
+ * needs it too and may not import `$lib/server`. Re-exported here so every
+ * existing importer of this module is unchanged and there is still one
+ * definition of what a cell magic is.
  */
-export function cellMagicName(source: string | null | undefined): string | null {
-	for (const raw of (source ?? '').split('\n')) {
-		if (raw.trim() === '') continue; // skip leading blank lines
-		const m = /^%%(\w+)/.exec(raw.trimStart());
-		return m ? m[1] : null; // the first non-blank line settles it
-	}
-	return null;
-}
-
-/** True for any `%%name` cell magic (whether or not its body is Python). */
-export function isCellMagicCell(source: string | null | undefined): boolean {
-	return cellMagicName(source) !== null;
-}
+export { isCellMagicCell } from '../cellMagic';
+export { cellMagicName };
 
 /**
  * Is this logical line ENTIRELY a magic / shell escape (`%foo …`, `!cmd`) rather

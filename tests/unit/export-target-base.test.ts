@@ -532,6 +532,24 @@ describe('exportImportWarning (the importability rule)', () => {
 		expect(exportImportWarning('lib/x.py', '.')).toBeNull();
 	});
 
+	it('is silent for a .mojo target, wherever it lands, because none of it is true there', () => {
+		const { exportImportWarning } = exportTargetLib;
+		// Every clause of this warning is about PYTHON import: the kernel's `sys.path`
+		// carries the code root, which is what makes an outside module unreachable from
+		// a code cell. A `%%mojo` cell reaches the compiler through a SUBPROCESS, so
+		// the code root decides nothing about a `.mojo` module - warning only for the
+		// outside case would advertise a remedy (move it under the root) that cannot
+		// work, and warning for both would be permanent chrome on every Mojo notebook.
+		expect(exportImportWarning('lib/k.mojo', 'roots/pr1')).toBeNull();
+		expect(exportImportWarning('lib/k.mojo', '../wt')).toBeNull();
+		expect(exportImportWarning('lib/k.mojo', '~/elsewhere')).toBeNull();
+		expect(exportImportWarning('roots/pr10/k.mojo', 'roots/pr1')).toBeNull();
+		expect(exportImportWarning('lib/K.MOJO', 'roots/pr1')).toBeNull();
+		// The Python half is untouched, so the silence is about the target's LANGUAGE
+		// and not about the rule having been switched off.
+		expect(exportImportWarning('lib/x.py', 'roots/pr1')).toMatch(/cannot import/);
+	});
+
 	it('never throws on a declaration the shape owner REFUSES, and warns instead', () => {
 		const { exportImportWarning } = exportTargetLib;
 		// A hand-edited `~` root reaches the browser verbatim (`readRoot` returns an
