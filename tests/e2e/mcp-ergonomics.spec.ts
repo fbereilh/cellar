@@ -1,6 +1,6 @@
 import { test, expect } from '@playwright/test';
 import { spawnSync, type ChildProcess } from 'node:child_process';
-import { mkdtempSync, existsSync, rmSync } from 'node:fs';
+import { mkdtempSync, existsSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
@@ -28,6 +28,8 @@ import { runtimeAvailable, bootCellar, killCellar, REPO } from './harness';
 let launcher: ChildProcess | null = null;
 let client: Client | null = null;
 let workspace = '';
+/** The live app's base URL, for the HTTP surfaces an agent has no tool for (undo). */
+let appUrl = '';
 /** Whether pandas could be installed into the workspace venv (the reported case). */
 let hasPandas = false;
 
@@ -54,6 +56,7 @@ test.beforeAll(async () => {
 	workspace = mkdtempSync(join(tmpdir(), 'cellar-e2e-ergo-'));
 	const booted = await bootCellar(workspace);
 	launcher = booted.proc;
+	appUrl = booted.url;
 
 	// The reported inspect_variable case is a pandas frame, so put pandas in the
 	// workspace venv the kernel runs on. Best-effort: a machine that cannot fetch
@@ -194,6 +197,52 @@ test('clear_outputs drops saved outputs by handle, and clears everything when id
 
 	expect(await call('clear_outputs', {})).toMatchObject({ ok: true, count: 1 });
 	expect(await hasOutput(c.id)).toBe(false);
+});
+
+test('undo after clear_outputs gives an over-cap notebook its outputs back', async ({ request }) => {
+	// THE HEADLINE FAILURE, at the layer the user meets it: an agent clears an
+	// output-heavy notebook and undo cannot bring the results back. Two independent
+	// causes, and this exercises both at once - the clear falls MID-SEQUENCE (the
+	// pre-action checkpoint used to be throttled away four times in five) on a
+	// notebook whose outputs are far past the old 2 MB inline snapshot cap (which
+	// used to make the checkpoint drop them even when one WAS taken).
+	await call('use_notebook', { name: 'undoable' });
+
+	// Stream output is capped per run (`DEFAULT_CAPS.maxStreamBytes`, ~500 KB), so
+	// the over-cap volume is built across cells rather than in one giant print.
+	const ids: string[] = [];
+	for (let i = 0; i < 5; i++) {
+		const c = await call('add_and_run', { source: 'print("Z" * 480_000)', route_imports: false });
+		ids.push(c.id);
+	}
+	// A few more agent actions, so the clear below is nowhere near a throttle
+	// boundary - its position in the sequence must not decide whether undo works.
+	for (let i = 0; i < 3; i++) await call('add_cell', { source: `spacer = ${i}`, route_imports: false });
+
+	// Measured on DISK, which is what the user's undo has to put back. The agent
+	// surface emits HANDLES (short prefixes); the `.ipynb` keeps the full UUIDs, so
+	// these are matched by prefix rather than compared for equality.
+	const outputBytes = () => {
+		const doc = JSON.parse(readFileSync(join(workspace, 'undoable.ipynb'), 'utf8')) as {
+			cells: Array<{ id: string; outputs?: unknown[] }>;
+		};
+		const mine = doc.cells.filter((c) => ids.some((h) => c.id.startsWith(h)));
+		expect(mine, 'every handle resolved to a cell on disk').toHaveLength(ids.length);
+		return mine.reduce((n, c) => n + JSON.stringify(c.outputs ?? []).length, 0);
+	};
+	expect(outputBytes(), 'the notebook is genuinely past the old 2 MB cap').toBeGreaterThan(2_000_000);
+
+	const cleared = await call('clear_outputs', { ids });
+	expect(cleared).toMatchObject({ ok: true, count: 5 });
+	// The tool no longer warns that undo may fail, because it no longer may.
+	expect(cleared).not.toHaveProperty('undo');
+	expect(outputBytes()).toBeLessThan(1000);
+
+	// Undo is the human's surface (there is deliberately no MCP tool for it), so it
+	// goes through the same route the History panel's Undo button posts to.
+	const res = await request.post(`${appUrl}/api/checkpoints`, { data: { action: 'undo-agent', path: 'undoable.ipynb' } });
+	expect(res.ok(), await res.text()).toBe(true);
+	expect(outputBytes(), 'the cleared outputs are back on disk').toBeGreaterThan(2_000_000);
 });
 
 test('inspect_variable answers an array-heavy frame in a bounded reply', async () => {

@@ -121,18 +121,17 @@
  * system, exactly what the transcript deliberately withholds: the notebook file
  * carries every cell the user marked `hidden_from_agent`, and so do the copies
  * Cellar itself writes beside it (`<stem>.py`, `<stem>.html`,
- * `.ipynb_checkpoints/<stem>-checkpoint.ipynb`) and
- * `<root>/.cellar/checkpoints.json`. So a reads-on run also passes
- * `--disallowedTools`, built by the SAME `chatToolPolicy` and enumerated in
- * `denialPatterns`: the CURRENT notebook and the artifacts named after it
- * (always, whatever its extension), `<root>/.cellar/` whole, and - unless the
- * person opted other notebooks in - every `.ipynb` FILE in the workspace. Measured
- * against claude 2.1.238: a deny rule BEATS the allow rule for a path inside
- * the granted root, a sibling file in that root still reads, and the denial is
- * enforced per file by the tools themselves (a Grep over the granted directory
- * for the denied file's content found nothing, and a recursive Glob for every
- * `.ipynb` under it listed nothing), which is what makes it bound Grep and Glob
- * and not only Read.
+ * `.ipynb_checkpoints/<stem>-checkpoint.ipynb`) and `<root>/.cellar/`'s
+ * checkpoint store. So a reads-on run also passes `--disallowedTools`, built by
+ * the SAME `chatToolPolicy` and enumerated in `denialPatterns`: the CURRENT
+ * notebook and the artifacts named after it (always, whatever its extension),
+ * `<root>/.cellar/` whole, and - unless the person opted other notebooks in -
+ * every `.ipynb` FILE in the workspace. Measured against claude 2.1.238: a deny
+ * rule BEATS the allow rule for a path inside the granted root, a sibling file
+ * in that root still reads, and the denial is enforced per file by the tools
+ * themselves (a Grep over the granted directory for the denied file's content
+ * found nothing, and a recursive Glob for every `.ipynb` under it listed
+ * nothing), which is what makes it bound Grep and Glob and not only Read.
  *
  * Denying the current notebook is an ANSWER-QUALITY decision as much as a
  * privacy one - the model already holds it as a curated, FRESH transcript, so
@@ -666,13 +665,16 @@ export function chatReadsBlockedCause(readRoot: unknown, notebookPath: unknown):
  *      cells the user deliberately marked `hidden_from_agent`, and (c) a second,
  *      conflicting view of the very thing it is looking at. There is no case
  *      where reading it beats the transcript it already holds.
- *   2. **`<root>/.cellar/` whole**, Cellar's own per-project state. The artifact
- *      that matters there is `checkpoints.json`, which stores full cell
- *      snapshots INCLUDING outputs and hidden cells - the same content rule 1
- *      denies, reachable through a back door. It is denied as a DIRECTORY rather
- *      than as that one file: everything under it is Cellar runtime state the
- *      model needs none of, and a directory rule covers whatever is added there
- *      later instead of silently going stale.
+ *   2. **`<root>/.cellar/` whole**, Cellar's own per-project state. What matters
+ *      there is the checkpoint store, which snapshots full cells - hidden ones
+ *      included - as a `checkpoints.json` index of sources + metadata plus one
+ *      output sidecar per checkpoint at `checkpoints/<id>.json`: the same content
+ *      rule 1 denies, reachable through a back door. It is denied as a DIRECTORY
+ *      rather than as any one file: everything under it is Cellar runtime state
+ *      the model needs none of, and a directory rule covers whatever is added
+ *      there later instead of silently going stale - which is exactly what
+ *      happened when the outputs moved out of the index into those sidecars, with
+ *      no edit to this policy.
  *   3. **Every `.ipynb` FILE in the workspace**, unless the person opted OTHER
  *      notebooks in. Off (the default) the reply still reads `.py`, `.md` and
  *      data files; on, other notebooks open up while rules 1 and 2 stand either
