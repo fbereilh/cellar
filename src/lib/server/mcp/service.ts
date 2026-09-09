@@ -1448,11 +1448,13 @@ export async function consolidate(
 	{ allowUnrecoverable = false }: { allowUnrecoverable?: boolean } = {}
 ) {
 	const target = nb ?? getActiveNotebookPath();
+	let undo: ReturnType<typeof undoWarning> = {};
 	if (consolidateDestroysOutputs(target)) {
 		const guard = destructiveCheckpoint(target, allowUnrecoverable);
 		if ('refused' in guard) return guard;
+		undo = undoWarning(guard.cp);
 	} else autoCheckpointBeforeAgentAction(target);
-	return consolidateImports(target, { actor: 'agent' });
+	return { ...(await consolidateImports(target, { actor: 'agent' })), ...undo };
 }
 
 /**
@@ -1627,6 +1629,11 @@ export type UnrecoverableRefusal = {
  * all refuse identically rather than one of them destroying silently. A tool added
  * later that deletes saved outputs belongs here too.
  *
+ * A caller that WAIVES the refusal is not left silent about the loss it accepted:
+ * every one of those tools reports the same fact on its own result through
+ * `undoWarning`, from one shape, so which tool destroyed the outputs cannot decide
+ * whether the caller is told.
+ *
  * A refused call changes NOTHING, which is why the snapshot is ABANDONED rather than
  * taken and then removed: entering it in the store is what triggers FIFO eviction, so
  * a call that is about to refuse would first destroy the oldest snapshot and its
@@ -1704,7 +1711,7 @@ export function removeCells(ids: string[], nb?: string | null, { allowUnrecovera
 	if ('refused' in guard) return guard;
 	const res = deleteCells(full, target);
 	if (!res.ok) return { ok: false as const, refused: res.reason };
-	return { ok: true as const, deleted, count: deleted.length };
+	return { ok: true as const, deleted, count: deleted.length, ...undoWarning(guard.cp) };
 }
 
 /**
@@ -1821,23 +1828,25 @@ export function clearOutputs(
 }
 
 /**
- * The honesty half of `clearOutputs`: report when the pre-clear checkpoint cannot
- * give the cleared outputs back. Present ONLY in that case, so an ordinary clear
- * pays no tokens for it.
+ * The honesty half of EVERY destructive tool: report when the pre-action checkpoint
+ * cannot give the destroyed outputs back. Present ONLY in that case, so an ordinary
+ * call pays no tokens for it.
  *
- * It is now reachable ONLY through `allow_unrecoverable:true` - a caller that
- * asked to proceed knowingly. Every other route to a checkpoint that cannot hold
- * the outputs is refused BEFORE the clear (`destructiveCheckpoint`), which is the
- * point: this used to be the whole mitigation, and reporting a loss after causing
- * it is not a mitigation. It survives because a knowing caller still deserves the
- * fact in its result rather than only in the refusal it waived.
+ * It is reachable ONLY through `allow_unrecoverable:true` - a caller that asked to
+ * proceed knowingly. Every other route to a checkpoint that cannot hold the outputs
+ * is refused BEFORE anything is destroyed (`destructiveCheckpoint`), which is the
+ * point: this used to be the whole mitigation, and reporting a loss after causing it
+ * is not a mitigation. It survives because a caller that WAIVED the refusal still
+ * deserves the fact in its own result rather than only in the refusal it waived - so
+ * all four destructive tools report it, from this ONE shape, rather than one of them
+ * saying it and the other three staying silent about the same loss.
  */
 function undoWarning(cp: CheckpointMeta) {
 	if (!cp.outputsTruncated) return {};
 	return {
 		undo: {
 			outputs_recoverable: false as const,
-			reason: `the pre-clear checkpoint could not store the outputs (${cp.outputsError ?? 'unknown error'}) and allow_unrecoverable was set, so undo brings these cells back empty`
+			reason: `the pre-action checkpoint could not store this notebook's outputs (${cp.outputsError ?? 'unknown error'}) and allow_unrecoverable was set, so undo cannot bring the destroyed outputs back`
 		}
 	};
 }
@@ -1925,12 +1934,14 @@ export function setType(
 	// throttled tier where a run's or an edit's snapshot belongs. Decided from the
 	// CURRENT cell, not from the requested type alone: converting a markdown cell
 	// (which holds none) destroys nothing whatever it becomes.
+	let undo: ReturnType<typeof undoWarning> = {};
 	if (dropsOutputs(cell, type)) {
 		const guard = destructiveCheckpoint(target, allowUnrecoverable);
 		if ('refused' in guard) return guard;
+		undo = undoWarning(guard.cp);
 	} else autoCheckpointBeforeAgentAction(target);
 	setCellType(id, type, target);
-	return { ok: true as const };
+	return { ok: true as const, ...undo };
 }
 
 /**

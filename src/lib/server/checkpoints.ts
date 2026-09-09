@@ -56,9 +56,24 @@
  * every snapshot's outputs sat in the single index file, which is held in memory
  * and re-serialized on EVERY write — so a per-snapshot `MAX_SNAPSHOT_BYTES` cap had
  * to drop them, and it dropped them for exactly the output-heavy notebook
- * `clear_outputs` exists to shed weight from. Out-of-band there is no such cap:
- * the sidecar is written ONCE, read only on restore, and deleted on eviction, so
- * the repeated-write path got CHEAPER at the same time as the guarantee got real.
+ * `clear_outputs` exists to shed weight from. Out-of-band the sidecar is written
+ * ONCE, read only on restore, and deleted on eviction, so the repeated-write path
+ * got CHEAPER at the same time as the guarantee got real.
+ *
+ * THE CAP AND THE THROTTLE RIDE TOGETHER, ON THE RECOVERABLE TIER ONLY. That
+ * symmetry is the design, not an accident of two separate edits: both are licensed
+ * by the SAME one fact — the state a recoverable action overwrites can be produced
+ * again (a run's outputs come back by re-running; an edit does not touch outputs at
+ * all) — so that tier keeps `MAX_SNAPSHOT_BYTES` per snapshot, past which the
+ * outputs are dropped, the sources + metadata are kept, and the snapshot is flagged
+ * `outputsTruncated`. The DESTRUCTIVE tier gets NEITHER, for that same one fact read
+ * the other way: what it overwrites cannot be produced again, so it may not be
+ * throttled and it may not be capped. Do NOT "simplify" the cap back onto both tiers
+ * (a destructive action would again be undoable only up to the cap, which is the bug
+ * this split exists to close) and do NOT lift it off both (every throttled run
+ * checkpoint would again stringify and write the whole output set of an output-heavy
+ * notebook, synchronously, on the process that also carries the kernel websockets
+ * and the SSE output fan-out).
  *
  * BOUNDING. History is capped at `MAX_PER_NOTEBOOK` snapshots per notebook (FIFO
  * eviction, which deletes the evicted snapshot's sidecar with it). Sidecars are
@@ -96,6 +111,15 @@ import type { CellView } from './types';
 
 /** Why a checkpoint was taken. */
 export type CheckpointTrigger = 'manual' | 'agent' | 'restore';
+
+/**
+ * Which AUTO tier took a checkpoint. It decides the two rules that ride with the
+ * throttle: `recoverable` is capped at `MAX_SNAPSHOT_BYTES` and writes its index
+ * entry on the ordinary debounce, while `destructive` is uncapped and flushes the
+ * index synchronously. A `manual` or `restore` snapshot belongs to neither tier —
+ * neither is throttled, so neither is capped.
+ */
+export type CheckpointTier = 'recoverable' | 'destructive';
 
 /** A full point-in-time snapshot of a notebook's cells (source + outputs + metadata). */
 export interface Checkpoint {
@@ -156,6 +180,14 @@ function outputBudgetBytes(): number {
 	const raw = Number(process.env.CELLAR_CHECKPOINT_OUTPUT_BUDGET_BYTES);
 	return Number.isFinite(raw) && raw > 0 ? raw : 256 * 1024 * 1024;
 }
+/**
+ * Per-snapshot cap on the RECOVERABLE tier's stored outputs, measured on the
+ * serialized sidecar bytes. Past it the outputs are dropped and the snapshot keeps
+ * its sources + metadata, flagged `outputsTruncated`. It is the companion of the
+ * throttle below and belongs to the same one tier for the same one reason — see the
+ * tier symmetry in the header. The destructive tier is UNCAPPED.
+ */
+const MAX_SNAPSHOT_BYTES = 2 * 1024 * 1024;
 /**
  * Auto-checkpoint throttle: take one automatic snapshot per this many agent
  * actions (plus the very first). The captain may retune this single constant.
@@ -251,8 +283,12 @@ function enforceOutputBudget(store: Record<string, Checkpoint[]>, keepId: string
  * once, from the single `ensureLoaded` miss, so it costs one readdir per process.
  *
  * It deliberately does NOT need to cover "the sidecar landed but the index write was
- * still debounced": `createCheckpoint` flushes the index synchronously whenever a
- * sidecar was written, precisely so this sweep can never erase a live undo record.
+ * still debounced" ON THE DESTRUCTIVE TIER: `createCheckpoint` flushes the index
+ * synchronously there, precisely so this sweep can never erase the undo record for a
+ * destruction that is already durable. Every other path keeps the debounced write, so
+ * a SIGKILL inside that 250ms window can leave a sidecar this sweep then deletes —
+ * which for a recoverable-tier snapshot costs outputs a re-run can produce again, the
+ * same degradation of history the budget's own eviction already makes.
  *
  * STATED LIMIT: a SECOND Cellar instance in the same workspace (`cellar --new`,
  * which the per-folder instance lock otherwise prevents) can sweep a sidecar the
@@ -334,14 +370,24 @@ export function listCheckpoints(nb?: string | null): CheckpointMeta[] {
  * nothing is pushed, nothing is evicted, no `checkpoints:changed` is published and
  * the store is not marked dirty, so a refused call really does change nothing. The
  * metadata is still RETURNED, so the caller can name the cause in its refusal.
+ *
+ * `tier` names the auto tier this snapshot belongs to and decides the two rules that
+ * ride with the throttle — the per-snapshot output cap, and whether the index write
+ * is synchronous. See `CheckpointTier` and the tier symmetry in the header.
  */
 export function createCheckpoint(
 	nb?: string | null,
 	{
 		trigger = 'manual',
 		label,
-		abandonIfOutputsLost = false
-	}: { trigger?: CheckpointTrigger; label?: string; abandonIfOutputsLost?: boolean } = {}
+		abandonIfOutputsLost = false,
+		tier
+	}: {
+		trigger?: CheckpointTrigger;
+		label?: string;
+		abandonIfOutputsLost?: boolean;
+		tier?: CheckpointTier;
+	} = {}
 ): CheckpointMeta {
 	const store = ensureLoaded();
 	const key = keyFor(nb);
@@ -372,7 +418,7 @@ export function createCheckpoint(
 		cellCount: cells.length,
 		cells
 	};
-	storeOutputs(cp, live);
+	storeOutputs(cp, live, tier === 'recoverable' ? MAX_SNAPSHOT_BYTES : Infinity);
 	// Decided BEFORE anything is committed - see `abandonIfOutputsLost` above.
 	if (abandonIfOutputsLost && cp.outputsTruncated) return metaOf(cp);
 	const list = store[key] ?? (store[key] = []);
@@ -392,13 +438,16 @@ export function createCheckpoint(
 	// A sidecar on disk that the index does not yet REFERENCE is a file
 	// `sweepOrphanOutputs` deletes on the next start - so between the synchronous
 	// sidecar write and the 250ms debounced index write there is a window in which a
-	// SIGKILL makes the destruction durable and its undo record not merely lost but
-	// actively erased. Flushing the index synchronously whenever a sidecar was really
-	// written closes it, and is proportionate: this path has just done a synchronous
-	// whole-file write of the outputs themselves, so one small index write beside it
-	// is a rounding error. A checkpoint that stored NO sidecar has nothing a sweep
-	// could delete, so it keeps the ordinary debounced path.
-	if (cp.outputsStored) flush();
+	// SIGKILL makes a destruction durable and its undo record not merely lost but
+	// actively erased. Flushing the index synchronously closes it, and it is scoped to
+	// the DESTRUCTIVE tier because that is the only tier with such a window: a
+	// recoverable-tier checkpoint destroys nothing, so it keeps the ordinary debounced
+	// write rather than paying a synchronous whole-file index write on the
+	// highest-frequency action there is. Where it does run it is proportionate - this
+	// path has just done a synchronous whole-file write of the outputs themselves, so
+	// one small index write beside it is a rounding error - and a checkpoint that
+	// stored NO sidecar has nothing a sweep could delete.
+	if (tier === 'destructive' && cp.outputsStored) flush();
 	publishGlobal({ type: 'checkpoints:changed', nb: resolveNotebookPath(nb) });
 	return metaOf(cp);
 }
@@ -408,13 +457,24 @@ export function createCheckpoint(
  * A notebook with no outputs at all writes nothing and is NOT flagged truncated -
  * there is nothing missing, so a destructive action on it has nothing to warn about.
  *
+ * `maxBytes` is the caller's tier cap (`Infinity` for an uncapped one). Past it the
+ * outputs are DROPPED: no sidecar is written, the entry keeps its sources + metadata
+ * and is flagged `outputsTruncated`. Measured on the serialized bytes, the same unit
+ * the store-wide budget counts in, so the two bounds speak one language.
+ *
  * `live` is the live document's cell views, so the outputs are serialized without a
  * second copy; the resulting string is the sidecar's exact bytes.
  */
-function storeOutputs(cp: Checkpoint, live: CellView[]): void {
+function storeOutputs(cp: Checkpoint, live: CellView[], maxBytes: number): void {
 	if (!live.some((c) => c.outputs?.length)) return;
 	try {
 		const json = JSON.stringify(live.map((c) => c.outputs ?? []));
+		if (Buffer.byteLength(json) > maxBytes) {
+			cp.outputsStored = false;
+			cp.outputsTruncated = true;
+			cp.outputsError = `the outputs are larger than this checkpoint tier's ${maxBytes}-byte per-snapshot cap`;
+			return;
+		}
 		mkdirSync(outputsDir(), { recursive: true });
 		writeFileSync(outputsPath(cp.id), json);
 		cp.outputsStored = true;
@@ -482,6 +542,10 @@ function defaultLabel(trigger: string): string {
  * folded into the batch protected by the previous checkpoint). Because the snapshot
  * is taken BEFORE the action, restoring it walks the notebook back to before the
  * current batch of up to N actions. Called from the MCP service layer.
+ *
+ * Its snapshots are also CAPPED at `MAX_SNAPSHOT_BYTES` of outputs, by the very
+ * argument that licenses the throttle: what these actions overwrite can be produced
+ * again. Cap and throttle are one decision on one tier - see the header.
  */
 export function autoCheckpointBeforeAgentAction(nb?: string | null): CheckpointMeta | null {
 	const key = keyFor(nb);
@@ -498,7 +562,7 @@ export function autoCheckpointBeforeAgentAction(nb?: string | null): CheckpointM
 	if (dueByCount || dueByTime) {
 		actionsSinceCheckpoint.set(key, 0); // reset → exactly one checkpoint per N actions
 		lastAutoCheckpointAt.set(key, now);
-		return createCheckpoint(nb, { trigger: 'agent' });
+		return createCheckpoint(nb, { trigger: 'agent', tier: 'recoverable' });
 	}
 	actionsSinceCheckpoint.set(key, count);
 	return null;
@@ -506,7 +570,10 @@ export function autoCheckpointBeforeAgentAction(nb?: string | null): CheckpointM
 
 /**
  * Snapshot before a DESTRUCTIVE agent action - one that deletes saved outputs -
- * and NEVER throttle it. Returns the checkpoint's metadata; the caller reads
+ * and NEVER throttle it, NEVER cap its outputs, and flush its index entry
+ * synchronously. All three follow from the one fact that what this tier overwrites
+ * cannot be produced again (see the header); the recoverable tier gets the opposite
+ * of all three for the same reason. Returns the checkpoint's metadata; the caller reads
  * `outputsTruncated` to decide whether the action it is about to take is
  * recoverable (see the tiers in the header).
  *
@@ -526,7 +593,7 @@ export function checkpointBeforeDestructiveAgentAction(
 	nb?: string | null,
 	{ abandonIfOutputsLost = false }: { abandonIfOutputsLost?: boolean } = {}
 ): CheckpointMeta {
-	return createCheckpoint(nb, { trigger: 'agent', abandonIfOutputsLost });
+	return createCheckpoint(nb, { trigger: 'agent', abandonIfOutputsLost, tier: 'destructive' });
 }
 
 /** Find a stored checkpoint (with its cells) by id, or null. */

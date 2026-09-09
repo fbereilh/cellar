@@ -637,13 +637,26 @@ describe('set_cell_type is on the destructive tier exactly when it drops outputs
 		});
 	});
 
-	it.skipIf(!chmodBlocksWrites)('converts anyway when the caller waives the guarantee', async () => {
+	it.skipIf(!chmodBlocksWrites)('converts anyway when the caller waives the guarantee, and SAYS what was lost', async () => {
 		const { target, handles } = await makeNotebook('retype-waived.ipynb', 2);
 		const id = svc.resolveRef(target, handles[1]);
 		withUnwritableSidecars(target, () => {
-			expect(svc.setType(handles[1], 'markdown', target, { allowUnrecoverable: true })).toMatchObject({ ok: true });
+			const r = svc.setType(handles[1], 'markdown', target, { allowUnrecoverable: true });
+			expect(r).toMatchObject({ ok: true });
+			// The refusal is the primary mitigation, but a caller that WAIVED it still
+			// deserves the fact in its own result - the same `undo` shape `clear_outputs`
+			// reports, from every destructive tool rather than from that one alone.
+			expect(r.ok && 'undo' in r && r.undo).toMatchObject({ outputs_recoverable: false });
 			expect(nbmod.listCells(target).find((c) => c.id === id)?.cell_type).toBe('markdown');
 		});
+	});
+
+	it('says nothing about undo on an ordinary conversion that really is recoverable', async () => {
+		const { target, handles } = await makeNotebook('retype-ordinary.ipynb', 2);
+		const r = svc.setType(handles[1], 'markdown', target);
+		expect(r).toMatchObject({ ok: true });
+		// Conditional, so an ordinary call pays no tokens for it.
+		expect(r.ok && 'undo' in r).toBe(false);
 	});
 
 	it('keeps the tool DESCRIPTION naming the guarantee and its exception', async () => {

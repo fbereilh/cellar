@@ -145,17 +145,30 @@ describe('a sweep that deletes an output-carrying cell is never throttled', () =
 		expect(cpmod.listCheckpoints(target).length - before, 'a refused call leaves no snapshot').toBe(0);
 	});
 
-	it.skipIf(!chmodBlocksWrites)('sweeps anyway when the caller waives the guarantee', async () => {
+	it.skipIf(!chmodBlocksWrites)('sweeps anyway when the caller waives the guarantee, and SAYS what was lost', async () => {
 		const { target, doomedId } = notebookWithDisposableImportsCell('sweep-waived.ipynb');
 		cpmod.createCheckpoint(target, { trigger: 'manual' });
 		const dir = join(WS, '.cellar', 'checkpoints');
 		chmodSync(dir, 0o500);
+		let r: Awaited<ReturnType<typeof svc.consolidate>>;
 		try {
-			expect(await svc.consolidate(target, { allowUnrecoverable: true })).toMatchObject({ changed: true });
+			r = await svc.consolidate(target, { allowUnrecoverable: true });
 		} finally {
 			chmodSync(dir, 0o700);
 		}
+		expect(r).toMatchObject({ changed: true });
+		// The refusal is the primary mitigation; a caller that WAIVED it still gets the
+		// fact in its own result, in the one `undo` shape every destructive tool uses.
+		expect('undo' in r && r.undo).toMatchObject({ outputs_recoverable: false });
 		expect(nbmod.listCells(target).some((c) => c.id === doomedId)).toBe(false);
+	});
+
+	it('says nothing about undo on an ordinary sweep whose outputs really are recoverable', async () => {
+		const { target } = notebookWithDisposableImportsCell('sweep-ordinary.ipynb');
+		const r = await svc.consolidate(target);
+		expect(r).toMatchObject({ changed: true });
+		// Conditional, so an ordinary sweep pays no tokens for it.
+		expect('undo' in r).toBe(false);
 	});
 });
 

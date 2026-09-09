@@ -6,8 +6,11 @@
  * which is held in memory and re-serialized on every write - so a per-snapshot
  * `MAX_SNAPSHOT_BYTES` (2 MB) cap had to drop them, and it dropped them for exactly
  * the output-heavy notebook `clear_outputs` exists to shed weight from. They now
- * live one file per checkpoint at `.cellar/checkpoints/<id>.json`, with no size cap
- * at all; the bound is a store-wide budget whose eviction is NEWEST-WINS.
+ * live one file per checkpoint at `.cellar/checkpoints/<id>.json`. The bound is a
+ * store-wide budget whose eviction is NEWEST-WINS, and the only per-snapshot cap left
+ * is the RECOVERABLE tier's - which rides with that tier's throttle, on the one fact
+ * that what a recoverable action overwrites can be produced again. The destructive
+ * tier gets neither, which is what makes undo after a clear real.
  *
  * What is pinned here is what a wrong guess would silently break: that a restore
  * really returns the bytes (not merely "some output"), that the index stays free of
@@ -31,6 +34,13 @@ type Nb = typeof import('../../src/lib/server/notebook');
  * the tests around it.
  */
 async function freshWorkspace(): Promise<{ ws: string; cp: Cp; nb: Nb }> {
+	// The index write is DEBOUNCED, and `workspaceRoot()` is read when it finally
+	// fires - so a previous instance's pending write would land in the workspace this
+	// call is about to point at, overwriting a store it knows nothing about. Let it
+	// land where it belongs first. (Only the RECOVERABLE/manual paths leave one: the
+	// destructive tier flushes synchronously, which is the point of that tier.)
+	if (started) await waitForFlush();
+	started = true;
 	const ws = mkdtempSync(join(tmpdir(), 'cellar-cp-out-'));
 	process.env.CELLAR_WORKSPACE = ws;
 	vi.resetModules();
@@ -38,6 +48,9 @@ async function freshWorkspace(): Promise<{ ws: string; cp: Cp; nb: Nb }> {
 	const cp = await import('../../src/lib/server/checkpoints');
 	return { ws, cp, nb };
 }
+
+/** Whether any workspace has been minted yet - the first call has nothing to settle. */
+let started = false;
 
 const out = (text: string) => [{ output_type: 'stream' as const, name: 'stdout' as const, text }];
 const sidecarDir = (ws: string) => join(ws, '.cellar', 'checkpoints');
@@ -157,6 +170,48 @@ describe('the store-wide budget sheds the OLDEST sidecars, never the newest', ()
 	});
 });
 
+describe('the per-snapshot cap and the synchronous index write belong to ONE tier', () => {
+	it('drops outputs over the cap on the throttled tier while the destructive tier keeps the same volume', async () => {
+		const { ws, cp, nb } = await freshWorkspace();
+		// Past MAX_SNAPSHOT_BYTES (2 MB): the volume the recoverable tier drops - a
+		// run's outputs come back by re-running - and the destructive tier must keep,
+		// because nothing but that snapshot can give them back.
+		const big = 'z'.repeat(2_500_000);
+		const { target } = notebookWithOutput(nb, 'tiers.ipynb', big);
+
+		const recoverable = cp.autoCheckpointBeforeAgentAction(target)!;
+		expect(recoverable, 'the first agent action always snapshots').toBeTruthy();
+		expect(recoverable.outputsTruncated, 'over the cap, so the outputs were dropped').toBe(true);
+		expect(recoverable.cellCount, 'the sources and metadata are still snapshotted').toBe(2);
+		expect(sidecars(ws), 'no sidecar was written at all').toHaveLength(0);
+		expect(
+			existsSync(join(ws, '.cellar', 'checkpoints.json')),
+			'and nothing was flushed synchronously - this tier destroys nothing'
+		).toBe(false);
+
+		const destructive = cp.checkpointBeforeDestructiveAgentAction(target);
+		expect(destructive.outputsTruncated, 'the destructive tier is uncapped').toBe(false);
+		expect(sidecars(ws), 'the same outputs, this time stored').toHaveLength(1);
+		// ...and its undo record is on disk before the destruction it protects is.
+		expect(readFileSync(join(ws, '.cellar', 'checkpoints.json'), 'utf8')).toContain(destructive.id);
+	});
+
+	it('keeps a recoverable checkpoint UNDER the cap on the debounced index write', async () => {
+		const { ws, cp, nb } = await freshWorkspace();
+		const { target } = notebookWithOutput(nb, 'under-cap.ipynb', 'small enough to store');
+		const snap = cp.autoCheckpointBeforeAgentAction(target)!;
+		expect(snap.outputsTruncated, 'under the cap, so the outputs were stored').toBe(false);
+		expect(sidecars(ws)).toHaveLength(1);
+		// A sidecar WAS written, so a rule keyed on that alone would have flushed here.
+		// The index must still be waiting on the 250ms debounce: a run checkpoint
+		// destroys nothing, so it has no window to close and may not pay a synchronous
+		// whole-file index write on the highest-frequency agent action there is.
+		expect(existsSync(join(ws, '.cellar', 'checkpoints.json')), 'still debounced').toBe(false);
+		await waitForFlush();
+		expect(existsSync(join(ws, '.cellar', 'checkpoints.json')), 'and it lands on the debounce').toBe(true);
+	});
+});
+
 describe('a dropped checkpoint takes its sidecar with it', () => {
 	it('deletes the file when FIFO eviction drops the oldest snapshot', async () => {
 		const { ws, cp, nb } = await freshWorkspace();
@@ -175,14 +230,14 @@ describe('a dropped checkpoint takes its sidecar with it', () => {
 		// The destruction a checkpoint protects is persisted SYNCHRONOUSLY while the
 		// index write is debounced 250ms, so a crash in that window used to leave the
 		// undo record unreferenced - and the orphan sweep then actively DELETED the
-		// bytes that were still sitting recoverable on disk. `createCheckpoint` now
-		// flushes the index synchronously whenever a sidecar was really written, so the
-		// reference is durable before the destructive action proceeds. Driven by NOT
-		// waiting for the debounce and re-loading the store from disk, which is exactly
-		// what the next process start does.
+		// bytes that were still sitting recoverable on disk. The DESTRUCTIVE tier
+		// therefore flushes the index synchronously, so the reference is durable before
+		// the destructive action proceeds. Driven by NOT waiting for the debounce and
+		// re-loading the store from disk, which is exactly what the next process start
+		// does.
 		const { ws, cp, nb } = await freshWorkspace();
 		const { target, cellId } = notebookWithOutput(nb, 'unflushed.ipynb', 'still recoverable');
-		const snap = cp.createCheckpoint(target, { trigger: 'agent' });
+		const snap = cp.checkpointBeforeDestructiveAgentAction(target);
 		expect(sidecars(ws)).toHaveLength(1);
 
 		// No `waitForFlush()`: the whole point is that the index is already on disk.
