@@ -110,6 +110,16 @@ describe('where the guard is wired', () => {
 		expect(src).toMatch(/if\s*\(!outcome\.ok\)[\s\S]{0,200}throw new Error/);
 	});
 
+	it('the launcher names the ABSENT artifact, not a file that is sitting right there', () => {
+		// `missing` covers absent AND incomplete alike, so assertUsableBuild has to
+		// report through missingReason(): for a `vite build` killed part-way,
+		// build/index.js exists, and the old "production build not found at
+		// <buildEntry>" sent the reader looking at a file that is present.
+		const src = read('bin/cellar.js');
+		expect(src).toMatch(/missingReason\(REPO, freshness\)/);
+		expect(src).not.toMatch(/production build not found at \$\{freshness\.buildEntry\}/);
+	});
+
 	it('bounds the launcher boot and says WHY it failed', () => {
 		const src = read('tests/e2e/harness.ts');
 		// A bound, not the old bare 90_000 literal, and overridable for a cold cache.

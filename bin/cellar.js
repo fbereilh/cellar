@@ -153,7 +153,12 @@ import {
 } from '../src/lib/server/instances.js';
 import { CONFIRM_PHRASE, planCleanup, resolveCallerWorkspace, workspaceKey } from '../src/lib/server/cleanup-plan.js';
 import { resolveWorkspacePorts } from '../src/lib/server/ports.js';
-import { buildFreshness, stalenessReason, SKIP_ENV } from '../src/lib/server/build-freshness.js';
+import {
+	buildFreshness,
+	missingReason,
+	stalenessReason,
+	SKIP_ENV
+} from '../src/lib/server/build-freshness.js';
 
 const REPO = dirname(dirname(fileURLToPath(import.meta.url)));
 
@@ -1377,7 +1382,11 @@ function assertUsableBuild() {
 	if (useDev) return true;
 	const freshness = buildFreshness(REPO);
 	if (freshness.state === 'missing') {
-		console.error(`[cellar] production build not found at ${freshness.buildEntry}.`);
+		// `missing` covers an ABSENT build and an INCOMPLETE one alike, so the
+		// message has to come from missingReason(): for a `vite build` killed
+		// part-way, build/index.js is right there and "not found at
+		// <build/index.js>" would send the reader looking at a file that exists.
+		console.error(`[cellar] ${missingReason(REPO, freshness)}.`);
 		console.error('[cellar] Run `npm run build` first, or pass --dev to use the Vite dev server.');
 		shutdown(1, 'production build missing');
 		return false;
