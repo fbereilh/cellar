@@ -280,6 +280,13 @@ test('keyboard reaches both, and the state is in the accessibility tree', async 
 	for (let i = 0; i < 4 && !(await exp.evaluate((el) => el === document.activeElement)); i++)
 		await page.keyboard.press('Tab');
 	await expect(exp).toBeFocused();
+	// Read the export toggle's NAME before the flip, so the assertion below is about
+	// the name STAYING PUT rather than about one spelling of it. That spelling is
+	// target-aware (`Cell.svelte`'s `exportModuleLabel`: `.py module` / `.mojo module`,
+	// and bare `module` when the notebook names no target, which is this fixture) - a
+	// pinned literal here goes stale the next time an export target is added, which is
+	// exactly how it went stale when `.mojo` landed.
+	const exportName = await exp.getAttribute('aria-label');
 	await page.keyboard.press('Enter');
 	await expect(exp).toHaveAttribute('aria-pressed', 'true');
 
@@ -291,7 +298,10 @@ test('keyboard reaches both, and the state is in the accessibility tree', async 
 
 	// a toggle button's NAME stays put while `aria-pressed` carries the state, so
 	// a screen reader is never told two things at once
-	await expect(exp).toHaveAttribute('aria-label', "Export this cell to the notebook's .py module");
+	// it says what the control DOES (export this cell), and it is the SAME name it
+	// carried before the press
+	expect(exportName).toMatch(/^Export this cell to the notebook's /);
+	await expect(exp).toHaveAttribute('aria-label', exportName!);
 	await expect(hid).toHaveAttribute('aria-label', 'Hide this cell from AI agents');
 	// the sighted tooltip DOES track the state
 	await expect(hid).toHaveAttribute('title', /Hidden from AI agents/);
