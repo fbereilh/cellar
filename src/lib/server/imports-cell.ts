@@ -191,6 +191,87 @@ export function routeImports(
 	return { source: stripped, added, importsCellId: cell.id };
 }
 
+/** Everything a consolidate sweep would do, decided before the document is touched. */
+interface ConsolidatePlan {
+	/** The cell the imports merge INTO, when one already exists or can be adopted. */
+	importsSourceCell: CellView | null;
+	existing: CellView | undefined;
+	adoptable: boolean;
+	/** Every module-level import statement lifted out of the other cells. */
+	collected: string[];
+	/** Cells left with source after the lift. */
+	edits: { id: string; source: string }[];
+	/** Cells the lift emptied, which are deleted - in the order they are deleted in. */
+	removals: string[];
+	/**
+	 * Of `removals`, the ones that will REALLY be deleted (the sweep stops at the
+	 * notebook's last cell) AND that carry saved output. That output is destroyed by
+	 * the delete and nothing but a re-run can recreate it, which is what puts a
+	 * consolidate on the destructive checkpoint tier - see `consolidateDestroysOutputs`.
+	 */
+	deletedWithOutputs: string[];
+}
+
+/**
+ * Plan the sweep over a snapshot of the cells. Split out because the DECISION
+ * "does this sweep destroy saved output" has to be made by the caller BEFORE the
+ * sweep runs (it decides which checkpoint tier the action takes), and planning it
+ * twice from one rule is far safer than keeping a second, drifting copy of what the
+ * sweep removes. Pure: reads the cells, writes nothing.
+ */
+function planConsolidate(cells: CellView[]): ConsolidatePlan {
+	const existing = cells.find(isImportsCell);
+	const adoptable = !existing && !!cells[0] && isPythonCodeCell(cells[0]) && isImportsOnly(cells[0].source);
+	const importsSourceCell = existing ?? (adoptable ? cells[0] : null);
+
+	const collected: string[] = [];
+	const edits: { id: string; source: string }[] = [];
+	const removals: string[] = [];
+	const removalOutputs = new Set<string>();
+	for (const cell of cells) {
+		if (!isPythonCodeCell(cell) || cell.id === importsSourceCell?.id) continue;
+		if (isCellMagicCell(cell.source)) continue; // never sweep a cell magic's body
+		const { statements, source, changed } = extractTopLevelImports(cell.source);
+		if (!changed) continue;
+		collected.push(...statements);
+		if (source.trim() === '') {
+			removals.push(cell.id);
+			if (cell.outputs?.length) removalOutputs.add(cell.id);
+		} else edits.push({ id: cell.id, source });
+	}
+
+	// Mirror the removal loop's own stop condition (a notebook always keeps at least
+	// one cell), so a removal that will never happen is not counted as destroying
+	// anything. Reading it off the plan rather than guessing is what lets an
+	// idempotent consolidate stay honestly on the throttled tier.
+	let remaining = cells.length;
+	const deletedWithOutputs: string[] = [];
+	for (const id of removals) {
+		if (remaining <= 1) break;
+		remaining--;
+		if (removalOutputs.has(id)) deletedWithOutputs.push(id);
+	}
+
+	return { importsSourceCell, existing, adoptable, collected, edits, removals, deletedWithOutputs };
+}
+
+/**
+ * Would a consolidate sweep of this notebook DELETE a cell that carries saved
+ * output? An imports-only cell routinely does (`import tensorflow` leaves a
+ * FutureWarning on stderr), and deleting it destroys that output just as surely as
+ * `clear_outputs` does - so the agent-facing `consolidate` takes the never-throttled
+ * destructive checkpoint exactly when this is true, and stays on the cheap throttled
+ * tier when it is not.
+ *
+ * Costs one extra planning pass (a tokenizer walk of each Python cell, no I/O and no
+ * kernel) over a sweep that is a rare, explicit action; the alternative - taking the
+ * destructive tier unconditionally - would mint a checkpoint for every idempotent
+ * re-consolidate and evict the history worth going back to.
+ */
+export function consolidateDestroysOutputs(nb?: string | null): boolean {
+	return planConsolidate(listCells(resolveNotebookPath(nb))).deletedWithOutputs.length > 0;
+}
+
 /**
  * Sweep every module-level import in the notebook into the imports cell, strip
  * them from their source cells, and run the imports cell.
@@ -214,26 +295,11 @@ export async function consolidateImports(
 ): Promise<ConsolidateResult> {
 	const abs = resolveNotebookPath(nb);
 	const cells = listCells(abs);
-	const existing = cells.find(isImportsCell);
 
 	// Resolve the imports cell FIRST so it is excluded from its own sweep, then
 	// plan every edit before touching the document (planning over a mutating array
 	// is how a sweep silently skips cells).
-	const adoptable = !existing && !!cells[0] && isPythonCodeCell(cells[0]) && isImportsOnly(cells[0].source);
-	const importsSourceCell = existing ?? (adoptable ? cells[0] : null);
-
-	const collected: string[] = [];
-	const edits: { id: string; source: string }[] = [];
-	const removals: string[] = [];
-	for (const cell of cells) {
-		if (!isPythonCodeCell(cell) || cell.id === importsSourceCell?.id) continue;
-		if (isCellMagicCell(cell.source)) continue; // never sweep a cell magic's body
-		const { statements, source, changed } = extractTopLevelImports(cell.source);
-		if (!changed) continue;
-		collected.push(...statements);
-		if (source.trim() === '') removals.push(cell.id);
-		else edits.push({ id: cell.id, source });
-	}
+	const { existing, adoptable, collected, edits, removals } = planConsolidate(cells);
 
 	// Nothing to lift, no cell already designated, and no first cell worth adopting
 	// → this notebook has no imports to manage. Do not create an empty pinned cell.

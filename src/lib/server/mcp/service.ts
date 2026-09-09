@@ -50,7 +50,7 @@ import { agentStatus as databricksStatus, agentRuntimeBlock, connectionStatus as
 import { publish } from '../events';
 import { enqueueRun, queuesByNotebook, queuePosition, queueStateFor } from '../run-queue';
 import { executeCellRun, clearOutputsForQueue } from '../run';
-import { consolidateImports, routeImports, runImportsCell } from '../imports-cell';
+import { consolidateDestroysOutputs, consolidateImports, routeImports, runImportsCell } from '../imports-cell';
 import { buildTree, resolveInWorkspace, workspaceRoot } from '../fstree';
 import { isPyPath, isPyNotebookFile } from '../jupytext';
 import { buildNotebookHtml, exportFilename } from '../export-html';
@@ -79,7 +79,6 @@ import {
 	autoCheckpointBeforeAgentAction,
 	checkpointBeforeDestructiveAgentAction,
 	createCheckpoint,
-	discardCheckpoint,
 	type CheckpointMeta
 } from '../checkpoints';
 import { computeHandles, resolveCellId } from './cellHandle';
@@ -1428,10 +1427,31 @@ async function finishImportRouting(nb: string, cellId: string | null, added: str
 /**
  * Sweep every module-level import in the active notebook into its imports cell
  * and run it. Idempotent; see `imports-cell.js`.
+ *
+ * A sweep DELETES any cell it empties, and an imports-only cell routinely carries
+ * saved output (`import tensorflow` leaves a FutureWarning on stderr), so that
+ * delete destroys results exactly as `delete_cells` does. It therefore takes the
+ * never-throttled destructive checkpoint - and the same refuse-before-destroying
+ * guard - whenever the sweep would really delete such a cell. Under the throttled
+ * tier alone a consolidate landing four actions into an agent's batch was covered
+ * only by a snapshot up to N actions older than the cell it removed, or by none at
+ * all if the cell was created inside that batch.
+ *
+ * The tier is decided from what THIS sweep would destroy, not from the tool being
+ * called (`consolidateDestroysOutputs`, which plans the sweep without touching the
+ * document) - the same rule `setType` follows. So the everyday idempotent
+ * consolidate, which deletes nothing, stays on the cheap throttled tier and mints
+ * no checkpoint of its own.
  */
-export async function consolidate(nb?: string | null) {
+export async function consolidate(
+	nb?: string | null,
+	{ allowUnrecoverable = false }: { allowUnrecoverable?: boolean } = {}
+) {
 	const target = nb ?? getActiveNotebookPath();
-	autoCheckpointBeforeAgentAction(target);
+	if (consolidateDestroysOutputs(target)) {
+		const guard = destructiveCheckpoint(target, allowUnrecoverable);
+		if ('refused' in guard) return guard;
+	} else autoCheckpointBeforeAgentAction(target);
 	return consolidateImports(target, { actor: 'agent' });
 }
 
@@ -1601,23 +1621,24 @@ export type UnrecoverableRefusal = {
  *     because "clear the outputs" is itself how a user frees a full disk and a flat
  *     refusal would trap them there.
  *
- * Its three callers are the three output-destroying tools - `clear_outputs`,
- * `delete_cells` and the `set_cell_type` conversions that drop a code cell's
- * outputs - so all three refuse identically rather than one of them destroying
- * silently. A tool added later that deletes saved outputs belongs here too.
+ * Its callers are the output-destroying tools - `clear_outputs`, `delete_cells`,
+ * the `set_cell_type` conversions that drop a code cell's outputs, and a
+ * `consolidate_imports` sweep that would delete an output-carrying cell - so they
+ * all refuse identically rather than one of them destroying silently. A tool added
+ * later that deletes saved outputs belongs here too.
  *
- * A refused call changes NOTHING, so the checkpoint it just took is discarded: a
- * leftover snapshot of an unchanged document would push the human's real undo target
- * one step out of reach (`removeCells` and `setType` state the same rule for their
- * own refusals).
+ * A refused call changes NOTHING, which is why the snapshot is ABANDONED rather than
+ * taken and then removed: entering it in the store is what triggers FIFO eviction, so
+ * a call that is about to refuse would first destroy the oldest snapshot and its
+ * outputs on the way to saying "nothing was changed". `createCheckpoint` states the
+ * rule; here it is only asked for.
  */
 function destructiveCheckpoint(
 	nb: string,
 	allowUnrecoverable: boolean
 ): { cp: CheckpointMeta } | UnrecoverableRefusal {
-	const cp = checkpointBeforeDestructiveAgentAction(nb);
+	const cp = checkpointBeforeDestructiveAgentAction(nb, { abandonIfOutputsLost: !allowUnrecoverable });
 	if (cp.outputsTruncated && !allowUnrecoverable) {
-		discardCheckpoint(nb, cp.id);
 		return {
 			ok: false,
 			refused: 'outputs_unrecoverable',
@@ -1891,7 +1912,8 @@ export function setType(
 ) {
 	const target = nb ?? getActiveNotebookPath();
 	id = asFullId(target, id);
-	if (!getCell(id, target)) return { ok: false as const, missing: true as const };
+	const cell = getCell(id, target);
+	if (!cell) return { ok: false as const, missing: true as const };
 	if (isPyUnsupportedType(type) && isPyTextNotebook(target))
 		return { ok: false as const, refused: textNotebookTypeMessage(type) };
 	// Converting a code cell to markdown/raw DROPS that cell's outputs (`applyCellType`),
@@ -1903,7 +1925,7 @@ export function setType(
 	// throttled tier where a run's or an edit's snapshot belongs. Decided from the
 	// CURRENT cell, not from the requested type alone: converting a markdown cell
 	// (which holds none) destroys nothing whatever it becomes.
-	if (dropsOutputs(getCell(id, target), type)) {
+	if (dropsOutputs(cell, type)) {
 		const guard = destructiveCheckpoint(target, allowUnrecoverable);
 		if ('refused' in guard) return guard;
 	} else autoCheckpointBeforeAgentAction(target);

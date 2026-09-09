@@ -105,8 +105,8 @@ describe('auto-checkpoint throttles by agent-action count', () => {
 		// The two tiers are independent mechanisms over one store. A destructive
 		// snapshot must not GRANT the recoverable tier credit (or a run right after a
 		// clear would skip a snapshot it was due) and must not SPEND it (or a refused
-		// destructive call, which discards its checkpoint, would leave the counters
-		// describing a snapshot that no longer exists).
+		// destructive call, whose snapshot is abandoned before it is ever committed,
+		// would leave the counters describing a snapshot that does not exist).
 		const path = 'tiers.ipynb';
 		nb.createNotebook(path);
 		nb.addCell(null, 'code', path, null, 'x = 1');

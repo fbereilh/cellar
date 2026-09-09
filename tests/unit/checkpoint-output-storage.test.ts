@@ -171,15 +171,36 @@ describe('a dropped checkpoint takes its sidecar with it', () => {
 		expect(sidecars(ws)).toHaveLength(25);
 	});
 
-	it('deletes the file when a refused destructive action discards its checkpoint', async () => {
+	it('never sweeps a sidecar whose checkpoint the index has NOT had time to record', async () => {
+		// The destruction a checkpoint protects is persisted SYNCHRONOUSLY while the
+		// index write is debounced 250ms, so a crash in that window used to leave the
+		// undo record unreferenced - and the orphan sweep then actively DELETED the
+		// bytes that were still sitting recoverable on disk. `createCheckpoint` now
+		// flushes the index synchronously whenever a sidecar was really written, so the
+		// reference is durable before the destructive action proceeds. Driven by NOT
+		// waiting for the debounce and re-loading the store from disk, which is exactly
+		// what the next process start does.
 		const { ws, cp, nb } = await freshWorkspace();
-		const { target } = notebookWithOutput(nb, 'discard.ipynb', 'o');
+		const { target, cellId } = notebookWithOutput(nb, 'unflushed.ipynb', 'still recoverable');
 		const snap = cp.createCheckpoint(target, { trigger: 'agent' });
 		expect(sidecars(ws)).toHaveLength(1);
 
-		cp.discardCheckpoint(target, snap.id);
-		expect(cp.listCheckpoints(target)).toHaveLength(0);
-		expect(sidecars(ws)).toHaveLength(0);
+		// No `waitForFlush()`: the whole point is that the index is already on disk.
+		vi.resetModules();
+		const cp2 = await import('../../src/lib/server/checkpoints');
+		const nb2 = await import('../../src/lib/server/notebook');
+		expect(cp2.listCheckpoints(target).map((c) => c.id), 'the index recorded it synchronously').toContain(snap.id);
+		expect(sidecars(ws), 'the sweep left the live sidecar alone').toHaveLength(1);
+
+		// ...and it still restores its outputs, which is the guarantee this protects.
+		nb2.clearOutputs(cellId, target);
+		expect(cp2.restoreCheckpoint(target, snap.id).ok).toBe(true);
+		expect(outputText(nb2.listCells(target).find((c) => c.id === cellId)!)).toBe('still recoverable');
+		// The restore's own pre-restore snapshot holds no outputs, so it takes the
+		// ordinary DEBOUNCED write - which must land before the next test points
+		// CELLAR_WORKSPACE somewhere else, or this module instance's late flush writes
+		// this store into that workspace.
+		await waitForFlush();
 	});
 
 	it('sweeps sidecars the index no longer knows about (a crash between the two writes)', async () => {

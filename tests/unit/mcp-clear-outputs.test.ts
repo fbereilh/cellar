@@ -23,6 +23,8 @@ import { describe, it, expect, beforeAll, vi } from 'vitest';
 import { chmodSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 
 // A `.py` notebook's real read/write shell out to jupytext in the project venv,
 // which a unit test has no business needing. Only the round-trip is stubbed: the
@@ -61,6 +63,27 @@ beforeAll(async () => {
 	queue = await import('../../src/lib/server/run-queue');
 	cpmod = await import('../../src/lib/server/checkpoints');
 });
+
+/**
+ * The description of a tool as the SHIPPED server EMITS it at connect - the string
+ * an agent is really billed for and the only thing most agents ever read about a
+ * tool. Read over an in-memory MCP client off `createCellarMcpServer()`, the same
+ * factory `startMcpServer` mints a session with, so a behaviour-preserving reformat
+ * of the registration cannot break these assertions and a matching phrase in dead
+ * code cannot satisfy them. (`mojo-cell-mcp.test.ts` uses the same route for the
+ * emitted schemas.)
+ */
+async function emittedDescription(name: string): Promise<string> {
+	const srv = await import('../../src/lib/server/mcp/server');
+	const server = srv.createCellarMcpServer();
+	const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+	const client = new Client({ name: 'test-agent', version: '0.0.0' });
+	await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+	const tool = (await client.listTools()).tools.find((t) => t.name === name);
+	expect(tool, `${name} must be registered`).toBeTruthy();
+	expect(tool!.description, `${name} must carry a description`).toBeTruthy();
+	return tool!.description!;
+}
 
 /** One stream output, the shape a `print()` leaves behind. */
 const out = (text: string) => [{ output_type: 'stream' as const, name: 'stdout' as const, text }];
@@ -474,6 +497,45 @@ describe('the pre-clear checkpoint really can give the outputs back', () => {
 		});
 	});
 
+	it.skipIf(!chmodBlocksWrites)('leaves the OLDEST snapshot alone when it refuses at the history cap', async () => {
+		// A refusal says "nothing was changed", and that has to be literally true. The
+		// snapshot used to be entered in the store and then removed - but ENTERING it is
+		// what triggers FIFO eviction, so at MAX_PER_NOTEBOOK (25) a call that was about
+		// to refuse had already destroyed the oldest snapshot and rm'd its sidecar,
+		// possibly a human's own manual save point. It is now abandoned before it is
+		// committed, so the store is untouched.
+		// Built WITHOUT agent tools, so the history holds only the checkpoints this test
+		// takes and the oldest of them is one that already sees the outputs.
+		const { target, ids } = makeUntouchedNotebook('refuse-at-cap.ipynb', 'the results\n');
+		const id = ids[0]; // a full UUID, which `asFullId` accepts like any handle
+		// Fill the history to MAX_PER_NOTEBOOK so the very next commit would evict.
+		while (cpmod.listCheckpoints(target).length < 25) cpmod.createCheckpoint(target, { trigger: 'manual' });
+		const before = cpmod.listCheckpoints(target);
+		expect(before).toHaveLength(25);
+		// The one a committed-then-removed snapshot would have destroyed on its way out.
+		const victim = before.at(-1)!;
+		expect(victim.outputsTruncated, 'the oldest snapshot really holds the outputs').toBe(false);
+
+		// Sidecar writes now fail; the directory already exists (every checkpoint above
+		// stored one), so this is exactly the full-disk / unwritable-.cellar shape.
+		const dir = join(WS, '.cellar', 'checkpoints');
+		chmodSync(dir, 0o500);
+		try {
+			expect(svc.clearOutputs([id], target)).toMatchObject({ ok: false, refused: 'outputs_unrecoverable' });
+		} finally {
+			chmodSync(dir, 0o700);
+		}
+
+		const after = cpmod.listCheckpoints(target);
+		expect(after.map((c) => c.id), 'a refused call evicted nothing and added nothing').toEqual(before.map((c) => c.id));
+		// ...and that oldest snapshot still RESTORES its outputs, so its sidecar was
+		// not rm'd either - the store is byte-for-byte where the call found it.
+		nbmod.clearOutputs(id, target);
+		expect(nbmod.listCells(target).find((c) => c.id === id)?.outputs ?? []).toHaveLength(0);
+		expect(cpmod.restoreCheckpoint(target, victim.id).ok).toBe(true);
+		expect(nbmod.listCells(target).find((c) => c.id === id)?.outputs ?? []).toHaveLength(1);
+	});
+
 	it.skipIf(!chmodBlocksWrites)('proceeds and SAYS SO when the caller waives the guarantee', () => {
 		// `allow_unrecoverable` exists because clearing outputs is itself how a user
 		// frees a full disk, so a flat refusal would trap them. A knowing caller still
@@ -487,33 +549,28 @@ describe('the pre-clear checkpoint really can give the outputs back', () => {
 		});
 	});
 
-	it('keeps the tool DESCRIPTION matching what undo now guarantees', () => {
-		const src = readFileSync(new URL('../../src/lib/server/mcp/server.ts', import.meta.url), 'utf8');
-		const desc = src.slice(src.indexOf("registerTool('clear_outputs'"));
-		const line = desc.slice(0, desc.indexOf('\n'));
-
+	it('keeps the tool DESCRIPTION matching what undo now guarantees', async () => {
 		// A tool description is paid on every MCP session AND is the only thing most
 		// agents ever read, so a WRONG claim there does more damage than a wrong result
 		// field. It used to over-claim ("one undoable checkpoint"); it was then
 		// corrected to under-claim ("throttled", "undo may not") because both halves
 		// really could fail. Both halves are fixed, so the caveats must go with them -
-		// an agent told undo may not work will not use undo.
-		expect(line).not.toMatch(/throttled/);
-		expect(line).not.toMatch(/undo may not/);
+		// an agent told undo may not work will not use undo. Asserted on the string
+		// the SHIPPED server EMITS at connect, which is what an agent is billed for.
+		const desc = await emittedDescription('clear_outputs');
+		expect(desc).not.toMatch(/throttled/);
+		expect(desc).not.toMatch(/undo may not/);
 		// ...and what replaces them is the guarantee plus its ONE exception, named.
-		expect(line).toMatch(/undo restores them/);
-		expect(line).toMatch(/REFUSED before clearing/);
-		expect(line).toMatch(/allow_unrecoverable/);
-
+		expect(desc).toMatch(/undo restores them/);
+		expect(desc).toMatch(/REFUSED before clearing/);
+		expect(desc).toMatch(/allow_unrecoverable/);
 		// ...and honest WITHOUT growing: the same string is billed on every MCP
 		// session, so a correction has to be paid for by cutting words elsewhere.
 		// `mcp-ergonomics.spec.ts` asserts this same bound over the real wire, but
 		// e2e is deliberately out of CI and the no-mistakes gate, so a description
 		// that grew past it merged green and only failed much later. Carry the bound
 		// here too, where it actually runs.
-		const literal = line.match(/description: '((?:[^'\\]|\\.)*)'/)?.[1];
-		expect(literal, 'clear_outputs description is a single-quoted literal').toBeTruthy();
-		expect(literal!.replace(/\\(.)/g, '$1').length).toBeLessThan(700);
+		expect(desc.length).toBeLessThan(700);
 	});
 });
 
@@ -589,15 +646,16 @@ describe('set_cell_type is on the destructive tier exactly when it drops outputs
 		});
 	});
 
-	it('keeps the tool DESCRIPTION naming the guarantee and its exception', () => {
+	it('keeps the tool DESCRIPTION naming the guarantee and its exception', async () => {
 		// The description is the only thing most agents ever read about this tool, and
 		// it already told them the conversion "drops that cell's outputs" - so it has to
-		// say what now happens to them, and that the call can be refused.
-		const src = readFileSync(new URL('../../src/lib/server/mcp/server.ts', import.meta.url), 'utf8');
-		const line = src.slice(src.indexOf("registerTool('set_cell_type'")).split('\n')[0];
-		expect(line).toMatch(/undo brings them back/);
-		expect(line).toMatch(/REFUSED before converting/);
-		expect(line).toMatch(/allow_unrecoverable/);
+		// say what now happens to them, and that the call can be refused. Read off the
+		// description the SHIPPED server really EMITS at connect (the delivered
+		// contract), not off the registration's source text.
+		const desc = await emittedDescription('set_cell_type');
+		expect(desc).toMatch(/undo brings them back/);
+		expect(desc).toMatch(/REFUSED before converting/);
+		expect(desc).toMatch(/allow_unrecoverable/);
 	});
 });
 

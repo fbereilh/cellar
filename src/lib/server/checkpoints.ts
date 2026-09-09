@@ -34,10 +34,15 @@
  *     `checkpointBeforeDestructiveAgentAction`, which is NEVER throttled. Under the
  *     old single-tier rule four out of every five `clear_outputs` calls were preceded
  *     by NO snapshot at all, so "the agent wiped my results" had no undo behind it.
- *     Today that is `clear_outputs`, `delete_cells`, and the `set_cell_type`
- *     conversions that drop a code cell's outputs. A run is deliberately NOT in this
- *     set: it is the highest-frequency action there is and re-running is its own
+ *     Today that is `clear_outputs`, `delete_cells`, the `set_cell_type` conversions
+ *     that drop a code cell's outputs, and a `consolidate_imports` sweep that would
+ *     delete an imports-only cell carrying saved output. A run is deliberately NOT in
+ *     this set: it is the highest-frequency action there is and re-running is its own
  *     recovery.
+ *
+ * Note the tier is decided from what the action WOULD destroy in THIS document, not
+ * from which tool was called: a `set_cell_type` that keeps the outputs, and a
+ * consolidate that deletes nothing, are both correctly on the throttled tier.
  *
  * STORAGE mirrors `ui-state.js`: a single JSON file under the workspace's
  * `.cellar/` dir (already gitignored in full), keyed by workspace-relative
@@ -70,7 +75,10 @@
  * not be WRITTEN (a full disk, an unwritable `.cellar/`, a payload past the JS
  * string limit). That is an error rather than a policy, so it is flagged
  * `outputsTruncated` with the cause on `outputsError`, and the destructive tools
- * REFUSE before destroying anything rather than reporting the loss afterwards.
+ * REFUSE before destroying anything rather than reporting the loss afterwards. Such
+ * a snapshot is ABANDONED before it is ever entered in the store
+ * (`abandonIfOutputsLost`), never entered and then removed — see `createCheckpoint`
+ * for why the difference is a real one and not bookkeeping.
  *
  * This module depends on `notebook.js` (read the live cells to snapshot, replace
  * the live cells to restore) but nothing in `notebook.js` depends on it — the
@@ -238,9 +246,13 @@ function enforceOutputBudget(store: Record<string, Checkpoint[]>, keepId: string
 }
 
 /**
- * Delete sidecars no checkpoint refers to any more — a crash between the sidecar
- * write and the debounced index write, or a hand-deleted `checkpoints.json`. Runs
+ * Delete sidecars no checkpoint refers to any more — a partial write this process
+ * could not clean up, a crash mid-write, or a hand-deleted `checkpoints.json`. Runs
  * once, from the single `ensureLoaded` miss, so it costs one readdir per process.
+ *
+ * It deliberately does NOT need to cover "the sidecar landed but the index write was
+ * still debounced": `createCheckpoint` flushes the index synchronously whenever a
+ * sidecar was written, precisely so this sweep can never erase a live undo record.
  *
  * STATED LIMIT: a SECOND Cellar instance in the same workspace (`cellar --new`,
  * which the per-folder instance lock otherwise prevents) can sweep a sidecar the
@@ -311,10 +323,25 @@ export function listCheckpoints(nb?: string | null): CheckpointMeta[] {
 /**
  * Snapshot the notebook's current cells into a new checkpoint and return its
  * metadata. `trigger` labels why it was taken (`manual` / `agent` / `restore`).
+ *
+ * `abandonIfOutputsLost` is for a caller that will REFUSE its action when the
+ * outputs could not be stored (the destructive tier). It decides that BEFORE the
+ * entry is committed, and that ordering is the whole point: committing the entry
+ * and then removing it cannot be a no-op, because `list.push` is what triggers
+ * FIFO eviction, so at `MAX_PER_NOTEBOOK` a call that is about to refuse had
+ * already destroyed the oldest snapshot and `rmSync`'d its sidecar - possibly a
+ * human `manual` one - while its own refusal said "nothing was changed". Abandoned,
+ * nothing is pushed, nothing is evicted, no `checkpoints:changed` is published and
+ * the store is not marked dirty, so a refused call really does change nothing. The
+ * metadata is still RETURNED, so the caller can name the cause in its refusal.
  */
 export function createCheckpoint(
 	nb?: string | null,
-	{ trigger = 'manual', label }: { trigger?: CheckpointTrigger; label?: string } = {}
+	{
+		trigger = 'manual',
+		label,
+		abandonIfOutputsLost = false
+	}: { trigger?: CheckpointTrigger; label?: string; abandonIfOutputsLost?: boolean } = {}
 ): CheckpointMeta {
 	const store = ensureLoaded();
 	const key = keyFor(nb);
@@ -346,6 +373,8 @@ export function createCheckpoint(
 		cells
 	};
 	storeOutputs(cp, live);
+	// Decided BEFORE anything is committed - see `abandonIfOutputsLost` above.
+	if (abandonIfOutputsLost && cp.outputsTruncated) return metaOf(cp);
 	const list = store[key] ?? (store[key] = []);
 	list.push(cp);
 	// FIFO eviction takes the evicted snapshot's sidecar with it, or `.cellar/` would
@@ -360,6 +389,16 @@ export function createCheckpoint(
 	}
 	enforceOutputBudget(store, cp.id);
 	scheduleWrite();
+	// A sidecar on disk that the index does not yet REFERENCE is a file
+	// `sweepOrphanOutputs` deletes on the next start - so between the synchronous
+	// sidecar write and the 250ms debounced index write there is a window in which a
+	// SIGKILL makes the destruction durable and its undo record not merely lost but
+	// actively erased. Flushing the index synchronously whenever a sidecar was really
+	// written closes it, and is proportionate: this path has just done a synchronous
+	// whole-file write of the outputs themselves, so one small index write beside it
+	// is a rounding error. A checkpoint that stored NO sidecar has nothing a sweep
+	// could delete, so it keeps the ordinary debounced path.
+	if (cp.outputsStored) flush();
 	publishGlobal({ type: 'checkpoints:changed', nb: resolveNotebookPath(nb) });
 	return metaOf(cp);
 }
@@ -384,6 +423,15 @@ function storeOutputs(cp: Checkpoint, live: CellView[]): void {
 		// A full disk, an unwritable `.cellar/`, or a payload past the JS string limit.
 		// Flagged rather than thrown: a source-only checkpoint is still worth keeping,
 		// and the destructive tools read this flag to refuse BEFORE destroying anything.
+		//
+		// A failed `writeFileSync` can leave a PARTIAL file behind (ENOSPC truncates
+		// mid-write), and this entry will never claim to own it, so nothing but the
+		// once-per-process orphan sweep would ever remove it. Delete it here instead:
+		// the entry may also be ABANDONED outright above, in which case there is no
+		// entry left to attribute the file to at all.
+		try {
+			rmSync(outputsPath(cp.id), { force: true });
+		} catch {}
 		cp.outputsStored = false;
 		cp.outputsTruncated = true;
 		cp.outputsError = outputsErrorText(e);
@@ -465,36 +513,20 @@ export function autoCheckpointBeforeAgentAction(nb?: string | null): CheckpointM
  * Deliberately does NOT touch the throttle counters, in either direction. Reading
  * them would make a destructive action's snapshot depend on how many runs preceded
  * it, which is the bug; writing them would let a destructive action grant or spend
- * credit the recoverable tier is owed, so a refused call (which discards its
- * checkpoint) would leave the counters describing a snapshot that no longer exists.
- * The two tiers are independent mechanisms over one store.
+ * credit the recoverable tier is owed, so an ABANDONED call would leave the counters
+ * describing a snapshot that was never entered. The two tiers are independent
+ * mechanisms over one store.
+ *
+ * `abandonIfOutputsLost` is passed straight through: a caller that will refuse when
+ * the outputs could not be stored must ALSO not commit the entry, or the commit's
+ * own FIFO eviction destroys an older snapshot on the way to a refusal claiming
+ * nothing was changed. See `createCheckpoint`.
  */
-export function checkpointBeforeDestructiveAgentAction(nb?: string | null): CheckpointMeta {
-	return createCheckpoint(nb, { trigger: 'agent' });
-}
-
-/**
- * Remove a checkpoint and its sidecar. The one caller is a destructive tool that
- * took its pre-action snapshot, found it could not hold the outputs, and refused:
- * a refused call must change nothing, and a leftover snapshot of an unchanged
- * document would push the human's real undo target one step further out of reach
- * (the same rule `removeCells` and `setType` state for their own refusals).
- */
-export function discardCheckpoint(nb: string | null | undefined, id: string): void {
-	const store = ensureLoaded();
-	const key = keyFor(nb);
-	const list = store[key];
-	if (!list) return;
-	const i = list.findIndex((c) => c.id === id);
-	if (i < 0) return;
-	const [cp] = list.splice(i, 1);
-	if (cp.outputsStored) {
-		try {
-			rmSync(outputsPath(cp.id), { force: true });
-		} catch {}
-	}
-	scheduleWrite();
-	publishGlobal({ type: 'checkpoints:changed', nb: resolveNotebookPath(nb) });
+export function checkpointBeforeDestructiveAgentAction(
+	nb?: string | null,
+	{ abandonIfOutputsLost = false }: { abandonIfOutputsLost?: boolean } = {}
+): CheckpointMeta {
+	return createCheckpoint(nb, { trigger: 'agent', abandonIfOutputsLost });
 }
 
 /** Find a stored checkpoint (with its cells) by id, or null. */
