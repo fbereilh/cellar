@@ -27,13 +27,18 @@ name: E2E
 #     pins that, because a Playwright change that started splitting files would
 #     break the suite in a way that reads as flakiness.
 #
-#   * WORKERS INSIDE each shard. `playwright.config.ts` used to hardcode
-#     `workers: process.env.CI ? 1 : 2`. That `1` was never measured against a
-#     CI run — e2e had never run in CI when it was written (#47), so it is the
-#     old unconditional default left standing on a branch nobody had taken, not
-#     a guard against anything observed. The suite is latency-bound, not
-#     CPU-bound (measured: 0.67 of one core across a serial run), so a 4-vCPU
-#     runner is not the constraint. `CELLAR_E2E_WORKERS` sets it here.
+#   * ONE WORKER per shard, and this one IS measured. `playwright.config.ts`
+#     used to hardcode `workers: process.env.CI ? 1 : 2`; that `1` was never
+#     measured (e2e had never run in CI when #47 wrote it, so it was the old
+#     unconditional default left on a branch nobody had taken), so it was
+#     replaced by `CELLAR_E2E_WORKERS`, which CI sets here. At 6 shards x 2
+#     workers a full run was 6m26s with NINE failures, every one timeout-shaped
+#     — a page that never finished loading inside 30s, `virtualization-pinning`,
+#     the same timing-sensitive real-kernel family AGENTS.md records `workers: 4`
+#     breaking on a 15-core machine. Two workers on FOUR vCPUs is that same
+#     contention: each worker is a chromium + a launcher + a jupyter-server + a
+#     python kernel. So the parallelism moved OUT of the shard and INTO the
+#     matrix, where the runners are free and do not contend.
 #
 #   * fail-fast: false — one red shard must not cancel the others, or a single
 #     failure hides the state of the rest of the suite and makes the flake rate
@@ -83,7 +88,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: [1, 2, 3, 4, 5, 6]
+        shard: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
 
     env:
       # Make a missing kernel runtime FAIL rather than skip. Every spec is
@@ -93,12 +98,22 @@ jobs:
       # strictly worse than no job, because it manufactures assurance. The guard
       # lives in tests/e2e/global-setup.ts and shares the specs' own predicate.
       CELLAR_E2E_REQUIRE_RUNTIME: '1'
-      # See the WORKERS note above. Raise or lower here, not in the config.
-      CELLAR_E2E_WORKERS: '2'
+      # See the WORKERS note above. Raise or lower HERE, not in the config —
+      # and only with a measurement, because the failures it causes look like
+      # unrelated flakiness rather than like overload.
+      CELLAR_E2E_WORKERS: '1'
 
     steps:
       - uses: actions/checkout@v5
 
+      # Node 20 DELIBERATELY, matching ci.yml and the `>=18` floor in
+      # package.json `engines` - not just "the same as the other job". The
+      # global `WebSocket` is Node 22+, so a Node 20 runner is what exercises
+      # the `ws` fallback in `kernel.ts`'s `makeSettings` that real Node-18/20
+      # users get. That is not hypothetical: this pin is what caught cellar
+      # being unable to execute ANY cell on its own declared floor, on the very
+      # first Linux run. Raising it here would retire that coverage, and the
+      # Node 22+ path is what every developer machine already runs.
       - uses: actions/setup-node@v5
         with:
           node-version: 20
@@ -117,14 +132,29 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      # ~40s cold, seconds warm. Keyed on the resolved Playwright version, so a
-      # dependency bump gets a fresh browser instead of a silently stale one.
+      # Keyed on the resolved Playwright version, so a dependency bump gets a
+      # fresh browser instead of a silently stale one.
       - name: Resolve Playwright version
         id: pw
         run: echo "version=$(node -p "require('@playwright/test/package.json').version")" >> "$GITHUB_OUTPUT"
 
-      - name: Cache Playwright browsers
-        uses: actions/cache@v4
+      # restore/save SPLIT rather than plain `actions/cache`, and the `if:
+      # always()` is the whole point: the combined action does NOT save when the
+      # job fails, and this is a GATE - the runs immediately after a red one are
+      # a fix plus a re-run, which is exactly when you want the cache warm.
+      # MEASURED: after a run whose shards failed, neither cache existed, so
+      # every shard paid the cold ~20s Chromium install again.
+      #
+      # All six shards race to save the same key; the five losers tar the
+      # directory, fail to reserve it, log a benign "another job may be creating
+      # this cache" and carry on. Restricting the save to shard 1 would spare
+      # that (~10s each, on a COLD run only - i.e. the first run and a
+      # Playwright bump), and is deliberately NOT done: any shard being able to
+      # warm the cache is the more robust arrangement for a gate, and this is
+      # the cheaper mistake of the two.
+      - name: Restore Playwright browsers
+        id: pw-cache
+        uses: actions/cache/restore@v4
         with:
           path: ~/.cache/ms-playwright
           key: ms-playwright-${{ runner.os }}-${{ steps.pw.outputs.version }}
@@ -132,19 +162,39 @@ jobs:
       - name: Install Chromium
         run: npx playwright install --with-deps chromium
 
+      - name: Save Playwright browsers
+        # `!cancelled()`, NOT `always()`: cancel-in-progress fires on every
+        # force-push, and `always()` would save a HALF-EXTRACTED browser that
+        # later runs then restore and treat as installed. (The venv below is
+        # self-protecting - `ensureHostEnv` writes its `.cellar-host-ready`
+        # marker last - but it takes the same guard so the two read alike.)
+        if: ${{ !cancelled() && steps.pw-cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: ms-playwright-${{ runner.os }}-${{ steps.pw.outputs.version }}
+
       # Cellar's private Jupyter host env (`~/.cellar/host-venv`, jupyter-server).
       # 40MB / 123 packages. The launcher would create it lazily on first boot,
       # which is too late: `runtimeAvailable()` reads it with existsSync when the
       # FIRST test runs, so on a cold runner every spec would skip before the
       # launcher that creates it ever booted.
-      - name: Cache cellar host venv
-        uses: actions/cache@v4
+      - name: Restore cellar host venv
+        id: venv-cache
+        uses: actions/cache/restore@v4
         with:
           path: ~/.cellar/host-venv
           key: cellar-host-venv-${{ runner.os }}-v1
 
       - name: Provision the kernel runtime
         run: node scripts/ensure-e2e-runtime.js
+
+      - name: Save cellar host venv
+        if: ${{ !cancelled() && steps.venv-cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.cellar/host-venv
+          key: cellar-host-venv-${{ runner.os }}-v1
 
       # Per shard, deliberately — see the header. The specs serve the production
       # build, so this is not optional: `globalSetup` refuses a build that is

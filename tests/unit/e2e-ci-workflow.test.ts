@@ -156,7 +156,13 @@ describe('sharding splits whole spec files', () => {
 		// docs: this is a behaviour of the installed version, and a change to it
 		// would break the suite as flakiness rather than as an error. `--list`
 		// collects without running, so this costs no launcher boots.
-		const SHARDS = 6;
+		// The count comes from the WORKFLOW's own matrix, never a literal here:
+		// the invariant is about the shape CI really runs, so a matrix resized
+		// without re-checking it is exactly what this must not let through.
+		const matrix = workflow().match(/shard:\s*\[([^\]]+)\]/);
+		expect(matrix, 'the workflow no longer declares a shard matrix').toBeTruthy();
+		const SHARDS = matrix![1].split(',').length;
+		expect(SHARDS).toBeGreaterThan(1);
 		const seen = new Map<string, number[]>();
 		for (let i = 1; i <= SHARDS; i++) {
 			const out = spawnSync(
