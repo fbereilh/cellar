@@ -35,6 +35,7 @@ import {
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { SKIP_ENV } from '../../src/lib/server/build-freshness.js';
 import { ensureFreshBuild, invokedAsCli } from '../../scripts/ensure-build.js';
 import globalSetup from '../../tests/e2e/global-setup';
 import { bootDiagnostic } from '../../tests/e2e/harness';
@@ -350,17 +351,48 @@ function launcherTree(build: LauncherBuild): string {
 	return tree;
 }
 
+/**
+ * What the fixture launcher inherits from the machine running the suite, as an
+ * ALLOW-LIST rather than a scrub of the names known to matter today.
+ *
+ * The launcher reads its own knobs straight off `process.env`, and one of them —
+ * `CELLAR_SKIP_BUILD_CHECK`, which its own refusal message and docs/SETUP.md both
+ * tell users to export — GATES the stale branch. Spreading `process.env` in
+ * therefore let a developer's shell decide the verdict: with it exported the stale
+ * case did not refuse at all but walked on into venv resolution (MEASURED: "No
+ * usable virtualenv found"), so `npm run test` — the must-pass merge gate — failed
+ * for a reason unrelated to the change under test, and did real toolchain work
+ * while doing it. `CELLAR_VENV` is the same shape one step further on.
+ *
+ * An allow-list is what makes the guarantee STRUCTURAL: no ambient `CELLAR_*` can
+ * reach the child because none is named here, so a knob added to the launcher
+ * later cannot quietly reopen this. A case that wants one sets it EXPLICITLY, and
+ * `HOME` is always the throwaway one, so the verdict depends on the fixture tree
+ * and nothing else.
+ *
+ * What is passed, and why each is needed: `PATH`, because it is how the launcher
+ * finds `uv` (and the one lever the override case pulls); `TMPDIR`, so the child
+ * writes its temporaries where this machine wants them; and the two Windows
+ * variables Node itself needs to spawn at all, copied only where they exist.
+ */
+const LAUNCHER_ENV_PASSTHROUGH = ['PATH', 'TMPDIR', 'SystemRoot', 'ComSpec'];
+
 function runLauncher(
 	build: LauncherBuild,
 	env: Record<string, string> = {}
 ): { code: number | null; said: string } {
 	const tree = launcherTree(build);
 	const home = mkdtempSync(join(tmpdir(), 'cellar-launcher-home-'));
+	const base: Record<string, string> = {};
+	for (const name of LAUNCHER_ENV_PASSTHROUGH) {
+		const value = process.env[name];
+		if (value !== undefined) base[name] = value;
+	}
 	try {
 		const run = spawnSync(
 			process.execPath,
 			[join(tree, 'bin', 'cellar.js'), '--workspace', join(tree, 'ws'), '--new', '--yes'],
-			{ encoding: 'utf8', timeout: 30_000, env: { ...process.env, HOME: home, ...env } }
+			{ encoding: 'utf8', timeout: 30_000, env: { ...base, HOME: home, ...env } }
 		);
 		return { code: run.status, said: `${run.stdout ?? ''}${run.stderr ?? ''}` };
 	} finally {
@@ -413,5 +445,22 @@ describe('the launcher refuses an unusable build', () => {
 		expect(said).not.toMatch(/STALE/);
 		expect(said).not.toContain('production build stale');
 		expect(said).toContain('uv is required');
+	});
+
+	it('still refuses a STALE build when the SUITE\'s own shell exported the override', () => {
+		// The verdict must come from the fixture tree, never from the machine running
+		// the suite: this variable is one users are told to export, and it gates the
+		// stale branch, so inheriting it made the case above pass or fail on a shell
+		// setting - the merge gate breaking for someone who took our own advice.
+		// Stubbed on `process.env`, which IS the ambient leak, so this fails against
+		// an inherited environment and passes against a built one.
+		vi.stubEnv(SKIP_ENV, '1');
+		try {
+			const { code, said } = runLauncher('stale');
+			expect(code).toBe(1);
+			expect(said).toMatch(/STALE/);
+		} finally {
+			vi.unstubAllEnvs();
+		}
 	});
 });
