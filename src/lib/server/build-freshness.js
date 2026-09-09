@@ -42,8 +42,8 @@ const SKIP_DIRS = new Set(['node_modules', '.git', '.svelte-kit', 'build']);
  * removed by hand) leaves an entry point that starts, answers, and renders a
  * broken page. That case is worse than a stale build, because it passes the mtime
  * comparison: every e2e spec then boots happily and fails on its assertions
- * instead — MEASURED at ~35s of timeouts per test (a 3-test spec: 104s all-fail,
- * versus 8.8s all-pass against a complete build), with nothing in the failure
+ * instead — MEASURED at ~33s of timeouts per test (a 2-test spec: 65s all-fail,
+ * versus 2.5s all-pass against a complete build), with nothing in the failure
  * naming the build. So an incomplete build classifies as `missing`, i.e. "rebuild
  * this", which is exactly what it needs.
  */

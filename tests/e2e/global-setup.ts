@@ -13,7 +13,7 @@
  *   - an INCOMPLETE build (`build/client` gone, a `vite build` killed part-way) →
  *     which passes the mtime comparison, so the launcher boots, the pages are
  *     broken, and each test burns its full assertion timeout on a misleading
- *     failure. MEASURED: a 3-test spec took 104s all-fail versus 8.8s all-pass.
+ *     failure. MEASURED: a 2-test spec took 65s all-fail versus 2.5s all-pass.
  *
  * Running the same one guard here covers EVERY invocation, and it is the only
  * place it runs — see scripts/ensure-build.js.

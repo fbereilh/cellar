@@ -76,7 +76,7 @@ describe('buildFreshness', () => {
 		// part-way, or a `build/client` removed by hand, leaves an entry point that
 		// PASSES the mtime comparison. The launcher then starts, serves broken
 		// pages, and every e2e spec fails on its assertions with nothing naming the
-		// build — MEASURED at ~35s per test (a 3-test spec: 104s all-fail vs 8.8s
+		// build — MEASURED at ~33s per test (a 2-test spec: 65s all-fail vs 2.5s
 		// all-pass). `missing` is the right verdict: what it needs is a rebuild.
 		writeAt(join(repo, 'src', 'lib', 'a.ts'), 'export const a = 1;', OLD);
 		freezeDirs(join(repo, 'src'), OLD);

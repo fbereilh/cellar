@@ -28,12 +28,14 @@ export function runtimeAvailable(): boolean {
 /**
  * How long a launcher gets to print its URL before the boot is called dead.
  *
- * 60s, down from 90s. A warm boot here is ~5s (uv resolves the throwaway
- * workspace's venv from cache), so this is over 10x the measured cost and still
- * bounds a wedged launcher at a minute per spec rather than a minute and a half -
- * which matters at `workers: 2` across ~50 spec files, where a systemic boot
- * failure is paid once per file. `CELLAR_E2E_BOOT_TIMEOUT_MS` raises it for a
- * genuinely cold uv cache, which is a one-time per-machine cost.
+ * 60s, down from 90s. A warm boot here is ~1.2s MEASURED (three runs at load 4;
+ * uv resolves the throwaway workspace's venv from cache), so 60s is ~46x the
+ * measured cost - deliberately generous, because the cost of guessing LOW is a
+ * whole spec file's worth of false failures on a merely loaded machine, while the
+ * cost of guessing high is one wedged launcher held a minute instead of a minute
+ * and a half. That still matters at `workers: 2` across ~50 spec files, where a
+ * systemic boot failure is paid once per file. `CELLAR_E2E_BOOT_TIMEOUT_MS` raises
+ * it for a genuinely cold uv cache, which is a one-time per-machine cost.
  */
 const BOOT_TIMEOUT_MS = Number(process.env.CELLAR_E2E_BOOT_TIMEOUT_MS) || 60_000;
 

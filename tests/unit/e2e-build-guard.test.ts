@@ -8,7 +8,7 @@
  * `launcher exited early (1)` and the reason is buried in interleaved stdout; an
  * INCOMPLETE build passes the mtime comparison, so the launcher boots and each
  * test burns its assertion timeout on a misleading failure (MEASURED: a 3-test
- * spec took 104s all-fail versus 8.8s all-pass).
+ * spec took 65s all-fail versus 2.5s all-pass).
  *
  * These pin the behaviour of the shared guard plus the wiring that decides WHERE
  * it runs. The wiring half is source-shaped on purpose: playwright's config is not
