@@ -106,7 +106,11 @@ jobs:
 
       # `uv` is how the launcher creates and populates every venv; the app
       # fails fast without it rather than falling back to `python -m venv`.
-      - uses: astral-sh/setup-uv@v10
+      #
+      # Pinned to an EXACT release, not a moving major: setup-uv's moving major
+      # tags stop at v7 while its releases are at v10, so `@v10` does not
+      # resolve and fails the job in `Set up job` before any step runs.
+      - uses: astral-sh/setup-uv@v10.0.1
         with:
           enable-cache: true
 
