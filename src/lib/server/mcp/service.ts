@@ -1644,7 +1644,12 @@ function destructiveCheckpoint(
 	nb: string,
 	allowUnrecoverable: boolean
 ): { cp: CheckpointMeta } | UnrecoverableRefusal {
-	const cp = checkpointBeforeDestructiveAgentAction(nb, { abandonIfOutputsLost: !allowUnrecoverable });
+	// `guaranteed`: this is only ever reached for a call that really deletes saved
+	// outputs, so the snapshot is uncapped and its index entry lands synchronously.
+	const cp = checkpointBeforeDestructiveAgentAction(nb, {
+		retention: 'guaranteed',
+		abandonIfOutputsLost: !allowUnrecoverable
+	});
 	if (cp.outputsTruncated && !allowUnrecoverable) {
 		return {
 			ok: false,
@@ -1669,10 +1674,11 @@ function destructiveCheckpoint(
  * as it was before the pivot rather than after seven eighths of it, and
  * `deleteCells` makes the removal ONE document write rather than one per cell.
  *
- * That checkpoint is the DESTRUCTIVE, never-throttled one and it stores the
- * deleted cells' outputs, so undo brings the cells back WITH their results - a
- * delete destroys outputs just as surely as `clear_outputs` does. See
- * `destructiveCheckpoint` for the tier split and for the one case it refuses.
+ * That checkpoint is the DESTRUCTIVE, never-throttled one, and when a cell being
+ * deleted really holds outputs it also stores them, so undo brings the cells back
+ * WITH their results - a delete destroys outputs just as surely as `clear_outputs`
+ * does. See `destructiveCheckpoint` for the refusal, and the seam below for why
+ * this is the one caller that answers the tier's two questions separately.
  *
  * `deleteCells` also refuses a batch that would empty the notebook, and that
  * refusal is reported as such: an agent told `{ok:true, count:N}` over a document
@@ -1702,16 +1708,41 @@ export function removeCells(ids: string[], nb?: string | null, { allowUnrecovera
 	// Handles are prefixes of the CURRENT cell set, so read them before deleting.
 	const toHandle = handleFn(target);
 	const deleted = full.map(toHandle);
-	// Deleting a cell destroys its OUTPUTS as well as its source, so this takes the
-	// destructive (never-throttled) snapshot, not the throttled one - under the old
-	// rule a delete landing mid-batch was covered only by a snapshot taken up to N
-	// actions earlier, which brought the cells back carrying whatever outputs they
-	// had before that batch, or none at all if they were created inside it.
-	const guard = destructiveCheckpoint(target, allowUnrecoverable);
-	if ('refused' in guard) return guard;
+	// TWO INDEPENDENT QUESTIONS, and delete is the one caller that answers them
+	// differently - see `OutputRetention`.
+	//
+	// (a) May this snapshot be throttled away? NEVER, whatever the cells hold: a
+	//     delete destroys the cell's SOURCE, and that source may exist in no other
+	//     snapshot at all if the cell was created inside the current throttle batch.
+	//     Under the old rule a delete landing mid-batch was covered only by a snapshot
+	//     taken up to N actions earlier, which brought the cells back carrying
+	//     whatever outputs they had before that batch, or not at all.
+	// (b) Must the snapshot PRESERVE its outputs at any cost - uncapped sidecar,
+	//     synchronous index flush, and the refusal when either fails? Only when a cell
+	//     being deleted really carries outputs. Otherwise the call would stringify and
+	//     synchronously write the whole UNRELATED output set of an output-heavy
+	//     notebook, on the process that also carries the kernel websockets and the SSE
+	//     fan-out, for results it was never going to destroy.
+	//
+	// `setType` and `consolidate` destroy nothing at all when their own guard is false
+	// (a sql retype keeps its outputs; an idempotent consolidate deletes nothing), so
+	// for them both answers fall together and they drop to the throttled tier entire.
+	// Do not "simplify" this into that shape: it would put the deleted SOURCE back
+	// behind the throttle, which is the case this fix was written for.
+	//
+	// Stated cost of (b): past `MAX_SNAPSHOT_BYTES` an output-less delete's snapshot
+	// keeps no outputs, so undoing it restores the deleted cell's source with the
+	// notebook's other outputs blank - flagged `outputsTruncated`, and exactly what
+	// every throttled run checkpoint already does at that volume.
+	let undo: ReturnType<typeof undoWarning> = {};
+	if (full.some((id) => getCell(id, target)?.outputs?.length)) {
+		const guard = destructiveCheckpoint(target, allowUnrecoverable);
+		if ('refused' in guard) return guard;
+		undo = undoWarning(guard.cp);
+	} else checkpointBeforeDestructiveAgentAction(target, { retention: 'capped' });
 	const res = deleteCells(full, target);
 	if (!res.ok) return { ok: false as const, refused: res.reason };
-	return { ok: true as const, deleted, count: deleted.length, ...undoWarning(guard.cp) };
+	return { ok: true as const, deleted, count: deleted.length, ...undo };
 }
 
 /**

@@ -75,6 +75,17 @@
  * notebook, synchronously, on the process that also carries the kernel websockets
  * and the SSE output fan-out).
  *
+ * THEY ARE STILL TWO QUESTIONS, and one caller answers them differently.
+ * "May this snapshot be throttled away?" and "must it preserve the outputs it is
+ * taking at any cost?" coincide for every tool whose guard is about outputs - a
+ * `set_cell_type` that keeps them, or a consolidate that deletes nothing, destroys
+ * nothing at all and drops to the throttled tier entire. `delete_cells` does not: it
+ * destroys the cell's SOURCE whether or not that cell holds outputs, and that source
+ * may exist in no snapshot at all if the cell was created inside the current throttle
+ * batch, so it is NEVER throttled - while a delete that removes no outputs pays the
+ * uncapped sidecar and the synchronous flush for results it was never going to touch.
+ * `OutputRetention` is that second question, asked per call.
+ *
  * BOUNDING. History is capped at `MAX_PER_NOTEBOOK` snapshots per notebook (FIFO
  * eviction, which deletes the evicted snapshot's sidecar with it). Sidecars are
  * bounded in total by `outputBudgetBytes()` across the workspace (256 MB, or
@@ -86,9 +97,11 @@
  * outputs is a degradation of history, not a broken promise. A shed snapshot is
  * flagged `outputsTruncated` and still restores its sources.
  *
- * THE ONE REMAINING CASE where outputs cannot be preserved is a sidecar that could
- * not be WRITTEN (a full disk, an unwritable `.cellar/`, a payload past the JS
- * string limit). That is an error rather than a policy, so it is flagged
+ * THE ONE REMAINING CASE where outputs cannot be preserved is a WRITE that failed -
+ * the sidecar itself (a full disk, an unwritable `.cellar/`, a payload past the JS
+ * string limit), or, on a `guaranteed` snapshot, the index entry that references it,
+ * since an entry that never lands leaves the sidecar an orphan the next start's sweep
+ * deletes. That is an error rather than a policy, so it is flagged
  * `outputsTruncated` with the cause on `outputsError`, and the destructive tools
  * REFUSE before destroying anything rather than reporting the loss afterwards. Such
  * a snapshot is ABANDONED before it is ever entered in the store
@@ -113,13 +126,43 @@ import type { CellView } from './types';
 export type CheckpointTrigger = 'manual' | 'agent' | 'restore';
 
 /**
- * Which AUTO tier took a checkpoint. It decides the two rules that ride with the
- * throttle: `recoverable` is capped at `MAX_SNAPSHOT_BYTES` and writes its index
- * entry on the ordinary debounce, while `destructive` is uncapped and flushes the
- * index synchronously. A `manual` or `restore` snapshot belongs to neither tier —
- * neither is throttled, so neither is capped.
+ * How hard a snapshot works to KEEP the outputs it is taking.
+ *
+ * This is the SECOND of the two questions the auto path answers, and it is
+ * INDEPENDENT of the first. The first - may this snapshot be throttled away? - is
+ * answered by WHICH entry point a caller uses (`autoCheckpointBeforeAgentAction` vs
+ * `checkpointBeforeDestructiveAgentAction`). This one is answered per call, because
+ * the two do not always fall together: `delete_cells` destroys a cell's SOURCE
+ * whether or not that cell holds outputs, so it may NEVER be throttled (the source
+ * may exist in no other snapshot at all if the cell was created inside the current
+ * throttle batch), while a delete that removes no outputs has nothing to pay the
+ * preservation cost FOR. Collapsing the two back into one tier enum is how one of
+ * the halves gets lost: either an output-less delete starts synchronously writing
+ * the whole unrelated output set of an output-heavy notebook, or a delete stops
+ * being unthrottled and the source it destroys stops being recoverable.
  */
-export type CheckpointTier = 'recoverable' | 'destructive';
+export type OutputRetention =
+	/**
+	 * Uncapped, and the index entry is flushed SYNCHRONOUSLY, so the undo record
+	 * references its sidecar before the destruction it protects is persisted.
+	 * `abandonIfOutputsLost` lets the caller refuse when either half could not be
+	 * done. Only an action that DELETES saved outputs earns this.
+	 */
+	| 'guaranteed'
+	/**
+	 * Uncapped, index on the ordinary debounce. A human's `manual` save point and the
+	 * pre-restore snapshot: no action is overwriting anything, so nothing licenses a
+	 * cap and no destruction is racing the index write.
+	 */
+	| 'full'
+	/**
+	 * Capped at `MAX_SNAPSHOT_BYTES`, index on the ordinary debounce. What a snapshot
+	 * takes when the action in front of it destroys no outputs - every recoverable
+	 * action, and a `delete_cells` batch whose cells carry none. Past the cap the
+	 * outputs are dropped, the sources + metadata are kept, and the snapshot is
+	 * flagged `outputsTruncated`.
+	 */
+	| 'capped';
 
 /** A full point-in-time snapshot of a notebook's cells (source + outputs + metadata). */
 export interface Checkpoint {
@@ -367,13 +410,16 @@ export function listCheckpoints(nb?: string | null): CheckpointMeta[] {
  * FIFO eviction, so at `MAX_PER_NOTEBOOK` a call that is about to refuse had
  * already destroyed the oldest snapshot and `rmSync`'d its sidecar - possibly a
  * human `manual` one - while its own refusal said "nothing was changed". Abandoned,
- * nothing is pushed, nothing is evicted, no `checkpoints:changed` is published and
- * the store is not marked dirty, so a refused call really does change nothing. The
- * metadata is still RETURNED, so the caller can name the cause in its refusal.
+ * nothing is pushed, nothing is evicted and no `checkpoints:changed` is published, so
+ * a refused call really does leave the store where it found it. The metadata is still
+ * RETURNED, so the caller can name the cause in its refusal. A `guaranteed` snapshot
+ * whose INDEX write fails is abandoned the same way, one step later - see the flush
+ * below, which is deliberately settled while the push is the only change made.
  *
- * `tier` names the auto tier this snapshot belongs to and decides the two rules that
- * ride with the throttle — the per-snapshot output cap, and whether the index write
- * is synchronous. See `CheckpointTier` and the tier symmetry in the header.
+ * `retention` decides how hard this snapshot works to keep its outputs - the
+ * per-snapshot cap, and whether the index write is synchronous. It is a question
+ * apart from whether the snapshot may be throttled away; see `OutputRetention` and
+ * the tier symmetry in the header.
  */
 export function createCheckpoint(
 	nb?: string | null,
@@ -381,12 +427,12 @@ export function createCheckpoint(
 		trigger = 'manual',
 		label,
 		abandonIfOutputsLost = false,
-		tier
+		retention = 'full'
 	}: {
 		trigger?: CheckpointTrigger;
 		label?: string;
 		abandonIfOutputsLost?: boolean;
-		tier?: CheckpointTier;
+		retention?: OutputRetention;
 	} = {}
 ): CheckpointMeta {
 	const store = ensureLoaded();
@@ -418,11 +464,54 @@ export function createCheckpoint(
 		cellCount: cells.length,
 		cells
 	};
-	storeOutputs(cp, live, tier === 'recoverable' ? MAX_SNAPSHOT_BYTES : Infinity);
+	storeOutputs(cp, live, retention === 'capped' ? MAX_SNAPSHOT_BYTES : Infinity);
 	// Decided BEFORE anything is committed - see `abandonIfOutputsLost` above.
 	if (abandonIfOutputsLost && cp.outputsTruncated) return metaOf(cp);
+	const keyExisted = key in store;
 	const list = store[key] ?? (store[key] = []);
 	list.push(cp);
+	// A sidecar on disk that the index does not yet REFERENCE is a file
+	// `sweepOrphanOutputs` deletes on the next start - so between the synchronous
+	// sidecar write and the 250ms debounced index write there is a window in which a
+	// SIGKILL makes a destruction durable and its undo record not merely lost but
+	// actively erased. Flushing the index synchronously closes it, and only a
+	// `guaranteed` snapshot has such a window: nothing else is racing a destruction it
+	// is the undo record for, so nothing else pays a synchronous whole-file index
+	// write on the highest-frequency action there is. Where it does run it is
+	// proportionate - this path has just done a synchronous whole-file write of the
+	// outputs themselves - and a checkpoint that stored NO sidecar has nothing a sweep
+	// could delete.
+	//
+	// The flush sits BEFORE eviction on purpose. Its failure is a reason to ABANDON
+	// (an entry that never reaches disk is an undo record the next start's sweep
+	// deletes, which is the sidecar-unwritable case with the same user-visible
+	// consequence), and abandoning may only ever un-do things this call did: eviction
+	// `rmSync`s an older snapshot's sidecar, which no rollback can put back. So the
+	// durable-reference question is settled while the push is still the only change
+	// made.
+	scheduleWrite();
+	if (retention === 'guaranteed' && cp.outputsStored && !flush()) {
+		scheduleWrite(); // a failed flush cleared the timer; keep the retry armed
+		if (abandonIfOutputsLost) {
+			list.pop();
+			if (!keyExisted) delete store[key];
+			// Nothing references this sidecar now, so remove it rather than leave the
+			// once-per-process sweep to find it - the same cleanup a failed sidecar
+			// write does for its own partial file.
+			try {
+				rmSync(outputsPath(cp.id), { force: true });
+			} catch {}
+			cp.outputsStored = false;
+			cp.outputsTruncated = true;
+			cp.outputsError = 'the checkpoint index could not be written, so nothing would reference the stored outputs';
+			return metaOf(cp);
+		}
+		// The caller WAIVED the guarantee, so the entry stays: the sidecar is on disk
+		// and the in-memory index references it, so undo works in this process, and
+		// `dirty` is still set so the exit hook and the next scheduled write retry.
+		// Only a crash before one of those lands loses the reference - which is
+		// precisely what was waived.
+	}
 	// FIFO eviction takes the evicted snapshot's sidecar with it, or `.cellar/` would
 	// accumulate a file per checkpoint the index no longer knows about.
 	while (list.length > MAX_PER_NOTEBOOK) {
@@ -435,19 +524,6 @@ export function createCheckpoint(
 	}
 	enforceOutputBudget(store, cp.id);
 	scheduleWrite();
-	// A sidecar on disk that the index does not yet REFERENCE is a file
-	// `sweepOrphanOutputs` deletes on the next start - so between the synchronous
-	// sidecar write and the 250ms debounced index write there is a window in which a
-	// SIGKILL makes a destruction durable and its undo record not merely lost but
-	// actively erased. Flushing the index synchronously closes it, and it is scoped to
-	// the DESTRUCTIVE tier because that is the only tier with such a window: a
-	// recoverable-tier checkpoint destroys nothing, so it keeps the ordinary debounced
-	// write rather than paying a synchronous whole-file index write on the
-	// highest-frequency action there is. Where it does run it is proportionate - this
-	// path has just done a synchronous whole-file write of the outputs themselves, so
-	// one small index write beside it is a rounding error - and a checkpoint that
-	// stored NO sidecar has nothing a sweep could delete.
-	if (tier === 'destructive' && cp.outputsStored) flush();
 	publishGlobal({ type: 'checkpoints:changed', nb: resolveNotebookPath(nb) });
 	return metaOf(cp);
 }
@@ -562,20 +638,26 @@ export function autoCheckpointBeforeAgentAction(nb?: string | null): CheckpointM
 	if (dueByCount || dueByTime) {
 		actionsSinceCheckpoint.set(key, 0); // reset → exactly one checkpoint per N actions
 		lastAutoCheckpointAt.set(key, now);
-		return createCheckpoint(nb, { trigger: 'agent', tier: 'recoverable' });
+		return createCheckpoint(nb, { trigger: 'agent', retention: 'capped' });
 	}
 	actionsSinceCheckpoint.set(key, count);
 	return null;
 }
 
 /**
- * Snapshot before a DESTRUCTIVE agent action - one that deletes saved outputs -
- * and NEVER throttle it, NEVER cap its outputs, and flush its index entry
- * synchronously. All three follow from the one fact that what this tier overwrites
- * cannot be produced again (see the header); the recoverable tier gets the opposite
- * of all three for the same reason. Returns the checkpoint's metadata; the caller reads
+ * Snapshot before a DESTRUCTIVE agent action and NEVER throttle it. That much is
+ * unconditional: what such an action overwrites cannot be produced again, so the
+ * position of the call in the agent's action sequence may not decide whether it is
+ * recoverable. Returns the checkpoint's metadata; the caller reads
  * `outputsTruncated` to decide whether the action it is about to take is
  * recoverable (see the tiers in the header).
+ *
+ * `retention` is the SECOND, independent question - how hard this snapshot works to
+ * keep its outputs - and it is REQUIRED so that every caller states its answer
+ * rather than inheriting one by omission. `guaranteed` for an action that deletes
+ * saved outputs; `capped` for one that destroys only sources or structure, which
+ * still may not be throttled but has no outputs of its own to preserve. See
+ * `OutputRetention` for why the two questions cannot be collapsed.
  *
  * Deliberately does NOT touch the throttle counters, in either direction. Reading
  * them would make a destructive action's snapshot depend on how many runs preceded
@@ -590,10 +672,10 @@ export function autoCheckpointBeforeAgentAction(nb?: string | null): CheckpointM
  * nothing was changed. See `createCheckpoint`.
  */
 export function checkpointBeforeDestructiveAgentAction(
-	nb?: string | null,
-	{ abandonIfOutputsLost = false }: { abandonIfOutputsLost?: boolean } = {}
+	nb: string | null | undefined,
+	{ retention, abandonIfOutputsLost = false }: { retention: OutputRetention; abandonIfOutputsLost?: boolean }
 ): CheckpointMeta {
-	return createCheckpoint(nb, { trigger: 'agent', abandonIfOutputsLost, tier: 'destructive' });
+	return createCheckpoint(nb, { trigger: 'agent', abandonIfOutputsLost, retention });
 }
 
 /** Find a stored checkpoint (with its cells) by id, or null. */
@@ -651,18 +733,33 @@ function scheduleWrite(): void {
 	if (typeof writeTimer.unref === 'function') writeTimer.unref();
 }
 
-function flush(): void {
+/**
+ * Write the index now. Returns whether the store is on disk - true when the write
+ * succeeded, and true when there was nothing pending.
+ *
+ * `dirty` is cleared only AFTER a successful write. Cleared before it, as this used
+ * to, a FAILED write was indistinguishable from a successful one: the exit hook's own
+ * `flush` then returned early and the entry never reached disk by any route. The
+ * verdict is returned because the `guaranteed` path acts on it - there an index entry
+ * that never lands is an undo record the next start's orphan sweep deletes - while
+ * the ordinary debounced path still swallows the failure, as it always has, because
+ * that path destroys nothing.
+ */
+function flush(): boolean {
 	if (writeTimer) {
 		clearTimeout(writeTimer);
 		writeTimer = null;
 	}
-	if (!dirty || cache === null) return;
-	dirty = false;
+	if (!dirty || cache === null) return true;
 	try {
 		const p = storePath();
 		mkdirSync(dirname(p), { recursive: true });
 		writeFileSync(p, JSON.stringify(cache, null, 2) + '\n');
-	} catch {}
+	} catch {
+		return false;
+	}
+	dirty = false;
+	return true;
 }
 
 function installExitHook(): void {

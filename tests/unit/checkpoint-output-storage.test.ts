@@ -189,7 +189,7 @@ describe('the per-snapshot cap and the synchronous index write belong to ONE tie
 			'and nothing was flushed synchronously - this tier destroys nothing'
 		).toBe(false);
 
-		const destructive = cp.checkpointBeforeDestructiveAgentAction(target);
+		const destructive = cp.checkpointBeforeDestructiveAgentAction(target, { retention: 'guaranteed' });
 		expect(destructive.outputsTruncated, 'the destructive tier is uncapped').toBe(false);
 		expect(sidecars(ws), 'the same outputs, this time stored').toHaveLength(1);
 		// ...and its undo record is on disk before the destruction it protects is.
@@ -237,7 +237,7 @@ describe('a dropped checkpoint takes its sidecar with it', () => {
 		// does.
 		const { ws, cp, nb } = await freshWorkspace();
 		const { target, cellId } = notebookWithOutput(nb, 'unflushed.ipynb', 'still recoverable');
-		const snap = cp.checkpointBeforeDestructiveAgentAction(target);
+		const snap = cp.checkpointBeforeDestructiveAgentAction(target, { retention: 'guaranteed' });
 		expect(sidecars(ws)).toHaveLength(1);
 
 		// No `waitForFlush()`: the whole point is that the index is already on disk.

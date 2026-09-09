@@ -96,7 +96,7 @@ describe('auto-checkpoint throttles by agent-action count', () => {
 
 		// Positions 2..(N+2) - every one inside a batch the throttle would have skipped.
 		for (let i = 0; i < N + 1; i++) {
-			expect(cp.checkpointBeforeDestructiveAgentAction(path), `destructive action ${i}`).toBeTruthy();
+			expect(cp.checkpointBeforeDestructiveAgentAction(path, { retention: 'guaranteed' }), `destructive action ${i}`).toBeTruthy();
 		}
 		expect(cp.listCheckpoints(path).length - before).toBe(N + 1);
 	});
@@ -113,7 +113,7 @@ describe('auto-checkpoint throttles by agent-action count', () => {
 
 		expect(cp.autoCheckpointBeforeAgentAction(path)).not.toBeNull(); // action 1 of N
 		// A pile of destructive actions in the middle of that batch...
-		for (let i = 0; i < 10; i++) cp.checkpointBeforeDestructiveAgentAction(path);
+		for (let i = 0; i < 10; i++) cp.checkpointBeforeDestructiveAgentAction(path, { retention: 'guaranteed' });
 		// ...leaves the recoverable tier exactly where it was: the N-1 actions after a
 		// snapshot are skipped and the next one is due. If the destructive path had
 		// reset the counter, the very next call would be "action 1" again and snapshot;

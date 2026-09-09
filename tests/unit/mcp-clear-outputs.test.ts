@@ -20,7 +20,7 @@
  * the python dataflow subprocess.
  */
 import { describe, it, expect, beforeAll, vi } from 'vitest';
-import { chmodSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
@@ -838,5 +838,149 @@ describe('every destructive tool description holds the four honesty facts inside
 		expect(desc).toMatch(/undo restores the cells WITH their outputs/);
 		expect(desc).toMatch(/REFUSED before deleting anything/);
 		expect(desc).toMatch(/allow_unrecoverable/);
+	});
+});
+
+describe('delete_cells answers the tier\'s TWO questions separately', () => {
+	/**
+	 * A delete is never throttled WHATEVER the cells hold - it destroys the cell's
+	 * SOURCE, which may exist in no other snapshot if the cell was created inside the
+	 * current throttle batch - but it only pays the uncapped sidecar and the
+	 * synchronous index flush when a cell it removes really carries outputs. Its two
+	 * siblings (`set_cell_type`, `consolidate_imports`) destroy NOTHING when their own
+	 * guard is false, so for them both answers fall together; delete is the one caller
+	 * where they come apart, which is why the tests below drive both axes against ONE
+	 * notebook shape and let only the deleted cell's outputs differ.
+	 */
+	const BIG = 'y'.repeat(1_600_000); // 2 cells => ~3.2 MB, past MAX_SNAPSHOT_BYTES
+
+	/** Two cells carrying far more output than the capped tier will store, plus one more. */
+	function heavyNotebook(name: string, tailOutput: string | null): { target: string; tailId: string } {
+		const target = abs(name);
+		nbmod.createNotebook(name);
+		for (let i = 0; i < 2; i++) {
+			const c = nbmod.addCell(null, 'code', target, null, `heavy = ${i}`);
+			nbmod.setOutputs(c.id, out(`${BIG}\n`), target);
+		}
+		const tail = nbmod.addCell(null, 'code', target, null, 'tail = 1');
+		if (tailOutput !== null) nbmod.setOutputs(tail.id, out(tailOutput), target);
+		return { target, tailId: tail.id };
+	}
+
+	// Tolerates an absent directory so this block does not depend on an earlier test
+	// having minted the first sidecar.
+	const sidecarCount = () => {
+		const dir = join(WS, '.cellar', 'checkpoints');
+		return existsSync(dir) ? readdirSync(dir).length : 0;
+	};
+	const agentSnapshots = (target: string) => cpmod.listCheckpoints(target).filter((c) => c.trigger === 'agent');
+
+	it('snapshots an output-LESS delete mid-batch without storing the notebook\'s unrelated outputs', () => {
+		const { target, tailId } = heavyNotebook('delete-sources-only.ipynb', null);
+		// Walk into the middle of a throttle batch: action 1 snapshots, the next two are
+		// exactly the ones the recoverable tier folds into it.
+		expect(cpmod.autoCheckpointBeforeAgentAction(target), 'action 1 always snapshots').not.toBeNull();
+		expect(cpmod.autoCheckpointBeforeAgentAction(target), 'action 2 is folded in').toBeNull();
+		expect(cpmod.autoCheckpointBeforeAgentAction(target), 'action 3 is folded in').toBeNull();
+
+		const before = agentSnapshots(target).length;
+		const sidecarsBefore = sidecarCount();
+		expect(svc.removeCells([tailId], target)).toMatchObject({ ok: true, count: 1 });
+
+		// AXIS (a): never throttled. The delete took its own snapshot even though the
+		// recoverable tier would have skipped this position...
+		expect(agentSnapshots(target).length - before, 'the delete snapshotted itself').toBe(1);
+
+		// AXIS (b): it destroyed no outputs, so it did NOT stringify and write the
+		// notebook's 3.2 MB of unrelated results. Same notebook, same volume - only the
+		// deleted cell's outputs differ from the test below.
+		expect(sidecarCount(), 'no sidecar for outputs this call never touched').toBe(sidecarsBefore);
+		expect(agentSnapshots(target)[0].outputsTruncated, 'capped, and it says so').toBe(true);
+
+		// ...and that same snapshot is what brings the deleted SOURCE back, which is the
+		// whole reason a delete may not be throttled.
+		expect(nbmod.listCells(target).some((c) => c.id === tailId)).toBe(false);
+		expect(cpmod.undoLastAgentAction(target).ok).toBe(true);
+		expect(nbmod.listCells(target).find((c) => c.id === tailId)?.source).toBe('tail = 1');
+	});
+
+	it('stores the outputs when the deleted cell really carries them, and undo returns them', () => {
+		const { target, tailId } = heavyNotebook('delete-with-outputs.ipynb', 'the results\n');
+		const sidecarsBefore = sidecarCount();
+		const r = svc.removeCells([tailId], target);
+		expect(r).toMatchObject({ ok: true, count: 1 });
+		expect(r).not.toHaveProperty('undo');
+		// The same notebook shape as above, and this time the sidecar IS written -
+		// uncapped, so the notebook's 3.2 MB rides along rather than being dropped.
+		expect(sidecarCount(), 'the deleted outputs were stored').toBe(sidecarsBefore + 1);
+
+		expect(cpmod.undoLastAgentAction(target).ok).toBe(true);
+		const back = nbmod.listCells(target).find((c) => c.id === tailId);
+		expect(back?.source).toBe('tail = 1');
+		expect((back?.outputs?.[0] as { text?: string })?.text, 'the cell came back WITH its results').toBe('the results\n');
+	});
+});
+
+describe('an index write that never lands is treated as an unrecoverable checkpoint', () => {
+	/**
+	 * The sidecar is written synchronously and so is the destruction it protects, so a
+	 * `guaranteed` snapshot flushes its index entry synchronously too - an entry that
+	 * never reaches disk leaves the sidecar an orphan the next start's sweep DELETES,
+	 * which is the sidecar-unwritable case with the same user-visible consequence. It
+	 * therefore takes the same refusal and the same waiver rather than failing
+	 * invisibly at the one moment durability matters.
+	 */
+	function withUnwritableIndex<T>(target: string, fn: () => T): T {
+		// Force the sidecar directory into existence and leave it WRITABLE: the point
+		// is that the outputs land and only the reference to them does not.
+		cpmod.createCheckpoint(target, { trigger: 'manual' });
+		const index = join(WS, '.cellar', 'checkpoints.json');
+		writeFileSync(index, '{}');
+		chmodSync(index, 0o400);
+		try {
+			return fn();
+		} finally {
+			chmodSync(index, 0o600);
+		}
+	}
+
+	it.skipIf(!chmodBlocksWrites)('REFUSES before clearing, and leaves no orphaned sidecar behind', () => {
+		const target = abs('index-unwritable.ipynb');
+		nbmod.createNotebook('index-unwritable.ipynb');
+		for (let i = 0; i < 2; i++) {
+			const c = nbmod.addCell(null, 'code', target, null, `a = ${i}`);
+			nbmod.setOutputs(c.id, out('keep me\n'), target);
+		}
+		withUnwritableIndex(target, () => {
+			const sidecarsBefore = readdirSync(join(WS, '.cellar', 'checkpoints')).length;
+			const agentsBefore = cpmod.listCheckpoints(target).filter((c) => c.trigger === 'agent').length;
+
+			const r = svc.clearOutputs(undefined, target);
+			expect(r).toMatchObject({ ok: false, refused: 'outputs_unrecoverable' });
+			expect(r.ok === false && 'reason' in r && r.reason).toMatch(/nothing was changed/i);
+			expect(r.ok === false && 'reason' in r && r.reason).toMatch(/allow_unrecoverable/);
+
+			// Nothing destroyed, nothing committed, and the sidecar the abandoned
+			// snapshot had already written is gone rather than left for the sweep.
+			expect(withOutputs(target)).toEqual([1, 2]);
+			expect(cpmod.listCheckpoints(target).filter((c) => c.trigger === 'agent')).toHaveLength(agentsBefore);
+			expect(readdirSync(join(WS, '.cellar', 'checkpoints')).length).toBe(sidecarsBefore);
+		});
+	});
+
+	it.skipIf(!chmodBlocksWrites)('proceeds on the waiver, keeping an undo record that works in this process', () => {
+		const target = abs('index-unwritable-waived.ipynb');
+		nbmod.createNotebook('index-unwritable-waived.ipynb');
+		const cell = nbmod.addCell(null, 'code', target, null, 'a = 0');
+		nbmod.setOutputs(cell.id, out('gone\n'), target);
+		withUnwritableIndex(target, () => {
+			expect(svc.clearOutputs(undefined, target, { allowUnrecoverable: true })).toMatchObject({ ok: true, count: 1 });
+			expect(withOutputs(target)).toEqual([]);
+			// The entry was KEPT, not abandoned: only the reference's DURABILITY was
+			// waived, so undo still works here and only a crash before the retry lands
+			// would lose it.
+			expect(cpmod.undoLastAgentAction(target).ok).toBe(true);
+			expect((nbmod.listCells(target).find((c) => c.id === cell.id)?.outputs?.[0] as { text?: string })?.text).toBe('gone\n');
+		});
 	});
 });
