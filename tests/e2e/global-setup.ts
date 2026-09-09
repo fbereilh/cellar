@@ -20,8 +20,17 @@
  */
 import { ensureFreshBuild } from '../../scripts/ensure-build.js';
 
-export default function globalSetup(): void {
-	const outcome = ensureFreshBuild();
+/**
+ * Playwright calls this with its resolved config, which this hook has no use for.
+ * The second parameter is the `ensureFreshBuild` options seam: it lets a unit test
+ * drive BOTH branches against a fixture repo rather than the real checkout, so the
+ * abort is pinned as behaviour instead of as a shape in this file's source.
+ */
+export default function globalSetup(
+	_config?: unknown,
+	opts?: { repo?: string; log?: (msg: string) => void }
+): void {
+	const outcome = ensureFreshBuild(opts);
 	if (!outcome.ok) {
 		// Thrown, not logged: an aborted run says why on line one, where a run that
 		// went ahead and failed 300 assertions never would.

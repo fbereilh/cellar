@@ -85,7 +85,11 @@ describe('buildFreshness', () => {
 
 		const result = buildFreshness(repo);
 		expect(result.state).toBe('missing');
-		expect(missingReason(repo, result)).toContain('build/client');
+		// The ARTIFACT, not a path string, is what tells the two cases apart: naming
+		// it is the only separator-independent way to ask "was anything built at all".
+		expect(result.missingArtifact).toBe('client');
+		expect(missingReason(repo, result)).toMatch(/incomplete/i);
+		expect(missingReason(repo, result)).toMatch(/client/);
 	});
 
 	it('reports fresh when the build is newer than every source', () => {
@@ -160,7 +164,39 @@ describe('buildFreshness', () => {
 		writeAt(join(repo, 'src', 'lib', 'a.ts'), 'export const a = 1;', OLD);
 		const result = buildFreshness(repo);
 		expect(result.state).toBe('missing');
+		expect(result.missingArtifact).toBe('index.js');
 		expect(missingReason(repo, result)).toContain('build/index.js');
+		// NOTHING BUILT must not be reported as PART-WAY BUILT: the two send the
+		// reader to different places, and "incomplete" points at build/index.js,
+		// which in that case does not exist at all. This is the direction the
+		// verdicts silently inverted in whenever the platform separator is not `/`.
+		expect(missingReason(repo, result)).not.toMatch(/incomplete/i);
+	});
+
+	it('tells the two absences apart from the ARTIFACT, not from how the path is spelled', () => {
+		// The verdict may not be re-derived by string-matching a joined path against
+		// `build/index.js`: on Windows the missing artifact's path is spelled
+		// `build\index.js`, so a wholly absent build read as an incomplete one — and
+		// "incomplete" then points the reader at build/index.js, which is precisely
+		// the file that is not there. Modelled by handing over the Windows spelling
+		// on any platform; the artifact decides, so the verdict does not move.
+		const windowsSpelling = `${repo}\\build\\index.js`;
+		expect(
+			missingReason(repo, {
+				state: 'missing',
+				buildEntry: windowsSpelling,
+				missing: windowsSpelling,
+				missingArtifact: 'index.js'
+			})
+		).toMatch(/no production build found/);
+		expect(
+			missingReason(repo, {
+				state: 'missing',
+				buildEntry: '',
+				missing: `${repo}\\build\\client`,
+				missingArtifact: 'client'
+			})
+		).toMatch(/incomplete/i);
 	});
 
 	it('reports unknown for a packaged release install even when a shipped src file is newer', () => {

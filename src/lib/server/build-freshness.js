@@ -49,6 +49,9 @@ const SKIP_DIRS = new Set(['node_modules', '.git', '.svelte-kit', 'build']);
  */
 const REQUIRED_BUILD_ARTIFACTS = ['index.js', 'client'];
 
+/** The entry point itself: its absence means NOTHING was built, not a part-way build. */
+const BUILD_ENTRY_ARTIFACT = 'index.js';
+
 /** Escape hatch for anyone who knowingly wants the stale build served anyway. */
 export const SKIP_ENV = 'CELLAR_SKIP_BUILD_CHECK';
 
@@ -132,10 +135,13 @@ function isSourceCheckout(repo) {
  *
  * @param {string} repo absolute path to the cellar checkout / install root
  * @returns {{ state: 'missing'|'stale'|'fresh'|'unknown', buildEntry: string,
- *             missing?: string, newest?: string, buildMs?: number, newestMs?: number }}
+ *             missing?: string, missingArtifact?: string, newest?: string,
+ *             buildMs?: number, newestMs?: number }}
  *
  * `missing` covers an ABSENT build and an INCOMPLETE one alike (see
- * REQUIRED_BUILD_ARTIFACTS); `missing` names the first artifact that is absent.
+ * REQUIRED_BUILD_ARTIFACTS); `missing` names the first artifact that is absent
+ * and `missingArtifact` is its entry in that list, which is what tells the two
+ * cases apart WITHOUT re-deriving them from a path string.
  *
  * `unknown` means there is nothing meaningful to compare against — a packaged
  * install (npm/brew/Docker), where "stale" is not answerable and must never block
@@ -146,7 +152,7 @@ export function buildFreshness(repo) {
 	for (const artifact of REQUIRED_BUILD_ARTIFACTS) {
 		const full = join(repo, 'build', artifact);
 		if (!existsSync(full)) {
-			return { state: 'missing', buildEntry, missing: full };
+			return { state: 'missing', buildEntry, missing: full, missingArtifact: artifact };
 		}
 	}
 
@@ -185,12 +191,27 @@ export function buildFreshness(repo) {
 	return { state: 'stale', buildEntry, newest: newest.path, buildMs, newestMs: newest.mtimeMs };
 }
 
-/** Human-readable "what is absent", with the repo-relative missing artifact. */
+/**
+ * Human-readable "what is absent", with the repo-relative missing artifact.
+ *
+ * NOTHING BUILT and PART-WAY BUILT are different facts and must read differently:
+ * the whole point of naming the artifact is that for a `vite build` killed mid-way
+ * `build/index.js` is sitting right there, so pointing the reader at it wastes
+ * their time. Which case this is turns on the ARTIFACT (`missingArtifact`, an entry
+ * of REQUIRED_BUILD_ARTIFACTS), never on comparing a platform-joined path against
+ * a POSIX literal — `relative()` yields `build\index.js` on Windows, so a
+ * string-shaped test inverted the two verdicts there and reported a wholly absent
+ * build as an incomplete one. A result carrying no artifact (a hand-built one) is
+ * matched by path identity against the entry point, so the fallback is decided the
+ * same way rather than by separator luck.
+ */
 export function missingReason(repo, result) {
-	const rel = result.missing ? relative(repo, result.missing) || result.missing : 'build/index.js';
-	return rel === 'build/index.js'
-		? 'no production build found (build/index.js is absent)'
-		: `the production build is incomplete — ${rel} is absent`;
+	const entryMissing = result.missingArtifact
+		? result.missingArtifact === BUILD_ENTRY_ARTIFACT
+		: !result.missing || result.missing === join(repo, 'build', BUILD_ENTRY_ARTIFACT);
+	if (entryMissing) return `no production build found (build/${BUILD_ENTRY_ARTIFACT} is absent)`;
+	const rel = relative(repo, result.missing) || result.missing;
+	return `the production build is incomplete — ${rel} is absent`;
 }
 
 /** Human-readable "why is this stale", with the repo-relative offending file. */

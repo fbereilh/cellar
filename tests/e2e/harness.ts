@@ -37,7 +37,7 @@ export function runtimeAvailable(): boolean {
  * systemic boot failure is paid once per file. `CELLAR_E2E_BOOT_TIMEOUT_MS` raises
  * it for a genuinely cold uv cache, which is a one-time per-machine cost.
  */
-const BOOT_TIMEOUT_MS = Number(process.env.CELLAR_E2E_BOOT_TIMEOUT_MS) || 60_000;
+export const BOOT_TIMEOUT_MS = Number(process.env.CELLAR_E2E_BOOT_TIMEOUT_MS) || 60_000;
 
 /**
  * Say WHY a boot failed, at the assertion, not only in interleaved stdout.
@@ -47,13 +47,17 @@ const BOOT_TIMEOUT_MS = Number(process.env.CELLAR_E2E_BOOT_TIMEOUT_MS) || 60_000
  * rejection and nothing else. So the failure carries the build verdict (the
  * commonest cause by far - see tests/e2e/global-setup.ts) plus the tail of what
  * the launcher actually said.
+ *
+ * A pure function of (output, repo), and exported for that reason: what it CLAIMS
+ * about a build is the part worth pinning, and a unit test can drive it against a
+ * fixture repo without booting anything.
  */
-function bootDiagnostic(output: string): string {
+export function bootDiagnostic(output: string, repo: string = REPO): string {
 	const parts: string[] = [];
-	const freshness = buildFreshness(REPO);
-	if (freshness.state === 'missing') parts.push(missingReason(REPO, freshness));
+	const freshness = buildFreshness(repo);
+	if (freshness.state === 'missing') parts.push(missingReason(repo, freshness));
 	else if (freshness.state === 'stale')
-		parts.push(`the production build is STALE (${stalenessReason(REPO, freshness)})`);
+		parts.push(`the production build is STALE (${stalenessReason(repo, freshness)})`);
 	if (parts.length) parts.push('run `npm run build`');
 	const tail = output.trim().split('\n').slice(-8).join('\n');
 	return (
@@ -118,7 +122,15 @@ export function bootCellar(
 
 	return new Promise((resolvePromise, reject) => {
 		let buf = '';
+		// The exit handler stays wired for the whole life of the launcher - it is what
+		// reports one that dies before printing its URL - so it MUST NOT do work once
+		// the boot has settled: `killCellar` at teardown fires it after a perfectly
+		// good boot, and bootDiagnostic() walks src/ and static/ to build an Error
+		// that `reject` then discards on an already-resolved promise.
+		let settled = false;
 		const fail = (what: string) => {
+			if (settled) return;
+			settled = true;
 			clearTimeout(timer);
 			reject(new Error(`${what}${bootDiagnostic(buf)}`));
 		};
@@ -135,7 +147,8 @@ export function bootCellar(
 			buf += s;
 			process.stdout.write(`[cellar-e2e] ${s}`);
 			const m = buf.match(/app → (http:\/\/localhost:\d+)/);
-			if (m) {
+			if (m && !settled) {
+				settled = true;
 				clearTimeout(timer);
 				resolvePromise({ proc, url: m[1] });
 			}

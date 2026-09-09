@@ -11,16 +11,23 @@
  * spec took 65s all-fail versus 2.5s all-pass).
  *
  * These pin the behaviour of the shared guard plus the wiring that decides WHERE
- * it runs. The wiring half is source-shaped on purpose: playwright's config is not
- * loadable here, and e2e is deliberately absent from both CI and the no-mistakes
- * gate, so a unit-level assertion is the only thing that sees a regression.
+ * it runs, and e2e is deliberately absent from both CI and the no-mistakes gate, so
+ * a unit-level assertion is the only thing that sees a regression here. Everything
+ * that CAN be driven is driven: playwright's config, its `globalSetup` module and
+ * the harness are all ordinary importable modules, so the wiring is asserted by
+ * calling it against a fixture repo rather than by grepping for a shape. The one
+ * exception is the launcher's own message, which lives inside a CLI with no
+ * importable seam.
  */
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync, readFileSync, utimesSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { ensureFreshBuild } from '../../scripts/ensure-build.js';
+import globalSetup from '../../tests/e2e/global-setup';
+import { bootDiagnostic, BOOT_TIMEOUT_MS } from '../../tests/e2e/harness';
+import playwrightConfig from '../../playwright.config';
 
 const REPO = resolve(fileURLToPath(import.meta.url), '../../..');
 const read = (rel: string) => readFileSync(join(REPO, rel), 'utf8');
@@ -91,11 +98,40 @@ describe('ensureFreshBuild', () => {
 	});
 });
 
+/**
+ * Fixture builders, so each wiring case states the build state it is about.
+ * `build: 'exit 3'` throughout: a rebuild attempt is then visible as a failure,
+ * which is what proves the fresh path never spawns one.
+ */
+function fixtureFresh(): string {
+	writeAt(join(repo, 'package.json'), JSON.stringify({ scripts: { build: 'exit 3' } }), OLD);
+	writeAt(join(repo, 'src', 'a.ts'), 'export const a = 1;', OLD);
+	freezeSrc(OLD);
+	writeAt(join(repo, 'build', 'index.js'), '// built', NEW);
+	return repo;
+}
+function fixtureIncomplete(): string {
+	fixtureFresh();
+	rmSync(join(repo, 'build', 'client'), { recursive: true, force: true });
+	return repo;
+}
+function fixtureStale(): string {
+	writeAt(join(repo, 'package.json'), JSON.stringify({ scripts: { build: 'exit 3' } }), OLD);
+	writeAt(join(repo, 'build', 'index.js'), '// built', OLD);
+	writeAt(join(repo, 'src', 'a.ts'), 'export const a = 1;', NEW);
+	return repo;
+}
+
 describe('where the guard is wired', () => {
-	it('playwright runs it in globalSetup, so a bare `npx playwright test` cannot skip it', () => {
-		expect(read('playwright.config.ts')).toMatch(
-			/globalSetup:\s*'\.\/tests\/e2e\/global-setup\.ts'/
-		);
+	it('playwright runs the guard module in globalSetup, so a bare `npx playwright test` cannot skip it', async () => {
+		// The config's own value, resolved and imported: proves it names a real
+		// module, and that the module is the very one whose abort behaviour the
+		// cases below drive. A source grep would pass for a commented-out line.
+		const named = playwrightConfig.globalSetup;
+		expect(typeof named).toBe('string');
+		const mod = await import(pathToFileURL(resolve(REPO, String(named))).href);
+		expect(typeof mod.default).toBe('function');
+		expect(mod.default).toBe(globalSetup);
 	});
 
 	it('is not ALSO an npm hook — one guard, not two walks per `npm run test:e2e`', () => {
@@ -103,32 +139,76 @@ describe('where the guard is wired', () => {
 	});
 
 	it('globalSetup ABORTS the run when the build cannot be made good', () => {
-		const src = read('tests/e2e/global-setup.ts');
-		expect(src).toContain('ensureFreshBuild(');
 		// Thrown, not logged: an aborted run says why on line one, where a run that
-		// went ahead and failed 300 assertions never would.
-		expect(src).toMatch(/if\s*\(!outcome\.ok\)[\s\S]{0,200}throw new Error/);
+		// went ahead and failed 300 assertions never would. And the reason names the
+		// CAUSE plus the fix, not just "the build failed".
+		let thrown: unknown = null;
+		try {
+			globalSetup(undefined, { repo: fixtureIncomplete(), log: () => {} });
+		} catch (err) {
+			thrown = err;
+		}
+		expect(thrown).toBeInstanceOf(Error);
+		const message = (thrown as Error).message;
+		expect(message).toMatch(/incomplete/i);
+		expect(message).toContain('build/client');
+		expect(message).toContain('npm run build');
+	});
+
+	it('globalSetup lets a fresh build through without spawning a rebuild', () => {
+		expect(() => globalSetup(undefined, { repo: fixtureFresh(), log: () => {} })).not.toThrow();
+	});
+
+	it('a failed boot names the BUILD, not just the exit code', () => {
+		// The whole point of the diagnostic: `launcher exited early (1)` on its own
+		// sends the reader into the launcher's source, while the build verdict says
+		// what to do. The incomplete case is the one that matters most — the entry
+		// point is present, so the launcher boots and the failure looks unrelated.
+		const said = bootDiagnostic('[cellar] workspace: /tmp/ws\nboom\n', fixtureIncomplete());
+		expect(said).toMatch(/incomplete/i);
+		expect(said).toContain('build/client');
+		expect(said).toContain('npm run build');
+		expect(said).toContain('boom');
+	});
+
+	it('a failed boot names a STALE build too', () => {
+		const said = bootDiagnostic('boom\n', fixtureStale());
+		expect(said).toMatch(/STALE/);
+		expect(said).toContain('src');
+	});
+
+	it('claims nothing about the build when the build is fine, and still quotes the launcher', () => {
+		// Over-reporting is the failure mode here: a boot that died for its own
+		// reasons must not be blamed on a build that is provably good.
+		const lines = Array.from({ length: 12 }, (_, i) => `line-${i + 1}`).join('\n');
+		const said = bootDiagnostic(lines, fixtureFresh());
+		expect(said).not.toMatch(/build:/);
+		// The TAIL, so a launcher that talked for a whole spec file does not bury it.
+		expect(said).toContain('line-12');
+		expect(said).not.toContain('line-1\n');
+	});
+
+	it('bounds the launcher boot at 60s, and lets a cold machine raise it', async () => {
+		expect(BOOT_TIMEOUT_MS).toBe(60_000);
+		vi.stubEnv('CELLAR_E2E_BOOT_TIMEOUT_MS', '120000');
+		vi.resetModules();
+		try {
+			const reloaded = await import('../../tests/e2e/harness');
+			expect(reloaded.BOOT_TIMEOUT_MS).toBe(120_000);
+		} finally {
+			vi.unstubAllEnvs();
+			vi.resetModules();
+		}
 	});
 
 	it('the launcher names the ABSENT artifact, not a file that is sitting right there', () => {
-		// `missing` covers absent AND incomplete alike, so assertUsableBuild has to
-		// report through missingReason(): for a `vite build` killed part-way,
-		// build/index.js exists, and the old "production build not found at
-		// <buildEntry>" sent the reader looking at a file that is present.
+		// `assertUsableBuild` lives inside the CLI, which runs on import and resolves
+		// its repo from its own location, so there is no seam to drive: this is the
+		// one source-shaped check here. What it guards is that the launcher routes
+		// through missingReason() — whose two messages ARE driven, in
+		// tests/unit/build-freshness.test.ts.
 		const src = read('bin/cellar.js');
 		expect(src).toMatch(/missingReason\(REPO, freshness\)/);
 		expect(src).not.toMatch(/production build not found at \$\{freshness\.buildEntry\}/);
-	});
-
-	it('bounds the launcher boot and says WHY it failed', () => {
-		const src = read('tests/e2e/harness.ts');
-		// A bound, not the old bare 90_000 literal, and overridable for a cold cache.
-		expect(src).toMatch(/BOOT_TIMEOUT_MS\s*=\s*Number\(process\.env\.CELLAR_E2E_BOOT_TIMEOUT_MS\)/);
-		expect(src).toMatch(/\|\|\s*60_000/);
-		expect(src).not.toContain('90_000');
-		// Both failure paths (timeout AND early exit) carry the diagnostic: the
-		// build verdict plus the tail of what the launcher actually said.
-		expect(src).toMatch(/bootDiagnostic\(buf\)/);
-		expect(src).toMatch(/proc\.on\('exit',\s*\(code\)\s*=>\s*fail\(/);
 	});
 });
