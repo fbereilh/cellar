@@ -318,16 +318,36 @@ test('an env-FORCED runtime says the environment controls it and offers no Apply
 	await page.request.put(`${baseURL}/api/ui-state`, { data: { 'cellar-databricks-runtime': null } });
 });
 
+/**
+ * Forget the persisted tab session, so a test starts from an empty tab set.
+ *
+ * The key is read back from the store rather than rebuilt here: it is
+ * `cellar-tabs:<workspace>` and the workspace the server reports need not be the
+ * `mkdtemp` string this file holds (macOS resolves `/var` through `/private`).
+ */
+async function clearTabSession(page: Page): Promise<void> {
+	const state = await (await page.request.get(`${baseURL}/api/ui-state`)).json();
+	const cleared: Record<string, null> = {};
+	for (const key of Object.keys(state ?? {})) if (key.startsWith('cellar-tabs:')) cleared[key] = null;
+	if (Object.keys(cleared).length) await page.request.put(`${baseURL}/api/ui-state`, { data: cleared });
+}
+
 test('with no notebook open, Apply now is disabled and says so - never a silent no-op', async ({ page }) => {
 	await page.request.put(`${baseURL}/api/ui-state`, { data: { 'cellar-databricks-runtime': true } });
 	await mockDatabricksStatus(page, connectedStatus()); // pending: kernel started, no live runtime
 	await page.goto(`${baseURL}/?ws=${encodeURIComponent(workspace)}`);
 	// Deliberately leave NO notebook open: the sidebar then has no active notebook
 	// path, which is what makes the restart a no-op. The tab session is persisted
-	// per workspace SERVER-side, so an earlier test's notebook can be restored here -
-	// close whatever came back rather than assuming a clean slate.
-	const closers = page.getByTestId('tab-close');
-	for (let i = 0; i < 8 && (await closers.count()) > 0; i++) await closers.first().click();
+	// per workspace SERVER-side, so an earlier test's notebook is restored here and
+	// has to be forgotten first.
+	//
+	// Forgotten through the STORE, not by clicking the close buttons: that loop read
+	// a count, clicked `first()`, then re-read - racing the tab removal against its
+	// own persist, and capped at 8 besides. It held on a fast machine and failed on
+	// Linux CI, where it left a tab open and burned the full timeout on an empty
+	// state that could never come. (Same helper as toolbar-consolidate-imports.)
+	await clearTabSession(page);
+	await page.reload();
 	await expect(page.getByTestId('empty-state')).toBeVisible();
 	await openDatabricksSection(page);
 
