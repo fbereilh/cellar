@@ -52,6 +52,7 @@
 		isSqlCell,
 		isRawCell,
 		isChatCell,
+		codeTypeMenuLabel,
 		isMojoCell,
 		isPythonCodeCell,
 		offersCellType,
@@ -1219,7 +1220,12 @@
 	// The `code` option is LABELLED by the notebook's language, since that is what
 	// choosing it produces - `Mojo` in a Mojo notebook - while its VALUE stays
 	// `code`: converting a SQL cell back to an ordinary code cell is one action
-	// whatever language the notebook is written in.
+	// whatever language the notebook is written in. The label comes from the shared,
+	// unit-tested `codeTypeMenuLabel`, which takes the NOTEBOOK language and nothing
+	// else: read from this cell's `isMojo` it was false for every markdown, raw, SQL
+	// and chat cell, so a Mojo notebook offered `Python` on exactly the cells this
+	// menu exists to convert (vitest runs without the SvelteKit plugin, so a rule
+	// left as an expression here could not be tested at all).
 	const ALL_TYPE_OPTIONS: { v: LogicalCellType; label: string; hint: string }[] = [
 		{ v: 'code', label: 'Python', hint: 'python3' },
 		{ v: 'sql', label: 'SQL', hint: 'spark.sql' },
@@ -1229,7 +1235,7 @@
 	];
 	const typeOptions = $derived(
 		ALL_TYPE_OPTIONS.filter((o) => offersCellType(o.v, isPy)).map((o) =>
-			o.v === 'code' && isMojo ? { ...o, label: 'Mojo', hint: '%%mojo' } : o
+			o.v === 'code' ? { ...o, ...codeTypeMenuLabel(notebookLanguage) } : o
 		)
 	);
 	function chooseType(type: LogicalCellType) {

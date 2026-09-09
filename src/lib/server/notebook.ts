@@ -1547,9 +1547,14 @@ export function setExportTarget(
  * language-only sibling existed briefly and was superseded the moment a refusal
  * had to tell the two nulls apart, since one resolution answers both questions
  * and a second accessor only invites a second resolution on a hot read path.
- * `language` is nullable on purpose - `docExportLanguage`'s `python` fallback is
- * the ELIGIBILITY answer and must never be read as a fact about the notebook, or
- * a refusal names a `.py` module over a notebook that targets nothing.
+ *
+ * `language` is nullable on purpose and is the SENTENCE half: it is the module a
+ * refusal may name, so with no target there is nothing to name and a null must
+ * never be defaulted into one. The ELIGIBILITY half is the separate,
+ * non-nullable `eligibility` (the NOTEBOOK's language, which `docExportLanguage`
+ * returns and nothing else) - reading `language ?? 'python'` for it answers
+ * `python` over a Mojo notebook that has no target yet, which is how the agent
+ * write surface came to refuse a mark every other surface accepted.
  */
 export function exportTargetInfoFor(nb?: string | null): ExportTargetLanguageInfo {
 	return docExportTargetInfo(docFor(nb));

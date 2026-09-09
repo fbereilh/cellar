@@ -197,6 +197,32 @@ export function isMojoCell(cell: LanguageCell, nbLang: NotebookLanguage = 'pytho
 }
 
 /**
+ * How the type menu's `code` OPTION reads, for a notebook of this language.
+ *
+ * Choosing that option produces a cell in the NOTEBOOK's language (`applyCellType`
+ * writes no tag, and an untagged code cell IS the notebook's language), so the
+ * label is a function of the notebook and of NOTHING about the cell being
+ * converted. Stated as a function taking only `NotebookLanguage` because the
+ * per-cell reading is unrepresentable that way: read from `isMojoCell(cell, ...)`
+ * instead - which is false for every markdown, raw, SQL and chat cell whatever the
+ * notebook - a Mojo notebook offered "Python / python3" on exactly the cells the
+ * menu exists to convert, i.e. it told the user the opposite of what the click did.
+ *
+ * Its VALUE stays `code` (see `LOGICAL_CELL_TYPES`): converting a SQL cell back to
+ * an ordinary code cell is one action whatever language the notebook is written in.
+ *
+ * Deliberately NOT shared with the toolbar's own type label, which is lower-case
+ * chrome describing a cell that already HAS a type, where this is a menu entry
+ * naming an action; they are two presentations and folding them together would
+ * decide one's casing from the other.
+ */
+export function codeTypeMenuLabel(nbLang: NotebookLanguage): { label: string; hint: string } {
+	return nbLang === MOJO_LANGUAGE
+		? { label: 'Mojo', hint: '%%mojo' }
+		: { label: 'Python', hint: 'python3' };
+}
+
+/**
  * True for an nbformat `raw` cell: verbatim text Cellar never executes and never
  * renders (frontmatter for Quarto/nbdev, directives for nbconvert). The ONE
  * predicate, so no surface hand-writes `cell.cell_type === 'raw'`.

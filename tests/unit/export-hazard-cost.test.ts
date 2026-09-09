@@ -239,10 +239,15 @@ describe('get_notebook_map adds no export-target resolution of its own', () => {
 	});
 
 	it('a notebook with NO target reports the language as null, never as python', async () => {
-		// The honest nullable the refusal wording rests on: eligibility falls back to
-		// `python`, the VIEW does not.
+		// The honest nullable the refusal wording rests on: it reports the MODULE, and
+		// there is none. ELIGIBILITY is the separate, non-nullable field beside it -
+		// the NOTEBOOK's language - so no caller has to default the null into one.
 		const { nb } = await notebook('map-none.ipynb', 'python', 'x = 1');
 		expect(nbmod.getNotebook(nb).exportLanguage).toBeNull();
-		expect(nbmod.exportTargetInfoFor(nb)).toEqual({ configured: false, language: null });
+		expect(nbmod.exportTargetInfoFor(nb)).toEqual({
+			configured: false,
+			language: null,
+			eligibility: 'python'
+		});
 	});
 });

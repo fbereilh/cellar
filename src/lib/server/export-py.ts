@@ -416,6 +416,19 @@ export interface ExportTargetLanguageInfo {
 	configured: boolean;
 	/** The module language it names, or null when it names none Cellar builds. */
 	language: ExportLanguage | null;
+	/**
+	 * WHICH language ELIGIBILITY is judged by, so a caller holding this object
+	 * cannot reach for `language ?? 'python'` and get it wrong.
+	 *
+	 * It is `docExportLanguage`, i.e. the NOTEBOOK's language, and it is
+	 * deliberately NOT nullable: eligibility always has an answer, while `language`
+	 * is null until a target names a module. Reading the nullable one for it
+	 * answers `python` over a Mojo notebook that has no target yet, so the agent
+	 * write surface refused a mark the UI, the REST route and `get_notebook_map`
+	 * all accepted. `exportEligibilityLanguage` states the same split for a caller
+	 * that has the two values loose rather than this object.
+	 */
+	eligibility: ExportLanguage;
 }
 
 export function docExportTargetInfo(
@@ -433,9 +446,10 @@ export function docExportTargetInfo(
 	// persist-driven publish, and with no notebook-level target stored the resolution
 	// sweeps EVERY cell for a `#|default_exp` directive. Defaulted, so every other
 	// caller is unchanged.
+	const eligibility = docExportLanguage(doc);
 	return resolved
-		? { configured: true, language: targetNamesModule(resolved) ? docExportLanguage(doc) : null }
-		: { configured: false, language: null };
+		? { configured: true, language: targetNamesModule(resolved) ? eligibility : null, eligibility }
+		: { configured: false, language: null, eligibility };
 }
 
 /**

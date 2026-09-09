@@ -2268,15 +2268,21 @@ export function setExportTarget(
 export function setCellExport(ids: string[], exported: boolean, nb?: string | null) {
 	const target = nb ?? getActiveNotebookPath();
 	if (isPyTextNotebook(target)) return { ok: false as const, refused: 'py-notebook' as const };
-	// Eligibility is a MATCH against the target's module language, not a fixed
-	// "is this Python" - see `exportRole`'s `canExportCell`. Kept NULLABLE here and
-	// defaulted only where eligibility is asked, and carried alongside whether a
-	// target is CONFIGURED at all: there are three states, and the refusal must be
-	// able to say which one it saw rather than naming a `.py` module the notebook
-	// does not have.
+	// Eligibility is a MATCH against the module's language, not a fixed "is this
+	// Python" - see `exportRole`'s `canExportCell` - and WHICH language that is is
+	// the NOTEBOOK's, which `ExportTargetLanguageInfo.eligibility` answers so this
+	// call site cannot choose. Defaulting the nullable `language` instead answered
+	// `python` for a Mojo notebook with no target yet, so this tool refused a
+	// `%%mojo` cell the row toggle, `PATCH /api/cells/[id]` and `get_notebook_map`
+	// all treat as eligible - one document, four surfaces, one of them disagreeing.
+	//
+	// `targetLang` stays NULLABLE and is read only by the refusal's WORDING, beside
+	// whether a target is CONFIGURED at all: there are three states, and the refusal
+	// must be able to say which one it saw rather than naming a `.py` module the
+	// notebook does not have.
 	const targetInfo = exportTargetInfoFor(target);
 	const targetLang = targetInfo.language;
-	const lang = targetLang ?? 'python';
+	const lang = targetInfo.eligibility;
 	const full: string[] = [];
 	const seen = new Set<string>();
 	for (const ref of ids) {
@@ -2482,7 +2488,10 @@ function moduleFailure(target: string, exportTarget: string | null) {
 function moduleForeign(target: string, exportTarget: string | null) {
 	if (
 		!exportTarget ||
-		!exportCellCount(listCells(target), exportTargetLanguage(exportTarget) ?? 'python') ||
+		!exportCellCount(
+			listCells(target),
+			exportEligibilityLanguage(getNotebookLanguage(target), exportTargetLanguage(exportTarget))
+		) ||
 		!foreignModuleAt(exportTarget)
 	)
 		return {};
@@ -2619,7 +2628,12 @@ function moduleWarning(target: string, where: ExportTargetFields, wrote: boolean
 	const failed = moduleFailure(target, exportTarget);
 	if ('module' in failed) return failed;
 	if (!exportTarget) return {};
-	if (exportCellCount(listCells(target), exportTargetLanguage(exportTarget) ?? 'python')) {
+	if (
+		exportCellCount(
+			listCells(target),
+			exportEligibilityLanguage(getNotebookLanguage(target), exportTargetLanguage(exportTarget))
+		)
+	) {
 		// Asked FIRST, because every branch below describes a module a later export
 		// could write, and here none ever can: a file Cellar did not generate occupies
 		// the target, so the clobber guard declines it and re-calling `set_export_target`

@@ -38,6 +38,7 @@ import type { CellView } from '../../src/lib/server/types';
 import {
 	MOJO_LANGUAGE,
 	cellLanguage,
+	codeTypeMenuLabel,
 	hasPythonDataflow,
 	isMojoCell,
 	isNotebookLanguage,
@@ -571,5 +572,34 @@ describe('the header check reuses the ONE cell-magic rule, not a second regex', 
 		const compiled = mojoToCellSource(MOJO_WITH_IMPORT);
 		expect(normalizeForAnalysis(compiled)).toBe('');
 		expect(isCellMagicCell(compiled)).toBe(true);
+	});
+});
+
+describe("the type menu's `code` option reads the NOTEBOOK's language", () => {
+	// Choosing that option produces a cell in the notebook's language, so the label
+	// is a function of the NOTEBOOK and of nothing about the cell being converted.
+	// Read from the per-cell `isMojoCell` instead - false for every markdown, raw,
+	// SQL and chat cell whatever the notebook - a Mojo notebook offered "Python /
+	// python3" on exactly the cells the menu exists to convert, i.e. it told the
+	// user the opposite of what the click did. The rule lives in a pure module
+	// because vitest runs without the SvelteKit plugin, so an expression inside
+	// `Cell.svelte` could not be tested at all.
+	it('names Mojo for a Mojo notebook and Python for a Python one', () => {
+		expect(codeTypeMenuLabel('mojo')).toEqual({ label: 'Mojo', hint: '%%mojo' });
+		expect(codeTypeMenuLabel('python')).toEqual({ label: 'Python', hint: 'python3' });
+	});
+
+	it('answers for the notebook even where NO cell of it would read as Mojo', () => {
+		// The reachable defect, stated as the property that separates the two rules:
+		// in a Mojo notebook every markdown, raw, SQL and chat cell answers `false` to
+		// the per-cell test, yet the option they are offered still creates a Mojo cell.
+		const cells = [
+			{ cell_type: 'markdown', source: '# Notes' },
+			{ cell_type: 'raw', source: 'x' },
+			{ cell_type: 'code', source: 'select 1', metadata: { cellar: { language: 'sql' } } },
+			{ cell_type: 'code', source: 'hi', metadata: { cellar: { language: 'chat' } } }
+		];
+		for (const cell of cells) expect(isMojoCell(cell, MOJO_LANGUAGE)).toBe(false);
+		expect(codeTypeMenuLabel(MOJO_LANGUAGE).label).toBe('Mojo');
 	});
 });
