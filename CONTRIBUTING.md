@@ -65,7 +65,7 @@ floor rather than raising it for one test file.
 The end-to-end suite (`tests/e2e/`) drives the real `cellar` launcher in a
 browser and needs the full kernel runtime (`uv` + `python3` + the cached
 host-venv). It **gates every PR** from `.github/workflows/e2e.yml`, which
-provisions that runtime and shards the run across six runners - unsharded and
+provisions that runtime and shards the run across ten runners (~5 min of wall clock) - unsharded and
 serial it is a 45-60 min job, which is why it was ungated until the sharding
 existed. Two rules there are worth knowing before you touch that workflow:
 
