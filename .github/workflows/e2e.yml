@@ -56,7 +56,20 @@ name: E2E
 # ── Why not post-merge or nightly ─────────────────────────────────────────────
 # Because detection is not prevention: a post-merge job still lets the breakage
 # land, and its whole value depends on somebody reading a tab nobody opens.
-# Gating is the point; the sharding above is what makes it cost minutes.
+# Running on every PR is the point; the sharding above is what makes it minutes.
+#
+# ── No retries, deliberately ──────────────────────────────────────────────────
+# `playwright.config.ts` keeps `retries: 0`. A retry would make these numbers
+# look better without the suite being better, and would remove the very signal
+# needed to drive the flake rate down — per-test 98-99% against per-run 0-of-5
+# says the instability is broad and shallow, which is a thing to measure and fix
+# rather than to absorb. Flaky specs get FIXED here; several already were.
+#
+# ── What is still true, and what is deferred ──────────────────────────────────
+# This runs on every PR and is visible to everyone. What is NOT yet decided is
+# whether it becomes hard-blocking via branch protection — which does not exist
+# on this repo today for any check, `build-check` included. The honest
+# precondition for that is a per-run pass rate that is not 0-of-5.
 
 on:
   pull_request:

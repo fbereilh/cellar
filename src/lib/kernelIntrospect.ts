@@ -52,6 +52,7 @@
 export type IntrospectRefusal =
 	| 'no_kernel'
 	| 'busy'
+	| 'busy_timeout'
 	| 'restarting'
 	| 'dead'
 	| 'not_ready'
@@ -118,6 +119,11 @@ export function refusalMessage(reason: IntrospectRefusal): string {
 			return 'No kernel is running for this notebook yet - run a cell to start one.';
 		case 'busy':
 			return 'The kernel is busy running a cell, so it was not asked.';
+		case 'busy_timeout':
+			// Deliberately NOT 'the kernel is busy': no cell of the user's is running.
+			// Cellar's own background work held the kernel and Cellar stopped waiting
+			// for it, which is a different fact and a different thing to do about it.
+			return 'Cellar gave up waiting for its own background work on this kernel - try again in a moment.';
 		case 'restarting':
 			return 'The kernel is restarting.';
 		case 'dead':
