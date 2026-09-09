@@ -22,6 +22,7 @@ import { INSPECT_HEAD_ROWS, INSPECT_ARRAY_HEAD_ROWS, INSPECT_ARRAY_ITEMS, INSPEC
 import { McpSessionRegistry, SESSION_IDLE_MS, REAPER_INTERVAL_MS } from './sessions';
 import { runAsAgent, digestFor, deletionNote, currentSeq, DIGEST_PREFIX } from './userActivity';
 import { CellRefError } from './cellHandle';
+import { isNotebookUnavailable } from '../notebook';
 import { TextNotebookCellTypeError } from '../../cellLanguage';
 import { reasonWithoutServerPath } from '../../serverMessage';
 
@@ -194,6 +195,20 @@ function resolveOne(target: string, ref: string, sessionId: string | undefined):
 		// a ref that never existed keeps today's message, which is the distinction the
 		// whole thing turns on. Still `isError` either way: the operation really did
 		// not happen.
+		// The NOTEBOOK could not be opened, which is not a fact about this handle at
+		// all: `svc.resolveRef` reads the document, so a notebook deleted or renamed
+		// out from under a pinned session throws here and the generic branch below
+		// forwarded it verbatim - `notebook not found: <ABSOLUTE SERVER PATH>`,
+		// attributed as if the agent's cell ref were bad. Classified at THIS shared
+		// boundary rather than in one tool, because every id-addressed tool resolves
+		// through here, and it is what makes the write tools' own `unavailable`
+		// outcome reachable at the wire rather than only at the service.
+		if (isNotebookUnavailable(e))
+			return {
+				error: notFound(
+					`the notebook could not be opened, so cell ${ref} could not be resolved: ${svc.unavailableReason(e)}`
+				)
+			};
 		if ((e as CellRefError)?.code === 'not_found') {
 			const note = deletionNote(target, ref, sessionId);
 			if (note) return { error: notFound(note) };
@@ -826,7 +841,7 @@ export function registerTools(server: McpServer) {
 		const unavailable = 'unavailable' in r ? String(r.unavailable ?? '') : null;
 		if (unavailable !== null)
 			return notFound(
-				`the notebook could not be opened, so its language is unchanged: ${reasonWithoutServerPath(unavailable)}`
+				`the notebook could not be opened, so its language is unchanged: ${unavailable}`
 			);
 		if ('refused' in r) return notFound(pyNotebookRefusal('the notebook language cannot be stored'));
 		if ('invalid' in r) return notFound(`refused: ${r.invalid}`);
@@ -854,7 +869,7 @@ export function registerTools(server: McpServer) {
 		// message carries the doc layer's absolute path, which is stripped here.
 		if ('unavailable' in r)
 			return notFound(
-				`the notebook could not be opened, so no export mark was changed: ${reasonWithoutServerPath(String(r.unavailable ?? ''))}`
+				`the notebook could not be opened, so no export mark was changed: ${String(r.unavailable ?? '')}`
 			);
 		if ('refused' in r) return notFound(pyNotebookRefusal('a cell cannot be marked for export'));
 		// A per-cell refusal names the handle the AGENT supplied, not the full UUID
@@ -912,7 +927,7 @@ export function registerTools(server: McpServer) {
 		// worded as the accepted-but-unsaved case below, which claims the target took.
 		if ('unavailable' in r)
 			return notFound(
-				`the notebook could not be opened, so its export target is unchanged: ${reasonWithoutServerPath(String(r.unavailable ?? ''))}`
+				`the notebook could not be opened, so its export target is unchanged: ${String(r.unavailable ?? '')}`
 			);
 		if ('refused' in r) return notFound(pyNotebookRefusal('an export target cannot be stored'));
 		if ('invalid' in r) return notFound(`refused: ${r.invalid} - the export target must be a .py or .mojo path that resolves inside the workspace`);

@@ -42,8 +42,10 @@ import {
 	notebookExists,
 	getNotebookRoot,
 	getNotebookLanguage,
-	isNotebookUnavailable
+	isNotebookUnavailable,
+	NotebookUnavailableError
 } from '../notebook';
+import { reasonWithoutServerPath } from '../../serverMessage';
 import { setNotebookRootAndRestart, listWorkspaceRoots } from '../notebook-root-actions';
 import { resolveRootDir } from '../notebookRoot';
 import { ROOTS_DIR, normalizeRootPath, textNotebookRootError } from '../../notebookRoot';
@@ -2086,13 +2088,31 @@ export function setReportView(enabled: boolean, nb?: string | null) {
  * `setExportTarget`'s catch deliberately returns without asking the document
  * anything, and this one now does the same.
  */
+/**
+ * The `unavailable` message a caller reads, decided HERE because this is the last
+ * place that still holds the error OBJECT - everything downstream sees a string.
+ *
+ * `isNotebookUnavailable` covers TWO classes and only ONE carries a path:
+ * `NotebookUnavailableError` is `notebook not found: <abs>`, so it is stripped;
+ * `NotebookReadError` is path-free by construction (the leak is fixed AT THE READ)
+ * and its detail is the FILE'S OWN CONTENT, which the blunt stripper eats - a
+ * corrupt notebook reporting `Unexpected token '/', "{"a": / }" is not valid JSON`
+ * came back with the very `/` identifying the corruption removed. Stripping
+ * downstream is recorded as tried and WITHDRAWN for that reason, so the decision
+ * may not be left to a handler that has only the text.
+ */
+export function unavailableReason(err: unknown): string {
+	const msg = String((err as Error)?.message ?? err);
+	return err instanceof NotebookUnavailableError ? reasonWithoutServerPath(msg) : msg;
+}
+
 export function setNotebookLanguage(language: string, nb?: string | null) {
 	const target = nb ?? getActiveNotebookPath();
 	try {
 		return { language: setNotebookLanguageDoc(language, target), ...exportTargetFields(target) };
 	} catch (err) {
 		if (isNotebookUnavailable(err))
-			return { ok: false as const, unavailable: String((err as Error)?.message ?? err) };
+			return { ok: false as const, unavailable: unavailableReason(err) };
 		if (err instanceof TextNotebookLanguageError)
 			return { ok: false as const, refused: 'py-notebook' as const };
 		if (err instanceof InvalidNotebookLanguageError)
@@ -2187,7 +2207,7 @@ function exportWriteGuard(nb: string) {
 		return isPyTextNotebook(nb) ? { ok: false as const, refused: 'py-notebook' as const } : null;
 	} catch (err) {
 		if (isNotebookUnavailable(err))
-			return { ok: false as const, unavailable: String((err as Error)?.message ?? err) };
+			return { ok: false as const, unavailable: unavailableReason(err) };
 		throw err;
 	}
 }
@@ -2210,7 +2230,7 @@ export function setExportTarget(
 		// Opening the document is its own outcome and is checked before the write one:
 		// nothing was applied there, so `writeFailed` would claim the target took.
 		if (isNotebookUnavailable(err))
-			return { ok: false as const, unavailable: String((err as Error)?.message ?? err) };
+			return { ok: false as const, unavailable: unavailableReason(err) };
 		// NOT a refusal: the doc layer validates before it mutates, so the only other
 		// throw is the notebook write (EACCES, ENOSPC, a read-only checkout). The target
 		// was accepted and the live document HOLDS it - reporting that as an invalid path

@@ -1302,11 +1302,61 @@ describe('at the wire: the tool is really callable', () => {
 		expect(body(r)).not.toMatch(/could not be saved|already holds it/i);
 		expect(body(r)).not.toContain(WS);
 
-		// The marking tool ANSWERS rather than throwing, through the same guard.
-		const marks = svc.setCellExport([code[0]], true, target);
-		expect(marks).toMatchObject({ ok: false });
-		expect('unavailable' in marks).toBe(true);
-		expect('writeFailed' in marks).toBe(false);
+		// The MARKING tool is driven over the WIRE, which is the only level that sees
+		// it: the handler resolves handles FIRST, so `resolveMany` reaches `docFor`
+		// before the tool's own guard can run and used to forward the raw
+		// `notebook not found: <abs>` as if the CELL ref were bad. Answered at the one
+		// shared boundary, so every id-addressed tool is covered rather than this one.
+		const marks = (await client.callTool({
+			name: 'set_cell_export',
+			arguments: { ids: [code[0]], export: true, notebook: rel }
+		})) as CallResult;
+		expect(marks.isError).toBe(true);
+		expect(body(marks)).toMatch(/could not be opened/i);
+		expect(body(marks)).not.toContain(WS);
+		// ...and it is not attributed to the HANDLE: the ref is named as the thing that
+		// could not be resolved, never rejected as if the agent had supplied a bad one.
+		expect(body(marks)).not.toMatch(new RegExp(`cell ${code[0]} not found`, 'i'));
+
+		// A READ tool resolving the same handles is covered by the same boundary -
+		// that is what makes this a class fix rather than a per-tool patch.
+		const read = (await client.callTool({
+			name: 'read_cells',
+			arguments: { ids: [code[0]], notebook: rel }
+		})) as CallResult;
+		expect(read.isError).toBe(true);
+		expect(body(read)).toMatch(/could not be opened/i);
+		expect(body(read)).not.toContain(WS);
+	});
+
+	it("forwards a PARSE refusal's detail intact - only the not-found throw carries a path", async () => {
+		// `isNotebookUnavailable` covers two classes and only one has a path to strip.
+		// A `NotebookReadError`'s detail is the FILE'S OWN CONTENT, and the blunt
+		// stripper eats the token identifying the corruption - stripping downstream is
+		// recorded as tried and withdrawn, so the decision is made where the error
+		// object still exists rather than at a handler holding only the text.
+		const rel = 'wire-corrupt.ipynb';
+		const target = abs(rel);
+		await makeNotebook(rel);
+		const client = await connect();
+		nbmod.dropDocs(target);
+		const bytes = '{"a": / }';
+		writeFileSync(target, bytes);
+		let detail = '';
+		try {
+			JSON.parse(bytes);
+		} catch (err) {
+			detail = String((err as Error).message);
+		}
+		expect(detail).toContain(bytes);
+
+		const r = (await client.callTool({
+			name: 'set_export_target',
+			arguments: { path: 'lib/corrupt.py', notebook: rel }
+		})) as CallResult;
+		expect(r.isError).toBe(true);
+		expect(body(r)).toContain(detail);
+		expect(body(r)).not.toContain(WS);
 	});
 
 	it('names the handle the agent supplied, not the UUID it resolved to', async () => {

@@ -144,10 +144,10 @@
 		/** How many cells are currently marked for export. */
 		exportCount?: number;
 		/**
-		 * The cells carrying an export flag the current target cannot honour - the
-		 * target's extension moved under a mark nothing rewrites, the cell was
-		 * converted to a type that contributes no module source, or there is no target
-		 * at all. Reported ONCE here, since it is a notebook-wide fact; each affected
+		 * The cells carrying an export flag this notebook's module cannot honour - the
+		 * cell's own source is Mojo under a `.py` module, or it was converted to a
+		 * type that contributes no module source. Reported ONCE here, since it is a
+		 * notebook-wide fact; each affected
 		 * cell carries only a short marker (`EXPORT_STRANDED_BADGE`). It is a SUMMARY
 		 * rather than a count because the remedy turns on how many of those cells have
 		 * a module language at all (`$lib/exportRole`).

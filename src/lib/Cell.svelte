@@ -417,8 +417,8 @@
 		exportLanguage === null ? 'module' : `${exportLanguage === 'mojo' ? '.mojo' : '.py'} module`
 	);
 	// Cellar's own flag is set, but this cell can go in no module the notebook
-	// currently names - the target's extension moved under a mark nothing rewrites,
-	// or the target was cleared (`exportMarkStranded`). The toggle is RENDERED for
+	// currently names - its own source is Mojo under a `.py` module, or it was
+	// converted to a type with no module source (`exportMarkStranded`). The toggle is RENDERED for
 	// such a cell rather than omitted, greyed, and it still CLEARS the flag: the
 	// server gates marking on eligibility and unmarking on nothing, so this is the
 	// one surface that can retire an otherwise invisible key from the user's
@@ -2279,7 +2279,8 @@
 					     where it cannot apply rather than permanently disabled. Presence
 					     follows the cell TYPE, never the flag - with ONE exception, which is
 					     about a flag that is already there: a STRANDED mark (`exportStranded`,
-					     the target's extension moved under it, or the target cleared) renders
+					     its own source disagrees with the notebook, or it was converted to a
+					     type with no module source) renders
 					     the toggle greyed beside a SHORT marker, so the key is visible in the
 					     notebook and clearable in place instead of sitting invisible in the
 					     committed `.ipynb`. The reason itself is a notebook-wide fact and is

@@ -346,15 +346,17 @@ export function isExportCell(cell: ExportCell, lang: ExportLanguage = 'python'):
  * Does this cell carry Cellar's own export FLAG while being INELIGIBLE for the
  * module the notebook currently targets?
  *
- * Reachable and ordinary: mark some Python cells for a `.py` target, then point
- * the target at a `.mojo` one (or the reverse). Nothing rewrites the notebook -
- * silently editing the user's committed `.ipynb` because a setting moved is worse
- * than the stale flag - so `metadata.cellar.export` stays where it is, `isExportCell`
- * reads false, the cell contributes to no module and the export count drops.
+ * Reachable in two shapes, and no longer by the target moving: mark a code cell and
+ * then paste `%%mojo` into it (its own SOURCE now disagrees with its notebook), or
+ * convert it to a type that contributes no module source at all. Nothing rewrites
+ * the notebook - silently editing the user's committed `.ipynb` because a setting
+ * moved is worse than the stale flag - so `metadata.cellar.export` stays where it
+ * is, `isExportCell` reads false, the cell contributes to no module and the export
+ * count drops.
  *
  * It exists because a row toggle that is merely ABSENT there leaves that flag with
  * no surface at all: invisible in the notebook, still in the committed file, and
- * clearable only by pointing the target back. So the toggle is RENDERED for such a
+ * clearable only by undoing the edit that stranded it. So the toggle is RENDERED for such a
  * cell - greyed, saying why, and still able to clear the flag, which the server
  * allows (`setCellExports` gates only MARKING on eligibility, never unmarking).
  *
