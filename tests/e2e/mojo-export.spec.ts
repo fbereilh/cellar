@@ -237,6 +237,52 @@ test('a .py module shows no Mojo warning and takes no Mojo cell', async ({ page,
 	await expect(page.locator(`[data-cell-id="${id}"]`).getByTestId('toggle-export')).toHaveCount(0);
 });
 
+test('with NO target the badge stays silent - there is no module for it to be about', async ({
+	page,
+	request
+}) => {
+	// The badge SPEAKS ABOUT A MODULE, so it must be gated the way the server's
+	// once-per-notebook twin is (`docHazards` returns nothing with no target
+	// configured, "warning there would be noise on a notebook that exports nothing").
+	// Fed the NOTEBOOK's language instead it warned that a `main` would be dropped
+	// from an export that cannot happen at all, while the bar beside it said nothing.
+	const rel = 'no-target.ipynb';
+	const created = await request.post(`${baseURL}/api/notebooks`, { data: { path: rel, create: true } });
+	expect(created.ok(), await created.text()).toBeTruthy();
+	const lang = await request.post(`${baseURL}/api/notebooks/language`, {
+		data: { language: 'mojo', path: rel }
+	});
+	expect(lang.ok(), await lang.text()).toBeTruthy();
+
+	// TWO marked cells that each define `main` - exactly the shape that badges the
+	// earlier one once a `.mojo` target exists.
+	const view = await request.get(`${baseURL}/api/notebooks?path=${encodeURIComponent(rel)}`);
+	const ids = ((await view.json()).notebook.cells as Array<{ id: string }>).map((c) => c.id);
+	const added = await request.post(`${baseURL}/api/cells`, {
+		data: { afterId: ids[0], cellType: 'code', source: MAIN, nb: rel }
+	});
+	expect(added.ok(), await added.text()).toBeTruthy();
+	ids.push((await added.json()).cell.id as string);
+	for (const id of ids) {
+		expect((await request.patch(`${baseURL}/api/cells/${id}`, { data: { source: MAIN, nb: rel } })).ok()).toBeTruthy();
+		expect((await request.patch(`${baseURL}/api/cells/${id}`, { data: { export: true, nb: rel } })).ok()).toBeTruthy();
+	}
+
+	await openNotebook(page, rel);
+	// Both cells really ARE marked - so the silence is the gate, not an empty set.
+	await expect(page.locator('[data-testid="export-count"]:visible')).toHaveText('2 cells marked');
+	await expect(page.locator('[data-testid="main-dropped-badge"]:visible')).toHaveCount(0);
+
+	// Naming a `.mojo` target is the ONLY thing that changes, and now it speaks -
+	// which is what makes the assertion above about the gate rather than the rule.
+	const set = await request.post(`${baseURL}/api/notebooks/export-py`, {
+		data: { op: 'set-target', target: 'lib/late.mojo', base: 'workspace', path: rel }
+	});
+	expect(set.ok(), await set.text()).toBeTruthy();
+	await expect(badgeIn(page, ids[0])).toBeVisible({ timeout: 15_000 });
+	await expect(badgeIn(page, ids[1])).toHaveCount(0);
+});
+
 test('the export toggle names the target language, and a stranded mark stays clearable', async ({
 	page,
 	request

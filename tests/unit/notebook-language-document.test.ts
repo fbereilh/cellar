@@ -20,7 +20,7 @@
  * what is under test is which cells the sweep rewrites.
  */
 import { describe, it, expect, beforeAll, vi } from 'vitest';
-import { mkdtempSync, writeFileSync, readFileSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -297,6 +297,30 @@ describe('a .py TEXT notebook cannot BE a Mojo notebook', () => {
 	});
 });
 
+/**
+ * The imports role SURVIVES a language switch, because a switch touches no cell -
+ * the design, not an oversight. So the mark is still there afterwards, doing
+ * nothing, and the one surface that can retire it (the cell's ⋮ menu) renders it
+ * greyed and clear-only rather than hiding it. That control is only worth
+ * offering if the SERVER really accepts the clear, which is what this pins: the
+ * export precedent is that marking is gated on eligibility and UNMARKING is gated
+ * on nothing.
+ */
+describe('an imports role kept across a language switch can still be CLEARED', () => {
+	it('setCellRole clears it on a Mojo notebook, and it leaves the committed file', () => {
+		const nb = makeNotebook('imports-role.ipynb', [{ source: 'import os', cellar: { role: 'imports' } }], MOJO_LANGUAGE);
+		expect(nbmod.getNotebookLanguage(nb)).toBe('mojo');
+		const marked = nbmod.listCells(nb)[0];
+		expect(marked.metadata?.cellar?.role).toBe('imports');
+
+		expect(nbmod.setCellRole(marked.id, null, nb)).toBe(true);
+		expect(nbmod.listCells(nb)[0].metadata?.cellar?.role).toBeUndefined();
+		// It really left the user's file, which is the whole point of keeping the
+		// control reachable rather than hiding it with the notebook switched.
+		expect(readFileSync(nb, 'utf8')).not.toContain('"imports"');
+	});
+});
+
 describe('the REST route reports the language refusal in the shape the browser resyncs on', () => {
 	let POST: (evt: { request: Request }) => Promise<Response>;
 
@@ -486,5 +510,49 @@ describe('the route tells a REFUSED language from a FAILED WRITE, so the UI can 
 		const payload = await res.json();
 		expect(payload.reason).toBe('mojo-in-py-notebook');
 		expect(payload.language).toBe('python');
+	});
+
+	/**
+	 * The THIRD outcome, and the one a `writeFailed` catch-all got wrong: the
+	 * document could not be OPENED, so `setNotebookLanguage` threw BEFORE it mutated
+	 * anything. Reported as a failed save it claimed the language had been applied
+	 * while nothing had, and sent the user to a save that never ran - plus the
+	 * absolute server path the doc layer's throw carries.
+	 *
+	 * Reachable with an ordinary open tab: the notebook is deleted or renamed
+	 * outside Cellar (or through the explorer, which drops the live doc), and the
+	 * next flip of the selector re-reads it.
+	 */
+	it('a notebook that cannot be OPENED is its own outcome, never a failed save', async () => {
+		const nb = join(WS, 'vanished.ipynb');
+		nbmod.createNotebook('vanished.ipynb');
+		// What an explorer delete leaves behind: no live doc, no file.
+		nbmod.dropDocs(nb);
+		rmSync(nb);
+
+		const res = await post({ language: 'mojo', path: nb });
+		const payload = await res.json();
+		expect(payload.ok).toBe(false);
+		expect(payload.reason).toBe('notebook-unavailable');
+		// NOT the write-failure shape: nothing was applied, so nothing may claim it was.
+		expect(payload.writeFailed).toBeUndefined();
+		expect(String(payload.message)).not.toMatch(/could not be saved/i);
+		// And it carries NO `language`, so the select keeps the value it already had
+		// rather than adopting a `python` nothing observed.
+		expect('language' in payload).toBe(false);
+		// The absolute server path the throw carries never reaches the browser.
+		expect(String(payload.message)).not.toContain(WS);
+	});
+
+	it('an UNPARSEABLE notebook takes that same outcome - the reader refuses before any mutation', async () => {
+		const nb = join(WS, 'corrupt.ipynb');
+		nbmod.createNotebook('corrupt.ipynb');
+		nbmod.dropDocs(nb);
+		writeFileSync(nb, '// not a notebook\n');
+
+		const payload = await (await post({ language: 'mojo', path: nb })).json();
+		expect(payload.reason).toBe('notebook-unavailable');
+		expect(payload.writeFailed).toBeUndefined();
+		expect(String(payload.message)).not.toContain(WS);
 	});
 });

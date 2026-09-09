@@ -36,6 +36,7 @@
 		exportCellCount,
 		exportDirectiveOwnsCell,
 		exportLanguageOf,
+		exportModuleLanguage as exportModuleLanguageOf,
 		exportMarkedTwice,
 		exportStrandedSummary,
 		exportTargetLanguage,
@@ -288,13 +289,15 @@
 		exportTargetLanguage(exportResolved ?? exportTarget) !== null
 	);
 	// The MODULE language, or null when there is no module for a sentence to be
-	// about. It is the NOTEBOOK's language, never the extension's: the extension
-	// FOLLOWS the language now (`setNotebookLanguage` re-expresses it, and
-	// `setExportTarget` refuses a mismatch), so deriving it from the path here would
-	// reintroduce the second, contradictable spelling the whole axis removes. Derived
-	// from `notebookLanguage`, which is itself mirrored over SSE, so this needs no
-	// wire field of its own and cannot lag the server's answer.
-	const exportModuleLanguage = $derived(exportTargetNamesModule ? notebookLanguage : null);
+	// about. The rule is the shared, unit-tested `exportModuleLanguage`, whose header
+	// owns the reason and states it beside its `exportEligibilityLanguage` twin - the
+	// two halves of one split, so which of them a surface reads is a decision made
+	// once rather than at each call site, where it has now been got wrong twice.
+	// Derived from `notebookLanguage`, which is itself mirrored over SSE, so this
+	// needs no wire field of its own and cannot lag the server's answer.
+	const exportModuleLanguage = $derived(
+		exportModuleLanguageOf(notebookLanguage, exportTargetNamesModule)
+	);
 	// The language ELIGIBILITY is decided against - the notebook's, whether or not a
 	// target is configured, exactly as `docExportLanguage` answers on the server. An
 	// unconfigured PYTHON notebook still answers `python`, so its per-cell toggle
@@ -317,8 +320,17 @@
 	 * moment it loses one, and it is the SAME rule the exporter applies, so the
 	 * badge can never disagree with the file. Empty for any non-`.mojo` target, so
 	 * an ordinary notebook derives one `!== 'mojo'` comparison and stops.
+	 *
+	 * It reads the NULLABLE module language, not the notebook's: this SPEAKS ABOUT A
+	 * MODULE, and with no target configured there is no module for it to be about -
+	 * exactly the gate the server's own twin applies (`docHazards` returns `[]` on
+	 * that branch, so fed the notebook language the per-cell badge would warn about a
+	 * dropped `main` while the once-per-notebook hazard it pairs with stayed silent,
+	 * over an export that cannot happen at all). Eligibility - `exportCount`,
+	 * `exportStranded`, `moduleSourceIds` - takes the notebook language instead,
+	 * which is what the server decides eligibility against.
 	 */
-	const mojoMainDropped = $derived(mojoMainDroppedIds(cells, exportLanguage));
+	const mojoMainDropped = $derived(mojoMainDroppedIds(cells, exportModuleLanguage));
 	// Constructs in the MARKED cells that make the generated module uncompilable
 	// (`$lib/exportHazard`). Server-derived like the three fields above - the rule
 	// needs the Python line tokenizer, which is server-only - seeded on load and

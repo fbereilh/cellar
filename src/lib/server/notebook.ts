@@ -411,6 +411,39 @@ export function lastExportError(nb?: string | null): string | null {
 }
 
 /**
+ * The notebook could not be OPENED at all: no live document, and the file is
+ * gone, unreadable or does not parse. TYPED so a caller can tell it apart from a
+ * failed WRITE without matching message text - the `InvalidExportTargetError`
+ * rule, and load-bearing for the same reason: a setter that validates before it
+ * mutates has exactly two throw classes after that point, and they mean opposite
+ * things. A `docFor` failure happened BEFORE anything was applied, while a
+ * `persist` failure happened after, over a value the live document already holds.
+ * Reporting the first as the second tells the user their change took when nothing
+ * did, and sends them to fix a save that was never the problem.
+ *
+ * The message keeps the ABSOLUTE path it always carried (callers depend on it and
+ * a server log wants it); a user-facing surface strips it through
+ * `$lib/serverMessage`'s `reasonWithoutServerPath`.
+ */
+export class NotebookUnavailableError extends Error {
+	constructor(message: string) {
+		super(message);
+		this.name = 'NotebookUnavailableError';
+	}
+}
+
+/**
+ * Did this throw come from OPENING the notebook rather than from writing it? The
+ * ONE predicate both write surfaces ask (the REST route and the MCP tool), so the
+ * two cannot classify one document's failure differently. It covers the reader's
+ * own typed refusals (`NotebookReadError`: blank, unparseable, unreadable) as well
+ * as the not-found throw.
+ */
+export function isNotebookUnavailable(err: unknown): boolean {
+	return err instanceof NotebookUnavailableError || err instanceof NotebookReadError;
+}
+
+/**
  * Load (or lazily create) the document for an absolute path. Loading NEVER
  * writes to disk — a `.ipynb` is persisted only on a genuine mutation (create /
  * add / edit / run / …), so opening Cellar in a folder drops no uninvited file
@@ -428,7 +461,7 @@ function loadDoc(abs: string): NotebookDoc {
 	if (isPyPath(abs)) {
 		// A `.py` notebook (jupytext percent/light or Databricks source). `jpFormat`
 		// records which format to write it back in; the cells carry no outputs.
-		if (!existsSync(abs)) throw new Error('notebook not found: ' + abs);
+		if (!existsSync(abs)) throw new NotebookUnavailableError('notebook not found: ' + abs);
 		const parsed = readPyNotebook(abs);
 		enforceUniqueIds(parsed.cells);
 		doc = { path: abs, cells: parsed.cells, metadata: undefined, jpFormat: parsed.format };
@@ -445,7 +478,7 @@ function loadDoc(abs: string): NotebookDoc {
 		doc = { path: abs, cells: [starterCell()], metadata: undefined };
 		docs.set(abs, doc);
 	} else {
-		throw new Error('notebook not found: ' + abs);
+		throw new NotebookUnavailableError('notebook not found: ' + abs);
 	}
 	return doc;
 }
@@ -1198,9 +1231,10 @@ export function setCellExport(
 	const doc = docFor(nb);
 	const cell = find(doc, id);
 	if (!cell) return { ok: false, reason: 'no-such-cell' };
-	// The export target's extension names the module's LANGUAGE, and eligibility is
-	// a match against it (`exportRole`'s `canExportCell`): a Mojo cell has no place
-	// in a `.py` module and a Python cell none in a `.mojo` one.
+	// The module's LANGUAGE is the NOTEBOOK's (`docExportLanguage`, which the target's
+	// extension merely follows), and eligibility is a match against it (`exportRole`'s
+	// `canExportCell`): Mojo source has no place in a `.py` module and Python source
+	// none in a `.mojo` one.
 	const lang = docExportLanguage(doc);
 	if (exported && !canExportCell(cell, lang)) return { ok: false, reason: 'not-code' };
 	// The source owns the mark (see `setCellExports`). A MARK request is already
@@ -1226,11 +1260,11 @@ export function setCellExport(
  *
  * Only cells that actually CHANGE are touched, so a re-mark of an
  * already-marked cell writes nothing and emits nothing (zero git diff, no module
- * mtime churn). Marking requires a code cell whose LANGUAGE matches the export
- * target's (`canExportCell`, the shared eligibility half of `isExportCell` itself
- * - a markdown or SQL cell has no module source at all, and a Mojo cell has none
- * a `.py` module could hold, so setting the flag there would be a lie the exporter
- * ignores) while UNMARKING clears the flag wherever
+ * mtime churn). Marking requires a code cell whose LANGUAGE matches the module's -
+ * which is the NOTEBOOK's (`canExportCell`, the shared eligibility half of
+ * `isExportCell` itself - a markdown or SQL cell has no module source at all, and
+ * Mojo source has none a `.py` module could hold, so setting the flag there would
+ * be a lie the exporter ignores) while UNMARKING clears the flag wherever
  * it is found, which is also how a stale flag on a hand-edited `.ipynb` is
  * cleared. Returns the ids actually changed.
  *
@@ -2104,8 +2138,8 @@ export function setCellType(id: string, cellType: LogicalCellType, nb?: string |
  * The in-place half of a type switch, shared by the single-cell setter and the
  * `setCellTypes` batch so the two can never diverge on the metadata rules: any
  * non-code type (markdown, raw) clears outputs, and anything holding no Python
- * (those two plus SQL, Mojo and chat) drops the imports role and the nbdev export
- * flag.
+ * (those two plus SQL and chat) drops the imports role. The nbdev export flag is
+ * KEPT - see the rule at that line.
  *
  * `LiveNotebook.applyCellTypeLocally` is the browser's copy of exactly these
  * rules - `cell:type` carries no metadata, so a client half that skipped one
@@ -2138,25 +2172,29 @@ function applyCellType(cell: Cell, cellType: LogicalCellType): void {
 	}
 	if (lang) cell.metadata.cellar.language = lang;
 	else delete cell.metadata.cellar.language;
-	// A cell the kernel actually executes as Python - i.e. an UNTAGGED code cell,
-	// which is why `!lang` is the whole test. Markdown and raw never reach the
-	// kernel at all; SQL and Mojo reach it compiled (to `spark.sql(...)` and to a
-	// `%%mojo` magic), so neither holds Python; a CHAT cell's source is prose the
-	// kernel never sees.
+	// A code cell carrying no per-cell language TAG - which is what `!lang` tests,
+	// and the only question this rule needs. Markdown and raw never reach the kernel
+	// at all; a SQL cell reaches it compiled to `spark.sql(...)`; a CHAT cell's
+	// source is prose the kernel never sees. It is deliberately NOT "the kernel runs
+	// this as Python": in a MOJO notebook such a cell is compiled to a `%%mojo`
+	// magic, and that is the NOTEBOOK's axis, which this per-cell rule neither reads
+	// nor needs - see the two uses below, each of which says why.
 	const runnable = cell.cell_type === 'code' && !lang;
 	// Only a code cell holds outputs - markdown and raw carry none, and
 	// `serialize` would drop them anyway.
 	if (cell.cell_type !== 'code') cell.outputs = [];
 	// The imports role may not sit on a cell holding no Python: the kernel never sees
-	// a markdown or raw cell, and a SQL, Mojo or chat cell's source is not Python, so
-	// every import routed into it would be stranded with nothing to run them.
+	// a markdown or raw cell, and a SQL or chat cell's source is not Python, so every
+	// import routed into it would be stranded with nothing to run them. The NOTEBOOK
+	// language is a separate question and is deliberately not asked here - a switch
+	// touches no cell, so a role it strands is surfaced on the cell (greyed, clearable
+	// - `importsRoleStranded`) rather than deleted from the user's committed file.
 	if (!runnable && cell.metadata.cellar.role === IMPORTS_ROLE) delete cell.metadata.cellar.role;
 	// The EXPORT flag is deliberately NOT dropped, and `runnable` is the wrong
-	// question for it in any case: a Mojo cell is the ONLY eligible kind under a
-	// `.mojo` target, so clearing on conversion destroyed the mark on this feature's
-	// own happy path - paste a Modular example into a `code` cell (its `%%mojo`
-	// header makes it eligible), mark it, then convert it to the `mojo` type, which
-	// the agent doctrine tells agents to do.
+	// question for it in any case: eligibility is a LANGUAGE MATCH against the
+	// module (`canExportCell`), not "does the kernel run this as Python", so a cell
+	// this predicate calls unrunnable can be exactly the one the module wants - a
+	// plain `code` cell in a Mojo notebook is both.
 	//
 	// It is not dropped for an INELIGIBLE cell either. That is the same rule a target
 	// change already follows: a mark the current target cannot honour STRANDS

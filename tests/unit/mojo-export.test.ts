@@ -33,6 +33,7 @@ import { join } from 'node:path';
 import {
 	canExportCell,
 	exportEligibilityLanguage,
+	exportModuleLanguage,
 	exportLanguageOf,
 	exportCellCount,
 	exportMarkStranded,
@@ -1130,6 +1131,29 @@ describe('the wiring the browser ships', () => {
 		expect(exportMarkStranded(code, lang)).toBe(false);
 	});
 
+	it('a surface that SPEAKS ABOUT A MODULE reads the nullable one instead', () => {
+		// The other half of that same split, and the two must disagree exactly where a
+		// call site got it wrong: with no target configured, ELIGIBILITY still answers
+		// the notebook's language while anything naming a module answers null.
+		expect(exportModuleLanguage('mojo', false)).toBeNull();
+		expect(exportModuleLanguage('python', false)).toBeNull();
+		expect(exportEligibilityLanguage('mojo', exportModuleLanguage('mojo', false))).toBe('mojo');
+		// Once a target names a module the two coincide - the module's language FOLLOWS
+		// the notebook's - so nothing else in the bar or the row moves.
+		expect(exportModuleLanguage('mojo', true)).toBe('mojo');
+		expect(exportModuleLanguage('python', true)).toBe('python');
+
+		// The consequence the badge renders. Fed the NOTEBOOK's language, a Mojo
+		// notebook with no target warns that a `main` will be dropped from an export
+		// that cannot happen at all - while the server's once-per-notebook twin, gated
+		// on a configured target, says nothing.
+		const cells = [cell('a', MAIN, { export: true }), cell('b', MAIN, { export: true })];
+		expect([...mojoMainDroppedIds(cells, exportModuleLanguage('mojo', false))]).toEqual([]);
+		// With a module to be about it speaks, and names the earlier cell - so the gate
+		// is what changed, not the rule.
+		expect([...mojoMainDroppedIds(cells, exportModuleLanguage('mojo', true))]).toEqual(['a']);
+	});
+
 	it('the client half KEEPS the export mark on a type change, like the server', () => {
 		// The two halves must stay in lockstep (`cell:type` carries no metadata, so a
 		// client that dropped the flag would draw a cell as unmarked until a reload,
@@ -1195,12 +1219,11 @@ describe('the wiring the browser ships', () => {
 		//
 		// Its VALUE is the notebook's language, never the path's extension: deriving it
 		// from the path here would put back the second spelling able to contradict the
-		// notebook, which is exactly what this axis removes.
+		// notebook, which is exactly what this axis removes. BOTH halves of that split
+		// now live in `exportRole` (`exportModuleLanguage` / `exportEligibilityLanguage`)
+		// and are driven against their real inputs above, so what is left for source to
+		// say is only that the nullable one is what reaches the bar.
 		const live = read('LiveNotebook.svelte');
-		expect(live).toContain(
-			'const exportModuleLanguage = $derived(exportTargetNamesModule ? notebookLanguage : null);'
-		);
-		expect(live).toContain('const exportLanguage = $derived(notebookLanguage);');
 		expect(live).toContain('exportLanguage={exportModuleLanguage}');
 		expect(live).toContain('exportStranded={exportStranded}');
 	});
@@ -1245,7 +1268,10 @@ describe('the wiring the browser ships', () => {
 	});
 
 	it('the notebook derives the badge set from the shared rule, per cell', () => {
-		expect(read('LiveNotebook.svelte')).toMatch(/mojoMainDropped = \$derived\(mojoMainDroppedIds\(cells, exportLanguage\)\)/);
+		// WHICH language it is fed is the split asserted behaviourally above (a
+		// module-speaking surface reads the nullable one); what only source can say is
+		// that the set is derived from the shared rule and handed down per cell.
+		expect(read('LiveNotebook.svelte')).toMatch(/mojoMainDropped = \$derived\(\s*mojoMainDroppedIds\(/);
 		expect(read('Notebook.svelte')).toContain('mainDropped={mojoMainDropped.has(cell.id)}');
 	});
 });

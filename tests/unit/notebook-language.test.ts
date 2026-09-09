@@ -53,6 +53,12 @@ import {
 	NOTEBOOK_LANGUAGES
 } from '../../src/lib/cellLanguage';
 import { canExportCell, isExportCell } from '../../src/lib/exportRole';
+import {
+	IMPORTS_ROLE,
+	importsRoleStranded,
+	isImportsCell,
+	notebookUsesImportsCell
+} from '../../src/lib/importsRole';
 import { computeStaleness, STALE_STATE } from '../../src/lib/staleness';
 import {
 	MOJO_INSTALL_COMMAND,
@@ -163,6 +169,38 @@ describe('mojo is the NOTEBOOK\'s language, never a cell type', () => {
 		expect(isPyUnsupportedType('chat')).toBe(true);
 		for (const t of ['code', 'sql', 'markdown']) expect(isPyUnsupportedType(t)).toBe(false);
 	});
+});
+
+/**
+ * The imports role SURVIVES a language switch, because a switch touches no cell -
+ * which is the design, not an oversight. So a designation made while the notebook
+ * was Python is still there afterwards, doing nothing.
+ *
+ * That state is neither deleted nor left silent: the badge keeps asserting it and
+ * the control stays reachable, greyed, able only to CLEAR - the hidden-vs-greyed
+ * distinction the nbdev export toggle already draws. Hidden instead, the user is
+ * left with `metadata.cellar.role` in their committed `.ipynb`, chrome asserting
+ * it, and no way to remove it short of switching the notebook back.
+ */
+describe('an imports role kept across a language switch stays CLEARABLE', () => {
+	it('a Mojo notebook uses no imports cell, so MARKING one can never mean anything', () => {
+		expect(notebookUsesImportsCell('python')).toBe(true);
+		expect(notebookUsesImportsCell(MOJO)).toBe(false);
+	});
+
+	it('a cell that ALREADY carries the role is STRANDED there, not merely ineligible', () => {
+		const marked = cell('a', MOJO_MAIN, { role: IMPORTS_ROLE });
+		const plain = cell('b', MOJO_MAIN);
+		// The mark is still on the cell after the switch - nothing per-cell was written.
+		expect(isImportsCell(marked)).toBe(true);
+		// Stranded is the MARKED case only: a cell with no role has no state to clear,
+		// so its control stays hidden rather than rendering greyed and inert.
+		expect(importsRoleStranded(marked, MOJO)).toBe(true);
+		expect(importsRoleStranded(plain, MOJO)).toBe(false);
+		// And in a Python notebook nothing is stranded at all - the role works there.
+		expect(importsRoleStranded(marked, 'python')).toBe(false);
+	});
+
 });
 
 describe('a mojo cell compiles to the %%mojo cell magic at RUN time', () => {

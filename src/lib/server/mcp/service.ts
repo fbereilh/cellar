@@ -41,7 +41,8 @@ import {
 	createNotebook as createNotebookDoc,
 	notebookExists,
 	getNotebookRoot,
-	getNotebookLanguage
+	getNotebookLanguage,
+	isNotebookUnavailable
 } from '../notebook';
 import { setNotebookRootAndRestart, listWorkspaceRoots } from '../notebook-root-actions';
 import { resolveRootDir } from '../notebookRoot';
@@ -2074,12 +2075,24 @@ export function setReportView(enabled: boolean, nb?: string | null) {
  * call failed and goes on writing Python into a notebook now executing Mojo, so
  * the persist case is its OWN outcome carrying what IS true - the language that
  * took, and the export target it moved to.
+ *
+ * OPENING the document is a THIRD outcome and is checked FIRST, because it happens
+ * BEFORE anything is applied (`isNotebookUnavailable`: the notebook is gone,
+ * unreadable or unparseable - what an agent's pinned session meets when the file
+ * is deleted or renamed outside Cellar). Folded into `writeFailed` it claimed a
+ * language that never took. It is also why that branch may not re-enter the doc
+ * layer: `getNotebookLanguage`/`exportTargetFields` both call `docFor`, so on this
+ * very path they throw AGAIN and the tool escapes its own result union entirely -
+ * `setExportTarget`'s catch deliberately returns without asking the document
+ * anything, and this one now does the same.
  */
 export function setNotebookLanguage(language: string, nb?: string | null) {
 	const target = nb ?? getActiveNotebookPath();
 	try {
 		return { language: setNotebookLanguageDoc(language, target), ...exportTargetFields(target) };
 	} catch (err) {
+		if (isNotebookUnavailable(err))
+			return { ok: false as const, unavailable: String((err as Error)?.message ?? err) };
 		if (err instanceof TextNotebookLanguageError)
 			return { ok: false as const, refused: 'py-notebook' as const };
 		if (err instanceof InvalidNotebookLanguageError)

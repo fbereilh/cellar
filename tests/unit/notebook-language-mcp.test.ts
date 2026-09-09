@@ -19,7 +19,7 @@
  * agent is actually billed for.
  */
 import { describe, it, expect, beforeAll, vi } from 'vitest';
-import { mkdtempSync, writeFileSync, readFileSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
@@ -218,6 +218,42 @@ describe('a refusal and a failed save are different outcomes, not one failure', 
 		// And the document really DID take it, which is the fact the wording turns on.
 		expect(nbmod.getNotebookLanguage(nb)).toBe('mojo');
 		expect(readFileSync(nb, 'utf8')).toBe(onDisk);
+	});
+
+	/**
+	 * The THIRD outcome. The document could not be OPENED (deleted or renamed under a
+	 * session that had pinned it), so the setter threw BEFORE it mutated anything.
+	 *
+	 * Two things were wrong when this fell into the `writeFailed` branch. It claimed
+	 * the language had been applied over a notebook nothing touched - the exact
+	 * false-claim class that whole split exists to remove, with the sign flipped -
+	 * and that branch re-entered the doc layer for the values it reports, so it threw
+	 * AGAIN on this very path and the tool escaped its own result union entirely.
+	 */
+	it('a notebook that cannot be OPENED reports THAT, and never escapes the result union', async () => {
+		const client = await connect('s-gone');
+		const nb = nbmod.createNotebook('gone.ipynb').path;
+		await client.callTool({ name: 'use_notebook', arguments: { name: 'gone.ipynb' } });
+		// What an explorer delete leaves behind for a session still pinned to it.
+		nbmod.dropDocs(nb);
+		rmSync(nb);
+
+		const res = (await client.callTool({
+			name: 'set_notebook_language',
+			arguments: { language: 'mojo' }
+		})) as CallResult;
+
+		// It ANSWERED - a re-entrant catch threw out of the handler instead.
+		expect(res.isError).toBe(true);
+		const body = bodyOf(res);
+		expect(body).toMatch(/could not be opened/i);
+		expect(body).toMatch(/unchanged/i);
+		// Not the two outcomes that mean the opposite: nothing was applied, so neither
+		// the applied-in-memory wording nor the convert-the-notebook remedy belongs.
+		expect(body).not.toMatch(/applied in memory/i);
+		expect(body).not.toMatch(/\.py text notebook/i);
+		// The absolute server path the doc layer's throw carries is stripped.
+		expect(body).not.toContain(WS);
 	});
 });
 

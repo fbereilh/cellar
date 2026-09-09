@@ -23,6 +23,7 @@ import { McpSessionRegistry, SESSION_IDLE_MS, REAPER_INTERVAL_MS } from './sessi
 import { runAsAgent, digestFor, deletionNote, currentSeq, DIGEST_PREFIX } from './userActivity';
 import { CellRefError } from './cellHandle';
 import { TextNotebookCellTypeError } from '../../cellLanguage';
+import { reasonWithoutServerPath } from '../../serverMessage';
 
 const text = (obj: unknown) => ({ content: [{ type: 'text' as const, text: JSON.stringify(obj) }] });
 const notFound = (msg: string) => ({ content: [{ type: 'text' as const, text: msg }], isError: true });
@@ -819,6 +820,14 @@ export function registerTools(server: McpServer) {
 	// its cause and its remedy are the same (that document stores no metadata).
 	server.registerTool('set_notebook_language', { description: 'Set the notebook\'s LANGUAGE: "python" or "mojo". A notebook is one or the other, never both - every plain code cell in it is written in this language (there is no mojo cell type). Switching touches NO cell: markdown, raw, sql and chat cells are unaffected, and code cells simply run as the new language (doctrine clause 12). The nbdev export target follows it - a stored `utils.py` becomes `utils.mojo` and back - so the two can never disagree; the reply reports the target so you can name it again correctly. Refused on a `.py` text notebook, which stores no notebook metadata. Returns {language, export_target, ...}.', inputSchema: { language: z.enum(['python', 'mojo']), ...notebookParam } }, async ({ language, notebook }, extra: ToolExtra) => {
 		const r = svc.setNotebookLanguage(language, targetOf(extra, notebook));
+		// Checked FIRST, and it is NOT the write failure below: the document could not
+		// be OPENED, so nothing was applied at all. Reported as a failed save it would
+		// claim the language took and send the agent to fix a save that never ran.
+		const unavailable = 'unavailable' in r ? String(r.unavailable ?? '') : null;
+		if (unavailable !== null)
+			return notFound(
+				`the notebook could not be opened, so its language is unchanged: ${reasonWithoutServerPath(unavailable)}`
+			);
 		if ('refused' in r) return notFound(pyNotebookRefusal('the notebook language cannot be stored'));
 		if ('invalid' in r) return notFound(`refused: ${r.invalid}`);
 		// NOT a refusal: the language was ACCEPTED and the open notebook already holds

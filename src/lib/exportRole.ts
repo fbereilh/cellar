@@ -190,6 +190,32 @@ export function exportEligibilityLanguage(
 }
 
 /**
+ * The OTHER half of that split, stated here beside it so the pair is one rule
+ * rather than two call-site choices: WHICH language a surface that SPEAKS ABOUT A
+ * MODULE reads.
+ *
+ * It is the notebook's language, but only once a target actually names a module -
+ * `null` otherwise, because with no module there is nothing for such a surface to
+ * be about. That is the gate the server's own hazard rule applies (`docHazards`
+ * returns `[]` with no target configured, "warning there would be noise on a
+ * notebook that exports nothing"), so a client surface reading the notebook
+ * language instead speaks while the once-per-notebook fact it pairs with stays
+ * silent, over an export that cannot happen at all.
+ *
+ * It is derived from the NOTEBOOK's language and never from the target's
+ * extension: the extension FOLLOWS the language (`setNotebookLanguage`
+ * re-expresses it, `setExportTarget` refuses a mismatch), so reading it back would
+ * reintroduce the second, contradictable spelling this axis removes. All
+ * `targetNamesModule` contributes is whether there IS a module.
+ */
+export function exportModuleLanguage(
+	notebookLanguage: ExportLanguage,
+	targetNamesModule: boolean
+): ExportLanguage | null {
+	return targetNamesModule ? notebookLanguage : null;
+}
+
+/**
  * Does this cell's SOURCE carry nbdev's bare `#| export` directive?
  *
  * Read STATICALLY, never by running the cell - a `#|` line is a comment. The

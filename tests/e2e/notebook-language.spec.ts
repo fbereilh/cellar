@@ -111,7 +111,7 @@ async function typeInto(page: Page, cell: Locator, text: string): Promise<void> 
 	await page.keyboard.type(text);
 }
 
-type DiskCell = { id?: string; cell_type?: string; metadata?: { cellar?: { language?: string } } };
+type DiskCell = { id?: string; cell_type?: string; metadata?: { cellar?: { language?: string; role?: string } } };
 const onDisk = (name: string): { cells: DiskCell[] } => JSON.parse(readFileSync(join(workspace, name), 'utf8'));
 
 test.beforeAll(async () => {
@@ -352,6 +352,73 @@ test('a Mojo notebook shows NO staleness chip, and never goes stale', async ({ p
 	await typeInto(page, cell, 'def main():\n    print("edited")');
 	await page.waitForTimeout(2_000);
 	await expect(page.getByTestId('stale-badge')).toHaveCount(0);
+});
+
+/**
+ * The imports role SURVIVES a language switch - nothing per-cell is written, which
+ * is the design - so the mark is still in the committed `.ipynb` afterwards.
+ *
+ * Hiding its only control there left the user with the badge still asserting the
+ * role, the key still in their file, and no way to remove it short of switching
+ * the notebook back. So the control is RENDERED greyed and can only CLEAR: the
+ * same hidden-vs-greyed rule the export toggle one control along follows.
+ */
+test('a kept imports mark stays clearable after the switch, greyed and clear-only', async ({ page }) => {
+	test.setTimeout(120_000);
+	const errors = watchErrors(page);
+	const name = 'lang-imports-role.ipynb';
+	writeFileSync(
+		join(workspace, name),
+		JSON.stringify({
+			cells: [
+				{
+					cell_type: 'code',
+					id: PY_ID,
+					metadata: { cellar: { role: 'imports' } },
+					source: ['import os'],
+					outputs: [],
+					execution_count: null
+				},
+				{ cell_type: 'code', id: 'other00000', metadata: {}, source: ['print(1)'], outputs: [], execution_count: null }
+			],
+			metadata: {},
+			nbformat: 4,
+			nbformat_minor: 5
+		})
+	);
+	await page.goto(`${baseURL}/?ws=${encodeURIComponent(workspace)}`);
+	await page.locator(`[data-testid="tree-file"][data-path="${name}"]`).click();
+	const marked = cellBy(page, PY_ID);
+	await expect(marked).toBeVisible({ timeout: 30_000 });
+	await expect(marked.getByTestId('imports-badge')).toBeVisible();
+
+	await chooseLanguage(page, 'mojo');
+	// The switch touched no cell, so the mark - and the badge asserting it - survive.
+	await expect(marked.getByTestId('imports-badge')).toBeVisible();
+	expect(onDisk(name).cells.find((c) => c.id === PY_ID)?.metadata?.cellar?.role).toBe('imports');
+
+	// The control is THERE, greyed, and says why - where a cell that carries no mark
+	// still gets nothing, since marking can never mean anything here.
+	await marked.getByTestId('cell-actions').click();
+	const item = marked.getByTestId('toggle-imports-role');
+	await expect(item).toBeVisible();
+	await expect(item).toHaveAttribute('data-imports-stranded', 'true');
+	await expect(item).toHaveAttribute('title', /Python kernel/i);
+	await expect(item).toHaveText(/Unmark/i);
+	await item.click();
+
+	// It CLEARED - badge gone, and the key really left the user's committed file.
+	await expect(marked.getByTestId('imports-badge')).toHaveCount(0);
+	await expect
+		.poll(() => onDisk(name).cells.find((c) => c.id === PY_ID)?.metadata?.cellar?.role, { timeout: 15_000 })
+		.toBeUndefined();
+
+	// And an UNMARKED cell of the same notebook is offered nothing at all.
+	const plain = cellBy(page, 'other00000');
+	await plain.getByTestId('cell-actions').click();
+	await expect(plain.getByTestId('toggle-imports-role')).toHaveCount(0);
+	await page.keyboard.press('Escape');
+	expect(errors).toEqual([]);
 });
 
 test('a .py TEXT notebook offers no selector - it can only ever be Python', async ({ page }) => {

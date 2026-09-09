@@ -26,7 +26,12 @@
 	import HtmlOutput from '$lib/HtmlOutput.svelte';
 	import WidgetOutput from '$lib/WidgetOutput.svelte';
 	import { foldKey, numberHeadingLine, splitHeadingSegments } from '$lib/headings';
-	import { isImportsCell } from '$lib/importsRole';
+	import {
+		isImportsCell,
+		importsRoleStranded,
+		notebookUsesImportsCell,
+		IMPORTS_ROLE_STRANDED_TITLE
+	} from '$lib/importsRole';
 	import {
 		canExportCell,
 		isExportCell,
@@ -363,12 +368,26 @@
 	// with the "imports" badge, and free to live at any index. Only a Python code
 	// cell can hold the role, so the mark action is offered only when `canBeImports`.
 	const isImports = $derived(isImportsCell(cell));
+	// The mark is set but the notebook's language means it can never do anything -
+	// a designation made while the notebook was Python and kept when it switched,
+	// since a language change touches no cell. The rule is the shared, unit-tested
+	// `importsRoleStranded`, whose header owns the reason.
+	const importsStranded = $derived(importsRoleStranded(cell, notebookLanguage));
 	// Only a PYTHON code cell can hold the role - the imports cell is RUN by the
 	// Python kernel, so every import routed into one on a Mojo notebook would be
 	// stranded with nothing to execute them (and `routeImports`/`consolidateImports`
-	// refuse such a notebook at their entry, so the item would be a dead control).
-	// `isMojo` is the notebook's language, which is what decides this now.
-	const canBeImports = $derived(logicalType === 'code' && !isMojo);
+	// refuse such a notebook at their entry, so MARKING there would be a dead
+	// control and stays hidden).
+	//
+	// A cell that ALREADY carries the mark is the exception, and it is the same
+	// hidden-vs-greyed rule the export toggle one control along follows: the item is
+	// RENDERED, greyed and able only to CLEAR, because this menu is the one surface
+	// that can retire a key the user would otherwise be left with in their committed
+	// `.ipynb` under a badge still asserting it. Hidden there, the state is
+	// unreachable except by switching the notebook back.
+	const canBeImports = $derived(
+		logicalType === 'code' && (notebookUsesImportsCell(notebookLanguage) || isImports)
+	);
 	// nbdev-style export: this code cell is written to the notebook's `.py` module.
 	// The row toggle asks `canExportCell` - the SAME eligibility rule the setters and
 	// `isExportCell` ask - rather than re-deriving one: `canBeImports` is
@@ -2568,8 +2587,10 @@
 							</button>
 							{#if canBeImports}
 							<button
-								class="flex items-center gap-2 rounded px-2 py-1.5 text-left hover:bg-base-200 {isImports ? 'text-base-content' : 'text-primary'}"
+								class="flex items-center gap-2 rounded px-2 py-1.5 text-left hover:bg-base-200 {importsStranded ? 'text-base-content/50' : isImports ? 'text-base-content' : 'text-primary'}"
 								onclick={toggleImportsRole}
+								title={importsStranded ? IMPORTS_ROLE_STRANDED_TITLE : undefined}
+								data-imports-stranded={importsStranded ? 'true' : undefined}
 								data-testid="toggle-imports-role"
 							>
 								<svg class="h-3.5 w-3.5 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 17v5" /><path d="M9 10.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24V16a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V7a1 1 0 0 1 1-1 2 2 0 0 0 0-4H8a2 2 0 0 0 0 4 1 1 0 0 1 1 1z" /></svg>
