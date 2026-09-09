@@ -1,7 +1,13 @@
 <script lang="ts">
 	import Cell from '$lib/Cell.svelte';
 	import type { LogicalCellType } from '$lib/server/types';
-	import { offersCellType } from '$lib/cellLanguage';
+	import {
+		offersCellType,
+		isNotebookLanguage,
+		NOTEBOOK_LANGUAGES,
+		NOTEBOOK_LANGUAGE_LABELS,
+		type NotebookLanguage
+	} from '$lib/cellLanguage';
 	import type { CellActivation, KeyMode, CellRegisterApi, SegHidden, UICell } from '$lib/types';
 	import type { StalenessEntry } from '$lib/staleness';
 	import type { CellChangeStatus } from '$lib/gitdiff';
@@ -177,11 +183,25 @@
 		exportBaseBusy?: boolean;
 		/** Re-express the stored target under a new base (or record a pre-target choice). */
 		onSetExportBase?: (base: string) => void;
+		/**
+		 * The NOTEBOOK's language: what every plain `code` cell in it is written in.
+		 * The ONE authority for python-vs-mojo (`$lib/cellLanguage`) - there is no
+		 * per-cell tag, so this is what the language selector sets and what every
+		 * language-aware surface below reads.
+		 */
+		notebookLanguage?: NotebookLanguage;
+		/** True while a language change is in flight (the selector is disabled). */
+		languageBusy?: boolean;
+		/** Outcome of the last language change (applied / refused), beside the selector. */
+		languageFeedback?: string;
+		/** Set the notebook's language. */
+		onSetLanguage?: (language: NotebookLanguage) => void;
 		/** This notebook's declared code root (kernel cwd + sys.path), or null for the workspace. */
 		root?: string | null;
 		/** True for a `.py` text notebook, which stores no notebook metadata (no root
-		 *  picker) and, being rebuilt from its cells on save, cannot hold a raw, Mojo
-		 *  or chat cell (no Raw/Mojo/Chat entry in a cell's type menu). */
+		 *  picker, no language selector - it can only ever be Python) and, being
+		 *  rebuilt from its cells on save, cannot hold a raw or chat cell (no
+		 *  Raw/Chat entry in a cell's type menu). */
 		isPy?: boolean;
 		/** The workspace's code roots — an empty list renders no root control at all. */
 		availableRoots?: WorkspaceRootOption[];
@@ -304,6 +324,10 @@
 		exportHazards = [],
 		exportBaseBusy = false,
 		onSetExportBase,
+		notebookLanguage = 'python',
+		languageBusy = false,
+		languageFeedback = '',
+		onSetLanguage = () => {},
 		root = null,
 		isPy = false,
 		availableRoots = [],
@@ -651,6 +675,26 @@
 	let exportFeedback = $state('');
 	let exporting = $state(false);
 	const showExportBar = $derived(!isPy);
+	// The LANGUAGE selector. Shown on every `.ipynb`, unlike the code-root bar's
+	// opt-in chrome: every notebook HAS a language and it decides how every code cell
+	// in it runs, so the one place that says which is not something to make the user
+	// go and enable. A `.py` text notebook is excluded for the reason it has no root
+	// picker either - it stores no notebook metadata, so it can only ever be Python
+	// and a control offering otherwise would be refused on click.
+	const showLanguageBar = $derived(!isPy);
+	// The select is DRIVEN by the settled `notebookLanguage`, never by the click: a
+	// refusal (a `.py` notebook reached through a stale tab) must leave the control
+	// showing what the document really holds, which is the same non-optimistic rule
+	// the export BASE select follows.
+	let languageSelectEl = $state<HTMLSelectElement | null>(null);
+	function onLanguageSelect(e: Event) {
+		const next = (e.currentTarget as HTMLSelectElement).value;
+		// Put the control back on the settled value straight away; `notebookLanguage`
+		// re-renders it the moment the server answers.
+		if (languageSelectEl) languageSelectEl.value = notebookLanguage;
+		if (!isNotebookLanguage(next) || next === notebookLanguage || languageBusy) return;
+		onSetLanguage(next);
+	}
 	// The base select is DRIVEN by `exportBase`, never by the click (the
 	// `selectedRoot` idiom below): with a stored target a base change is applied
 	// non-optimistically - the server RE-EXPRESSES the same file under the new
@@ -1080,6 +1124,7 @@
 				onSetType={onSetType}
 				onSetRole={onSetRole}
 				{exportLanguage}
+				{notebookLanguage}
 				mainDropped={mojoMainDropped.has(cell.id)}
 				onSetExport={onSetExport}
 				onSetScrolled={onSetScrolled}
@@ -1207,6 +1252,52 @@
 				Consolidate imports
 			</button>
 		</div>
+		{#if showLanguageBar}
+			<!-- The notebook's LANGUAGE: what every plain code cell in it is written in.
+			     First of the notebook-level bars because it is the most fundamental of
+			     them - it decides how every code cell RUNS, and the export bar's own
+			     module extension FOLLOWS it. Same visual family as the two bars below,
+			     and deliberately as quiet: it is a property of the notebook, not a
+			     call to action. -->
+			<div
+				class="mb-4 flex flex-wrap items-center gap-2 rounded-box border border-base-300 bg-base-100 px-3 py-2 text-sm"
+				data-testid="language-bar"
+			>
+				<span class="flex items-center gap-1.5 font-medium text-base-content/70">
+					<svg class="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m8 8-4 4 4 4" /><path d="m16 8 4 4-4 4" /><path d="m13 5-2 14" /></svg>
+					Language
+				</span>
+				<select
+					bind:this={languageSelectEl}
+					class="select select-bordered select-xs w-auto pr-7"
+					value={notebookLanguage}
+					onchange={onLanguageSelect}
+					disabled={languageBusy}
+					data-testid="language-select"
+					aria-label="The language this notebook's code cells are written in"
+				>
+					{#each NOTEBOOK_LANGUAGES as l (l)}
+						<option value={l}>{NOTEBOOK_LANGUAGE_LABELS[l]}</option>
+					{/each}
+				</select>
+				<!-- What it reaches, and what it does NOT cost - the code-root bar states
+				     its kernel-restart price here, and the honest thing to say about this
+				     one is that it has none: nothing per-cell is written and no kernel is
+				     restarted, so markdown, raw, SQL and chat cells are untouched. The
+				     export clause is here because that target is the one OTHER setting
+				     this moves. -->
+				<span class="text-xs text-base-content/55">
+					every code cell runs as {NOTEBOOK_LANGUAGE_LABELS[notebookLanguage]}; markdown, raw,
+					SQL and chat cells are unaffected. The export target's extension follows it. No
+					kernel restart - variables are kept.
+				</span>
+				{#if languageFeedback}
+					<span class="text-xs text-base-content/70" data-testid="language-feedback"
+						>{languageFeedback}</span
+					>
+				{/if}
+			</div>
+		{/if}
 		{#if showRootBar}
 			<!-- Code root: the directory THIS notebook's kernel runs in and imports from
 			     (normally a git worktree under `roots/`). WHEN it is rendered is

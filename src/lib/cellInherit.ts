@@ -17,7 +17,7 @@
  *    Mojo.
  *  - **Markdown, raw and chat cells are SKIPPED, not stopped at.** A prose cell
  *    between two Mojo cells is exactly the shape a documented notebook has, and
- *    stopping there would make the language flip back to Python at every heading.
+ *    stopping there would make a SQL run flip back to code at every heading.
  *    Chat is skipped for the same reason it can never be INHERITED (below).
  *  - **No preceding code cell ⇒ the caller's default**, which is Python
  *    everywhere today. The first cell of an empty notebook is unchanged.
@@ -28,7 +28,7 @@
  * let a click on "+ Code" create a cell whose Run button spends money on a model
  * turn. Cellar already refuses to let AGENTS create chat cells for that reason
  * (`chat` is absent from every MCP write enum); creating one from a gesture that
- * says "code" would be the same surprise from the other direction. A seventh
+ * says "code" would be the same surprise from the other direction. A sixth
  * language is likewise NOT inheritable until it is named here.
  *
  * WHY THIS IS CLIENT-SIDE AND NOT A RULE INSIDE `addCell`. Three server-side
@@ -54,8 +54,13 @@ type InheritCell = { cell_type?: string; metadata?: CellMetadata | null } | null
  * The code languages a plain "+ Code" insertion may take from the cell above.
  * An ALLOWLIST: `chat` is deliberately absent (see the module header), and so is
  * every non-code type, so an unlisted logical type falls back to the default.
+ *
+ * Mojo needs no entry and must not gain one: it is the NOTEBOOK's language
+ * (`$lib/cellLanguage`), so a plain `code` cell created in a Mojo notebook is
+ * already Mojo. The only thing left for this rule to carry across is SQL, which
+ * really is a per-cell kind.
  */
-export const INHERITABLE_CODE_TYPES: readonly LogicalCellType[] = ['code', 'sql', 'mojo'];
+export const INHERITABLE_CODE_TYPES: readonly LogicalCellType[] = ['code', 'sql'];
 
 /** May a plain code insertion inherit this logical type? */
 export function isInheritableCodeType(cellType: unknown): cellType is LogicalCellType {

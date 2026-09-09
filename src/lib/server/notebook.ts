@@ -21,7 +21,15 @@
 import { dirname, join, resolve, isAbsolute, relative, sep } from 'node:path';
 import { existsSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
-import { readNotebook, NotebookReadError, deserialize, writeNotebook, serialize, stringify } from './ipynb';
+import {
+	readNotebook,
+	NotebookReadError,
+	defaultMetadata,
+	deserialize,
+	writeNotebook,
+	serialize,
+	stringify
+} from './ipynb';
 import { isPyPath, readPyNotebook, writePyNotebook } from './jupytext';
 import { publish } from './events';
 import { cancelRun } from './run-queue';
@@ -45,13 +53,26 @@ import {
 	exportDirectiveOwnsCell,
 	exportMarkedTwice,
 	exportTargetLanguage,
+	moduleExtension,
 	type ExportLanguage
 } from '../exportRole';
 import { isHiddenFromAgent } from '../agentVisibility';
 import { isExportBase, type ExportBase } from '../exportTarget';
 import { gitRootOf } from './git';
 import { resolveInWorkspace } from './fstree';
-import { isLogicalCellType, isPyUnsupportedType, languageTagFor, logicalCellType, nbCellType, textNotebookCellTypeError } from '../cellLanguage';
+import {
+	isLogicalCellType,
+	isNotebookLanguage,
+	isPyUnsupportedType,
+	languageTagFor,
+	logicalCellType,
+	nbCellType,
+	notebookLanguageOf,
+	textNotebookCellTypeError,
+	textNotebookLanguageError,
+	NOTEBOOK_LANGUAGES,
+	type NotebookLanguage
+} from '../cellLanguage';
 import { foldImportChange, pruneImportBindings } from './importBindings';
 import { stripRuntimeMeta } from './clean';
 import { normalizeRootPath, textNotebookRootError } from '../notebookRoot';
@@ -64,6 +85,7 @@ import type {
 	ImportChangeStamps,
 	LogicalCellType,
 	LastRun,
+	NotebookCellarNamespace,
 	NotebookDoc,
 	NotebookReadFailure,
 	NotebookView
@@ -487,7 +509,8 @@ function notebookView(doc: NotebookDoc): NotebookView {
 		root: readRoot(doc),
 		isPy: !!doc.jpFormat,
 		headerNumbering: readHeaderNumbering(doc),
-		hideAllCode: !!doc.metadata?.cellar?.hide_all_code
+		hideAllCode: !!doc.metadata?.cellar?.hide_all_code,
+		language: notebookLanguageOf(doc.metadata)
 	};
 }
 
@@ -517,11 +540,14 @@ function exportTargetView(doc: NotebookDoc): {
 	const info = resolveExportTarget(doc);
 	return {
 		exportBase: readExportBase(doc),
-		// The language THIS resolution named, carried rather than re-derived by the
-		// reader: `getNotebookMap` is the most frequently called agent read tool and
-		// `resolveExportTarget` sweeps every cell for a `#|default_exp` directive when
-		// no target is stored, so asking a second time doubles that sweep on it.
-		exportLanguage: info ? exportTargetLanguage(info.ok ? info.target : info.path) : null,
+		// The MODULE language, which is the NOTEBOOK's - reported only once a target
+		// names a module at all, so `null` still means "no module for a sentence to be
+		// about" and no surface invents a `.py` one. Read through the shared
+		// `docExportTargetInfo` (which is handed this same `info`) rather than off the
+		// extension: the extension follows the language now, not the other way round.
+		exportLanguage: info && exportTargetLanguage(info.ok ? info.target : info.path) !== null
+			? notebookLanguageOf(doc.metadata)
+			: null,
 		exportResolved: info && info.ok ? info.target : null,
 		exportResolveError: info && !info.ok ? info.error : null,
 		// The SAME `info` is threaded in rather than resolved a second time here, and
@@ -529,6 +555,36 @@ function exportTargetView(doc: NotebookDoc): {
 		// where an agent-only kind may not appear (`$lib/exportHazard`).
 		exportHazards: docHumanExportHazards(doc, info)
 	};
+}
+
+/**
+ * The notebook's `cellar` namespace, MATERIALIZED for writing.
+ *
+ * Two things every notebook-level setter needs, and both were got wrong the same
+ * way at each of them before this existed:
+ *
+ *  - `doc.metadata` is seeded with `defaultMetadata()`, NOT `{}`. `serialize`
+ *    writes `doc.metadata ?? defaultMetadata()`, so a document that has never
+ *    carried metadata gets its kernelspec from that fallback - and a setter that
+ *    seeded a bare `{}` made the fallback stop applying, so the FIRST notebook-level
+ *    setting a user ever chose silently deleted the notebook's kernelspec from disk.
+ *  - it hands back the namespace rather than assigning it, so a caller that CLEARS
+ *    its key can prune an emptied namespace (`pruneCellar`) instead of leaving
+ *    `"cellar": {}` in the committed file. Clean-on-save preserves the namespace
+ *    whole, so that residue is a permanent line of git diff for a setting that is
+ *    no longer set.
+ */
+function notebookCellar(doc: NotebookDoc): NotebookCellarNamespace {
+	const metadata = doc.metadata ?? defaultMetadata();
+	doc.metadata = metadata;
+	metadata.cellar = metadata.cellar ?? {};
+	return metadata.cellar;
+}
+
+/** Drop the `cellar` namespace once the last key in it has been cleared. */
+function pruneCellar(doc: NotebookDoc): void {
+	const metadata = doc.metadata;
+	if (metadata?.cellar && Object.keys(metadata.cellar).length === 0) delete metadata.cellar;
 }
 
 /**
@@ -1376,13 +1432,26 @@ export function setExportTarget(
 			throw new InvalidExportTargetError(
 				`unknown export base ${JSON.stringify(wanted)}: expected "workspace", "notebook" or "git" - clear the export target to reset the base, then set the path again`
 			);
-		// The extension is not decoration: it names the module's LANGUAGE, which decides
-		// which cells go in it (`exportRole`'s `canExportCell`) and how it is assembled
-		// (no `__all__` and one `main` for Mojo - `$lib/mojoExport`). Anything else is
-		// refused for the sharper reason above: the exporter WRITES this path.
-		if (!exportTargetLanguage(raw))
+		// The extension is not decoration: it must AGREE with the module's language,
+		// which decides how the module is assembled (no `__all__` and one `main` for
+		// Mojo - `$lib/mojoExport`). Anything else is refused for the sharper reason
+		// above: the exporter WRITES this path.
+		const named = exportTargetLanguage(raw);
+		if (!named)
 			throw new InvalidExportTargetError(
 				`export target ${raw} is not a .py or .mojo file: the generated module is written to this path, so it must name a .py or .mojo module`
+			);
+		// The module's language is the NOTEBOOK's (`docExportLanguage`), so the
+		// extension FOLLOWS it and may not contradict it - that contradiction is the
+		// second setting this axis exists to remove. Refused here rather than coerced:
+		// silently rewriting a path the user typed is how they end up looking for a file
+		// that is not where they asked for it. (`setNotebookLanguage` re-expresses the
+		// STORED target when the language moves, which is the other direction and is a
+		// change to the setting they just made.)
+		const nbLang = notebookLanguageOf(doc.metadata);
+		if (named !== nbLang)
+			throw new InvalidExportTargetError(
+				`export target ${raw} names a ${moduleExtension(named)} module, but this notebook's language is ${nbLang === 'mojo' ? 'Mojo' : 'Python'} - name a ${moduleExtension(nbLang)} module instead, or change the notebook's language first`
 			);
 		const baseDir = exportBaseDir(doc, wanted); // refuses `git` with no repository
 		let abs: string;
@@ -1399,14 +1468,14 @@ export function setExportTarget(
 		}
 		stored = relative(baseDir, abs).split(sep).join('/');
 	}
-	doc.metadata = doc.metadata ?? {};
-	doc.metadata.cellar = doc.metadata.cellar ?? {};
-	if (stored) doc.metadata.cellar.export_target = stored;
-	else delete doc.metadata.cellar.export_target;
+	const cellar = notebookCellar(doc);
+	if (stored) cellar.export_target = stored;
+	else delete cellar.export_target;
 	// The base is a fact ABOUT a stored target: cleared with it, and never stored
 	// as an explicit `workspace` (absence is the one spelling of the default).
-	if (stored && wanted !== 'workspace') doc.metadata.cellar.export_base = wanted;
-	else delete doc.metadata.cellar.export_base;
+	if (stored && wanted !== 'workspace') cellar.export_base = wanted;
+	else delete cellar.export_base;
+	pruneCellar(doc);
 	persist(doc);
 	// Naming the file the module is written to is an EXPLICIT export action, so it
 	// regenerates - unlike an ordinary save, which no longer does. A CLEAR reaches
@@ -1530,11 +1599,11 @@ export function setExportBase(base: string, nb?: string | null, originId?: strin
 			`the current export target cannot be re-expressed: ${info && !info.ok ? info.error : 'no stored target resolves'} - clear the export target, then set the path again under the new base`
 		);
 	const baseDir = exportBaseDir(doc, wanted); // refuses `git` with no repository
-	doc.metadata = doc.metadata ?? {};
-	doc.metadata.cellar = doc.metadata.cellar ?? {};
-	doc.metadata.cellar.export_target = relative(baseDir, info.abs).split(sep).join('/');
-	if (wanted !== 'workspace') doc.metadata.cellar.export_base = wanted;
-	else delete doc.metadata.cellar.export_base;
+	const cellar = notebookCellar(doc);
+	cellar.export_target = relative(baseDir, info.abs).split(sep).join('/');
+	if (wanted !== 'workspace') cellar.export_base = wanted;
+	else delete cellar.export_base;
+	pruneCellar(doc);
 	persist(doc);
 	const state = exportTargetState(doc);
 	emit(doc, 'notebook:export-target', { ...state }, originId);
@@ -1559,13 +1628,13 @@ export function setHeaderNumbering(
 	originId?: string | null
 ): number[] {
 	const doc = docFor(nb);
-	doc.metadata = doc.metadata ?? {};
-	doc.metadata.cellar = doc.metadata.cellar ?? {};
+	const cellar = notebookCellar(doc);
 	const clean = [
 		...new Set((levels ?? []).filter((l) => Number.isInteger(l) && l >= 1 && l <= 6))
 	].sort((a, b) => a - b);
-	if (clean.length) doc.metadata.cellar.header_numbering = clean;
-	else delete doc.metadata.cellar.header_numbering;
+	if (clean.length) cellar.header_numbering = clean;
+	else delete cellar.header_numbering;
+	pruneCellar(doc);
 	persist(doc);
 	emit(doc, 'notebook:header-numbering', { levels: clean }, originId);
 	return clean;
@@ -1623,10 +1692,10 @@ export function setNotebookRoot(root: string | null | undefined, nb?: string | n
 	const normalized = normalizeRootPath(root);
 	const doc = docFor(nb);
 	if (normalized && doc.jpFormat) throw textNotebookRootError(normalized);
-	doc.metadata = doc.metadata ?? {};
-	doc.metadata.cellar = doc.metadata.cellar ?? {};
-	if (normalized) doc.metadata.cellar.root = normalized;
-	else delete doc.metadata.cellar.root;
+	const cellar = notebookCellar(doc);
+	if (normalized) cellar.root = normalized;
+	else delete cellar.root;
+	pruneCellar(doc);
 	persist(doc);
 	emit(doc, 'notebook:root', { root: normalized }, originId);
 	return normalized;
@@ -1645,13 +1714,106 @@ export function getHideAllCode(nb?: string | null): boolean {
  */
 export function setHideAllCode(hidden: boolean, nb?: string | null, originId?: string | null): boolean {
 	const doc = docFor(nb);
-	doc.metadata = doc.metadata ?? {};
-	doc.metadata.cellar = doc.metadata.cellar ?? {};
-	if (hidden) doc.metadata.cellar.hide_all_code = true;
-	else delete doc.metadata.cellar.hide_all_code;
+	const cellar = notebookCellar(doc);
+	if (hidden) cellar.hide_all_code = true;
+	else delete cellar.hide_all_code;
+	pruneCellar(doc);
 	persist(doc);
 	emit(doc, 'notebook:hide-all-code', { hidden: !!hidden }, originId);
 	return !!hidden;
+}
+
+/**
+ * The language every plain `code` cell in this notebook is written in - what the
+ * selector at the top of the notebook shows. `python` for a notebook that declares
+ * nothing, which is every notebook that predates the selector.
+ */
+export function getNotebookLanguage(nb?: string | null): NotebookLanguage {
+	return notebookLanguageOf(docFor(nb).metadata);
+}
+
+/**
+ * Set the notebook's language - the ONE authority for python-vs-mojo.
+ *
+ * Stored in the allowlisted `cellar` namespace so it round-trips through
+ * clean-on-save with zero git noise, and `python` DELETES the key rather than
+ * writing an explicit value: absence is the only spelling of the default, so a
+ * notebook that switches to Mojo and back is byte-identical to one that never
+ * switched (which is what "switching back leaves nothing stale" means at the file
+ * level), and no notebook is ever migrated into carrying the key.
+ *
+ * NO CELL IS TOUCHED. That is the design, not an optimisation: a code cell's
+ * language is READ from here, never copied onto the cell, so there is no second
+ * spelling to fall out of step, no per-cell rewrite to undo, and markdown and raw
+ * cells - which have no language at all - are unaffected by construction rather
+ * than by being skipped.
+ *
+ * A `.py` TEXT notebook REFUSES `mojo`, for exactly the reason it refuses a code
+ * root and a raw cell: `persist` writes such a document back from its cells alone,
+ * so the declaration would live only in memory and every cell would come back
+ * Python after a reload - the silent degrade this whole axis exists to prevent.
+ * Setting `python` stays allowed there, since it can only ever remove state.
+ *
+ * THE EXPORT TARGET FOLLOWS. The module's language is the notebook's
+ * (`docExportLanguage`), so a stored target's extension is re-expressed here -
+ * `utils.py` becomes `utils.mojo` and back. It is the same file being renamed to
+ * match the language it is now written in, and it is what keeps the two from ever
+ * disagreeing; the alternative (leaving a `.py` target on a Mojo notebook) is
+ * precisely the second contradicting setting the captain ruled out. A target
+ * naming no module Cellar builds is left exactly as it is - there is no extension
+ * to follow, and `resolveExportTarget` already refuses it by name.
+ */
+export function setNotebookLanguage(
+	language: string,
+	nb?: string | null,
+	originId?: string | null
+): NotebookLanguage {
+	const wanted = (language ?? '').trim();
+	if (!isNotebookLanguage(wanted))
+		throw new Error(
+			`unknown notebook language ${JSON.stringify(wanted)}: expected ${NOTEBOOK_LANGUAGES.map((l) => JSON.stringify(l)).join(' or ')}`
+		);
+	const doc = docFor(nb);
+	if (wanted !== 'python' && doc.jpFormat) throw textNotebookLanguageError();
+	// A genuine no-op writes NOTHING: no persist, no export regeneration, no event.
+	// Two things turn on that. It keeps re-setting the current language free of git
+	// churn (the idempotence every setting here owes), and it is what makes setting
+	// `python` on a `.py` TEXT notebook - which is always already Python - cost no
+	// blocking jupytext round trip, rather than rewriting the user's file to produce
+	// the bytes it already had.
+	if (wanted === notebookLanguageOf(doc.metadata)) return wanted;
+	const cellar = notebookCellar(doc);
+	if (wanted === 'python') delete cellar.language;
+	else cellar.language = wanted;
+	// The stored target's extension follows the language it now names - see above.
+	const stored = cellar.export_target;
+	let targetMoved = false;
+	if (typeof stored === 'string' && stored.trim()) {
+		const named = exportTargetLanguage(stored.trim());
+		if (named && named !== wanted) {
+			cellar.export_target = stored.trim().replace(/\.(py|mojo)$/i, moduleExtension(wanted));
+			targetMoved = true;
+		}
+	}
+	// Switching BACK must leave the file byte-identical to one that never switched,
+	// which means the NAMESPACE goes too when this emptied it: clean-on-save
+	// preserves `cellar` whole, so an `{}` left behind is a real, permanent line of
+	// git diff for a setting that is no longer set.
+	pruneCellar(doc);
+	persist(doc);
+	// Choosing the module's language IS naming what the module contains, so this
+	// joins `setExportTarget`/`setCellExports` as an explicit export action and
+	// regenerates best-effort through the same one path (a bad target must never
+	// cost the notebook write this call just made - see `regenerateExportModule`).
+	regenerateExportModule(doc);
+	// A target that MOVED is a change to the stored export setting, so it rides that
+	// setting's OWN event: every other tab's target field and base then update from
+	// the one snapshot they already understand, rather than needing a second rule
+	// that re-derives an extension from a language event. The initiating tab
+	// suppresses this echo by `originId` and adopts the state from the reply instead.
+	if (targetMoved) emit(doc, 'notebook:export-target', { ...exportTargetState(doc) }, originId);
+	emit(doc, 'notebook:language', { language: wanted }, originId);
+	return wanted;
 }
 
 /**

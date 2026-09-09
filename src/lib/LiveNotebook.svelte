@@ -9,12 +9,14 @@
 	import {
 		isChatCell,
 		isLogicalCellType,
+		isNotebookLanguage,
 		languageTagFor,
 		logicalTypeFor,
 		nbCellType,
 		offersCellType,
 		textNotebookTypeForReason,
-		textNotebookTypeMessage
+		textNotebookTypeMessage,
+		type NotebookLanguage
 	} from '$lib/cellLanguage';
 	import type {
 		CompleteOutcome,
@@ -171,7 +173,8 @@
 		  }
 		| { type: 'notebook:root'; root: string | null }
 		| { type: 'notebook:header-numbering'; levels: number[] }
-		| { type: 'notebook:hide-all-code'; hidden: boolean };
+		| { type: 'notebook:hide-all-code'; hidden: boolean }
+		| { type: 'notebook:language'; language: string };
 
 	/** A run-lifecycle event (run:cleared / run:start / run:output / run:output-append / run:end). */
 	type RunEvent =
@@ -264,14 +267,38 @@
 	let exportBase = $state<string>('workspace');
 	let exportResolved = $state<string | null>(null);
 	let exportResolveError = $state<string | null>(null);
-	// Which MODULE LANGUAGE this notebook's target names (`.py` -> python, `.mojo` ->
-	// mojo), which is what decides which cells are eligible for it. Read off the
-	// server's RESOLUTION where there is one and the stored form otherwise, so a
-	// target expressed under a non-workspace base still answers; `python` when no
-	// target is configured, the same legacy default the server applies, so the
-	// toggle on an unconfigured notebook behaves exactly as it always has.
-	const exportModuleLanguage = $derived(exportTargetLanguage(exportResolved ?? exportTarget));
-	const exportLanguage = $derived(exportModuleLanguage ?? 'python');
+	// The notebook's LANGUAGE - what every plain `code` cell in it is written in.
+	// Mirrors `notebook.metadata.cellar.language` (loaded on mount, kept live via the
+	// `notebook:language` SSE event). `python` is what a notebook declaring nothing
+	// is, which is every notebook that predates the selector, so this default is what
+	// keeps an untouched notebook rendering exactly as before.
+	//
+	// It is the ONE notebook-level condition every language-aware surface reads: the
+	// cell badge and type label, the export eligibility the row toggle asks about,
+	// and (in the follow-up) hiding the Python-only affordances. Nothing per-cell is
+	// written when it changes, so markdown, raw, SQL and chat cells are untouched by
+	// construction rather than by being skipped.
+	let notebookLanguage = $state<NotebookLanguage>('python');
+	// Does this notebook's target name a MODULE at all (`.py`/`.mojo`, versus a
+	// hand-edited `notes.txt` or nothing configured)? Read off the server's
+	// RESOLUTION where there is one and the stored form otherwise, so a target
+	// expressed under a non-workspace base still answers.
+	const exportTargetNamesModule = $derived(
+		exportTargetLanguage(exportResolved ?? exportTarget) !== null
+	);
+	// The MODULE language, or null when there is no module for a sentence to be
+	// about. It is the NOTEBOOK's language, never the extension's: the extension
+	// FOLLOWS the language now (`setNotebookLanguage` re-expresses it, and
+	// `setExportTarget` refuses a mismatch), so deriving it from the path here would
+	// reintroduce the second, contradictable spelling the whole axis removes. Derived
+	// from `notebookLanguage`, which is itself mirrored over SSE, so this needs no
+	// wire field of its own and cannot lag the server's answer.
+	const exportModuleLanguage = $derived(exportTargetNamesModule ? notebookLanguage : null);
+	// The language ELIGIBILITY is decided against - the notebook's, whether or not a
+	// target is configured, exactly as `docExportLanguage` answers on the server. An
+	// unconfigured PYTHON notebook still answers `python`, so its per-cell toggle
+	// behaves exactly as it always has.
+	const exportLanguage = $derived(notebookLanguage);
 	const exportCount = $derived(exportCellCount(cells, exportLanguage));
 	// Cells whose export FLAG is set but which no longer match the target's language
 	// (or which have no target to match at all). Summarised here beside `exportCount`,
@@ -316,6 +343,14 @@
 	let isPy = $state(false);
 	let availableRoots = $state<WorkspaceRootOption[]>([]);
 	let rootBusy = $state(false);
+	// The language selector's in-flight + outcome state, the code-root picker's
+	// shape: this write is SETTLED by the server rather than applied optimistically,
+	// because it can be REFUSED (a `.py` text notebook) and showing the switch as
+	// taken before the server agrees would claim every code cell runs in a language
+	// the document does not hold.
+	let languageBusy = $state(false);
+	let languageFeedback = $state('');
+	let languageFeedbackTimer: ReturnType<typeof setTimeout> | null = null;
 	let rootFeedback = $state('');
 	// The root bar's SESSION LATCH: once this notebook has been seen with a
 	// declared root, the bar stays for the life of this component - even after the
@@ -1608,6 +1643,9 @@
 			exportHazards = body.notebook.exportHazards ?? []; // why the generated module would not import
 			headerNumbering = body.notebook.headerNumbering ?? []; // display-only heading numbering
 			hideAllCode = !!body.notebook.hideAllCode; // notebook-wide hide-code (report view)
+			// The notebook's language, read back through the shared guard so a hand-edited
+			// value falls to `python` here exactly as it does on the server.
+			notebookLanguage = isNotebookLanguage(body.notebook.language) ? body.notebook.language : 'python';
 			root = body.notebook.root ?? null; // code root (kernel cwd + sys.path)
 			isPy = !!body.notebook.isPy; // a `.py` text notebook holds no root at all
 			// The root list is NOT fetched here: it is gated on the root bar being
@@ -1780,6 +1818,11 @@
 			headerNumbering = ev.levels ?? [];
 		} else if (ev.type === 'notebook:hide-all-code') {
 			hideAllCode = !!ev.hidden;
+		} else if (ev.type === 'notebook:language') {
+			// An unrecognised value can only come from a newer Cellar or a hand edit; the
+			// same strict test the server applies keeps this tab on the safe default
+			// rather than guessing a language for the user's code.
+			notebookLanguage = isNotebookLanguage(ev.language) ? ev.language : 'python';
 		} else if (ev.type === 'cell:deleted') {
 			cells = cells.filter((c) => c.id !== ev.cellId);
 			setRawEdit(ev.cellId, false);
@@ -2050,6 +2093,7 @@
 				pe.type === 'notebook:export-derived' ||
 				pe.type === 'notebook:header-numbering' ||
 				pe.type === 'notebook:hide-all-code' ||
+				pe.type === 'notebook:language' ||
 				pe.type === 'notebook:root'
 			)
 				applyStructuralEvent(pe as unknown as StructuralEvent);
@@ -2973,6 +3017,66 @@
 					rootFeedbackTimer = null;
 				}, ROOT_FEEDBACK_MS)
 			: null;
+	}
+
+	/**
+	 * The outcome of the last language change, beside the selector. Self-dismissing
+	 * for the same reason the root bar's is: it describes ONE action at ONE moment.
+	 */
+	function showLanguageFeedback(msg: string) {
+		languageFeedback = msg;
+		if (languageFeedbackTimer) clearTimeout(languageFeedbackTimer);
+		languageFeedbackTimer = msg
+			? setTimeout(() => {
+					languageFeedback = '';
+					languageFeedbackTimer = null;
+				}, ROOT_FEEDBACK_MS)
+			: null;
+	}
+
+	/**
+	 * Set the notebook's language, then let the server's answer settle it.
+	 *
+	 * NOT optimistic (the `setRootValue` rule): it can be refused on a `.py` text
+	 * notebook, and it moves the export target's extension, so the reply is what
+	 * both this state and the target field are settled from. Nothing per-cell is
+	 * written by either side, which is why switching costs no kernel and no cell
+	 * rewrite - see `setNotebookLanguage`.
+	 */
+	async function setLanguageValue(next: NotebookLanguage) {
+		if (next === notebookLanguage || languageBusy) return;
+		languageBusy = true;
+		showLanguageFeedback('');
+		try {
+			const res = await fetch('/api/notebooks/language', {
+				method: 'POST',
+				headers: { 'content-type': 'application/json' },
+				body: JSON.stringify({ language: next, path, originId })
+			});
+			const body = await res.json().catch(() => ({}));
+			if (!res.ok || !body?.ok)
+				throw new Error(body?.message || 'could not set the notebook language');
+			notebookLanguage = isNotebookLanguage(body.language) ? body.language : notebookLanguage;
+			// The stored target's extension may have MOVED with the language, and this
+			// tab suppresses its own `notebook:export-target` echo (originId), so the
+			// reply is the only thing that can settle its field. Adopted as one snapshot,
+			// in the same order the SSE branch uses (`exportTarget` LAST), rather than
+			// re-deriving an extension here - the server is what stored it.
+			const t = body.exportTarget;
+			if (t) {
+				exportBase = t.base ?? 'workspace';
+				exportResolved = t.resolved ?? null;
+				exportResolveError = t.resolveError ?? null;
+				exportTarget = t.target ?? null;
+			}
+			showLanguageFeedback(
+				`Applied - code cells now run as ${next === 'mojo' ? 'Mojo' : 'Python'}.`
+			);
+		} catch (err) {
+			showLanguageFeedback(String((err as Error)?.message ?? err));
+		} finally {
+			languageBusy = false;
+		}
 	}
 
 	/**
@@ -4690,6 +4794,10 @@
 			root={root}
 			isPy={isPy}
 			availableRoots={availableRoots}
+			notebookLanguage={notebookLanguage}
+			languageBusy={languageBusy}
+			languageFeedback={languageFeedback}
+			onSetLanguage={setLanguageValue}
 			rootBusy={rootBusy}
 			rootFeedback={rootFeedback}
 			onSetRoot={setRootValue}

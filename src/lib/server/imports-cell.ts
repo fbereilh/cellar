@@ -34,10 +34,11 @@ import {
 	addCellAt,
 	setCellRole,
 	getImportsCell,
+	getNotebookLanguage,
 	resolveNotebookPath
 } from './notebook';
 import { IMPORTS_ROLE, isImportsCell } from '../importsRole';
-import { isPythonCodeCell } from '../cellLanguage';
+import { isPythonCodeCell, type NotebookLanguage } from '../cellLanguage';
 import { extractTopLevelImports, mergeImportSources, isImportsOnly, hasTopLevelImports } from './imports';
 import { isCellMagicCell } from './magics';
 import { enqueueRun, queuePosition, RunCancelled } from './run-queue';
@@ -103,7 +104,7 @@ export function ensureImportsCell(nb?: string | null, originId?: string | null):
 	if (existing) return getCell(existing.id, nb)!;
 
 	const first = cells[0];
-	if (first && isPythonCodeCell(first) && isImportsOnly(first.source)) {
+	if (first && isPythonCodeCell(first, getNotebookLanguage(nb)) && isImportsOnly(first.source)) {
 		setCellRole(first.id, IMPORTS_ROLE, nb, originId);
 		return getCell(first.id, nb)!;
 	}
@@ -177,6 +178,14 @@ export function routeImports(
 	{ skipCellId = null }: { skipCellId?: string | null } = {}
 ): RouteImportsResult {
 	const none: RouteImportsResult = { source, added: [], importsCellId: null };
+	// A MOJO notebook has no Python imports to route: its code cells hold bare Mojo,
+	// so `extractTopLevelImports` would lift `from std.time import sleep` into a
+	// PYTHON imports cell and run it - breaking both halves at once (the Mojo cell no
+	// longer compiles, and the imports cell raises ModuleNotFoundError from then on).
+	// That is the measured defect `isPythonCodeCell` closes for the sweep below;
+	// routing needs the same guard at ITS entry, since it is handed raw source rather
+	// than a cell.
+	if (getNotebookLanguage(nb) !== 'python') return none;
 	if (skipCellId && getImportsCell(nb)?.id === skipCellId) return none;
 	// A cell magic (`%%bash`, `%%writefile foo.py`, …) is a deliberate special cell
 	// whose body is not ordinary Python — never rearrange its lines, even if the body
@@ -219,9 +228,10 @@ interface ConsolidatePlan {
  * twice from one rule is far safer than keeping a second, drifting copy of what the
  * sweep removes. Pure: reads the cells, writes nothing.
  */
-function planConsolidate(cells: CellView[]): ConsolidatePlan {
+function planConsolidate(cells: CellView[], nbLang: NotebookLanguage = 'python'): ConsolidatePlan {
 	const existing = cells.find(isImportsCell);
-	const adoptable = !existing && !!cells[0] && isPythonCodeCell(cells[0]) && isImportsOnly(cells[0].source);
+	const adoptable =
+		!existing && !!cells[0] && isPythonCodeCell(cells[0], nbLang) && isImportsOnly(cells[0].source);
 	const importsSourceCell = existing ?? (adoptable ? cells[0] : null);
 
 	const collected: string[] = [];
@@ -229,7 +239,7 @@ function planConsolidate(cells: CellView[]): ConsolidatePlan {
 	const removals: string[] = [];
 	const removalOutputs = new Set<string>();
 	for (const cell of cells) {
-		if (!isPythonCodeCell(cell) || cell.id === importsSourceCell?.id) continue;
+		if (!isPythonCodeCell(cell, nbLang) || cell.id === importsSourceCell?.id) continue;
 		if (isCellMagicCell(cell.source)) continue; // never sweep a cell magic's body
 		const { statements, source, changed } = extractTopLevelImports(cell.source);
 		if (!changed) continue;
@@ -269,7 +279,8 @@ function planConsolidate(cells: CellView[]): ConsolidatePlan {
  * re-consolidate and evict the history worth going back to.
  */
 export function consolidateDestroysOutputs(nb?: string | null): boolean {
-	return planConsolidate(listCells(resolveNotebookPath(nb))).deletedWithOutputs.length > 0;
+	const abs = resolveNotebookPath(nb);
+	return planConsolidate(listCells(abs), getNotebookLanguage(abs)).deletedWithOutputs.length > 0;
 }
 
 /**
@@ -299,7 +310,13 @@ export async function consolidateImports(
 	// Resolve the imports cell FIRST so it is excluded from its own sweep, then
 	// plan every edit before touching the document (planning over a mutating array
 	// is how a sweep silently skips cells).
-	const { existing, adoptable, collected, edits, removals } = planConsolidate(cells);
+	// The notebook's language decides which cells hold Python at all - in a Mojo
+	// notebook none do, so the plan comes back empty and the early return below
+	// leaves the document untouched (no stray empty imports cell is created).
+	const { existing, adoptable, collected, edits, removals } = planConsolidate(
+		cells,
+		getNotebookLanguage(abs)
+	);
 
 	// Nothing to lift, no cell already designated, and no first cell worth adopting
 	// → this notebook has no imports to manage. Do not create an empty pinned cell.

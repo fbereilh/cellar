@@ -11,11 +11,11 @@
  * `.ipynb` is worse than a stale key they can see and clear. `isExportCell`
  * ignores a stranded mark, so nothing stranded ever reaches a generated module.
  *
- * ELIGIBILITY IS TARGET-AWARE: the export target's extension names the module's
- * LANGUAGE (`.py` or `.mojo`, see `exportTargetLanguage`) and a cell is eligible
- * for it iff the cell's own language matches (`exportLanguageOf`). That is one
- * sentence covering both languages, rather than a `.py` rule with a Mojo
- * exclusion bolted on - see `canExportCell`.
+ * ELIGIBILITY IS LANGUAGE-AWARE: the module's LANGUAGE is the NOTEBOOK's (see
+ * `server/export-py.ts`'s `docExportLanguage`; the target path's extension merely
+ * has to agree with it) and a cell is eligible for it iff the cell's own language
+ * matches (`exportLanguageOf`). That is one sentence covering both languages,
+ * rather than a `.py` rule with a Mojo exclusion bolted on - see `canExportCell`.
  *
  * Both halves of the app read this identity — the server (`notebook.ts`,
  * `export-py.ts`) and the browser (`Cell.svelte`) — so it lives in one pure,
@@ -24,7 +24,7 @@
  */
 
 import type { CellMetadata } from '$lib/server/types';
-import { isLogicalCellType, isMojoCell } from '$lib/cellLanguage';
+import { isLogicalCellType, type NotebookLanguage } from '$lib/cellLanguage';
 import { hasMojoHeader } from '$lib/cellMagic';
 import { hasBareNbdevDirective } from '$lib/nbdevDirectives';
 
@@ -57,19 +57,38 @@ export function exportTargetLanguage(target: string | null | undefined): ExportL
 }
 
 /**
+ * The file extension a module of this language is written to - the INVERSE of
+ * `exportTargetLanguage`, and the ONE place the pairing is spelled.
+ *
+ * It matters more than it looks now that the notebook's language DECIDES the
+ * extension rather than the other way round: the setter validates against it, a
+ * language switch re-expresses the stored target through it, the `#|default_exp`
+ * directive builds a path with it, and four surfaces NAME it to the user. Those
+ * were five separate `lang === 'mojo' ? '.mojo' : '.py'` ternaries agreeing by
+ * coincidence.
+ */
+export function moduleExtension(lang: ExportLanguage): string {
+	return lang === 'mojo' ? '.mojo' : '.py';
+}
+
+/**
  * The language of the module source this cell WOULD contribute, or null when it
  * contributes none.
  *
  * Two things make a cell Mojo, and the second is why this is not simply the
- * logical cell type:
+ * notebook's language:
  *
- *   - Cellar's own `mojo` cell type (`metadata.cellar.language = 'mojo'`).
+ *   - The NOTEBOOK's declared language (`$lib/cellLanguage`), which is what a
+ *     plain `code` cell is written in. Passed in rather than read off the cell:
+ *     there is no per-cell mojo tag, by design.
  *   - A plain `code` cell whose source opens with a `%%mojo` cell magic - what a
- *     user gets by pasting an example out of Modular's own documentation without
- *     converting the cell's type. Such a cell reads as Python to every type-based
- *     test while its body is Mojo, and it is the LIVE DEFECT this rule closes:
- *     marked for export it had its Mojo body concatenated into a `.py` module
- *     that nbdev commits to git.
+ *     user gets by pasting an example out of Modular's own documentation into a
+ *     PYTHON notebook. Such a cell reads as Python to every type-based test while
+ *     its body is Mojo, and it is the LIVE DEFECT this rule closes: marked for
+ *     export it had its Mojo body concatenated into a `.py` module that nbdev
+ *     commits to git. It is deliberately kept: a `%%mojo` magic is the user's own
+ *     source, which Cellar does not control, so this guard is about what a cell
+ *     really CONTAINS and is orthogonal to the notebook's language axis.
  *
  * Deliberately scoped to `%%mojo` and to no other cell magic. A `%%bash` or
  * `%%html` cell is equally not-Python, and exporting one equally produces a module
@@ -79,17 +98,18 @@ export function exportTargetLanguage(target: string | null | undefined): ExportL
  * decision; claiming a `%%mojo` cell belongs in a `.mojo` module is not, because
  * that module is exactly where its body compiles.
  */
-export function exportLanguageOf(cell: ExportCell): ExportLanguage | null {
-	if (isMojoCell(cell)) return 'mojo';
+export function exportLanguageOf(
+	cell: ExportCell,
+	nbLang: NotebookLanguage = 'python'
+): ExportLanguage | null {
 	if (!isLogicalCellType(cell, 'code')) return null;
-	return hasMojoHeader(cell?.source) ? 'mojo' : 'python';
+	return hasMojoHeader(cell?.source) ? 'mojo' : nbLang;
 }
 
 /**
  * MAY this cell carry the export flag for a module of this language? Only a code
- * cell whose own language MATCHES the target's - a markdown/SQL/raw cell has no
- * module source at all, a Mojo cell has no place in a `.py` module, and a Python
- * cell has none in a `.mojo` one.
+ * cell whose own language MATCHES the module's - a markdown/SQL/raw cell has no
+ * module source at all, and a `%%mojo` cell has no place in a `.py` module.
  *
  * The Python half is `isLogicalCellType(cell, 'code')`, never a bare nbformat
  * `cell_type === 'code'`: a SQL cell IS an nbformat `code` cell tagged
@@ -105,22 +125,30 @@ export function exportLanguageOf(cell: ExportCell): ExportLanguage | null {
  * `isLogicalCellType` and agreeing only by coincidence. A cell can then never be
  * marked into a state the exporter ignores.
  *
- * ## Why `lang` is TARGET-AWARE rather than a flat "Mojo is not exportable"
+ * ## Why `lang` is a PARAMETER rather than a flat "Mojo is not exportable"
  *
  * Stated as an exclusion, this rule would have to be UNPICKED the moment a
- * `.mojo` target existed. Stated as a match, the `.mojo` export is an ADDITION:
- * the same sentence - a cell is exportable to a target iff its language matches
- * the target's extension - gives both answers, and a third language would inherit
- * it. `exportLanguageOf` is where a language is decided, once.
+ * `.mojo` module existed. Stated as a match, the `.mojo` export is an ADDITION:
+ * the same sentence - a cell is exportable to a module iff its language matches
+ * the module's - gives both answers, and a third language would inherit it.
+ * `exportLanguageOf` is where a cell's language is decided, once.
+ *
+ * ## ONE parameter answers BOTH halves, and that is the point
+ *
+ * `lang` is the module's language - and since `docExportLanguage` now returns the
+ * NOTEBOOK's, it is also the language a plain `code` cell is written in. So it is
+ * threaded into `exportLanguageOf` as the cell's language too. That is not a
+ * coincidence being exploited: it is "no second setting that can contradict the
+ * notebook's language" expressed in the signature, and it is why the only cell
+ * this can now find INELIGIBLE is one whose SOURCE disagrees with its notebook (a
+ * `%%mojo` magic in a Python notebook) or that contributes no module source at all.
  *
  * `lang` DEFAULTS to `'python'`, which is the legacy question and byte-for-byte
- * the previous behaviour: every export target that existed before `.mojo` was a
- * `.py` one. Every caller that has a target in scope passes the real value; the
- * one that cannot is `storedExportTarget`'s marked-cell gate, which is about an
- * nbdev `#|default_exp` directive - Python vocabulary - and says so.
+ * the previous behaviour: every notebook was a Python notebook before this axis
+ * existed. Every caller that has a notebook in scope passes the real value.
  */
 export function canExportCell(cell: ExportCell, lang: ExportLanguage = 'python'): boolean {
-	return exportLanguageOf(cell) === lang;
+	return exportLanguageOf(cell, lang) === lang;
 }
 
 /**
@@ -318,7 +346,7 @@ export function exportStrandedSummary(
 	for (const c of cells ?? []) {
 		if (!exportMarkStranded(c, lang)) continue;
 		count++;
-		if (exportLanguageOf(c) !== null) withLanguage++;
+		if (exportLanguageOf(c, lang) !== null) withLanguage++;
 	}
 	return { count, withLanguage };
 }

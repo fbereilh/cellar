@@ -25,6 +25,7 @@ import {
 	getHeaderNumbering,
 	setHeaderNumbering as setHeaderNumberingDoc,
 	setHideAllCode as setHideAllCodeDoc,
+	setNotebookLanguage as setNotebookLanguageDoc,
 	setHideInput as setHideInputDoc,
 	setExportTarget as setExportTargetDoc,
 	InvalidExportTargetError,
@@ -1015,6 +1016,11 @@ export async function getNotebookMap(nb?: string | null) {
 		// says which branch it is taking.
 		databricks: { connected: dbx.connected === true, runtime: agentRuntimeBlock(nb) },
 		display: {
+			// Not display at all, and deliberately reported here anyway: `language` is the
+			// notebook's ONE python-vs-mojo authority (doctrine clause 12), so it belongs
+			// beside `export_target` in the block an agent reads BEFORE it writes - what
+			// language to write, and where marked cells land, are the same decision.
+			language: view.language,
 			header_numbering: view.headerNumbering,
 			report_view: view.hideAllCode,
 			...exportTargetFields(nb)
@@ -2019,6 +2025,26 @@ export function setHeaderNumbering(levels: readonly number[] | null | undefined,
 export function setReportView(enabled: boolean, nb?: string | null) {
 	const target = nb ?? getActiveNotebookPath();
 	return { report_view: setHideAllCodeDoc(enabled, target) };
+}
+
+/**
+ * MCP `set_notebook_language`. The notebook's ONE python-vs-mojo authority: it
+ * decides what every plain `code` cell in it IS - how it runs, whether it has
+ * Python dataflow, and which module language the export writes.
+ *
+ * It touches NO cell (there is no per-cell language tag to rewrite), so markdown,
+ * raw, SQL and chat cells are unaffected by construction. The stored export
+ * target's extension FOLLOWS it, which is what keeps the two from disagreeing -
+ * see `setNotebookLanguage`, which owns both halves and the `.py`-notebook
+ * refusal.
+ *
+ * The result reports the target back BECAUSE it may have moved: an agent holding
+ * `utils.py` needs to know it is now `utils.mojo` before it names it again.
+ */
+export function setNotebookLanguage(language: string, nb?: string | null) {
+	const target = nb ?? getActiveNotebookPath();
+	const applied = setNotebookLanguageDoc(language, target);
+	return { language: applied, ...exportTargetFields(target) };
 }
 
 /**

@@ -34,6 +34,7 @@ import {
 	TEXT_NOTEBOOK_MOJO_MESSAGE,
 	TEXT_NOTEBOOK_RAW_MESSAGE,
 	TextNotebookCellTypeError,
+	TextNotebookLanguageError,
 	textNotebookTypeForReason,
 	textNotebookTypeMessage,
 	textNotebookTypeReason
@@ -271,17 +272,32 @@ describe('an .ipynb notebook is completely unaffected', () => {
  */
 describe('every unsupported type has its OWN message and refusal code, both ways', () => {
 	it('no type falls back to the raw copy, and the codes are distinct', () => {
-		expect([...PY_UNSUPPORTED_TYPES].sort()).toEqual(['chat', 'mojo', 'raw']);
+		// `mojo` left this list when it stopped being a cell TYPE: a `.py` notebook
+		// still cannot BE a Mojo notebook, but that refusal is now notebook-level
+		// (`setNotebookLanguage` / `TextNotebookLanguageError`), not a cell type.
+		expect([...PY_UNSUPPORTED_TYPES].sort()).toEqual(['chat', 'raw']);
 		const messages = PY_UNSUPPORTED_TYPES.map((t) => textNotebookTypeMessage(t));
 		const reasons = PY_UNSUPPORTED_TYPES.map((t) => textNotebookTypeReason(t));
 		expect(new Set(messages).size).toBe(PY_UNSUPPORTED_TYPES.length);
 		expect(new Set(reasons).size).toBe(PY_UNSUPPORTED_TYPES.length);
 		expect(textNotebookTypeMessage('raw')).toBe(TEXT_NOTEBOOK_RAW_MESSAGE);
 		expect(textNotebookTypeMessage('chat')).toBe(TEXT_NOTEBOOK_CHAT_MESSAGE);
-		expect(textNotebookTypeMessage('mojo')).toBe(TEXT_NOTEBOOK_MOJO_MESSAGE);
 		expect(textNotebookTypeReason('raw')).toBe(RAW_UNSUPPORTED_REASON);
 		expect(textNotebookTypeReason('chat')).toBe(CHAT_UNSUPPORTED_REASON);
-		expect(textNotebookTypeReason('mojo')).toBe(MOJO_UNSUPPORTED_REASON);
+	});
+
+	it('the NOTEBOOK-language refusal keeps its own copy and code, beside its two siblings', () => {
+		// Same argument, one level up - so it must not share the raw copy either, and
+		// its code has to stay distinct from both cell-type ones.
+		const err = new TextNotebookLanguageError();
+		expect(err.message).toBe(TEXT_NOTEBOOK_MOJO_MESSAGE);
+		expect(err.reason).toBe(MOJO_UNSUPPORTED_REASON);
+		expect(TEXT_NOTEBOOK_MOJO_MESSAGE).not.toBe(TEXT_NOTEBOOK_RAW_MESSAGE);
+		expect(TEXT_NOTEBOOK_MOJO_MESSAGE).not.toBe(TEXT_NOTEBOOK_CHAT_MESSAGE);
+		expect([RAW_UNSUPPORTED_REASON, CHAT_UNSUPPORTED_REASON]).not.toContain(MOJO_UNSUPPORTED_REASON);
+		// It is NOT a cell-type code, so it must not resolve back to one - a client
+		// picking a cell-type notice from it would say the wrong thing entirely.
+		expect(textNotebookTypeForReason(MOJO_UNSUPPORTED_REASON)).toBeNull();
 	});
 
 	it('a refusal code resolves back to the type it was reported for, and nothing else does', () => {

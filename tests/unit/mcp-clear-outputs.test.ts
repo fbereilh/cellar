@@ -70,7 +70,7 @@ beforeAll(async () => {
  * tool. Read over an in-memory MCP client off `createCellarMcpServer()`, the same
  * factory `startMcpServer` mints a session with, so a behaviour-preserving reformat
  * of the registration cannot break these assertions and a matching phrase in dead
- * code cannot satisfy them. (`mojo-cell-mcp.test.ts` uses the same route for the
+ * code cannot satisfy them. (`notebook-language-mcp.test.ts` uses the same route for the
  * emitted schemas.)
  */
 async function emittedDescription(name: string): Promise<string> {

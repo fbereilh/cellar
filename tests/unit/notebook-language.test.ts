@@ -1,8 +1,13 @@
 /**
- * The `mojo` LOGICAL cell type: identity, what runs, what is persisted, and - the
- * load-bearing half - the four Python-semantics engines it must stay OUT of.
+ * The MOJO NOTEBOOK LANGUAGE: identity, what runs, what is persisted, and - the
+ * load-bearing half - the four Python-semantics engines its cells must stay OUT of.
  *
- * WHY THOSE FOUR ARE THE POINT. A Mojo cell stores BARE Mojo (the SQL shape:
+ * Mojo is the NOTEBOOK's language (`metadata.cellar.language`), not a cell tag: a
+ * notebook is Python or Mojo and never both, so every plain `code` cell in a Mojo
+ * notebook IS a Mojo cell. That is why every predicate here is asked WITH a
+ * notebook language, and why the same cell answers differently under each.
+ *
+ * WHY THOSE FOUR ARE THE POINT. Such a cell stores BARE Mojo (the SQL shape:
  * source on disk stays the language, `server/mojo.ts` compiles it to the `%%mojo`
  * magic at run time), and bare Mojo is precisely the shape that breaks Cellar,
  * because every Python-semantics engine keyed off "is this an nbformat code cell"
@@ -22,7 +27,7 @@
  * "codify" a reality the engines do not produce.
  *
  * They also pin the shape of the fix: the exclusions are `isPythonCodeCell` /
- * `hasPythonDataflow` in `$lib/cellLanguage`, stated POSITIVELY, so a seventh
+ * `hasPythonDataflow` in `$lib/cellLanguage`, stated POSITIVELY, so a sixth
  * language is out by construction. The final block asserts exactly that - no
  * engine may name `mojo` - because a `&& !isMojoCell(c)` chain would pass every
  * behavioural test here and still leave the next language broken.
@@ -35,14 +40,17 @@ import {
 	cellLanguage,
 	hasPythonDataflow,
 	isMojoCell,
+	isNotebookLanguage,
 	isPythonCodeCell,
 	isSqlCell,
 	languageTagFor,
 	logicalCellType,
 	logicalTypeFor,
 	nbCellType,
+	notebookLanguageOf,
 	isPyUnsupportedType,
-	LOGICAL_CELL_TYPES
+	LOGICAL_CELL_TYPES,
+	NOTEBOOK_LANGUAGES
 } from '../../src/lib/cellLanguage';
 import { canExportCell, isExportCell } from '../../src/lib/exportRole';
 import { computeStaleness, STALE_STATE } from '../../src/lib/staleness';
@@ -65,48 +73,94 @@ import { analyzeDataflow, __resetDataflowState } from '../../src/lib/server/data
 
 const cell = (id: string, source: string, cellar: Record<string, unknown> = {}): CellView =>
 	({ id, cell_type: 'code', source, metadata: { cellar }, outputs: [] }) as unknown as CellView;
-const mojo = (id: string, source: string) => cell(id, source, { language: MOJO_LANGUAGE });
+/**
+ * A Mojo cell is just a plain code cell - what makes it Mojo is the NOTEBOOK it is
+ * in, which every predicate below is handed as `MOJO`. The helper exists to say
+ * that out loud at each call site rather than to build anything different.
+ */
+const mojo = (id: string, source: string) => cell(id, source);
+/** The notebook language a Mojo notebook declares, passed to every predicate. */
+const MOJO = MOJO_LANGUAGE;
 
 /** Mojo taken from Modular's own notebook docs: valid Mojo, and valid-looking Python. */
 const MOJO_MAIN = 'def main():\n    print("Hello from Mojo!")\n';
 const MOJO_WITH_IMPORT = 'from std.time import sleep\n\ndef main():\n    sleep(1.0)\n    print("done")\n';
 
-describe('mojo is a first-class logical cell type', () => {
-	it('is in the ONE vocabulary and maps onto an nbformat code cell', () => {
-		expect(LOGICAL_CELL_TYPES).toContain('mojo');
-		expect(nbCellType('mojo')).toBe('code');
-		expect(languageTagFor('mojo')).toBe(MOJO_LANGUAGE);
+describe('mojo is the NOTEBOOK\'s language, never a cell type', () => {
+	it('is NOT in the cell-type vocabulary - the selector is the only way to it', () => {
+		// A per-cell `mojo` type would be a second spelling of a notebook-level fact,
+		// i.e. exactly the mixed-language notebook the model rules out.
+		expect(LOGICAL_CELL_TYPES).not.toContain('mojo');
+		expect(languageTagFor('code')).toBeNull();
+		// ...while the NOTEBOOK vocabulary is the two languages, and nothing else.
+		expect([...NOTEBOOK_LANGUAGES].sort()).toEqual(['mojo', 'python']);
+		for (const l of NOTEBOOK_LANGUAGES) expect(isNotebookLanguage(l)).toBe(true);
+		for (const bad of ['sql', 'Mojo', '', null, undefined, 0]) expect(isNotebookLanguage(bad)).toBe(false);
 	});
 
-	it('is identified by the tag, and only on a code cell', () => {
-		expect(isMojoCell(mojo('a', MOJO_MAIN))).toBe(true);
-		expect(logicalCellType(mojo('a', MOJO_MAIN))).toBe('mojo');
-		expect(cellLanguage(mojo('a', MOJO_MAIN))).toBe('mojo');
-		// The tag on a markdown/raw cell (a hand edit) names nothing: the nbformat
-		// type wins, exactly as it does for the sql tag.
-		const marked = { cell_type: 'markdown', metadata: { cellar: { language: MOJO_LANGUAGE } } };
-		expect(isMojoCell(marked)).toBe(false);
-		expect(logicalCellType(marked)).toBe('markdown');
+	it('reads the notebook metadata, and ONLY an exact `mojo` means Mojo', () => {
+		expect(notebookLanguageOf({ cellar: { language: MOJO_LANGUAGE } })).toBe('mojo');
+		// Absence is the permanent spelling of Python - no migration, no shim.
+		expect(notebookLanguageOf({ cellar: {} })).toBe('python');
+		expect(notebookLanguageOf({})).toBe('python');
+		expect(notebookLanguageOf(null)).toBe('python');
+		expect(notebookLanguageOf(undefined)).toBe('python');
+		// A hand-edited or newer-Cellar value falls to the default that runs the
+		// notebook the way it has always run, rather than guessing.
+		for (const junk of ['Mojo', 'python3', 'zig', '', 1, true])
+			expect(notebookLanguageOf({ cellar: { language: junk } })).toBe('python');
 	});
 
-	it('leaves python, sql and chat cells reading exactly as before', () => {
-		expect(logicalCellType(cell('p', 'x = 1'))).toBe('code');
-		expect(logicalCellType(cell('s', 'select 1', { language: 'sql' }))).toBe('sql');
-		expect(logicalCellType(cell('c', 'why?', { language: 'chat' }))).toBe('chat');
-		expect(isMojoCell(cell('p', 'x = 1'))).toBe(false);
-		expect(isMojoCell(cell('s', 'select 1', { language: 'sql' }))).toBe(false);
+	it('makes every plain code cell of that notebook a Mojo cell', () => {
+		const c = mojo('a', MOJO_MAIN);
+		expect(isMojoCell(c, MOJO)).toBe(true);
+		expect(cellLanguage(c, MOJO)).toBe('mojo');
+		// The SAME cell in a Python notebook is Python - which is the whole point: the
+		// language is not a property of the cell.
+		expect(isMojoCell(c, 'python')).toBe(false);
+		expect(cellLanguage(c, 'python')).toBe('python');
+		// ...and its LOGICAL type is `code` under either, since that is what it is.
+		expect(logicalCellType(c)).toBe('code');
+	});
+
+	it('leaves markdown, raw, sql and chat cells untouched by the language', () => {
+		// The selector changes what a CODE cell is and nothing else. Each of these
+		// reads identically under both notebook languages.
+		const md = { cell_type: 'markdown', metadata: {} };
+		const raw = { cell_type: 'raw', metadata: {} };
+		const sql = cell('s', 'select 1', { language: 'sql' });
+		const chat = cell('c', 'why?', { language: 'chat' });
+		for (const lang of NOTEBOOK_LANGUAGES) {
+			expect(logicalCellType(md)).toBe('markdown');
+			expect(logicalCellType(raw)).toBe('raw');
+			expect(logicalCellType(sql)).toBe('sql');
+			expect(logicalCellType(chat)).toBe('chat');
+			expect(isMojoCell(md, lang)).toBe(false);
+			expect(isMojoCell(raw, lang)).toBe(false);
+			expect(isMojoCell(sql, lang)).toBe(false);
+			expect(isMojoCell(chat, lang)).toBe(false);
+			expect(cellLanguage(sql, lang)).toBe('sql');
+			expect(cellLanguage(chat, lang)).toBe('chat');
+		}
 	});
 
 	it('round-trips through the ONE forward+inverse tag mapping the cell:type event uses', () => {
 		for (const t of LOGICAL_CELL_TYPES) {
 			expect(logicalTypeFor(nbCellType(t), languageTagFor(t))).toBe(t);
 		}
-		// A tag from a newer Cellar reads as the code cell it already is on disk.
+		// A tag from a newer Cellar - or a legacy per-cell `mojo` one - reads as the
+		// code cell it already is on disk.
 		expect(logicalTypeFor('code', 'zig')).toBe('code');
+		expect(logicalTypeFor('code', MOJO_LANGUAGE)).toBe('code');
 	});
 
-	it('is refused on a .py TEXT notebook, through the SAME shared list as raw and chat', () => {
-		expect(isPyUnsupportedType('mojo')).toBe(true);
+	it('is refused on a .py TEXT notebook at the NOTEBOOK level, not as a cell type', () => {
+		// The refusal moved with the setting: a `.py` document stores no notebook
+		// metadata, so it cannot hold the declaration - the same argument raw and chat
+		// are refused by, one level up.
+		expect(isPyUnsupportedType('mojo')).toBe(false);
+		expect(isPyUnsupportedType('raw')).toBe(true);
+		expect(isPyUnsupportedType('chat')).toBe(true);
 		for (const t of ['code', 'sql', 'markdown']) expect(isPyUnsupportedType(t)).toBe(false);
 	});
 });
@@ -159,16 +213,29 @@ describe('THE FABRICATED-EDGE REGRESSION: a mojo cell never reaches the Python p
 		// Before the type existed this cell landed in the probe's Python bucket and
 		// came back `defines: ['main']` - an edge to a name the `mojo run` subprocess
 		// destroys the instant the cell ends.
-		const df = await analyzeDataflow([mojo('m', MOJO_MAIN), cell('p', 'main()')]);
+		// Under MOJO, no cell of the notebook is Python - so nothing is probed at all.
+		const df = await analyzeDataflow([mojo('m', MOJO_MAIN), cell('p', 'main()')], MOJO);
 		expect(df.m).toBeUndefined();
-		expect(df.p).toEqual({ defines: [], uses: ['main'] });
+		expect(df.p).toBeUndefined();
+		// The SAME cells in a PYTHON notebook are probed exactly as they always were -
+		// which is what shows the exclusion is the notebook's language, not a blanket.
+		const py = await analyzeDataflow([mojo('m', MOJO_MAIN), cell('p', 'main()')]);
+		expect(py.m?.defines).toEqual(['main']); // the fabricated edge, in a Python notebook
+		expect(py.p).toEqual({ defines: [], uses: ['main'] });
 	});
 
-	it('still probes ordinary Python cells beside it, so the exclusion is not a blanket', async () => {
-		const df = await analyzeDataflow([mojo('m', MOJO_MAIN), cell('p', 'import os\nresult = os.getcwd()'), cell('q', 'print(result)')]);
-		expect(df.m).toBeUndefined();
+	it('still probes ordinary Python cells in a PYTHON notebook, so the exclusion is not a blanket', async () => {
+		const df = await analyzeDataflow([cell('p', 'import os\nresult = os.getcwd()'), cell('q', 'print(result)')]);
 		expect(df.p?.defines).toContain('result');
 		expect(df.q?.uses).toContain('result');
+	});
+
+	it('keeps a SQL cell in the probe even in a Mojo notebook - its wrapper really binds', async () => {
+		// A SQL cell is a per-cell KIND, not the notebook's language, so the selector
+		// does not touch it: `sql.ts` still compiles it to a `spark.sql(...)` wrapper
+		// that binds `_sql_df`, and the synthetic contribution must survive.
+		const df = await analyzeDataflow([cell('s', 'select 1', { language: 'sql' })], MOJO);
+		expect(df.s?.defines).toContain('_sql_df');
 	});
 
 	it('reads a mojo cell that is NOT valid Python without failing the batch for its neighbours', async () => {
@@ -176,30 +243,45 @@ describe('THE FABRICATED-EDGE REGRESSION: a mojo cell never reaches the Python p
 		// except would swallow them as edge-free, which is indistinguishable from a
 		// genuinely edge-free cell - so keeping them out entirely is what makes the
 		// neighbours' answers trustworthy.
-		const df = await analyzeDataflow([
-			mojo('m', 'struct Point:\n    var x: Int\n\nfn main():\n    print("hi")\n'),
-			cell('p', 'total = 1'),
-			cell('q', 'print(total)')
-		]);
+		const df = await analyzeDataflow(
+			[
+				mojo('m', 'struct Point:\n    var x: Int\n\nfn main():\n    print("hi")\n'),
+				cell('p', 'total = 1'),
+				cell('q', 'print(total)')
+			],
+			MOJO
+		);
+		// Nothing in a Mojo notebook is handed to `ast` at all, so the unparseable cell
+		// cannot fail a batch for anyone: there is no batch.
 		expect(df.m).toBeUndefined();
-		expect(df.q?.uses).toEqual(['print', 'total']);
+		expect(df.p).toBeUndefined();
+		expect(df.q).toBeUndefined();
 	});
 });
 
 describe('THE STALENESS REGRESSION: a mojo cell has no verdict, so it shows no chip', () => {
 	const RAN = { at: 1000, durationMs: 1, actor: 'user' as const, status: 'ok', session: 7 };
-	const stale = (cells: CellView[], df: Record<string, { defines: string[]; uses: string[] }>) =>
+	const stale = (
+		cells: CellView[],
+		df: Record<string, { defines: string[]; uses: string[] }>,
+		nbLang: 'python' | 'mojo' = 'python'
+	) =>
 		computeStaleness(
 			cells.map((c) => ({ ...c, metadata: { ...c.metadata, cellar: { ...c.metadata?.cellar, lastRun: RAN } } })) as never,
 			df,
-			7
+			7,
+			null,
+			nbLang
 		);
 
-	it('reports n/a for a mojo cell - not fresh, and never stale', () => {
+	it('reports n/a for EVERY cell of a Mojo notebook - not fresh, and never stale', () => {
 		const cells = [mojo('m', MOJO_MAIN), cell('p', 'x = 1')];
-		const out = stale(cells, { p: { defines: ['x'], uses: [] } });
+		const out = stale(cells, { p: { defines: ['x'], uses: [] } }, MOJO);
 		expect(out.m.state).toBe(STALE_STATE.NA);
-		expect(out.p.state).toBe(STALE_STATE.FRESH);
+		expect(out.p.state).toBe(STALE_STATE.NA);
+		// The SAME cells in a Python notebook keep their ordinary verdicts.
+		const py = stale(cells, { p: { defines: ['x'], uses: [] } });
+		expect(py.p.state).toBe(STALE_STATE.FRESH);
 	});
 
 	it('keeps SQL cells in the graph, which is why the predicate is not just isPythonCodeCell', () => {
@@ -217,39 +299,73 @@ describe('THE STALENESS REGRESSION: a mojo cell has no verdict, so it shows no c
 		expect(out.p.state).toBe(STALE_STATE.STALE);
 	});
 
-	it('hasPythonDataflow: exactly code + sql, positively stated', () => {
+	it('hasPythonDataflow: exactly code + sql, positively stated, and scoped by the notebook', () => {
 		expect(hasPythonDataflow(cell('p', 'x'))).toBe(true);
 		expect(hasPythonDataflow(cell('s', 'select 1', { language: 'sql' }))).toBe(true);
-		expect(hasPythonDataflow(mojo('m', MOJO_MAIN))).toBe(false);
 		expect(hasPythonDataflow(cell('c', 'why?', { language: 'chat' }))).toBe(false);
 		expect(hasPythonDataflow({ cell_type: 'markdown' })).toBe(false);
 		expect(hasPythonDataflow({ cell_type: 'raw' })).toBe(false);
 		// A FOREIGN nbformat cell_type reads as neither: the strict test is what keeps
 		// an externally-authored cell out of the Python machinery.
 		expect(hasPythonDataflow({ cell_type: 'foo' })).toBe(false);
+		// In a MOJO notebook the code cell is out; the SQL cell stays in, because its
+		// wrapper binds names whatever the notebook's language is.
+		expect(hasPythonDataflow(cell('p', 'x'), MOJO)).toBe(false);
+		expect(hasPythonDataflow(cell('s', 'select 1', { language: 'sql' }), MOJO)).toBe(true);
 	});
 
-	it('isPythonCodeCell: exactly plain code', () => {
+	it('isPythonCodeCell: exactly plain code, in a Python notebook', () => {
 		expect(isPythonCodeCell(cell('p', 'x'))).toBe(true);
 		expect(isPythonCodeCell(cell('s', 'select 1', { language: 'sql' }))).toBe(false);
-		expect(isPythonCodeCell(mojo('m', MOJO_MAIN))).toBe(false);
 		expect(isPythonCodeCell({ cell_type: 'foo' })).toBe(false);
+		// The default is `python`, which is what keeps every untouched caller answering
+		// exactly as it did before the notebook had a language at all.
+		expect(isPythonCodeCell(cell('p', 'x'), 'python')).toBe(true);
+		expect(isPythonCodeCell(cell('p', 'x'), MOJO)).toBe(false);
 	});
 });
 
 describe('THE NBDEV-EXPORT REGRESSION: Mojo source can never reach the generated .py', () => {
-	it('canExportCell is false for a mojo cell and true for a python one', () => {
-		expect(canExportCell(cell('p', 'x = 1'))).toBe(true);
-		expect(canExportCell(mojo('m', MOJO_MAIN))).toBe(false);
-		expect(canExportCell(cell('s', 'select 1', { language: 'sql' }))).toBe(false);
+	it('a plain code cell is eligible for its OWN notebook\'s module, whichever that is', () => {
+		// The module's language IS the notebook's, so ONE argument answers both halves
+		// - which is "no second setting that can contradict the notebook" expressed in
+		// the signature. A plain code cell therefore always matches its own notebook's
+		// module; what is INELIGIBLE is a cell with no module source, or one whose
+		// SOURCE disagrees with its notebook (the next test).
+		expect(canExportCell(cell('p', 'x = 1'), 'python')).toBe(true);
+		expect(canExportCell(mojo('m', MOJO_MAIN), 'mojo')).toBe(true);
+		// A cell with no module source at all is eligible under neither language.
+		for (const lang of NOTEBOOK_LANGUAGES) {
+			expect(canExportCell(cell('s', 'select 1', { language: 'sql' }), lang)).toBe(false);
+			expect(canExportCell(cell('c', 'why?', { language: 'chat' }), lang)).toBe(false);
+			expect(canExportCell({ cell_type: 'markdown', source: '# hi' }, lang)).toBe(false);
+			expect(canExportCell({ cell_type: 'raw', source: '---' }, lang)).toBe(false);
+		}
 	});
 
-	it('a hand-edited export flag on a mojo cell is INERT, not merely un-settable', () => {
+	it('a `%%mojo` MAGIC cell still never reaches a .py module - the live defect stays closed', () => {
+		// This is the one thing that is NOT the notebook's language: a code cell whose
+		// SOURCE opens with the magic is Mojo whatever the notebook says, which is what
+		// a user gets by pasting an example out of Modular's docs into a Python
+		// notebook. Its body must not be concatenated into a `.py` file nbdev commits.
+		const pasted = cell('m', mojoToCellSource(MOJO_MAIN));
+		expect(canExportCell(pasted, 'python')).toBe(false);
+		expect(canExportCell(pasted, 'mojo')).toBe(true);
+		expect(isExportCell({ ...pasted, metadata: { cellar: { export: true } } }, 'python')).toBe(false);
+	});
+
+	it('a hand-edited export flag is INERT wherever the cell cannot contribute', () => {
 		// The module nbdev generates is committed to git, so a stale flag must not be
-		// able to concatenate Mojo into it through any door.
-		const marked = cell('m', MOJO_MAIN, { language: MOJO_LANGUAGE, export: true });
-		expect(isExportCell(marked)).toBe(false);
-		expect(isExportCell(cell('p', 'def f(): ...', { export: true }))).toBe(true);
+		// able to concatenate the wrong language into it through any door.
+		const sqlMarked = cell('s', 'select 1', { language: 'sql', export: true });
+		const mdMarked = { cell_type: 'markdown', source: '# hi', metadata: { cellar: { export: true } } };
+		for (const lang of NOTEBOOK_LANGUAGES) {
+			expect(isExportCell(sqlMarked, lang)).toBe(false);
+			expect(isExportCell(mdMarked, lang)).toBe(false);
+		}
+		// ...while an ordinary marked code cell reaches its own notebook's module.
+		expect(isExportCell(cell('p', 'def f(): ...', { export: true }), 'python')).toBe(true);
+		expect(isExportCell(mojo('m', MOJO_MAIN, ), 'mojo')).toBe(false); // unmarked
 	});
 });
 

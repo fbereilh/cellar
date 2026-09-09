@@ -49,7 +49,8 @@
 		isMojoCell,
 		isPythonCodeCell,
 		offersCellType,
-		logicalCellType
+		logicalCellType,
+		type NotebookLanguage
 	} from '$lib/cellLanguage';
 	import { relativeTime, formatDuration, formatElapsed } from '$lib/relativeTime';
 	import { nowMs, subscribeNow, runNowMs, subscribeRunNow } from '$lib/now.svelte';
@@ -118,6 +119,15 @@
 		 * applied to ELIGIBILITY only; every sentence reads the nullable value.
 		 */
 		exportLanguage?: ExportLanguage | null;
+		/**
+		 * The NOTEBOOK's language - what a plain `code` cell in it is written in.
+		 * Threaded down rather than read off the cell, because there is no per-cell
+		 * mojo tag: the notebook is the ONE authority (`$lib/cellLanguage`).
+		 *
+		 * Defaults to `python`, so a standalone mount - and every Python notebook -
+		 * renders exactly as it did before the selector existed.
+		 */
+		notebookLanguage?: NotebookLanguage;
 		/**
 		 * This cell is marked for a `.mojo` export AND a LATER exported cell also
 		 * defines a top-level `def main()`, so this one's `main` will not be written
@@ -216,6 +226,7 @@
 		keyMode = 'command',
 		staleState = null,
 		exportLanguage = null,
+		notebookLanguage = 'python',
 		mainDropped = false,
 		dragging = false,
 		foldedIds = new Set(),
@@ -315,12 +326,13 @@
 	// kernel; the reply arrives as a markdown display_data output. Runnable like
 	// SQL - the run button IS "ask".
 	const isChat = $derived(isChatCell(cell));
-	// A MOJO cell: a code cell tagged cellar.language='mojo'. Its source is Mojo,
-	// compiled to a `%%mojo` cell magic at run time and executed by the PYTHON
-	// kernel (Modular ships no Mojo kernel - see server/mojo.ts). Runnable like SQL;
-	// its Python-only affordances (export, imports role, staleness) are HIDDEN, each
-	// by the shared rule that already excludes it rather than by a check here.
-	const isMojo = $derived(isMojoCell(cell));
+	// A MOJO cell: a plain code cell in a notebook whose LANGUAGE is Mojo (there is
+	// no per-cell tag - `$lib/cellLanguage`). Its source is Mojo, compiled to a
+	// `%%mojo` cell magic at run time and executed by the PYTHON kernel (Modular
+	// ships no Mojo kernel - see server/mojo.ts). Runnable like SQL; its Python-only
+	// affordances (imports role, staleness) are HIDDEN, each by the shared rule that
+	// already excludes it rather than by a check here.
+	const isMojo = $derived(isMojoCell(cell, notebookLanguage));
 	// An nbformat `raw` cell: verbatim text Cellar never executes and never renders
 	// (Quarto/nbdev frontmatter, nbconvert directives). It has NO rendered mode -
 	// the deliberate contrast with markdown - so it is always shown as its source.
@@ -330,22 +342,31 @@
 	// shorthand is what rendered a Run button on a raw cell and posted YAML
 	// frontmatter to Python.
 	const isRunnable = $derived(!isMarkdown && !isRaw);
-	// The logical cell type the type menu speaks: code | sql | mojo | chat | markdown | raw.
+	// The logical cell type the type menu speaks: code | sql | chat | markdown | raw.
 	const logicalType = $derived(logicalCellType(cell));
 	const TYPE_LABELS: Record<LogicalCellType, string> = {
 		sql: 'SQL',
 		chat: 'chat',
-		mojo: 'mojo',
 		markdown: 'markdown',
 		raw: 'raw',
 		code: 'python3'
 	};
-	const typeLabel = $derived(TYPE_LABELS[logicalType] ?? 'python3');
+	// A `code` cell is labelled by the NOTEBOOK's language, since that is what it is
+	// written in - so a Mojo notebook's cells read `mojo` while its SQL, chat,
+	// markdown and raw cells keep their own labels, which the language never touches.
+	const typeLabel = $derived(
+		logicalType === 'code' && isMojo ? 'mojo' : (TYPE_LABELS[logicalType] ?? 'python3')
+	);
 	// The notebook's designated imports cell: user-choosable, marked in the toolbar
 	// with the "imports" badge, and free to live at any index. Only a Python code
 	// cell can hold the role, so the mark action is offered only when `canBeImports`.
 	const isImports = $derived(isImportsCell(cell));
-	const canBeImports = $derived(logicalType === 'code');
+	// Only a PYTHON code cell can hold the role - the imports cell is RUN by the
+	// Python kernel, so every import routed into one on a Mojo notebook would be
+	// stranded with nothing to execute them (and `routeImports`/`consolidateImports`
+	// refuse such a notebook at their entry, so the item would be a dead control).
+	// `isMojo` is the notebook's language, which is what decides this now.
+	const canBeImports = $derived(logicalType === 'code' && !isMojo);
 	// nbdev-style export: this code cell is written to the notebook's `.py` module.
 	// The row toggle asks `canExportCell` - the SAME eligibility rule the setters and
 	// `isExportCell` ask - rather than re-deriving one: `canBeImports` is
@@ -1150,32 +1171,41 @@
 		typeMenuEl.style.left = Math.max(8, Math.min(r.right - mw, window.innerWidth - mw - 8)) + 'px';
 		typeMenuEl.style.top = r.bottom + 4 + 'px';
 	}
-	// The cell-type menu options (Python / SQL / Mojo / Chat / Markdown / Raw). This
-	// menu is the ONLY create path for raw AND for mojo - there is deliberately no
-	// "+ Raw" or "+ Mojo" insert button, neither being worth a button on every gap
-	// (raw is once-per-notebook; a second mojo cell comes for free from the
-	// language a plain "+ Code" insertion INHERITS - see `$lib/cellInherit`). Chat
+	// The cell-type menu options (Code / SQL / Chat / Markdown / Raw). This
+	// menu is the ONLY create path for raw - there is deliberately no
+	// "+ Raw" insert button, it not being worth a button on every gap
+	// (raw is once-per-notebook). Mojo is NOT here at all: a code cell's language is
+	// the NOTEBOOK's, chosen once in the selector at the top, so offering it per cell
+	// is exactly how a notebook ends up holding two languages. Chat
 	// is different: asking a question recurs through a session the way code and
 	// markdown do, so it IS also creatable directly from the add affordances (the
 	// bottom add row and the hover-between strip in `Notebook.svelte`, both gated
 	// off `$lib/cellLanguage` on a `.py` notebook exactly like `typeOptions`
 	// below). Converting an existing cell stays here for every type.
 	//
-	// Raw, mojo AND chat are DROPPED on a `.py` text notebook: such a document is
+	// Raw AND chat are DROPPED on a `.py` text notebook: such a document is
 	// rebuilt from its cells on every save, carrying neither the raw marker nor any
-	// `cellar` metadata or outputs, so the server refuses all three
+	// `cellar` metadata or outputs, so the server refuses both
 	// (`assertCanHoldType`) - and a notebook that cannot hold a cell type must not
 	// be offered a control for one. WHICH types those are is read from
 	// `$lib/cellLanguage`, so the menu cannot drift from the writers' rule.
+	//
+	// The `code` option is LABELLED by the notebook's language, since that is what
+	// choosing it produces - `Mojo` in a Mojo notebook - while its VALUE stays
+	// `code`: converting a SQL cell back to an ordinary code cell is one action
+	// whatever language the notebook is written in.
 	const ALL_TYPE_OPTIONS: { v: LogicalCellType; label: string; hint: string }[] = [
 		{ v: 'code', label: 'Python', hint: 'python3' },
 		{ v: 'sql', label: 'SQL', hint: 'spark.sql' },
-		{ v: 'mojo', label: 'Mojo', hint: '%%mojo' },
 		{ v: 'chat', label: 'Chat', hint: 'claude' },
 		{ v: 'markdown', label: 'Markdown', hint: 'text' },
 		{ v: 'raw', label: 'Raw', hint: 'verbatim' }
 	];
-	const typeOptions = $derived(ALL_TYPE_OPTIONS.filter((o) => offersCellType(o.v, isPy)));
+	const typeOptions = $derived(
+		ALL_TYPE_OPTIONS.filter((o) => offersCellType(o.v, isPy)).map((o) =>
+			o.v === 'code' && isMojo ? { ...o, label: 'Mojo', hint: '%%mojo' } : o
+		)
+	);
 	function chooseType(type: LogicalCellType) {
 		typeMenuEl?.hidePopover();
 		if (type !== logicalType) onSetType(cell.id, type);
@@ -1396,15 +1426,17 @@
 	 * foreign nbformat `cell_type` must not be read as code), because the kernel's
 	 * completer and `token_at_cursor` speak Python about the Python namespace:
 	 * markdown and raw are prose, a chat cell's source is a question for a model, a
-	 * SQL cell's source is SQL that only becomes Python at RUN time, and a mojo
-	 * cell's is Mojo compiled by a `%%mojo` subprocess. Answering any of those with
-	 * Python names would be confidently wrong rather than merely unhelpful.
+	 * SQL cell's source is SQL that only becomes Python at RUN time, and in a MOJO
+	 * notebook a code cell's source is Mojo compiled by a `%%mojo` subprocess.
+	 * Answering any of those with Python names would be confidently wrong rather than
+	 * merely unhelpful - which is why the notebook's language is threaded in here
+	 * too: it is what decides whether a plain code cell holds Python at all.
 	 *
 	 * A function, not a derived value: the CodeMirror extensions are installed once
 	 * per editor and must read the CURRENT prop on every use.
 	 */
 	const kernelIntrospectFor = (): KernelIntrospectHandle | null =>
-		isPythonCodeCell(cell) ? (kernelIntrospect ?? null) : null;
+		isPythonCodeCell(cell, notebookLanguage) ? (kernelIntrospect ?? null) : null;
 
 	/**
 	 * Tab. Accepts the open suggestion if there is one (so a second Tab commits what

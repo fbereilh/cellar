@@ -38,7 +38,8 @@ import { dirname, basename, relative, resolve, sep } from 'node:path';
 import { resolveInWorkspace, workspaceRoot } from './fstree';
 import { gitRootOf } from './git';
 import { logicalLines, stripComments, splitSimpleStatements } from './imports';
-import { isExportCell, exportTargetLanguage, type ExportLanguage } from '../exportRole';
+import { isExportCell, exportTargetLanguage, moduleExtension, type ExportLanguage } from '../exportRole';
+import { notebookLanguageOf } from '../cellLanguage';
 import { MAIN_KEPT_COMMENT, mojoModuleSources, planMojoMains, stripMojoMagicHeader } from '../mojoExport';
 import { nbdevDirective, nbdevDirectiveOutsideBlock } from '../nbdevDirectives';
 import { nbdevLibPath } from './nbdev';
@@ -384,29 +385,17 @@ export function hazardsFor(cells: readonly Cell[], lang: ExportLanguage): Export
 }
 
 /**
- * The module LANGUAGE a resolved target names, or **null when it names none** -
- * a hand-edited `export_target`, or one whose base does not resolve, where the
- * stored form is the only spelling in hand and it is not a module Cellar builds.
+ * Does this resolved target's path name a module Cellar can BUILD (`.py` /
+ * `.mojo`) at all? False for a hand-edited `export_target` naming something else,
+ * where the stored form is the only spelling in hand.
  *
- * NULLABLE ON PURPOSE, and the `?? 'python'` default is written by the callers
- * that DECIDE ELIGIBILITY rather than baked in here. Folded into the accessor it
- * turned "no answer" into a confident false claim at every surface that REPORTS a
- * target, which produced the same defect five separate times: a refusal, a
- * warning or a label naming a `.py` module over a notebook that has none, sending
- * the reader to change an extension that does not exist. A reporting caller can
- * no longer obtain the default by accident.
+ * It asks about the PATH, never about the language - which is the notebook's
+ * (`docExportLanguage`) and no longer read off the extension. The extension still
+ * has to AGREE with it, which `resolveExportTarget` enforces below, so this stays
+ * a question about whether a module was named at all.
  */
-function targetModuleLanguage(info: ResolvedExportTarget): ExportLanguage | null {
-	return exportTargetLanguage(info.ok ? info.target : info.path);
-}
-
-/**
- * The module language export ELIGIBILITY is decided against, for a RESOLVED
- * target - the legacy question, so an unrecognized target answers `python`
- * exactly as it did before `.mojo` targets existed.
- */
-function eligibilityLanguage(info: ResolvedExportTarget): ExportLanguage {
-	return targetModuleLanguage(info) ?? 'python';
+function targetNamesModule(info: ResolvedExportTarget): boolean {
+	return exportTargetLanguage(info.ok ? info.target : info.path) !== null;
 }
 
 /**
@@ -431,8 +420,12 @@ export interface ExportTargetLanguageInfo {
 
 export function docExportTargetInfo(doc: NotebookDoc): ExportTargetLanguageInfo {
 	const info = resolveExportTarget(doc);
+	// The language is the NOTEBOOK's, reported only once a target names a module at
+	// all: the two facts are still separate (a target naming `notes.txt` is
+	// configured and names no module), but WHICH language a named module is in is no
+	// longer read off the extension - see `docExportLanguage`.
 	return info
-		? { configured: true, language: targetModuleLanguage(info) }
+		? { configured: true, language: targetNamesModule(info) ? docExportLanguage(doc) : null }
 		: { configured: false, language: null };
 }
 
@@ -446,21 +439,28 @@ export function docExportTargetLanguage(doc: NotebookDoc): ExportLanguage | null
 }
 
 /**
- * The module language export ELIGIBILITY is decided against - the one question
- * every eligibility caller outside this file asks, so none of them re-derives it
- * from a path.
+ * The module language the export writes, and the one export ELIGIBILITY is decided
+ * against: **the NOTEBOOK's language**, full stop.
  *
- * A notebook with NO target configured answers `python`: that is what every
- * notebook meant before `.mojo` targets existed, so the per-cell toggle on an
- * unconfigured notebook behaves exactly as it always has. The consequence is
- * stated rather than hidden - a Mojo cell can only be MARKED once the notebook
- * names a `.mojo` target, which is honest, since before that there is no module
- * for the mark to describe. Anything that WORDS that outcome must read
- * `docExportTargetInfo`/`docExportTargetLanguage` instead, which do not invent
- * the target.
+ * This is the whole of "the export target's language follows the notebook's". It
+ * used to be read off the target's EXTENSION, which made the module language a
+ * SECOND setting able to contradict the notebook's own - a Mojo notebook pointed
+ * at `utils.py` would have had its Mojo cells declared ineligible and its Python
+ * ones (of which it has none) assembled. Now the notebook decides, the extension
+ * merely has to agree, and the three places a disagreement could be created each
+ * refuse or follow: `setExportTarget` refuses a mismatched extension,
+ * `setNotebookLanguage` re-expresses the stored target's, and
+ * `resolveExportTarget` refuses a mismatch that arrived by hand-edit anyway.
+ *
+ * A notebook with no target configured still answers `python` when it is a Python
+ * notebook - unchanged - because that is simply what its language is.
+ *
+ * Anything that WORDS an outcome about the TARGET must still read
+ * `docExportTargetInfo`/`docExportTargetLanguage` instead, which do not invent a
+ * target the notebook does not have.
  */
 export function docExportLanguage(doc: NotebookDoc): ExportLanguage {
-	return docExportTargetLanguage(doc) ?? 'python';
+	return notebookLanguageOf(doc.metadata);
 }
 
 /**
@@ -490,7 +490,7 @@ function docHazards(
 	keep: (hazards: ExportHazard[]) => ExportHazard[]
 ): ExportHazard[] {
 	if (!resolved) return [];
-	const lang = eligibilityLanguage(resolved);
+	const lang = docExportLanguage(doc);
 	const exported = doc.cells.filter((c: Cell) => isExportCell(c, lang));
 	if (!exported.length) return [];
 	const hazards = keep(hazardsFor(exported, lang));
@@ -738,18 +738,27 @@ function storedExportTarget(
 			if (ignored === null) ignored = nbdevDirectiveOutsideBlock(c.source, 'default_exp');
 			continue;
 		}
-		// nbdev writes a dotted module path (`pkg.utils`); map it to a file path.
-		const rel = mod.endsWith('.py') ? mod : mod.replace(/\./g, '/') + '.py';
+		// nbdev writes a dotted module path (`pkg.utils`); map it to a file path. The
+		// EXTENSION is the notebook's language, never a fixed `.py`: a directive-derived
+		// target is a target like any other, so it must not be the one spelling able to
+		// contradict the notebook (`docExportLanguage`). For a Python notebook - nbdev's
+		// own vocabulary, and the only kind that carries these directives today - this
+		// expression is byte-identical to the `.py` it replaced.
+		const ext = moduleExtension(notebookLanguageOf(doc.metadata));
+		const rel = mod.endsWith(ext) ? mod : mod.replace(/\./g, '/') + ext;
 		return { ...directiveBase(rel), source: 'default_exp' };
 	}
 	// Nothing resolved, and the notebook holds a `#|default_exp` line nbdev ignores.
 	// The RULE is untouched (it stays ignored); what changes is that the drop stops
 	// being SILENT - see `misplacedDefaultExpError` for the harm, and for why the
 	// report needs a MARKED cell before it may speak.
-	// The Python question deliberately: this report is about an nbdev `#|default_exp`
-	// line, and nbdev's directive vocabulary is Python's. It is also the one caller
-	// with no target in scope - it IS the function that resolves one.
-	if (ignored !== null && doc.cells.some((c: Cell) => isExportCell(c, 'python')))
+	// Asked with the NOTEBOOK's language, which is what `isExportCell` eligibility
+	// means everywhere else: the gate is "does this notebook mark any cell at all",
+	// and a Mojo notebook's marked cells are Mojo ones. For a Python notebook - nbdev's
+	// own vocabulary, and the only kind that carries these directives today - this is
+	// the `'python'` it replaced. It is also the one caller with no target in scope:
+	// it IS the function that resolves one.
+	if (ignored !== null && doc.cells.some((c: Cell) => isExportCell(c, notebookLanguageOf(doc.metadata))))
 		return { path: '', base: 'workspace', source: 'default_exp', error: misplacedDefaultExpError(ignored) };
 	return null;
 }
@@ -878,6 +887,24 @@ export function resolveExportTarget(doc: NotebookDoc): ResolvedExportTarget | nu
 	// is the stray-module-at-the-workspace-root write this whole branch exists to
 	// stop. An explicit `export_target` is unaffected and is the escape hatch.
 	if (stored.error) return { ok: false, base, path, source, error: stored.error };
+	// REFUSE, never degrade: the module's language is the NOTEBOOK's, so a stored
+	// target whose extension names the OTHER one describes a file the export would
+	// never write. The two writers cannot create this state (`setExportTarget`
+	// refuses a mismatch and `setNotebookLanguage` re-expresses the stored target),
+	// so it only arrives by hand-edit - and silently writing Mojo into a `.py` path,
+	// or reading the extension as the authority again, are the two degrades this
+	// whole axis exists to remove.
+	const named = exportTargetLanguage(path);
+	const nbLang = notebookLanguageOf(doc.metadata);
+	if (named && named !== nbLang) {
+		return {
+			ok: false,
+			base,
+			path,
+			source,
+			error: `export target ${path} names a ${moduleExtension(named)} module, but this notebook's language is ${nbLang === 'mojo' ? 'Mojo' : 'Python'} - set the target again (its extension follows the notebook's language), or change the notebook's language`
+		};
+	}
 	if (!isExportBase(base)) {
 		return {
 			ok: false,
@@ -998,10 +1025,10 @@ export function exportNotebookToPy(doc: NotebookDoc): ExportResult {
 	// cell marked there is nothing to write anywhere, so the honest answer is
 	// `no-cells` (reporting the stored form), not a throw about a path that was
 	// never going to be written.
-	// The target's EXTENSION decides which cells may go in (`exportRole`'s
-	// `canExportCell`), so a `.mojo` target assembles the notebook's Mojo cells and a
-	// `.py` one its Python cells - one rule, both languages.
-	const lang = eligibilityLanguage(info);
+	// The NOTEBOOK's language decides which cells may go in (`exportRole`'s
+	// `canExportCell`), so a Mojo notebook assembles its Mojo cells and a Python one
+	// its Python cells - one rule, both languages, and one setting.
+	const lang = docExportLanguage(doc);
 	const exportedCells = doc.cells.filter((c: Cell) => isExportCell(c, lang));
 	const exported = exportedCells.map((c) => c.source);
 	if (!exported.length)
