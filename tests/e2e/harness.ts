@@ -1,6 +1,6 @@
 import { expect, type Page } from '@playwright/test';
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
-import { mkdirSync, writeFileSync, existsSync, chmodSync } from 'node:fs';
+import { mkdirSync, writeFileSync, existsSync, chmodSync, rmSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { buildFreshness, missingReason, stalenessReason } from '../../src/lib/server/build-freshness.js';
@@ -93,6 +93,32 @@ export function bootDiagnostic(output: string, repo: string = REPO): string {
 		(parts.length ? `\n  build: ${parts.join('; ')}.` : '') +
 		(tail ? `\n  last launcher output:\n${tail.replace(/^/gm, '    ')}` : '')
 	);
+}
+
+/**
+ * Remove a spec's throwaway workspace, tolerating the teardown race.
+ *
+ * Every spec's `afterAll` kills its launcher and then deletes the workspace, and
+ * `killCellar` only SIGNALS - it cannot wait, because it is called from a
+ * synchronous hook. So the launcher's own SIGTERM cleanup (which rewrites
+ * `<ws>/.cellar/runtime.json`) can still be running while `rmSync` walks the
+ * tree, and the removal fails `ENOTEMPTY` on a directory it had just emptied.
+ * MEASURED on Linux CI, where it failed a test whose every assertion had
+ * PASSED - a false red, which on a PR gate is the expensive kind of failure.
+ *
+ * `maxRetries` is node's own remedy for exactly this (it retries EBUSY, EMFILE,
+ * ENFILE, ENOTEMPTY and EPERM), and it costs nothing when there is no race.
+ * Anything still failing after that is swallowed: this is a `mkdtemp` directory
+ * under the OS temp dir, so the worst case is one leftover directory the OS
+ * reclaims - never a reason to fail a green test.
+ */
+export function removeWorkspace(ws: string | undefined | null): void {
+	if (!ws) return;
+	try {
+		rmSync(ws, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+	} catch {
+		/* a temp dir that would not delete is not a test failure */
+	}
 }
 
 /**

@@ -1,9 +1,9 @@
 import { test, expect, type Page } from '@playwright/test';
 import { spawnSync, type ChildProcess } from 'node:child_process';
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { runtimeAvailable, bootCellar, killCellar, openSidebarSection } from './harness';
+import { runtimeAvailable, bootCellar, killCellar, openSidebarSection, removeWorkspace } from './harness';
 
 /**
  * Chat cells against the REAL claude CLI - the one layer that proves the whole
@@ -170,7 +170,7 @@ test.afterAll(async () => {
 	launcher = null;
 	if (workspace && existsSync(workspace)) {
 		try {
-			rmSync(workspace, { recursive: true, force: true });
+			removeWorkspace(workspace);
 		} catch {
 			/* best effort */
 		}

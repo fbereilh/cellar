@@ -1,9 +1,9 @@
 import { test, expect, type Page, type Locator } from '@playwright/test';
 import { type ChildProcess } from 'node:child_process';
-import { mkdtempSync, writeFileSync, readFileSync, existsSync, rmSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { runtimeAvailable, bootCellar, killCellar } from './harness';
+import { runtimeAvailable, bootCellar, killCellar, removeWorkspace } from './harness';
 
 /**
  * The cell row's two STATE toggles - nbdev export, and hidden-from-agent -
@@ -133,7 +133,7 @@ test.beforeAll(async () => {
 
 test.afterAll(() => {
 	if (launcher) killCellar(launcher);
-	if (workspace && existsSync(workspace)) rmSync(workspace, { recursive: true, force: true });
+	removeWorkspace(workspace);
 });
 
 test('both toggles are in the row, and no menu is opened to reach them', async ({ page }) => {

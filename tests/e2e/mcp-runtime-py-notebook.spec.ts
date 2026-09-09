@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
-import { runtimeAvailable, bootCellar, killCellar, REPO, openSidebarSection } from './harness';
+import { runtimeAvailable, bootCellar, killCellar, REPO, openSidebarSection, removeWorkspace } from './harness';
 
 /**
  * The agent-facing Databricks-runtime surface and `.py` notebook pinning, over the
@@ -145,7 +145,7 @@ test.afterAll(async () => {
 	launcher = null;
 	if (workspace && existsSync(workspace)) {
 		try {
-			rmSync(workspace, { recursive: true, force: true });
+			removeWorkspace(workspace);
 		} catch {
 			/* best effort */
 		}

@@ -3,7 +3,7 @@ import { type ChildProcess } from 'node:child_process';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { runtimeAvailable, bootCellar, killCellar } from './harness';
+import { runtimeAvailable, bootCellar, killCellar, removeWorkspace } from './harness';
 import { CHAT_LEARNING_MODE_KEY } from '../../src/lib/chatCell';
 import { CHAT_LEARNING_MODE_BLOCK } from '../../src/lib/server/chat/claude-cli';
 
@@ -187,7 +187,7 @@ test.afterAll(() => {
 	launcher = null;
 	if (workspace && existsSync(workspace)) {
 		try {
-			rmSync(workspace, { recursive: true, force: true });
+			removeWorkspace(workspace);
 		} catch {
 			/* best effort */
 		}
