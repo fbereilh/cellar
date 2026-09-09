@@ -3,7 +3,8 @@ import {
 	setNotebookLanguage,
 	getExportTargetState,
 	getNotebookLanguage,
-	isNotebookUnavailable
+	isNotebookUnavailable,
+	NotebookUnavailableError
 } from '$lib/server/notebook';
 import { InvalidNotebookLanguageError, TextNotebookLanguageError } from '$lib/cellLanguage';
 import { reasonWithoutServerPath } from '$lib/serverMessage';
@@ -40,9 +41,15 @@ import { reasonWithoutServerPath } from '$lib/serverMessage';
  * - it points at a save that was never the problem and asserts a change that never
  * happened. It answers the REFUSAL shape (which the select reverts on) carrying no
  * `language`, so the tab keeps the value it already had rather than adopting a
- * `python` nothing observed, and its message is stripped of the absolute server
- * path the doc layer's throw carries (`reasonWithoutServerPath`).
- * Reported as the same 400, the tab took the refusal branch and left the select
+ * `python` nothing observed. Its message is stripped of the absolute server path
+ * ONLY for the throw that carries one (`NotebookUnavailableError`, whose text is
+ * `notebook not found: <abs>`): a `NotebookReadError` is path-free by
+ * construction - the leak was fixed AT THE READ - and its detail is the FILE'S OWN
+ * CONTENT, which the stripper eats (a corrupt notebook reporting
+ * `Unexpected token '/', "{"a": / }" is not valid JSON` came back with the very
+ * `/` identifying the corruption removed), so that one is forwarded verbatim.
+ * A WRITE FAILURE is the opposite case and may not borrow that shape. Reported as
+ * the same 400, the tab took the refusal branch and left the select
  * saying Python while `run.ts` compiled every code cell as Mojo, with nothing
  * left to correct it (no event is emitted on that path, and this tab would
  * echo-suppress it anyway). So a write failure keeps its own 5xx the client tells
@@ -66,7 +73,8 @@ export async function POST({ request }) {
 		return json({ ok: true, language, exportTarget: getExportTargetState(body.path) });
 	} catch (err) {
 		if (isNotebookUnavailable(err)) {
-			const why = reasonWithoutServerPath(String(err?.message ?? err));
+			const raw = String(err?.message ?? err);
+			const why = err instanceof NotebookUnavailableError ? reasonWithoutServerPath(raw) : raw;
 			return json(
 				{
 					ok: false,

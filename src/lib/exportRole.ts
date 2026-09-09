@@ -387,11 +387,12 @@ export const EXPORT_STRANDED_CELL_TITLE = 'Not exported - click to clear this st
  * many of them are on a cell that CONTRIBUTES module source at all.
  *
  * The second number is what makes the remedy honest. A stranded cell is either a
- * code cell in the other language - which a different target extension WOULD
- * take - or a cell that contributes no module source in ANY language, for which
- * no target could ever work; and since a conversion now keeps the mark
- * (`applyCellType`), the second is the commonest kind there is. One remedy for
- * both told half the users to change a setting that cannot help them.
+ * code cell in the other language - which a different NOTEBOOK LANGUAGE would
+ * take, the module's language being the notebook's - or a cell that contributes
+ * no module source in ANY language, for which no setting could ever work; and
+ * since a conversion now keeps the mark (`applyCellType`), the second is the
+ * commonest kind there is. One remedy for both told half the users to change a
+ * setting that cannot help them.
  */
 export interface ExportStrandedSummary {
 	/** Stranded marks in the notebook. Zero means the bar says nothing. */
@@ -444,6 +445,15 @@ export function exportStrandedCount(
  * exactly there. With none of the stranded cells carrying a language, clearing the
  * mark is the ONLY thing that resolves them, and the sentence says so and stops.
  *
+ * A cell that DOES have a language is resolved by changing the NOTEBOOK's
+ * language, never by repointing the target: the module's language FOLLOWS the
+ * notebook's, so `setExportTarget` REFUSES a `.mojo` path on a Python notebook.
+ * "Point the target at a module that takes them" therefore named an action the
+ * setter rejects - the same defect as the no-module-source case, reached from the
+ * other side - and the only reachable shape it applies to is a `%%mojo`-source
+ * cell in a Python notebook, which switching the notebook to Mojo makes eligible
+ * (it re-expresses `utils.py` as `utils.mojo` with it).
+ *
  * No wording claims what LANGUAGE the stranded cells ARE - the set can be mixed (a
  * Mojo cell under a `.py` target beside a markdown cell carrying a hand-edited
  * flag), so each states only what was observed: they are marked, the module leaves
@@ -461,9 +471,9 @@ export function exportStrandedExplanation(
 	if (withLanguage === 0)
 		return `${subject}, but ${count === 1 ? 'contributes' : 'contribute'} no module source, so ${them} exported nowhere whatever the target is. To resolve it, ${clear}.`;
 	if (moduleLanguage === null)
-		return `${subject}, but this notebook has no target module, so ${them} exported nowhere. Set a target path above, or ${clear}.`;
+		return `${subject}, but this notebook has no target module, so ${them} exported nowhere. Set a target path above (a module is written in the notebook's own language, so a cell in another one needs that changed too), or ${clear}.`;
 	const ext = moduleExtension(moduleLanguage);
-	return `${subject}, but cannot go in a ${ext} module, so ${them} exported nowhere. Point the target at a module that takes them, or ${clear}.`;
+	return `${subject}, but cannot go in a ${ext} module, so ${them} exported nowhere. A module is written in the notebook's own language, so change the notebook's language above, or ${clear}.`;
 }
 
 /**

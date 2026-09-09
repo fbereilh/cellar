@@ -848,6 +848,14 @@ export function registerTools(server: McpServer) {
 		if ('error' in res) return res.error;
 		const r = svc.setCellExport(res.ids, exported, target);
 		if (r.ok) return text(r);
+		// Checked BEFORE every other refusal, because it is the one that happened
+		// before anything was read or applied: the notebook could not be OPENED, so no
+		// mark moved and none of the sentences below describes what was seen. Its
+		// message carries the doc layer's absolute path, which is stripped here.
+		if ('unavailable' in r)
+			return notFound(
+				`the notebook could not be opened, so no export mark was changed: ${reasonWithoutServerPath(String(r.unavailable ?? ''))}`
+			);
 		if ('refused' in r) return notFound(pyNotebookRefusal('a cell cannot be marked for export'));
 		// A per-cell refusal names the handle the AGENT supplied, not the full UUID
 		// resolveMany expanded it to: an id the model cannot find anywhere in its own
@@ -866,6 +874,14 @@ export function registerTools(server: McpServer) {
 		// state, not either of those: naming one is not the remedy (there is one) and
 		// changing an extension is not either (there is no module to compare against),
 		// so it says what was seen and points at the error `get_notebook_map` reports.
+		//
+		// NONE of the four names an extension to pick. A module's language is the
+		// NOTEBOOK's, so `set_export_target` REFUSES a `.mojo` path on a Python
+		// notebook - and a non-null `cellLanguage` is reachable only for a `%%mojo`
+		// cell in one - which made "a .mojo path takes Mojo cells" an instruction the
+		// setter rejects on every branch that carried it. `set_notebook_language` is
+		// what moves the module's language, and it re-expresses the stored target with
+		// it, so branches 3 and 4 name it beside the target action each still needs.
 		if ('notCode' in r)
 			return notFound(
 				r.cellLanguage == null
@@ -873,8 +889,8 @@ export function registerTools(server: McpServer) {
 					: r.targetLanguage != null
 						? `cell ${asGiven(r.notCode)} is ${cellLang(r.cellLanguage)} code but this notebook's module is a ${moduleExt(r.targetLanguage)} one (its language is the notebook's - set_notebook_language)`
 						: r.targetConfigured
-							? `cell ${asGiven(r.notCode)} is ${cellLang(r.cellLanguage)} code and this notebook's export target names no module Cellar can build, so nothing is exported: read export_target_error from get_notebook_map, then fix the target with set_export_target (a ${moduleExt(r.cellLanguage)} path takes ${cellLang(r.cellLanguage)} cells)`
-							: `cell ${asGiven(r.notCode)} is ${cellLang(r.cellLanguage)} code and this notebook has no export target, so there is no module to mark it for: name one with set_export_target (a ${moduleExt(r.cellLanguage)} path takes ${cellLang(r.cellLanguage)} cells)`
+							? `cell ${asGiven(r.notCode)} is ${cellLang(r.cellLanguage)} code and this notebook's export target names no module Cellar can build, so nothing is exported: read export_target_error from get_notebook_map and fix the target with set_export_target - and since a module's language is the notebook's, ${cellLang(r.cellLanguage)} code also needs set_notebook_language`
+							: `cell ${asGiven(r.notCode)} is ${cellLang(r.cellLanguage)} code and this notebook has no export target, so there is no module to mark it for: name one with set_export_target - and since a module's language is the notebook's, ${cellLang(r.cellLanguage)} code also needs set_notebook_language`
 			);
 		// The one refusal that is not about the cell TYPE: nbdev's `#| export` in the
 		// source marks it, and Cellar never writes a directive, so there is no metadata
@@ -892,6 +908,12 @@ export function registerTools(server: McpServer) {
 	});
 	server.registerTool('set_export_target', { description: 'Set (or clear) your notebook\'s EXPORT TARGET: the module export-marked cells go to. Its extension FOLLOWS set_notebook_language (.py/.mojo); a mismatch is refused. `base` = what `path` is measured from: workspace, notebook (its folder), git (repo root); OMIT to KEEP the stored. path:null or "" clears the SETTING (a `#|default_exp` directive in a cell is NOT). Rewritten while a cell stays marked (set_cell_export); module = the write failed, or it will not import / lost main(). Refused: a path outside the workspace, git with no repo, a `.py` text notebook. Returns export_target (RESOLVED workspace-relative; a directive flags export_target_source) + export_base/export_path for other bases.', inputSchema: { path: z.string().nullable(), base: z.enum(['workspace', 'notebook', 'git']).optional(), ...notebookParam } }, async ({ path, base, notebook }, extra: ToolExtra) => {
 		const r = svc.setExportTarget(path, targetOf(extra, notebook), base);
+		// The notebook could not be OPENED: nothing was applied, so this may not be
+		// worded as the accepted-but-unsaved case below, which claims the target took.
+		if ('unavailable' in r)
+			return notFound(
+				`the notebook could not be opened, so its export target is unchanged: ${reasonWithoutServerPath(String(r.unavailable ?? ''))}`
+			);
 		if ('refused' in r) return notFound(pyNotebookRefusal('an export target cannot be stored'));
 		if ('invalid' in r) return notFound(`refused: ${r.invalid} - the export target must be a .py or .mojo path that resolves inside the workspace`);
 		// A valid path the notebook write could not save: say what happened, and do NOT

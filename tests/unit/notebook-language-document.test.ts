@@ -555,4 +555,29 @@ describe('the route tells a REFUSED language from a FAILED WRITE, so the UI can 
 		expect(payload.writeFailed).toBeUndefined();
 		expect(String(payload.message)).not.toContain(WS);
 	});
+
+	it("keeps a PARSE refusal's detail intact - the path strip is only for the throw that carries one", async () => {
+		// The path-stripper is blunt by design (it drops any `/`-leading token), and a
+		// parse refusal's detail is the FILE'S OWN CONTENT: run over it, it eats the
+		// very character identifying the corruption. That reader is already path-free
+		// by construction, so the strip is narrowed to the not-found throw instead.
+		const nb = join(WS, 'corrupt-detail.ipynb');
+		nbmod.createNotebook('corrupt-detail.ipynb');
+		nbmod.dropDocs(nb);
+		const bytes = '{"a": / }';
+		writeFileSync(nb, bytes);
+		// Whatever this runtime words it as, the excerpt it quotes is the file's bytes.
+		let detail = '';
+		try {
+			JSON.parse(bytes);
+		} catch (err) {
+			detail = String((err as Error).message);
+		}
+		expect(detail).toContain(bytes);
+
+		const payload = await (await post({ language: 'mojo', path: nb })).json();
+		expect(payload.reason).toBe('notebook-unavailable');
+		expect(String(payload.message)).toContain(detail);
+		expect(String(payload.message)).not.toContain(WS);
+	});
 });

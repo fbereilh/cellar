@@ -1090,8 +1090,11 @@ describe('at the wire: the tool is really callable', () => {
 		expect(body(bad)).toContain('set_export_target');
 		// It may NOT name a module the notebook does not have...
 		expect(body(bad)).not.toContain('module is a .py one');
-		// ...and it names the extension that WOULD admit this cell, which is the action.
-		expect(body(bad)).toContain('.mojo path takes Mojo cells');
+		// ...and every action it names is one a setter ACCEPTS. Naming an extension is
+		// not: a module's language FOLLOWS the notebook's, so `set_export_target`
+		// refuses a `.mojo` path here and only `set_notebook_language` can move it.
+		expect(body(bad)).not.toMatch(/path takes/);
+		expect(body(bad)).toContain('set_notebook_language');
 
 		// The mirror: once a target exists, the SAME cell gets the mismatch sentence
 		// instead, so neither wording can regress into the other.
@@ -1273,6 +1276,37 @@ describe('at the wire: the tool is really callable', () => {
 		})) as CallResult;
 		expect(bad.isError).toBe(true);
 		expect(marked(target, code[1])).toBe(false);
+	});
+
+	it('a notebook that cannot be OPENED is its own outcome on the EXPORT pair too', async () => {
+		// `isPyTextNotebook` reaches `docFor`, and both export write tools called it
+		// OUTSIDE any try - so for a notebook deleted or renamed out from under a pinned
+		// session the throw left the tool entirely and reached the agent as
+		// `notebook not found: <abs>`, an absolute server path escaping a result union
+		// that claims to be exhaustive. It is the SAME three-outcome split the language
+		// pair makes, through the same shared predicate: nothing was applied, so it may
+		// never be reported as a failed SAVE (which claims the change took).
+		const rel = 'wire-gone.ipynb';
+		const { target, code } = await makeNotebook(rel);
+		const client = await connect();
+		nbmod.dropDocs(target);
+		unlinkSync(target);
+
+		const r = (await client.callTool({
+			name: 'set_export_target',
+			arguments: { path: 'lib/gone.py', notebook: rel }
+		})) as CallResult;
+		expect(r.isError).toBe(true);
+		expect(body(r)).toMatch(/could not be opened/i);
+		// Neither of the two claims that were false here.
+		expect(body(r)).not.toMatch(/could not be saved|already holds it/i);
+		expect(body(r)).not.toContain(WS);
+
+		// The marking tool ANSWERS rather than throwing, through the same guard.
+		const marks = svc.setCellExport([code[0]], true, target);
+		expect(marks).toMatchObject({ ok: false });
+		expect('unavailable' in marks).toBe(true);
+		expect('writeFailed' in marks).toBe(false);
 	});
 
 	it('names the handle the agent supplied, not the UUID it resolved to', async () => {

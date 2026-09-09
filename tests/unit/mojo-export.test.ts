@@ -897,19 +897,27 @@ describe('a stranded mark stays clearable', () => {
 			expect(say).not.toMatch(/is not (Python|Mojo)|their own language/);
 		}
 
-		// A cell that DOES have a language keeps the target remedy, since changing the
-		// extension really would take it - and the sentence still names no language.
+		// A cell that DOES have a language is resolved by moving the NOTEBOOK's
+		// language, never by repointing the target: the module's language follows the
+		// notebook's, so `setExportTarget` REFUSES the other extension (driven against
+		// the real setter below). The sentence still names no language.
 		for (const lang of ['python', 'mojo'] as const) {
 			const say = exportStrandedExplanation({ count: 1, withLanguage: 1 }, lang);
-			expect(say).toContain('Point the target at a module that takes them');
+			expect(say).toContain("change the notebook's language");
+			expect(say).not.toMatch(/Point the target/);
 			expect(say).not.toContain('their own language');
 			expect(say).not.toContain('no module source');
 		}
-		// A MIXED set keeps it too: the target remedy applies to the cells that have a
-		// language, and clearing covers the rest.
+		// A MIXED set keeps it too: the language remedy applies to the cells that have
+		// one, and clearing covers the rest.
 		const mixed = exportStrandedExplanation({ count: 3, withLanguage: 1 }, 'python');
-		expect(mixed).toContain('Point the target');
+		expect(mixed).toContain("change the notebook's language");
 		expect(mixed).toContain("clear each mark from the cell's toolbar");
+		// With NO target the notebook still needs one named, but naming one alone
+		// cannot resolve a cell written in another language, so the sentence says both.
+		const none = exportStrandedExplanation({ count: 1, withLanguage: 1 }, null);
+		expect(none).toContain('Set a target path above');
+		expect(none).toContain("the notebook's own language");
 	});
 
 	it('the per-cell marker stays a MARKER, never the notebook-wide sentence', () => {
@@ -955,6 +963,49 @@ describe('a stranded mark stays clearable', () => {
 		const cleared = nbmod.listCells(nb).find((c) => c.id === id)!;
 		expect('export' in (cleared.metadata?.cellar ?? {})).toBe(false);
 		expect(exportMarkStranded(cleared, 'python')).toBe(false);
+	});
+
+	it('the remedy the bar names is one the setters ACCEPT, and the old one is refused', async () => {
+		// The rule `exportStrandedExplanation`'s header states: the remedy may not name
+		// an action that cannot help. Inverting the authority (a module's language now
+		// FOLLOWS the notebook's) turned the old "point the target at a module that
+		// takes them" into exactly that - `setExportTarget` REFUSES the other extension
+		// - so both halves are driven against the real setters here rather than read
+		// off the sentence.
+		const rel = 'stranded-remedy.ipynb';
+		const nb = nbmod.resolveNotebookPath(rel);
+		svc.useNotebook('sess-stranded-remedy', rel);
+		const { ids } = await svc.addCells([{ cell_type: 'code', source: 'x = 1' }], null, {
+			nb,
+			routeImports: false
+		});
+		const id = svc.resolveRef(nb, ids[0]);
+		nbmod.setExportTarget('lib/stranded-remedy.py', nb);
+		nbmod.setCellExports([id], true, nb);
+		// Marked while eligible, then stranded by its own SOURCE - the reachable order
+		// (marking a `%%mojo` cell is refused, which is why the toggle only clears).
+		nbmod.setSource(id, `%%mojo\n${MAIN}`, nb);
+
+		const strandedNow = () =>
+			exportStrandedSummary(nbmod.listCells(nb), nbmod.getNotebookLanguage(nb));
+		expect(strandedNow()).toEqual({ count: 1, withLanguage: 1 });
+
+		// THE DEAD REMEDY: repointing the target at the module that would take this
+		// cell is refused outright, so a sentence naming it sends the user nowhere.
+		expect(() => nbmod.setExportTarget('lib/stranded-remedy.mojo', nb)).toThrow(
+			/this notebook's language is Python/
+		);
+
+		// THE NAMED REMEDY: the sentence points at the notebook's language, and moving
+		// it really does resolve the cell - it re-expresses the target with it.
+		expect(
+			exportStrandedExplanation(strandedNow(), nbmod.getNotebook(nb).exportLanguage)
+		).toContain("change the notebook's language");
+		nbmod.setNotebookLanguage('mojo', nb);
+		expect(nbmod.getExportTarget(nb)).toBe('lib/stranded-remedy.mojo');
+		expect(strandedNow()).toEqual({ count: 0, withLanguage: 0 });
+		const eligible = nbmod.listCells(nb).find((c) => c.id === id)!;
+		expect(isExportCell(eligible, 'mojo')).toBe(true);
 	});
 });
 

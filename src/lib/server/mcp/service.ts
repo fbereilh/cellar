@@ -2163,13 +2163,43 @@ export function setNotebookLanguage(language: string, nb?: string | null) {
  * targeted any more" - a directive lives in a cell, so no notebook-level setter
  * can clear it.
  */
+/**
+ * The FIRST question both export write tools ask of a notebook, answered so that
+ * OPENING it cannot escape their result union.
+ *
+ * `isPyTextNotebook` reaches `docFor`, which throws for a notebook that is gone,
+ * unreadable or unparseable - what a pinned agent session meets when the file is
+ * deleted or renamed outside Cellar. Called bare, that throw left the tool
+ * entirely and reached the agent as `notebook not found: <abs>`, an absolute
+ * server path in a result whose union claims to be exhaustive.
+ *
+ * It is the same THREE-outcome split the language pair already makes, through the
+ * same shared `isNotebookUnavailable`: opening FAILED (nothing was applied - never
+ * `writeFailed`, which claims the change took and points at a save that was never
+ * the problem), the document cannot HOLD the setting (`py-notebook`), or the call
+ * may proceed. Returning null is the last of those.
+ *
+ * One call is enough for the whole tool: `docFor` CACHES, so every later read of
+ * the same notebook in that call is a hit and cannot throw this again.
+ */
+function exportWriteGuard(nb: string) {
+	try {
+		return isPyTextNotebook(nb) ? { ok: false as const, refused: 'py-notebook' as const } : null;
+	} catch (err) {
+		if (isNotebookUnavailable(err))
+			return { ok: false as const, unavailable: String((err as Error)?.message ?? err) };
+		throw err;
+	}
+}
+
 export function setExportTarget(
 	target: string | null | undefined,
 	nb?: string | null,
 	base?: string | null
 ) {
 	const nbTarget = nb ?? getActiveNotebookPath();
-	if (isPyTextNotebook(nbTarget)) return { ok: false as const, refused: 'py-notebook' as const };
+	const guard = exportWriteGuard(nbTarget);
+	if (guard) return guard;
 	try {
 		setExportTargetDoc(target ?? null, nbTarget, undefined, base ?? null);
 	} catch (err) {
@@ -2177,6 +2207,10 @@ export function setExportTarget(
 		// generate nothing on every later export (see `setExportTarget` in notebook.ts).
 		if (err instanceof InvalidExportTargetError)
 			return { ok: false as const, invalid: err.message };
+		// Opening the document is its own outcome and is checked before the write one:
+		// nothing was applied there, so `writeFailed` would claim the target took.
+		if (isNotebookUnavailable(err))
+			return { ok: false as const, unavailable: String((err as Error)?.message ?? err) };
 		// NOT a refusal: the doc layer validates before it mutates, so the only other
 		// throw is the notebook write (EACCES, ENOSPC, a read-only checkout). The target
 		// was accepted and the live document HOLDS it - reporting that as an invalid path
@@ -2267,7 +2301,8 @@ export function setExportTarget(
  */
 export function setCellExport(ids: string[], exported: boolean, nb?: string | null) {
 	const target = nb ?? getActiveNotebookPath();
-	if (isPyTextNotebook(target)) return { ok: false as const, refused: 'py-notebook' as const };
+	const guard = exportWriteGuard(target);
+	if (guard) return guard;
 	// Eligibility is a MATCH against the module's language, not a fixed "is this
 	// Python" - see `exportRole`'s `canExportCell` - and WHICH language that is is
 	// the NOTEBOOK's, which `ExportTargetLanguageInfo.eligibility` answers so this
