@@ -30,6 +30,7 @@
 	import {
 		canExportCell,
 		isExportCell,
+		exportEligibilityLanguage,
 		exportDirectiveOwnsCell,
 		exportMarkStranded,
 		exportMarkedTwice,
@@ -375,17 +376,16 @@
 	// is the strict test, so such a cell got a toggle whose `aria-pressed` could
 	// never move and whose setter always skipped it. An always-visible control that
 	// can never apply is worse than one behind a menu, so it is GATED, not disabled.
-	// ELIGIBILITY is decided against the NOTEBOOK's language, which is exactly what
-	// the server decides it against (`docExportLanguage`, full stop) - never the
-	// nullable module language, which is null until a target names a module and so
-	// answered `python` for a MOJO notebook that has not been given a target yet:
-	// the row then greyed a perfectly valid mark as stranded while the notebook-wide
-	// explanation (derived from the notebook language) reported none, and clicking
-	// that greyed toggle cleared a mark the server considers eligible. Where a
-	// target DOES name a module the two are the same value, so nothing else moves.
-	// Every SENTENCE below reads the nullable prop instead, so none of them claims a
-	// module the notebook does not have.
-	const exportCellLanguage = $derived(exportLanguage ?? notebookLanguage);
+	// WHICH language eligibility is judged by is the shared, unit-tested
+	// `exportEligibilityLanguage` rather than an expression here: vitest runs
+	// without the SvelteKit plugin so this component cannot be mounted, and e2e
+	// runs in neither CI nor the gate, so a rule left as a template expression can
+	// regress and merge green (the `defaultProfileNoticeApplies` precedent). It
+	// answers the NOTEBOOK's language - what the server decides it against too -
+	// and the reason the nullable module language may not be read here lives with
+	// it. Every SENTENCE below reads that nullable prop instead, so none of them
+	// claims a module the notebook does not have.
+	const exportCellLanguage = $derived(exportEligibilityLanguage(notebookLanguage, exportLanguage));
 	const canExport = $derived(canExportCell(cell, exportCellLanguage));
 	const isExport = $derived(isExportCell(cell, exportCellLanguage));
 	// How this control NAMES the module it writes to. With a target it is that

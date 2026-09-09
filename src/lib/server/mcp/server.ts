@@ -818,14 +818,17 @@ export function registerTools(server: McpServer) {
 	// `.py`-notebook refusal is reported by reason like the cell-type ones, since
 	// its cause and its remedy are the same (that document stores no metadata).
 	server.registerTool('set_notebook_language', { description: 'Set the notebook\'s LANGUAGE: "python" or "mojo". A notebook is one or the other, never both - every plain code cell in it is written in this language (there is no mojo cell type). Switching touches NO cell: markdown, raw, sql and chat cells are unaffected, and code cells simply run as the new language (doctrine clause 12). The nbdev export target follows it - a stored `utils.py` becomes `utils.mojo` and back - so the two can never disagree; the reply reports the target so you can name it again correctly. Refused on a `.py` text notebook, which stores no notebook metadata. Returns {language, export_target, ...}.', inputSchema: { language: z.enum(['python', 'mojo']), ...notebookParam } }, async ({ language, notebook }, extra: ToolExtra) => {
-		const target = targetOf(extra, notebook);
-		try {
-			return text(svc.setNotebookLanguage(language, target));
-		} catch (err) {
-			// A `.py` notebook cannot hold the declaration; the message names the cause
-			// and the fix (convert to .ipynb), so it is relayed rather than re-worded.
-			return notFound(String((err as Error)?.message ?? err));
-		}
+		const r = svc.setNotebookLanguage(language, targetOf(extra, notebook));
+		if ('refused' in r) return notFound(pyNotebookRefusal('the notebook language cannot be stored'));
+		if ('invalid' in r) return notFound(`refused: ${r.invalid}`);
+		// NOT a refusal: the language was ACCEPTED and the open notebook already holds
+		// it, so every plain code cell in it is ALREADY running as that language. Saying
+		// the call failed would leave an agent writing the other language into a notebook
+		// that has switched - so this names what is true, and does not hand back the
+		// refusals' remedy above.
+		if ('writeFailed' in r)
+			return notFound(`the notebook language was applied in memory but the notebook could not be saved: ${r.writeFailed} - the open notebook already holds ${JSON.stringify(r.language)} and every plain code cell in it runs as that language now; it is written to disk with the notebook's next successful save${r.export_target ? `. Export target: ${r.export_target}` : ''}`);
+		return text(r);
 	});
 
 	server.registerTool('set_report_view', { description: 'Turn the notebook-wide report view on/off: enabled:true renders every code cell OUTPUT-only, so a human reads results and markdown without the code; enabled:false shows code again. Display-only — no source is touched and cells still run. A per-cell set_hide_input override beats it in either direction. Returns the resulting report_view.', inputSchema: { enabled: z.boolean(), ...notebookParam } }, async ({ enabled, notebook }, extra: ToolExtra) => text(svc.setReportView(enabled, targetOf(extra, notebook))));

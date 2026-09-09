@@ -61,13 +61,14 @@ import { getNotebookStaleness, analyzeDataflow } from '../dataflow';
 import { STALE_STATE, staleIdsInOrder } from '../../staleness';
 import type { StalenessEntry, StalenessMap } from '../../staleness';
 import { resolveSymbol, resolveImpact } from '../../symbolGraph';
-import { isPyUnsupportedType, isSqlCell, nbCellType, isRawCell, isChatCell, languageTagFor, logicalCellType, textNotebookCellTypeError, textNotebookTypeMessage } from '../../cellLanguage';
+import { isPyUnsupportedType, isSqlCell, nbCellType, isRawCell, isChatCell, languageTagFor, logicalCellType, textNotebookCellTypeError, textNotebookTypeMessage, InvalidNotebookLanguageError, TextNotebookLanguageError } from '../../cellLanguage';
 import { isCodeHidden, hideInputExplicit } from '../../hideInput';
 import {
 	isExportCell,
 	canExportCell,
 	exportCellCount,
 	exportDirectiveOwnsCell,
+	exportEligibilityLanguage,
 	exportLanguageOf,
 	exportMarkedTwice,
 	exportTargetLanguage
@@ -940,13 +941,19 @@ export async function getNotebookMap(nb?: string | null) {
 	const stack: { node: MapSection; level: number }[] = [];
 	const toHandle = handleFn(nb);
 	const view = getNotebook(nb);
-	// Which module language this notebook's target names, so `export: true` marks the
-	// cells that really go into it - a Python cell under a `.mojo` target contributes
-	// nothing and must not be reported as exported. Read off the view `getNotebook`
-	// already resolved rather than resolved again: this is the most frequently called
-	// agent read tool, and with no target stored `resolveExportTarget` sweeps every
-	// cell looking for a `#|default_exp` directive, so a second call doubles it.
-	const exportLang = view.exportLanguage ?? 'python';
+	// Which language this notebook's marks are judged by, so `export: true` names the
+	// cells that really go into its module - a Python cell under a `.mojo` target
+	// contributes nothing and must not be reported as exported. Asked of the shared
+	// `exportEligibilityLanguage`, which is the SAME answer `setCellExports` gates
+	// marking on (`docExportLanguage`): read off the nullable module language
+	// instead, an untargeted MOJO notebook was judged as Python, so a `%%mojo` cell
+	// `set_cell_export` had just accepted came back unmarked here - the two agent
+	// surfaces disagreeing about one document. Both fields are read off the view
+	// `getNotebook` already resolved rather than resolved again: this is the most
+	// frequently called agent read tool, and with no target stored
+	// `resolveExportTarget` sweeps every cell looking for a `#|default_exp`
+	// directive, so a second call doubles it.
+	const exportLang = exportEligibilityLanguage(view.language, view.exportLanguage);
 	// The number each section renders with, so the agent reads the SAME heading the
 	// human does ("1. Setup", not "Setup") and can see the numbering is already
 	// being done for it - which is what stops it hardcoding a number into the source.
@@ -1999,8 +2006,8 @@ export function setType(
 /**
  * Would this conversion destroy saved outputs? Only a cell that HAS outputs and is
  * leaving `code` for a type that cannot hold them - `applyCellType`'s own rule
- * (`cell_type !== 'code'` ⇒ outputs cleared), read through `nbCellType` so the
- * logical types that stay nbformat `code` (sql, mojo) are correctly not destructive.
+ * (`cell_type !== 'code'` ⇒ outputs cleared), read through `nbCellType` so a
+ * logical type that stays nbformat `code` (sql) is correctly not destructive.
  */
 function dropsOutputs(cell: CellView | null, type: LogicalCellType): boolean {
 	return !!cell?.outputs?.length && cell.cell_type === 'code' && nbCellType(type) !== 'code';
@@ -2055,11 +2062,33 @@ export function setReportView(enabled: boolean, nb?: string | null) {
  *
  * The result reports the target back BECAUSE it may have moved: an agent holding
  * `utils.py` needs to know it is now `utils.mojo` before it names it again.
+ *
+ * A REFUSAL and a FAILED WRITE are told apart BY TYPE, never by matching message
+ * text - the `setExportTarget` split, for the identical reason. The doc layer
+ * VALIDATES before it mutates (an unknown language, or `mojo` on a `.py` text
+ * notebook - both typed), so its one other throw is the `persist`: a disk failure
+ * over a language the live document already HOLDS and that `run.ts` is already
+ * compiling every plain code cell as. Reported as a refusal, the agent is told the
+ * call failed and goes on writing Python into a notebook now executing Mojo, so
+ * the persist case is its OWN outcome carrying what IS true - the language that
+ * took, and the export target it moved to.
  */
 export function setNotebookLanguage(language: string, nb?: string | null) {
 	const target = nb ?? getActiveNotebookPath();
-	const applied = setNotebookLanguageDoc(language, target);
-	return { language: applied, ...exportTargetFields(target) };
+	try {
+		return { language: setNotebookLanguageDoc(language, target), ...exportTargetFields(target) };
+	} catch (err) {
+		if (err instanceof TextNotebookLanguageError)
+			return { ok: false as const, refused: 'py-notebook' as const };
+		if (err instanceof InvalidNotebookLanguageError)
+			return { ok: false as const, invalid: err.message };
+		return {
+			ok: false as const,
+			writeFailed: String((err as Error)?.message ?? err),
+			language: getNotebookLanguage(target),
+			...exportTargetFields(target)
+		};
+	}
 }
 
 /**

@@ -1996,15 +1996,17 @@ function seedCellar(doc: NotebookDoc, cell: CellWithCellar, cellar: unknown): vo
 
 /**
  * Refuse a type a `.py` TEXT notebook cannot hold (`PY_UNSUPPORTED_TYPES`:
- * `raw`, `chat`, `mojo`), BEFORE anything is written.
+ * `raw`, `chat`), BEFORE anything is written.
  *
  * `persist` writes such a document back through jupytext / the Databricks
  * converter, which rebuilds it from its cells and coerces every `cell_type` to
  * markdown|code, carrying no `cellar` metadata and no outputs - so a raw cell
  * would live only in memory and come back from disk as a runnable Python cell,
- * a chat cell would come back the same way with its REPLY gone, and a mojo cell
- * would come back as a Python cell holding Mojo source (see
- * `textNotebookCellTypeError`, which owns the reasoning and the messages). The
+ * and a chat cell would come back the same way with its REPLY gone (see
+ * `textNotebookCellTypeError`, which owns the reasoning and the messages). Mojo
+ * is refused on such a document too, but one level up: it is the NOTEBOOK's
+ * language rather than a cell type, so `setNotebookLanguage` owns that refusal.
+ * The
  * guard sits at EVERY doc-layer writer that can put such a type into a document
  * - the two that CONVERT a cell (`setCellType`, `setCellTypes`) and the two that
  * CREATE one (`addCell`, `addCellAt`) - so every surface offering one (the type
@@ -2013,7 +2015,7 @@ function seedCellar(doc: NotebookDoc, cell: CellWithCellar, cellar: unknown): vo
  * check each of them could forget. `addCellAt`'s only caller passes 'code'
  * today, so it is guarded to make the claim true by construction rather than by
  * that caller's argument. Which types are refused lives in `cellLanguage.ts`, so
- * a seventh logical type is decided there once instead of here per writer. Every
+ * a sixth logical type is decided there once instead of here per writer. Every
  * other type is unaffected, and an `.ipynb` never reaches the throw.
  *
  * The CREATE paths ask it through `assertCanHoldCell` as well, about the cell
@@ -2035,9 +2037,9 @@ function assertCanHoldType(doc: NotebookDoc, cellType: LogicalCellType): void {
  * still produced a chat cell - on a `.py` document, exactly the state the guard
  * refuses. Asking the cell itself closes that by construction: a caller-supplied
  * namespace can never produce a cell state the `cellType` argument would have
- * been refused for, and a seventh logical type carried the same way inherits the
- * rule instead of needing a check of its own (`mojo` landed under it with no
- * edit). Called before the cell is spliced in, so a refusal still writes nothing.
+ * been refused for, and a sixth logical type carried the same way inherits the
+ * rule instead of needing a check of its own. Called before the cell is spliced
+ * in, so a refusal still writes nothing.
  */
 function assertCanHoldCell(doc: NotebookDoc, cell: Cell): void {
 	assertCanHoldType(doc, logicalCellType(cell));

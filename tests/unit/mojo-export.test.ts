@@ -32,6 +32,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
 	canExportCell,
+	exportEligibilityLanguage,
 	exportLanguageOf,
 	exportCellCount,
 	exportMarkStranded,
@@ -1097,6 +1098,36 @@ describe('the wiring the browser ships', () => {
 		// A cell that contributes no module source at all matches NEITHER.
 		expect(canExportCell(md, 'python')).toBe(false);
 		expect(canExportCell(md, 'mojo')).toBe(false);
+	});
+
+	it('eligibility is judged by the NOTEBOOK, not by the nullable module language', () => {
+		// The cell row has BOTH values in hand - the notebook's language and the
+		// module's, which is null until a target names one - and only one of them may
+		// decide eligibility. `exportEligibilityLanguage` is where that choice lives,
+		// so it can be driven here at all: vitest runs without the SvelteKit plugin, so
+		// the component cannot be mounted, and e2e runs in neither CI nor the gate.
+		//
+		// THE CASE THAT MATTERS is a Mojo notebook with NO target yet. Judged by the
+		// module language (`module ?? 'python'`) it answers `python`, so the row greys a
+		// perfectly valid mark as STRANDED while the notebook-wide explanation - derived
+		// from the notebook's language - reports none, and clicking that greyed toggle
+		// CLEARS a mark the server considers eligible.
+		expect(exportEligibilityLanguage('mojo', null)).toBe('mojo');
+		expect(exportEligibilityLanguage('python', null)).toBe('python');
+		// Where a target DOES name a module the two values are equal (the module's
+		// language FOLLOWS the notebook's), so nothing else moves.
+		expect(exportEligibilityLanguage('mojo', 'mojo')).toBe('mojo');
+		expect(exportEligibilityLanguage('python', 'python')).toBe('python');
+
+		// And that is what the eligibility rule then ANSWERS, which is the consequence
+		// the row renders: a plain code cell of an untargeted Mojo notebook is
+		// exportable and NOT stranded, where the old form made it both ineligible and
+		// stranded at once.
+		const code = { cell_type: 'code', source: 'def main(): ...', metadata: { cellar: { export: true } } };
+		const lang = exportEligibilityLanguage('mojo', null);
+		expect(canExportCell(code, lang)).toBe(true);
+		expect(isExportCell(code, lang)).toBe(true);
+		expect(exportMarkStranded(code, lang)).toBe(false);
 	});
 
 	it('the client half KEEPS the export mark on a type change, like the server', () => {

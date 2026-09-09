@@ -19,7 +19,7 @@
  * agent is actually billed for.
  */
 import { describe, it, expect, beforeAll, vi } from 'vitest';
-import { mkdtempSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
@@ -29,6 +29,47 @@ vi.mock('../../src/lib/server/dataflow', () => ({
 	getNotebookStaleness: async () => ({ sid: null, cells: {} }),
 	analyzeDataflow: async () => ({})
 }));
+
+const { writeGate } = vi.hoisted(() => ({ writeGate: { failAt: null as string | null } }));
+
+/**
+ * The one thing that can throw out of the doc-layer setter AFTER it has mutated
+ * the live document: the `persist`. Induced at the atomic writer rather than by
+ * chmod'ing a directory, which is silently a no-op for root and so would report a
+ * safety that does not exist in a container.
+ */
+vi.mock('../../src/lib/server/atomic-write', async () => {
+	const actual = await vi.importActual<typeof import('../../src/lib/server/atomic-write')>(
+		'../../src/lib/server/atomic-write'
+	);
+	return {
+		...actual,
+		atomicWriteFileSync: (path: string, data: string) => {
+			if (writeGate.failAt && path === writeGate.failAt)
+				throw new Error("EACCES: permission denied, open '" + path + "'");
+			return actual.atomicWriteFileSync(path, data);
+		}
+	};
+});
+
+const PY_BYTES = '# Databricks notebook source\nprint(1)\n';
+
+/** The real helper spawns python; only its FORMAT coercion matters here. */
+vi.mock('../../src/lib/server/jupytext', async () => {
+	const actual = await vi.importActual<typeof import('../../src/lib/server/jupytext')>(
+		'../../src/lib/server/jupytext'
+	);
+	return {
+		...actual,
+		readPyNotebook: () => ({
+			format: 'databricks',
+			cells: [{ id: null, cell_type: 'code', source: 'print(1)', outputs: [], metadata: {} }]
+		}),
+		writePyNotebook: (path: string, cells: { source: string }[]) => {
+			writeFileSync(path, cells.map((c) => c.source).join('\n\n# COMMAND ----------\n\n') + '\n');
+		}
+	};
+});
 
 let WS: string;
 let nbmod: typeof import('../../src/lib/server/notebook');
@@ -116,6 +157,67 @@ describe('an agent can set the notebook language and SEE what it is writing', ()
 		const res = (await client.callTool({ name: 'set_notebook_language', arguments: { language: 'mojo' } })) as CallResult;
 		expect(bodyOf(res)).toContain('lib/utils.mojo');
 		expect(nbmod.getExportTarget(nb)).toBe('lib/utils.mojo');
+	});
+});
+
+/**
+ * A REFUSAL and a FAILED WRITE are the two ways this tool does not return the
+ * ordinary result, and they are OPPOSITE facts about the document: one leaves it
+ * Python, the other leaves it holding Mojo with `run.ts` already compiling every
+ * plain code cell as `%%mojo`. Collapsed into one "it failed", an agent told the
+ * switch did not happen keeps writing Python into a notebook that has switched -
+ * so the split is pinned in BOTH directions, at the real MCP wire.
+ */
+describe('a refusal and a failed save are different outcomes, not one failure', () => {
+	it('a .py text notebook is REFUSED, and stays python', async () => {
+		const client = await connect('s-py');
+		const py = join(WS, 'text.py');
+		writeFileSync(py, PY_BYTES);
+		await client.callTool({ name: 'use_notebook', arguments: { name: 'text.py' } });
+
+		const res = (await client.callTool({
+			name: 'set_notebook_language',
+			arguments: { language: 'mojo' }
+		})) as CallResult;
+
+		expect(res.isError).toBe(true);
+		const body = bodyOf(res);
+		expect(body).toMatch(/refused/i);
+		expect(body).toMatch(/\.py text notebook/i);
+		// The document really did NOT take it - which is what makes this the other case.
+		expect(nbmod.getNotebookLanguage(py)).toBe('python');
+	});
+
+	it('a failed SAVE reports the language as APPLIED, never as a refusal', async () => {
+		const client = await connect('s-writefail');
+		const nb = nbmod.createNotebook('writefail.ipynb').path;
+		await client.callTool({ name: 'use_notebook', arguments: { name: 'writefail.ipynb' } });
+		await client.callTool({ name: 'add_cell', arguments: { cell_type: 'code', source: 'x = 1' } });
+		const onDisk = readFileSync(nb, 'utf8');
+
+		writeGate.failAt = nb;
+		let res: CallResult;
+		try {
+			res = (await client.callTool({
+				name: 'set_notebook_language',
+				arguments: { language: 'mojo' }
+			})) as CallResult;
+		} finally {
+			writeGate.failAt = null;
+		}
+
+		const body = bodyOf(res);
+		// It says what IS true: the language took, in memory, and every code cell runs
+		// as it now. It must NOT read as the `.py` refusal above, whose remedy (convert
+		// the notebook) would send the agent to fix something that is not wrong.
+		expect(body).toMatch(/applied in memory/i);
+		expect(body).toMatch(/could not be saved/i);
+		expect(body).toContain('"mojo"');
+		expect(body).not.toMatch(/\.py text notebook/i);
+		expect(body).not.toMatch(/^refused/i);
+		// And the document really DID take it, which is the fact the wording turns on.
+		expect(nbmod.getNotebookLanguage(nb)).toBe('mojo');
+		expect(readFileSync(nb, 'utf8')).toBe(onDisk);
 	});
 });
 

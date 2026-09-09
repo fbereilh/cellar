@@ -158,6 +158,38 @@ export function canExportCell(cell: ExportCell, lang: ExportLanguage = 'python')
 }
 
 /**
+ * WHICH language eligibility is judged by, given the two the browser has in hand:
+ * the NOTEBOOK's language, and the nullable MODULE language (`exportLanguage` /
+ * `exportModuleLanguage` - null until a target names a module Cellar can build).
+ *
+ * It is the NOTEBOOK's, full stop - the same rule the server decides eligibility
+ * against (`docExportLanguage`, which returns `notebookLanguageOf` and nothing
+ * else). That is the notebook-language axis expressed once more: the module's
+ * language FOLLOWS the notebook's, so there is no second setting that could
+ * answer differently, and where a target DOES name a module the two values are
+ * equal anyway.
+ *
+ * THE NULLABLE ONE MAY ONLY BE READ BY A SENTENCE THAT NAMES A MODULE, never by
+ * eligibility, and this function exists to state that where it can be tested. It
+ * is null until a target names a module, so a rule reading it (`module ?? 'python'`)
+ * answers `python` for a MOJO notebook that has not been given a target yet: the
+ * row then greys a perfectly valid mark as STRANDED while the notebook-wide
+ * explanation - derived from the notebook's language - reports none, and clicking
+ * that greyed toggle CLEARS a mark the server considers eligible.
+ *
+ * `moduleLanguage` is therefore taken and deliberately NOT read: the caller has
+ * both values, so the answer has to say which of them decides rather than leave
+ * the choice at the call site, where it was got wrong once per surface.
+ */
+export function exportEligibilityLanguage(
+	notebookLanguage: ExportLanguage,
+	moduleLanguage: ExportLanguage | null
+): ExportLanguage {
+	void moduleLanguage;
+	return notebookLanguage;
+}
+
+/**
  * Does this cell's SOURCE carry nbdev's bare `#| export` directive?
  *
  * Read STATICALLY, never by running the cell - a `#|` line is a comment. The
