@@ -1,0 +1,164 @@
+name: E2E
+
+# The Playwright end-to-end suite, on EVERY pull request.
+#
+# ── Why this exists at all ────────────────────────────────────────────────────
+# The suite boots the real launcher (Node app + Jupyter sidecar + a python3
+# kernel) in a browser, so it is the only layer that sees what the full stack
+# does. It used to be a local, best-effort check, and the gap it left is a
+# matter of record: #115 changed an aria-label, `cell-row-toggles.spec.ts` still
+# pinned the old literal, and main sat red for 2h34m because nobody runs the
+# specs they did not write. Of the last 100 commits, 80 touched `src/` and 73 of
+# those also touched `tests/e2e/` — the suite is maintained, it just was not
+# gated. See data/cellar-ci-does-not-run-e2e/report.md.
+#
+# ── Why sharded, and why THIS shape ───────────────────────────────────────────
+# Unsharded and serial this is a 45-60 min job (19.8 min serial on an M5 Pro,
+# and `ubuntu-latest` measures 2.3-3x slower than that machine on this repo's
+# own build and unit steps). Against a 2m38s PR check that is a 15-25x latency
+# increase on every PR, which is why the investigation recommended NOT gating.
+# The shape below is what makes gating affordable instead:
+#
+#   * SHARDING (the big win). `--shard=i/N` splits the run across N runners.
+#     Sharding is safe here only because it splits at SPEC-FILE granularity —
+#     verified, not assumed: tests inside a file share one launcher, one
+#     workspace and one kernel and must stay ordered (`fullyParallel: false`),
+#     and no file appears in two shards. `tests/unit/e2e-ci-workflow.test.ts`
+#     pins that, because a Playwright change that started splitting files would
+#     break the suite in a way that reads as flakiness.
+#
+#   * WORKERS INSIDE each shard. `playwright.config.ts` used to hardcode
+#     `workers: process.env.CI ? 1 : 2`. That `1` was never measured against a
+#     CI run — e2e had never run in CI when it was written (#47), so it is the
+#     old unconditional default left standing on a branch nobody had taken, not
+#     a guard against anything observed. The suite is latency-bound, not
+#     CPU-bound (measured: 0.67 of one core across a serial run), so a 4-vCPU
+#     runner is not the constraint. `CELLAR_E2E_WORKERS` sets it here.
+#
+#   * fail-fast: false — one red shard must not cancel the others, or a single
+#     failure hides the state of the rest of the suite and makes the flake rate
+#     unmeasurable.
+#
+# ── Why each shard builds, rather than one job building and sharing it ────────
+# It looks like obvious waste and it is not. The build is ~56s on this runner
+# and it is embarrassingly parallel across shards, so per-shard it costs 56s of
+# wall clock ONCE, concurrently. Hoisting it into a `needs:` job serialises it
+# in front of every shard: build job (~91s incl. checkout, npm ci and upload)
+# THEN shard (~53s setup + tests), against per-shard (~101s setup incl. build +
+# tests). Hoisting is ~43s SLOWER end to end. It would save runner-minutes,
+# which are free on a public repo. Do not "fix" this into a shared build job.
+#
+# ── Why not post-merge or nightly ─────────────────────────────────────────────
+# Because detection is not prevention: a post-merge job still lets the breakage
+# land, and its whole value depends on somebody reading a tab nobody opens.
+# Gating is the point; the sharding above is what makes it cost minutes.
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  # On-demand runs from main — the cheap way to sample the suite's flake rate
+  # without pushing a commit. (GitHub only offers this for workflows that exist
+  # on the default branch, so it does nothing until this file has merged.)
+  workflow_dispatch:
+
+# Supersede an in-flight run when a new commit lands on the same ref, so a
+# force-push to a PR branch does not leave N shards burning on dead code.
+concurrency:
+  group: e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  e2e:
+    name: e2e (shard ${{ matrix.shard }}/${{ strategy.job-total }})
+    runs-on: ubuntu-latest
+    # A wedged launcher is bounded at 60s per spec file by the harness, so a
+    # systemic boot failure cannot run long — this is the backstop for a hang
+    # the harness cannot see, not the expected duration.
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4, 5, 6]
+
+    env:
+      # Make a missing kernel runtime FAIL rather than skip. Every spec is
+      # guarded by `test.skip(!runtimeAvailable(), …)` and Playwright exits 0
+      # for a fully-skipped run, so without this a job whose provisioning
+      # silently broke would be a permanently green check that ran zero tests —
+      # strictly worse than no job, because it manufactures assurance. The guard
+      # lives in tests/e2e/global-setup.ts and shares the specs' own predicate.
+      CELLAR_E2E_REQUIRE_RUNTIME: '1'
+      # See the WORKERS note above. Raise or lower here, not in the config.
+      CELLAR_E2E_WORKERS: '2'
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 20
+          cache: npm
+
+      # `uv` is how the launcher creates and populates every venv; the app
+      # fails fast without it rather than falling back to `python -m venv`.
+      - uses: astral-sh/setup-uv@v10
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        run: npm ci
+
+      # ~40s cold, seconds warm. Keyed on the resolved Playwright version, so a
+      # dependency bump gets a fresh browser instead of a silently stale one.
+      - name: Resolve Playwright version
+        id: pw
+        run: echo "version=$(node -p "require('@playwright/test/package.json').version")" >> "$GITHUB_OUTPUT"
+
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: ms-playwright-${{ runner.os }}-${{ steps.pw.outputs.version }}
+
+      - name: Install Chromium
+        run: npx playwright install --with-deps chromium
+
+      # Cellar's private Jupyter host env (`~/.cellar/host-venv`, jupyter-server).
+      # 40MB / 123 packages. The launcher would create it lazily on first boot,
+      # which is too late: `runtimeAvailable()` reads it with existsSync when the
+      # FIRST test runs, so on a cold runner every spec would skip before the
+      # launcher that creates it ever booted.
+      - name: Cache cellar host venv
+        uses: actions/cache@v4
+        with:
+          path: ~/.cellar/host-venv
+          key: cellar-host-venv-${{ runner.os }}-v1
+
+      - name: Provision the kernel runtime
+        run: node scripts/ensure-e2e-runtime.js
+
+      # Per shard, deliberately — see the header. The specs serve the production
+      # build, so this is not optional: `globalSetup` refuses a build that is
+      # stale, absent or incomplete.
+      - name: Build
+        run: npm run build
+
+      - name: Run E2E (shard ${{ matrix.shard }})
+        run: npx playwright test --shard=${{ matrix.shard }}/${{ strategy.job-total }}
+
+      # Traces are `retain-on-failure`, so this uploads only when there is
+      # something to look at — a red shard is diagnosable without re-running it
+      # locally against a runtime the reader may not have.
+      - name: Upload traces
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-traces-shard-${{ matrix.shard }}
+          path: test-results/
+          retention-days: 7
+          if-no-files-found: ignore

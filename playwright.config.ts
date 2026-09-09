@@ -36,8 +36,19 @@ export default defineConfig({
 	// timing-sensitive real-kernel specs. Do not raise it without first splitting
 	// those into their own workers:1 project. See
 	// data/cellar-test-timing-scout-t7/report.md.
+	//
+	// This used to read `process.env.CI ? 1 : 2`, and that `1` was NOT a measured
+	// guard — it is the file's original unconditional default (#47 added the `: 2`
+	// for local runs and left the CI branch as it found it) on a branch that had
+	// never once executed, because e2e did not run in CI until .github/workflows/
+	// e2e.yml. So there is nothing to preserve: the honest default is the same
+	// value on both, and `CELLAR_E2E_WORKERS` is where CI states its own. The
+	// suite is latency-bound rather than CPU-bound (MEASURED: user 583s + sys 215s
+	// across a 1191s serial wall ≈ 0.67 of one core), which is why a 4-vCPU runner
+	// takes more than one worker without becoming CPU-starved — but it is ALSO why
+	// it is sensitive to contention, so raise the env var on evidence, not hope.
 	fullyParallel: false,
-	workers: process.env.CI ? 1 : 2,
+	workers: Number(process.env.CELLAR_E2E_WORKERS) || 2,
 	retries: 0,
 	reporter: [['list']],
 	use: {

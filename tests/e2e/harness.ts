@@ -9,20 +9,49 @@ import { buildFreshness, missingReason, stalenessReason } from '../../src/lib/se
  * Shared launcher harness for cellar's Playwright E2E specs. Each spec boots the
  * REAL `cellar` launcher (Node app + Jupyter sidecar + a python3 kernel) against a
  * throwaway workspace; the app port is allocated dynamically per run, so the URL
- * is discovered from the launcher's stdout rather than a fixed `webServer`. The
- * runtime (uv + python3 + the cached host-venv) is not reliably present in CI, so
- * these are LOCAL, best-effort checks that SKIP when the runtime is missing — the
- * vitest unit suite is the must-pass gate.
+ * is discovered from the launcher's stdout rather than a fixed `webServer`.
+ *
+ * The runtime (uv + python3 + the cached host-venv) is provisioned in CI and the
+ * suite gates every PR (.github/workflows/e2e.yml). It still SKIPS when that
+ * runtime is missing, which is right for a developer machine without `uv` — but
+ * a skip is exactly wrong on a runner, so CI sets `CELLAR_E2E_REQUIRE_RUNTIME`
+ * and the run aborts instead. See `runtimeMissing` just below.
  */
 
 /** Repo root, resolved from this file's location (tests/e2e/harness.ts → ../..). */
 export const REPO = resolve(fileURLToPath(import.meta.url), '../../..');
 
+/**
+ * What the kernel runtime is MISSING, if anything - the one rule, stated as the
+ * list rather than as a boolean.
+ *
+ * `runtimeAvailable()` (the per-spec skip) and `assertRuntimePresent()` (the CI
+ * guard in tests/e2e/global-setup.ts) are both projections of THIS, because the
+ * two ask the same question and a second copy is how they come to disagree - and
+ * a disagreement here is the specific failure that makes a CI e2e job green while
+ * running nothing (every spec calls `test.skip(!runtimeAvailable(), …)`, and
+ * Playwright exits 0 for a fully-skipped run).
+ *
+ * Each entry names the thing to install rather than the check that failed, since
+ * the only reader who ever sees one is somebody fixing a runner.
+ */
+export function runtimeMissing(env: NodeJS.ProcessEnv = process.env): string[] {
+	const has = (cmd: string) =>
+		spawnSync(cmd, ['--version'], { stdio: 'ignore', env }).status === 0;
+	const hostVenv = join(env.HOME || '', '.cellar', 'host-venv', 'bin', 'python');
+	const missing: string[] = [];
+	if (!has('uv')) missing.push('uv (https://docs.astral.sh/uv/ - the launcher shells out to it for every venv op)');
+	if (!has('python3')) missing.push('python3');
+	if (!existsSync(hostVenv))
+		missing.push(
+			`cellar's Jupyter host venv at ${hostVenv} (create it with \`node scripts/ensure-e2e-runtime.js\`)`
+		);
+	return missing;
+}
+
 /** True only when the kernel runtime the E2E needs is actually present. */
-export function runtimeAvailable(): boolean {
-	const has = (cmd: string) => spawnSync(cmd, ['--version'], { stdio: 'ignore' }).status === 0;
-	const hostVenv = join(process.env.HOME || '', '.cellar', 'host-venv', 'bin', 'python');
-	return has('uv') && has('python3') && existsSync(hostVenv);
+export function runtimeAvailable(env: NodeJS.ProcessEnv = process.env): boolean {
+	return runtimeMissing(env).length === 0;
 }
 
 /**
