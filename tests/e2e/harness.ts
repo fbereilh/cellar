@@ -134,14 +134,22 @@ export function bootCellar(
 			clearTimeout(timer);
 			reject(new Error(`${what}${bootDiagnostic(buf)}`));
 		};
-		const timer = setTimeout(
-			() =>
-				fail(
-					`launcher did not print its URL within ${BOOT_TIMEOUT_MS}ms ` +
-						`(raise CELLAR_E2E_BOOT_TIMEOUT_MS if this machine is genuinely slower)`
-				),
-			BOOT_TIMEOUT_MS
-		);
+		const timer = setTimeout(() => {
+			// A timed-out launcher is still ALIVE, and nothing else will reap it: the
+			// promise rejects, so the spec's `launcher` is never assigned and its
+			// `if (launcher) killCellar(launcher)` teardown is skipped - leaving a
+			// detached process group (app + jupyter sidecar + kernel) holding ports
+			// past the whole Playwright run and past the removal of its mkdtemp
+			// workspace. "Fails FAST" must not mean "leaks an instance nobody reaps",
+			// so the same teardown the specs use runs here first. `killCellar` swallows
+			// its own errors, so it can never mask the timeout being reported.
+			// The `exit` path deliberately does NOT do this: that process is gone.
+			killCellar(proc);
+			fail(
+				`launcher did not print its URL within ${BOOT_TIMEOUT_MS}ms ` +
+					`(raise CELLAR_E2E_BOOT_TIMEOUT_MS if this machine is genuinely slower)`
+			);
+		}, BOOT_TIMEOUT_MS);
 		const scan = (chunk: Buffer) => {
 			const s = chunk.toString();
 			buf += s;

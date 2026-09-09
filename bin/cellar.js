@@ -1378,26 +1378,28 @@ function mcpConfigExcluded() {
  *
  * Returns true when the build is usable; otherwise it has already shut down.
  *
- * The tree to judge is a PARAMETER, defaulting to this launcher's own checkout,
- * so the refusal is a function of what is on disk there rather than of module
- * resolution — which is what lets both messages be driven against a throwaway
- * launcher tree (tests/unit/e2e-build-guard.test.ts).
+ * Both refusals are pinned BEHAVIOURALLY in tests/unit/e2e-build-guard.test.ts,
+ * which spawns this CLI as a subprocess from a throwaway tree (a copy of the
+ * launcher beside a symlink to `src/`) whose `build/` is in the state under test —
+ * so `REPO`, resolved from the copy's own location, IS the fixture. There is no
+ * repo seam to pass because none is needed: this file runs its work at import, so
+ * a subprocess is the only way to drive it at all.
  */
-function assertUsableBuild(repo = REPO) {
+function assertUsableBuild() {
 	if (useDev) return true;
-	const freshness = buildFreshness(repo);
+	const freshness = buildFreshness(REPO);
 	if (freshness.state === 'missing') {
 		// `missing` covers an ABSENT build and an INCOMPLETE one alike, so the
 		// message has to come from missingReason(): for a `vite build` killed
 		// part-way, build/index.js is right there and "not found at
 		// <build/index.js>" would send the reader looking at a file that exists.
-		console.error(`[cellar] ${missingReason(repo, freshness)}.`);
+		console.error(`[cellar] ${missingReason(REPO, freshness)}.`);
 		console.error('[cellar] Run `npm run build` first, or pass --dev to use the Vite dev server.');
 		shutdown(1, 'production build missing');
 		return false;
 	}
 	if (freshness.state === 'stale' && !process.env[SKIP_ENV]) {
-		console.error(`[cellar] production build is STALE: ${stalenessReason(repo, freshness)}.`);
+		console.error(`[cellar] production build is STALE: ${stalenessReason(REPO, freshness)}.`);
 		console.error('[cellar] Serving it would run OLD code against your current sources.');
 		console.error(
 			`[cellar] Run \`npm run build\` (or \`make build\`), pass --dev for the Vite dev server, or set ${SKIP_ENV}=1 to override.`
