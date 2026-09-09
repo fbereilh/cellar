@@ -712,7 +712,13 @@ function abortActiveRuns(nbKernel: NotebookKernel, reason: string, only?: readon
 	}
 }
 
-function makeSettings(signal?: AbortSignal) {
+/**
+ * Server settings for @jupyterlab/services.
+ *
+ * Exported for ONE claim worth pinning: that the returned `WebSocket` is always
+ * a usable constructor. See `tests/unit/kernel-websocket-settings.test.ts`.
+ */
+export function makeSettings(signal?: AbortSignal) {
 	const baseUrl = process.env.CELLAR_JUPYTER_URL || 'http://127.0.0.1:8888';
 	const token = process.env.CELLAR_JUPYTER_TOKEN || '';
 	const wsUrl = baseUrl.replace(/^http/, 'ws');
@@ -723,10 +729,25 @@ function makeSettings(signal?: AbortSignal) {
 		// `init` REPLACES @jupyterlab's default rather than merging into it, so its
 		// defaults are restated here alongside the caller's optional abort signal.
 		init: { cache: 'no-store', credentials: 'same-origin', signal },
-		// Node 18+ ships global fetch/WebSocket; pass them explicitly so
-		// @jupyterlab/services does not reach for a browser-only shim.
+		// Node 18+ ships a global `fetch`, so passing it is always a real value.
 		fetch: globalThis.fetch,
-		WebSocket: globalThis.WebSocket
+		// `WebSocket` is NOT the same story, and passing it unconditionally broke
+		// every cell run on the Node versions `package.json` `engines` declares.
+		// The global WebSocket is **Node 22+** (Node 21 had it behind
+		// `--experimental-websocket`; 18 and 20 have none at all), while
+		// `Private.makeSettings` spreads `...options` OVER its defaults - so on
+		// Node 20 this key arrived as `undefined` and CLOBBERED @jupyterlab's own
+		// default, which in Node is the `ws` package it already depends on
+		// (`typeof window === 'undefined' ? require('ws') : WebSocket`). Every
+		// `new settings.WebSocket(...)` then threw `WebSocket is not a
+		// constructor`, so the kernel socket never opened and a cell's output was
+		// that message. Invisible for as long as it was: the only layer that boots
+		// a kernel is e2e, which had never run in CI, and every dev machine here is
+		// on Node 26. Found by the first Linux run of .github/workflows/e2e.yml.
+		//
+		// So OMIT the key rather than passing undefined: on Node 22+ the global is
+		// used exactly as before, and below it @jupyterlab falls back to `ws`.
+		...(globalThis.WebSocket ? { WebSocket: globalThis.WebSocket } : {})
 	});
 }
 

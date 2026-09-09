@@ -25,9 +25,13 @@ import { runtimeAvailable, bootCellar, killCellar, openSidebarSection } from './
  * when the kernel runtime is absent (local-only, like the other specs).
  */
 
+// Default to this machine's temp dir, never a captured absolute path: an
+// evidence run's `/var/folders/...` directory is specific to the machine AND
+// the run that produced it, so pinning one makes the spec unrunnable anywhere
+// else - on Linux CI it is not even creatable, and the screenshot fails ENOENT
+// while the assertions it was decorating had all passed.
 const EVIDENCE_DIR =
-	process.env.CELLAR_EVIDENCE_DIR ||
-	'/var/folders/ds/m71hq5ln637g23x6xmrwqg080000gn/T/no-mistakes-evidence/01KY4M4DDS3WYADZQG78K2932G';
+	process.env.CELLAR_EVIDENCE_DIR || join(tmpdir(), 'cellar-evidence-databricks-header-pill');
 
 let launcher: ChildProcess | null = null;
 let workspace = '';
