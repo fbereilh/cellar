@@ -25,15 +25,24 @@
 import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { parsePandasDataFrameHtml } from '../../src/lib/dataframeHtml';
+import { parseDataFrameHtml } from '../../src/lib/dataframeHtml';
 
 // `import.meta.url` is not a file: URL under the jsdom environment, so resolve the
 // repo from vitest's cwd (the project root) instead.
 const REPO = process.cwd();
 
-/** A pandas `_repr_html_` table with the given row headers (the index labels). */
+/**
+ * A pandas `_repr_html_` table with the given row headers (the index labels).
+ *
+ * ONE blank leading `<th>` PER INDEX LEVEL, which is what pandas really emits: a
+ * two-level MultiIndex header reads `<th></th><th></th><th>value</th>`. The parser
+ * reads how many of those belong to the index from the body's `<th>` count, so a
+ * fixture with a single blank would be describing a table pandas never produces.
+ */
 function pandasHtml(indexLabels: string[][], columns = ['value']): string {
-	const head = `<tr style="text-align: right;"><th></th>${columns.map((c) => `<th>${c}</th>`).join('')}</tr>`;
+	const levels = indexLabels[0]?.length ?? 1;
+	const blanks = '<th></th>'.repeat(levels);
+	const head = `<tr style="text-align: right;">${blanks}${columns.map((c) => `<th>${c}</th>`).join('')}</tr>`;
 	const body = indexLabels
 		.map(
 			(labels, r) =>
@@ -50,7 +59,7 @@ describe('a pandas index is not unique, so it cannot key the grid', () => {
 	it('parses a plain duplicate index (set_index on a repeated column)', () => {
 		// The shape from the reported notebook: `.set_index("bidder_id")` where one
 		// bidder bid three times and another twice.
-		const payload = parsePandasDataFrameHtml(
+		const payload = parseDataFrameHtml(
 			pandasHtml([['3376'], ['3376'], ['3376'], ['3788'], ['3788'], ['5272']])
 		);
 		expect(payload).not.toBeNull();
@@ -64,7 +73,7 @@ describe('a pandas index is not unique, so it cannot key the grid', () => {
 	it('parses a flattened MultiIndex whose joined labels collide', () => {
 		// dataframeHtml joins a MultiIndex row's parts with ' / ', so two distinct
 		// tuples can flatten onto one label (here: a groupby over arm x outcome).
-		const payload = parsePandasDataFrameHtml(
+		const payload = parseDataFrameHtml(
 			pandasHtml([
 				['control', 'win'],
 				['control', 'win'],
@@ -79,7 +88,7 @@ describe('a pandas index is not unique, so it cannot key the grid', () => {
 	});
 
 	it('a unique index still parses normally (the fix changes nothing for it)', () => {
-		const payload = parsePandasDataFrameHtml(pandasHtml([['a'], ['b'], ['c']]));
+		const payload = parseDataFrameHtml(pandasHtml([['a'], ['b'], ['c']]));
 		expect(payload!.index).toEqual(['a', 'b', 'c']);
 		expect(new Set(payload!.index).size).toBe(payload!.index.length);
 	});

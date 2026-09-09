@@ -395,10 +395,15 @@ test('copy output copies an html table as readable text, never markup', async ({
 });
 
 test('copy output keeps the table shape when the Styler markup is pretty-printed', async ({ page }) => {
-	// The shape a real jinja-templated Styler emits. Its inter-tag newlines used to
-	// survive the tag strip and put every cell on its own line, so the frame pasted
-	// one column wide; the leading tab is the blank index heading, a real empty
-	// first column, so all three lines are the same width.
+	// The shape a real jinja-templated Styler emits. `dataframeHtml.ts` now READS a
+	// Styler, so this copies as the very table the grid shows - the same one-parser
+	// contract a saved `_repr_html_` follows below, which is what makes a live and a
+	// re-opened Styler copy identically. The leading tab is its index column.
+	//
+	// The tag-strip path this fixture used to take is still what an UNPARSEABLE rich
+	// table gets, and its inter-tag-newline rule (each cell landing on its own line,
+	// so the frame pasted one column wide) is pinned directly against
+	// `htmlToPlainText` in tests/unit/copy-cell.test.ts.
 	await openNotebook(page);
 	await reveal(page, 'copy-pretty-aaaaa');
 	await cellEl(page, 'copy-pretty-aaaaa').getByTestId('copy-output').click();

@@ -21,7 +21,7 @@
 	import StaticCode from '$lib/StaticCode.svelte';
 	import type { StaticLang } from '$lib/staticHighlight';
 	import DataFrameGrid from '$lib/DataFrameGrid.svelte';
-	import { parsePandasDataFrameHtml } from '$lib/dataframeHtml';
+	import { parseDataFrameHtml } from '$lib/dataframeHtml';
 	import PlotlyOutput from '$lib/PlotlyOutput.svelte';
 	import HtmlOutput from '$lib/HtmlOutput.svelte';
 	import WidgetOutput from '$lib/WidgetOutput.svelte';
@@ -766,20 +766,23 @@
 					return { tone: 'result', image: imageDataUrl(imgMime, d[imgMime]), segments: null };
 				}
 				// A *saved* DataFrame lost its structured MIME to clean-on-save and now
-				// carries only pandas' text/html repr. Recognize that repr (a
-				// `class="dataframe"` table) and render it with the interactive grid,
-				// so a reopened notebook looks like the live one. Only reached when no
-				// structured payload was present (checked above); any non-dataframe
-				// HTML parses to null and falls through to the sandboxed iframe.
+				// carries only its text/html repr. Recognize that repr - pandas' and
+				// polars' `class="dataframe"` tables, and a pandas Styler, which the
+				// kernel formatter never fires for at all - and render it with the
+				// interactive grid, so a reopened notebook looks like the live one.
+				// Only reached when no structured payload was present (checked above);
+				// any html the parser cannot read confidently (an unrecognized layout,
+				// a shape mismatch, a Styler whose cells hold markup) parses to null and
+				// falls through to the sandboxed iframe. See `$lib/dataframeHtml`.
 				if (d['text/html']) {
-					const parsed = parsePandasDataFrameHtml(asText(d['text/html']));
+					const parsed = parseDataFrameHtml(asText(d['text/html']));
 					if (parsed) {
 						return { tone: 'result', dataframe: parsed, segments: null };
 					}
 				}
-				// Rich text/html (Bokeh, Altair, folium, styled DataFrames, plotly's
-				// HTML renderer, …) renders in a sandboxed iframe so its embedded JS
-				// runs safely without touching the app.
+				// Rich text/html (Bokeh, Altair, folium, a styled DataFrame the grid
+				// refused, plotly's HTML renderer, …) renders in a sandboxed iframe so
+				// its embedded JS runs safely without touching the app.
 				if (d['text/html']) {
 					return { tone: 'result', html: asText(d['text/html']), segments: null };
 				}

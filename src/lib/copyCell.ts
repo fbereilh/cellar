@@ -26,15 +26,18 @@
 //                                              output - so an image-only cell
 //                                              offers no copy-output at all)
 //   5. `text/html` that PARSES as a     -> the same tab-separated table, via the
-//      pandas DataFrame repr               ONE parser `$lib/dataframeHtml`. A
-//                                          SAVED notebook lost the structured
+//      DataFrame table (pandas, polars,     ONE parser `$lib/dataframeHtml`. A
+//      or a pandas Styler)                  SAVED notebook lost the structured
 //                                          MIME to clean-on-save and carries only
 //                                          this repr, which is exactly how
 //                                          renderOutput still shows it as a grid -
 //                                          so a live and a re-opened DataFrame
-//                                          copy the same shape. Browser-only
-//                                          (DOMParser); outside a DOM it simply
-//                                          falls through to step 6.
+//                                          copy the same shape. A Styler's caption
+//                                          comes along, and a frame with no index
+//                                          contributes no index COLUMN, both
+//                                          exactly as the grid draws them.
+//                                          Browser-only (DOMParser); outside a DOM
+//                                          it simply falls through to step 6.
 //   6. any OTHER `text/html`            -> tag-stripped text, table cells
 //                                          tab-separated. Raw markup is never
 //                                          pasted. Every row keeps its column
@@ -93,7 +96,7 @@
 
 import type { CellOutput } from '$lib/server/types';
 import { asText, stripAnsi, type DataFramePayload } from '$lib/outputText';
-import { parsePandasDataFrameHtml } from '$lib/dataframeHtml';
+import { parseDataFrameHtml } from '$lib/dataframeHtml';
 
 /**
  * Trailing whitespace goes, EXCEPT a trailing tab: that tab is the separator of a
@@ -180,11 +183,19 @@ function dataframeTable(df: DataFramePayload): string {
 	const cols = Array.isArray(df.columns) ? df.columns.map(cellStr) : [];
 	const index = Array.isArray(df.index) ? df.index : [];
 	const rows = Array.isArray(df.data) ? df.data : [];
+	// A frame with no index (polars, `to_html(index=False)`) contributes no index
+	// COLUMN either, exactly as the grid draws it - a leading empty column would
+	// paste into a spreadsheet as a real, empty one. ABSENT means true, so every
+	// payload predating the field keeps its index column.
+	const hasIndex = df.has_index !== false;
 	const lines: string[] = [];
-	lines.push([cellStr(df.index_name), ...cols].join('\t'));
+	// A caption is part of what the cell SHOWS (the grid renders it), so it comes
+	// along - as its own leading line, above the header row.
+	if (typeof df.caption === 'string' && df.caption !== '') lines.push(df.caption);
+	lines.push([...(hasIndex ? [cellStr(df.index_name)] : []), ...cols].join('\t'));
 	for (let i = 0; i < rows.length; i++) {
 		const row = Array.isArray(rows[i]) ? rows[i] : [];
-		lines.push([cellStr(index[i]), ...row.map(cellStr)].join('\t'));
+		lines.push([...(hasIndex ? [cellStr(index[i])] : []), ...row.map(cellStr)].join('\t'));
 	}
 	if (df.truncated_rows || df.truncated_cols) {
 		lines.push(`[${totalOr(df.total_rows, rows.length)} rows x ${totalOr(df.total_cols, cols.length)} columns]`);
@@ -375,9 +386,9 @@ export function outputCopyText(o: CellOutput): string {
 				// the whole joined string twice on this path.
 				const html = asText(d['text/html']);
 				// A SAVED DataFrame: clean-on-save stripped the structured MIME, so this
-				// pandas repr is what renderOutput itself re-parses back into the grid.
-				// Same parser, same table - never a second one.
-				const parsed = parsePandasDataFrameHtml(html);
+				// repr - pandas, polars, or a pandas Styler - is what renderOutput itself
+				// re-parses back into the grid. Same parser, same table - never a second one.
+				const parsed = parseDataFrameHtml(html);
 				if (parsed) return dataframeTable(parsed);
 				return htmlToPlainText(html);
 			}
