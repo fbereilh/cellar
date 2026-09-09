@@ -1378,12 +1378,15 @@ function mcpConfigExcluded() {
  *
  * Returns true when the build is usable; otherwise it has already shut down.
  *
- * Both refusals are pinned BEHAVIOURALLY in tests/unit/e2e-build-guard.test.ts,
- * which spawns this CLI as a subprocess from a throwaway tree (a copy of the
- * launcher beside a symlink to `src/`) whose `build/` is in the state under test —
- * so `REPO`, resolved from the copy's own location, IS the fixture. There is no
- * repo seam to pass because none is needed: this file runs its work at import, so
- * a subprocess is the only way to drive it at all.
+ * Every refusal below is pinned BEHAVIOURALLY in tests/unit/e2e-build-guard.test.ts
+ * — the MISSING message in BOTH of its shapes (absent and incomplete, which reach
+ * the same branch and must read differently), the STALE message, and the
+ * CELLAR_SKIP_BUILD_CHECK override letting a stale build through. Each spawns this
+ * CLI as a subprocess from a throwaway tree (a copy of the launcher beside a
+ * symlink to `src/`) whose `build/` is in the state under test — so `REPO`,
+ * resolved from the copy's own location, IS the fixture. There is no repo seam to
+ * pass because none is needed: this file runs its work at import, so a subprocess
+ * is the only way to drive it at all.
  */
 function assertUsableBuild() {
 	if (useDev) return true;

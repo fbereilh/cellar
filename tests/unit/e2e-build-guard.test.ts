@@ -29,6 +29,7 @@ import {
 	readFileSync,
 	copyFileSync,
 	symlinkSync,
+	chmodSync,
 	utimesSync
 } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -237,6 +238,75 @@ describe('where the guard is wired', () => {
 		}
 	});
 
+	it('REAPS the launcher process group when the boot times out', async () => {
+		// The leak this pins is SILENT: drop `detached: true` from the spawn, or
+		// reorder `killCellar`/`fail`, and nothing fails - a launcher, its Jupyter
+		// sidecar and its kernel simply outlive the whole Playwright run and the
+		// removal of their mkdtemp workspace, holding ports, which is exactly the
+		// wedged instance this task exists to stop the suite producing.
+		//
+		// The seam is one already there rather than a new hook: `bootCellar` spawns
+		// the bare name `node` with `<ws>/.shim` first on PATH, and only ADDS its
+		// `open`/`xdg-open` stubs to that directory - so a `node` placed there first
+		// stands in for the launcher. The stand-in never prints a URL, so the boot
+		// can only end at the timeout, which is driven through the documented
+		// CELLAR_E2E_BOOT_TIMEOUT_MS override (itself only readable per-import
+		// because of the module-load fix pinned by the case above).
+		const ws = mkdtempSync(join(tmpdir(), 'cellar-reap-'));
+		const pidFile = join(ws, 'grandchild.pid');
+		const shim = join(ws, '.shim');
+		mkdirSync(shim, { recursive: true });
+		// The `sleep` is the whole point: it is a GRANDCHILD, so a pid-only kill
+		// leaves it orphaned and running while the direct child dies. Only reaping
+		// the GROUP - which is what the launcher's sidecar and kernel are - takes it.
+		const stub = join(shim, 'node');
+		writeFileSync(stub, `#!/bin/sh\nsleep 30 &\necho $! > "${pidFile}"\nwait\n`);
+		chmodSync(stub, 0o755);
+
+		const alive = (pid: number) => {
+			try {
+				process.kill(pid, 0);
+				return true;
+			} catch {
+				return false;
+			}
+		};
+
+		let group: number | null = null;
+		vi.stubEnv('CELLAR_E2E_BOOT_TIMEOUT_MS', '2000');
+		vi.resetModules();
+		try {
+			const { bootCellar } = await import('../../tests/e2e/harness');
+			const boot = bootCellar(ws).then(
+				() => null,
+				(err: Error) => err
+			);
+			const err = await boot;
+			expect(err).toBeInstanceOf(Error);
+			expect((err as Error).message).toMatch(/did not print its URL/);
+
+			// Read AFTER the rejection: the stand-in writes this within milliseconds of
+			// starting, so by the time the 2s bound has elapsed the file is certainly
+			// there - and asserting it exists is what keeps this from passing vacuously.
+			const child = Number(readFileSync(pidFile, 'utf8').trim());
+			expect(Number.isInteger(child) && child > 0).toBe(true);
+			group = child;
+
+			for (let i = 0; i < 100 && alive(child); i++) await new Promise((r) => setTimeout(r, 20));
+			expect(alive(child)).toBe(false);
+		} finally {
+			if (group != null && alive(group)) {
+				try {
+					process.kill(group, 'SIGKILL');
+				} catch {
+					/* already gone */
+				}
+			}
+			vi.unstubAllEnvs();
+			vi.resetModules();
+			rmSync(ws, { recursive: true, force: true });
+		}
+	});
 });
 
 /**
@@ -249,7 +319,9 @@ describe('where the guard is wired', () => {
  * process refuses and exits before any toolchain work: no venv, no sidecar, and
  * nothing written outside the fixture.
  */
-function launcherTree(build: 'absent' | 'incomplete'): string {
+type LauncherBuild = 'absent' | 'incomplete' | 'stale';
+
+function launcherTree(build: LauncherBuild): string {
 	const tree = mkdtempSync(join(tmpdir(), 'cellar-launcher-'));
 	mkdirSync(join(tree, 'bin'));
 	copyFileSync(join(REPO, 'bin', 'cellar.js'), join(tree, 'bin', 'cellar.js'));
@@ -257,22 +329,38 @@ function launcherTree(build: 'absent' | 'incomplete'): string {
 	// modules, while the launcher ITSELF stays a real file here so its own
 	// `import.meta.url` — and therefore the repo it judges — is this fixture.
 	symlinkSync(join(REPO, 'src'), join(tree, 'src'), 'dir');
+	// Inert for the two MISSING shapes, which return before the source comparison —
+	// but `isSourceCheckout` proves a checkout by a `.git` at the repo root, so
+	// without it the stale fixture classifies `unknown` and the launcher launches.
+	mkdirSync(join(tree, '.git'));
 	if (build === 'incomplete') {
 		mkdirSync(join(tree, 'build'), { recursive: true });
 		writeFileSync(join(tree, 'build', 'index.js'), '// built');
+	}
+	if (build === 'stale') {
+		mkdirSync(join(tree, 'build', 'client'), { recursive: true });
+		const entry = join(tree, 'build', 'index.js');
+		writeFileSync(entry, '// built');
+		// Stamped ancient rather than racing a real edit: `src` here is the symlink
+		// to the REAL tree, whose mtimes this fixture must not touch, so the only
+		// side of the comparison it may move is the build's own.
+		utimesSync(entry, OLD, OLD);
 	}
 	mkdirSync(join(tree, 'ws'));
 	return tree;
 }
 
-function refuseWith(build: 'absent' | 'incomplete'): { code: number | null; said: string } {
+function runLauncher(
+	build: LauncherBuild,
+	env: Record<string, string> = {}
+): { code: number | null; said: string } {
 	const tree = launcherTree(build);
 	const home = mkdtempSync(join(tmpdir(), 'cellar-launcher-home-'));
 	try {
 		const run = spawnSync(
 			process.execPath,
 			[join(tree, 'bin', 'cellar.js'), '--workspace', join(tree, 'ws'), '--new', '--yes'],
-			{ encoding: 'utf8', timeout: 30_000, env: { ...process.env, HOME: home } }
+			{ encoding: 'utf8', timeout: 30_000, env: { ...process.env, HOME: home, ...env } }
 		);
 		return { code: run.status, said: `${run.stdout ?? ''}${run.stderr ?? ''}` };
 	} finally {
@@ -283,7 +371,7 @@ function refuseWith(build: 'absent' | 'incomplete'): { code: number | null; said
 
 describe('the launcher refuses an unusable build', () => {
 	it('names build/index.js when NOTHING was built', () => {
-		const { code, said } = refuseWith('absent');
+		const { code, said } = runLauncher('absent');
 		expect(code).toBe(1);
 		expect(said).toContain('build/index.js');
 		expect(said).toMatch(/no production build found/i);
@@ -296,11 +384,34 @@ describe('the launcher refuses an unusable build', () => {
 		// file that EXISTS — so the reader looks at it, finds it there, and the real
 		// cause (build/client) is never named. Asserting both halves is what makes
 		// the two states provably DIFFERENT rather than merely both non-empty.
-		const { code, said } = refuseWith('incomplete');
+		const { code, said } = runLauncher('incomplete');
 		expect(code).toBe(1);
 		expect(said).toMatch(/incomplete/i);
 		expect(said).toContain('build/client');
 		expect(said).not.toContain('build/index.js');
 		expect(said).toContain('npm run build');
+	});
+
+	it('refuses a STALE build and names the source that outran it', () => {
+		const { code, said } = runLauncher('stale');
+		expect(code).toBe(1);
+		expect(said).toMatch(/STALE/);
+		// Not merely "the build is old": the message names the source that moved,
+		// which is what turns the refusal into something the reader can act on.
+		expect(said).toContain('src');
+		expect(said).toContain('npm run build');
+	});
+
+	it('lets CELLAR_SKIP_BUILD_CHECK serve a stale build anyway', () => {
+		// The override's whole promise is that the refusal does not fire, so the
+		// evidence has to be that the launcher got PAST it. `--new` skips the reap
+		// block, so the next thing `main()` does is require uv - and with uv off PATH
+		// that is a fast, unmistakably UNRELATED failure, reached only by a launcher
+		// that did not refuse. It writes nothing outside the fixture: the harness
+		// config reconcile runs far later, and never gets here.
+		const { said } = runLauncher('stale', { CELLAR_SKIP_BUILD_CHECK: '1', PATH: '/nonexistent' });
+		expect(said).not.toMatch(/STALE/);
+		expect(said).not.toContain('production build stale');
+		expect(said).toContain('uv is required');
 	});
 });
