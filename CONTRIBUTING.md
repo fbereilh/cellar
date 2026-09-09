@@ -79,7 +79,7 @@ guard runs from Playwright's own `globalSetup` (`tests/e2e/global-setup.ts` ->
 `scripts/ensure-build.js`) rather than an npm hook, so a single-spec
 `npx playwright test <spec>` is covered too - but `npm run test:e2e` is the
 command to type, because it stays correct if that wiring ever moves. It rebuilds
-only when `build/` is stale or incomplete, so a re-run against an already-fresh
+only when `build/` is stale, absent or incomplete, so a re-run against a fresh
 build pays nothing. This matters: the specs boot the real launcher *without*
 `--dev`, so they run the production build - and a stale one used to be served
 silently, testing code that was never compiled. That produced 11 false
