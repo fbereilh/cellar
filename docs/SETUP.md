@@ -85,10 +85,11 @@ node bin/cellar.js --dev                      # Vite dev server (hot reload)
 ```
 
 `make dev` is the second command. `make run` is the first, but rebuilds only when
-the build is stale (via `scripts/ensure-build.js`) instead of unconditionally.
-Note that a production launch refuses a **stale** build (built before your latest
-`src/` edit), not just a missing one: run `npm run build` (or `make run`, which
-does it for you), pass `--dev`, or set `CELLAR_SKIP_BUILD_CHECK=1` to override.
+the build is stale, absent or incomplete (via `scripts/ensure-build.js`) instead
+of unconditionally. Note that a production launch refuses a **stale** build (built
+before your latest `src/` edit), not just a missing one: run `npm run build` (or
+`make run`, which does it for you), pass `--dev`, or set
+`CELLAR_SKIP_BUILD_CHECK=1` to override.
 
 ## Kernel / venv resolution
 
@@ -687,9 +688,9 @@ npm run test      # unit suite - the merge gate
 `npm run test:e2e` is a best-effort local smoke test that boots the real launcher,
 runs `6*7`, and asserts `42` renders; it needs the full kernel runtime
 (`uv` + `python3` + the cached host-venv) and skips itself when that is absent.
-It rebuilds the app first when `build/` is older than `src/` (the specs serve the
-production build, so a stale one would silently test uncompiled code) and runs two
-spec files at a time. Install its browser once with `npx playwright install chromium`.
+It rebuilds the app first when `build/` is stale, absent or incomplete (the specs
+serve the production build, so a stale one would silently test uncompiled code) and
+runs two spec files at a time. Install its browser once with `npx playwright install chromium`.
 
 ## Troubleshooting
 
@@ -698,11 +699,13 @@ spec files at a time. Install its browser once with `npx playwright install chro
 - **`cellar: command not found` after `make setup`** - the `npm link` symlink needs
   the launcher's executable bit; `make setup` re-`chmod`s it. Re-run `make setup`,
   or run `node bin/cellar.js` directly.
-- **`production build is STALE` / `production build not found`** - a production
-  launch serves `build/index.js`, and refuses to run it against newer `src/`. Run
-  `npm run build` (or `make run`, which rebuilds only when stale), pass `--dev` for
-  the Vite dev server, or set `CELLAR_SKIP_BUILD_CHECK=1` to serve the stale build
-  anyway. A packaged install (npm/brew/Docker) never triggers this.
+- **`production build is STALE` / `no production build found` / incomplete build** -
+  a production launch serves `build/index.js`, and refuses to run it against newer
+  `src/`, against no build at all, or against one only part-way written (the
+  message names the artifact that is missing). Run `npm run build` (or `make run`,
+  which rebuilds only when it has to), pass `--dev` for the Vite dev server, or set
+  `CELLAR_SKIP_BUILD_CHECK=1` to serve the stale build anyway. A packaged install
+  (npm/brew/Docker) never triggers this.
 - **Port already in use** - Cellar yields rather than fights for a port, so this
   only happens if you pinned `CELLAR_APP_PORT` / `CELLAR_MCP_PORT` /
   `CELLAR_JUPYTER_PORT`. Unset them to let Cellar choose. A *remembered* port that

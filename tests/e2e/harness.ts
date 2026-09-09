@@ -3,6 +3,7 @@ import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
 import { mkdirSync, writeFileSync, existsSync, chmodSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { buildFreshness, missingReason, stalenessReason } from '../../src/lib/server/build-freshness.js';
 
 /**
  * Shared launcher harness for cellar's Playwright E2E specs. Each spec boots the
@@ -22,6 +23,47 @@ export function runtimeAvailable(): boolean {
 	const has = (cmd: string) => spawnSync(cmd, ['--version'], { stdio: 'ignore' }).status === 0;
 	const hostVenv = join(process.env.HOME || '', '.cellar', 'host-venv', 'bin', 'python');
 	return has('uv') && has('python3') && existsSync(hostVenv);
+}
+
+/**
+ * How long a launcher gets to print its URL before the boot is called dead.
+ *
+ * 60s, down from 90s. A warm boot here is ~1.2s MEASURED (three runs at load 4;
+ * uv resolves the throwaway workspace's venv from cache), so 60s is ~46x the
+ * measured cost - deliberately generous, because the cost of guessing LOW is a
+ * whole spec file's worth of false failures on a merely loaded machine, while the
+ * cost of guessing high is one wedged launcher held a minute instead of a minute
+ * and a half. That still matters at `workers: 2` across ~50 spec files, where a
+ * systemic boot failure is paid once per file. `CELLAR_E2E_BOOT_TIMEOUT_MS` raises
+ * it for a genuinely cold uv cache, which is a one-time per-machine cost.
+ */
+export const BOOT_TIMEOUT_MS = Number(process.env.CELLAR_E2E_BOOT_TIMEOUT_MS) || 60_000;
+
+/**
+ * Say WHY a boot failed, at the assertion, not only in interleaved stdout.
+ *
+ * `launcher exited early (1)` on its own sends you reading the launcher's source;
+ * the launcher had already printed the real reason, but Playwright reports the
+ * rejection and nothing else. So the failure carries the build verdict (the
+ * commonest cause by far - see tests/e2e/global-setup.ts) plus the tail of what
+ * the launcher actually said.
+ *
+ * A pure function of (output, repo), and exported for that reason: what it CLAIMS
+ * about a build is the part worth pinning, and a unit test can drive it against a
+ * fixture repo without booting anything.
+ */
+export function bootDiagnostic(output: string, repo: string = REPO): string {
+	const parts: string[] = [];
+	const freshness = buildFreshness(repo);
+	if (freshness.state === 'missing') parts.push(missingReason(repo, freshness));
+	else if (freshness.state === 'stale')
+		parts.push(`the production build is STALE (${stalenessReason(repo, freshness)})`);
+	if (parts.length) parts.push('run `npm run build`');
+	const tail = output.trim().split('\n').slice(-8).join('\n');
+	return (
+		(parts.length ? `\n  build: ${parts.join('; ')}.` : '') +
+		(tail ? `\n  last launcher output:\n${tail.replace(/^/gm, '    ')}` : '')
+	);
 }
 
 /**
@@ -79,24 +121,49 @@ export function bootCellar(
 	);
 
 	return new Promise((resolvePromise, reject) => {
-		const timer = setTimeout(() => reject(new Error('launcher did not become ready in time')), 90_000);
 		let buf = '';
+		// The exit handler stays wired for the whole life of the launcher - it is what
+		// reports one that dies before printing its URL - so it MUST NOT do work once
+		// the boot has settled: `killCellar` at teardown fires it after a perfectly
+		// good boot, and bootDiagnostic() walks src/ and static/ to build an Error
+		// that `reject` then discards on an already-resolved promise.
+		let settled = false;
+		const fail = (what: string) => {
+			if (settled) return;
+			settled = true;
+			clearTimeout(timer);
+			reject(new Error(`${what}${bootDiagnostic(buf)}`));
+		};
+		const timer = setTimeout(() => {
+			// A timed-out launcher is still ALIVE, and nothing else will reap it: the
+			// promise rejects, so the spec's `launcher` is never assigned and its
+			// `if (launcher) killCellar(launcher)` teardown is skipped - leaving a
+			// detached process group (app + jupyter sidecar + kernel) holding ports
+			// past the whole Playwright run and past the removal of its mkdtemp
+			// workspace. "Fails FAST" must not mean "leaks an instance nobody reaps",
+			// so the same teardown the specs use runs here first. `killCellar` swallows
+			// its own errors, so it can never mask the timeout being reported.
+			// The `exit` path deliberately does NOT do this: that process is gone.
+			killCellar(proc);
+			fail(
+				`launcher did not print its URL within ${BOOT_TIMEOUT_MS}ms ` +
+					`(raise CELLAR_E2E_BOOT_TIMEOUT_MS if this machine is genuinely slower)`
+			);
+		}, BOOT_TIMEOUT_MS);
 		const scan = (chunk: Buffer) => {
 			const s = chunk.toString();
 			buf += s;
 			process.stdout.write(`[cellar-e2e] ${s}`);
 			const m = buf.match(/app → (http:\/\/localhost:\d+)/);
-			if (m) {
+			if (m && !settled) {
+				settled = true;
 				clearTimeout(timer);
 				resolvePromise({ proc, url: m[1] });
 			}
 		};
 		proc.stdout?.on('data', scan);
 		proc.stderr?.on('data', scan);
-		proc.on('exit', (code) => {
-			clearTimeout(timer);
-			reject(new Error(`launcher exited early (${code})`));
-		});
+		proc.on('exit', (code) => fail(`launcher exited early (${code})`));
 	});
 }
 

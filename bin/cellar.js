@@ -153,7 +153,12 @@ import {
 } from '../src/lib/server/instances.js';
 import { CONFIRM_PHRASE, planCleanup, resolveCallerWorkspace, workspaceKey } from '../src/lib/server/cleanup-plan.js';
 import { resolveWorkspacePorts } from '../src/lib/server/ports.js';
-import { buildFreshness, stalenessReason, SKIP_ENV } from '../src/lib/server/build-freshness.js';
+import {
+	buildFreshness,
+	missingReason,
+	stalenessReason,
+	SKIP_ENV
+} from '../src/lib/server/build-freshness.js';
 
 const REPO = dirname(dirname(fileURLToPath(import.meta.url)));
 
@@ -1372,12 +1377,26 @@ function mcpConfigExcluded() {
  * was never compiled. See src/lib/server/build-freshness.js.
  *
  * Returns true when the build is usable; otherwise it has already shut down.
+ *
+ * Every refusal below is pinned BEHAVIOURALLY in tests/unit/e2e-build-guard.test.ts
+ * — the MISSING message in BOTH of its shapes (absent and incomplete, which reach
+ * the same branch and must read differently), the STALE message, and the
+ * CELLAR_SKIP_BUILD_CHECK override letting a stale build through. Each spawns this
+ * CLI as a subprocess from a throwaway tree (a copy of the launcher beside a
+ * symlink to `src/`) whose `build/` is in the state under test — so `REPO`,
+ * resolved from the copy's own location, IS the fixture. There is no repo seam to
+ * pass because none is needed: this file runs its work at import, so a subprocess
+ * is the only way to drive it at all.
  */
 function assertUsableBuild() {
 	if (useDev) return true;
 	const freshness = buildFreshness(REPO);
 	if (freshness.state === 'missing') {
-		console.error(`[cellar] production build not found at ${freshness.buildEntry}.`);
+		// `missing` covers an ABSENT build and an INCOMPLETE one alike, so the
+		// message has to come from missingReason(): for a `vite build` killed
+		// part-way, build/index.js is right there and "not found at
+		// <build/index.js>" would send the reader looking at a file that exists.
+		console.error(`[cellar] ${missingReason(REPO, freshness)}.`);
 		console.error('[cellar] Run `npm run build` first, or pass --dev to use the Vite dev server.');
 		shutdown(1, 'production build missing');
 		return false;

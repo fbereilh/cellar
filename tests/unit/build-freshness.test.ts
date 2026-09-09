@@ -13,7 +13,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync, readdirSync, utimesSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { buildFreshness, stalenessReason } from '../../src/lib/server/build-freshness.js';
+import { buildFreshness, missingReason, stalenessReason } from '../../src/lib/server/build-freshness.js';
 
 let repo: string;
 
@@ -49,7 +49,11 @@ function freezeDirs(root: string, seconds: number) {
 beforeEach(() => {
 	repo = mkdtempSync(join(tmpdir(), 'cellar-freshness-'));
 	mkdirSync(join(repo, 'src', 'lib'), { recursive: true });
-	mkdirSync(join(repo, 'build'), { recursive: true });
+	// `build/client` beside the entry point: adapter-node serves the client bundle
+	// from there, so a build without it is INCOMPLETE and classifies as `missing`
+	// (see the incomplete-build cases below). Every "this build is usable" fixture
+	// therefore has to have one.
+	mkdirSync(join(repo, 'build', 'client'), { recursive: true });
 	// A `.git` marks this as a real source checkout (dev clone / CI / e2e harness),
 	// which is what makes "stale" an answerable question. Packaged-install cases
 	// remove it below.
@@ -65,6 +69,27 @@ describe('buildFreshness', () => {
 	it('reports missing when there is no build/index.js', () => {
 		writeAt(join(repo, 'src', 'lib', 'a.ts'), 'export const a = 1;', OLD);
 		expect(buildFreshness(repo).state).toBe('missing');
+	});
+
+	it('reports missing when build/client is absent (an INCOMPLETE build)', () => {
+		// The case that costs the most and hides the best: a `vite build` killed
+		// part-way, or a `build/client` removed by hand, leaves an entry point that
+		// PASSES the mtime comparison. The launcher then starts, serves broken
+		// pages, and every e2e spec fails on its assertions with nothing naming the
+		// build — MEASURED at ~33s per test (a 2-test spec: 65s all-fail vs 2.5s
+		// all-pass). `missing` is the right verdict: what it needs is a rebuild.
+		writeAt(join(repo, 'src', 'lib', 'a.ts'), 'export const a = 1;', OLD);
+		freezeDirs(join(repo, 'src'), OLD);
+		rmSync(join(repo, 'build', 'client'), { recursive: true, force: true });
+		writeAt(join(repo, 'build', 'index.js'), '// built', NEW);
+
+		const result = buildFreshness(repo);
+		expect(result.state).toBe('missing');
+		// The ARTIFACT, not a path string, is what tells the two cases apart: naming
+		// it is the only separator-independent way to ask "was anything built at all".
+		expect(result.missingArtifact).toBe('client');
+		expect(missingReason(repo, result)).toMatch(/incomplete/i);
+		expect(missingReason(repo, result)).toMatch(/client/);
 	});
 
 	it('reports fresh when the build is newer than every source', () => {
@@ -133,6 +158,45 @@ describe('buildFreshness', () => {
 		touch(join(repo, 'src', 'node_modules'), NEW);
 
 		expect(buildFreshness(repo).state).toBe('fresh');
+	});
+
+	it('names the absent entry point rather than a component when nothing is built', () => {
+		writeAt(join(repo, 'src', 'lib', 'a.ts'), 'export const a = 1;', OLD);
+		const result = buildFreshness(repo);
+		expect(result.state).toBe('missing');
+		expect(result.missingArtifact).toBe('index.js');
+		expect(missingReason(repo, result)).toContain('build/index.js');
+		// NOTHING BUILT must not be reported as PART-WAY BUILT: the two send the
+		// reader to different places, and "incomplete" points at build/index.js,
+		// which in that case does not exist at all. This is the direction the
+		// verdicts silently inverted in whenever the platform separator is not `/`.
+		expect(missingReason(repo, result)).not.toMatch(/incomplete/i);
+	});
+
+	it('tells the two absences apart from the ARTIFACT, not from how the path is spelled', () => {
+		// The verdict may not be re-derived by string-matching a joined path against
+		// `build/index.js`: on Windows the missing artifact's path is spelled
+		// `build\index.js`, so a wholly absent build read as an incomplete one — and
+		// "incomplete" then points the reader at build/index.js, which is precisely
+		// the file that is not there. Modelled by handing over the Windows spelling
+		// on any platform; the artifact decides, so the verdict does not move.
+		const windowsSpelling = `${repo}\\build\\index.js`;
+		expect(
+			missingReason(repo, {
+				state: 'missing',
+				buildEntry: windowsSpelling,
+				missing: windowsSpelling,
+				missingArtifact: 'index.js'
+			})
+		).toMatch(/no production build found/);
+		expect(
+			missingReason(repo, {
+				state: 'missing',
+				buildEntry: '',
+				missing: `${repo}\\build\\client`,
+				missingArtifact: 'client'
+			})
+		).toMatch(/incomplete/i);
 	});
 
 	it('reports unknown for a packaged release install even when a shipped src file is newer', () => {

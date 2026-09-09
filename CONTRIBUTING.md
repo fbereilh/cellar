@@ -74,11 +74,15 @@ npx playwright install chromium   # once
 npm run test:e2e
 ```
 
-`npm run test:e2e` **builds first** (the `pretest:e2e` hook, `scripts/ensure-build.js`)
-and rebuilds only when `build/` is older than `src/`, so a re-run against an
-already-fresh build pays nothing. This matters: the specs boot the real launcher
-*without* `--dev`, so they run the production build - and a stale one used to be
-served silently, testing code that was never compiled. That produced 11 false
+**Never run a bare `npx playwright test`** - use `npm run test:e2e`. The build
+guard runs from Playwright's own `globalSetup` (`tests/e2e/global-setup.ts` ->
+`scripts/ensure-build.js`) rather than an npm hook, so a single-spec
+`npx playwright test <spec>` is covered too - but `npm run test:e2e` is the
+command to type, because it stays correct if that wiring ever moves. It rebuilds
+only when `build/` is stale, absent or incomplete, so a re-run against a fresh
+build pays nothing. This matters: the specs boot the real launcher *without*
+`--dev`, so they run the production build - and a stale one used to be served
+silently, testing code that was never compiled. That produced 11 false
 failures burning ~18 minutes of expect-timeouts on results that were meaningless
 in both directions. The launcher now refuses a stale build outright
 (`src/lib/server/build-freshness.js`; `CELLAR_SKIP_BUILD_CHECK=1` overrides).
