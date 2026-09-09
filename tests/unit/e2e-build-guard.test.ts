@@ -7,26 +7,36 @@
  * or absent build makes the launcher refuse, so every spec fails with
  * `launcher exited early (1)` and the reason is buried in interleaved stdout; an
  * INCOMPLETE build passes the mtime comparison, so the launcher boots and each
- * test burns its assertion timeout on a misleading failure (MEASURED: a 3-test
+ * test burns its assertion timeout on a misleading failure (MEASURED: a 2-test
  * spec took 65s all-fail versus 2.5s all-pass).
  *
  * These pin the behaviour of the shared guard plus the wiring that decides WHERE
  * it runs, and e2e is deliberately absent from both CI and the no-mistakes gate, so
- * a unit-level assertion is the only thing that sees a regression here. Everything
- * that CAN be driven is driven: playwright's config, its `globalSetup` module and
- * the harness are all ordinary importable modules, so the wiring is asserted by
- * calling it against a fixture repo rather than by grepping for a shape. The one
- * exception is the launcher's own message, which lives inside a CLI with no
- * importable seam.
+ * a unit-level assertion is the only thing that sees a regression here.
+ *
+ * Everything here is DRIVEN, never grepped: playwright's config, its `globalSetup`
+ * module and the harness are ordinary importable modules, and the launcher - which
+ * runs its work at import, so it cannot be imported - is spawned against a
+ * throwaway tree whose `build/` is in the state under test.
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, readFileSync, utimesSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import {
+	mkdtempSync,
+	mkdirSync,
+	writeFileSync,
+	rmSync,
+	readFileSync,
+	copyFileSync,
+	symlinkSync,
+	utimesSync
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { ensureFreshBuild } from '../../scripts/ensure-build.js';
+import { ensureFreshBuild, invokedAsCli } from '../../scripts/ensure-build.js';
 import globalSetup from '../../tests/e2e/global-setup';
-import { bootDiagnostic, BOOT_TIMEOUT_MS } from '../../tests/e2e/harness';
+import { bootDiagnostic } from '../../tests/e2e/harness';
 import playwrightConfig from '../../playwright.config';
 
 const REPO = resolve(fileURLToPath(import.meta.url), '../../..');
@@ -95,6 +105,23 @@ describe('ensureFreshBuild', () => {
 		expect(outcome.ok).toBe(false);
 		expect(outcome.reason).toMatch(/incomplete/i);
 		expect(outcome.reason).toContain('build/client');
+	});
+
+	it('still guards `make run` when the checkout is reached through a symlink', () => {
+		// The CLI form has to recognise ITSELF to do any work at all, and Node
+		// realpaths an ESM entry while leaving `process.argv[1]` as typed — so on a
+		// checkout under a symlinked directory the two spellings differ and a
+		// lexical comparison silently switches the guard OFF: `make run` exits 0
+		// having built nothing, and the user meets the launcher's stale refusal
+		// instead of the rebuild `make run` advertises.
+		const self = join(REPO, 'scripts', 'ensure-build.js');
+		const link = join(repo, 'ensure-build-link.js');
+		symlinkSync(self, link);
+
+		expect(invokedAsCli(self)).toBe(true);
+		expect(invokedAsCli(link)).toBe(true);
+		expect(invokedAsCli(join(REPO, 'scripts', 'gen-changelog.sh'))).toBe(false);
+		expect(invokedAsCli(undefined)).toBe(false);
 	});
 });
 
@@ -189,26 +216,91 @@ describe('where the guard is wired', () => {
 	});
 
 	it('bounds the launcher boot at 60s, and lets a cold machine raise it', async () => {
-		expect(BOOT_TIMEOUT_MS).toBe(60_000);
-		vi.stubEnv('CELLAR_E2E_BOOT_TIMEOUT_MS', '120000');
+		// Both halves re-import with the env EXPLICITLY set, because harness.ts reads
+		// it once at module load: asserting the statically imported binding would be
+		// asserting the ambient environment, so anyone who took harness.ts's own
+		// advice and exported the override on a cold uv cache would fail `npm test`,
+		// the merge gate, for a reason unrelated to their change.
+		vi.stubEnv('CELLAR_E2E_BOOT_TIMEOUT_MS', '');
 		vi.resetModules();
 		try {
-			const reloaded = await import('../../tests/e2e/harness');
-			expect(reloaded.BOOT_TIMEOUT_MS).toBe(120_000);
+			const bare = await import('../../tests/e2e/harness');
+			expect(bare.BOOT_TIMEOUT_MS).toBe(60_000);
+
+			vi.stubEnv('CELLAR_E2E_BOOT_TIMEOUT_MS', '120000');
+			vi.resetModules();
+			const raised = await import('../../tests/e2e/harness');
+			expect(raised.BOOT_TIMEOUT_MS).toBe(120_000);
 		} finally {
 			vi.unstubAllEnvs();
 			vi.resetModules();
 		}
 	});
 
-	it('the launcher names the ABSENT artifact, not a file that is sitting right there', () => {
-		// `assertUsableBuild` lives inside the CLI, which runs on import and resolves
-		// its repo from its own location, so there is no seam to drive: this is the
-		// one source-shaped check here. What it guards is that the launcher routes
-		// through missingReason() — whose two messages ARE driven, in
-		// tests/unit/build-freshness.test.ts.
-		const src = read('bin/cellar.js');
-		expect(src).toMatch(/missingReason\(REPO, freshness\)/);
-		expect(src).not.toMatch(/production build not found at \$\{freshness\.buildEntry\}/);
+});
+
+/**
+ * The launcher's own refusal, driven for real.
+ *
+ * `bin/cellar.js` runs its work at import, so it cannot be imported — but it can
+ * be SPAWNED, and its repo is its own location, so a throwaway tree (a copy of the
+ * launcher beside a symlink to the real `src/`) puts any `build/` state under it
+ * that a case needs. `assertUsableBuild()` is the first thing `main()` does, so the
+ * process refuses and exits before any toolchain work: no venv, no sidecar, and
+ * nothing written outside the fixture.
+ */
+function launcherTree(build: 'absent' | 'incomplete'): string {
+	const tree = mkdtempSync(join(tmpdir(), 'cellar-launcher-'));
+	mkdirSync(join(tree, 'bin'));
+	copyFileSync(join(REPO, 'bin', 'cellar.js'), join(tree, 'bin', 'cellar.js'));
+	// Symlinked, not copied: the launcher's imports realpath through it to the real
+	// modules, while the launcher ITSELF stays a real file here so its own
+	// `import.meta.url` — and therefore the repo it judges — is this fixture.
+	symlinkSync(join(REPO, 'src'), join(tree, 'src'), 'dir');
+	if (build === 'incomplete') {
+		mkdirSync(join(tree, 'build'), { recursive: true });
+		writeFileSync(join(tree, 'build', 'index.js'), '// built');
+	}
+	mkdirSync(join(tree, 'ws'));
+	return tree;
+}
+
+function refuseWith(build: 'absent' | 'incomplete'): { code: number | null; said: string } {
+	const tree = launcherTree(build);
+	const home = mkdtempSync(join(tmpdir(), 'cellar-launcher-home-'));
+	try {
+		const run = spawnSync(
+			process.execPath,
+			[join(tree, 'bin', 'cellar.js'), '--workspace', join(tree, 'ws'), '--new', '--yes'],
+			{ encoding: 'utf8', timeout: 30_000, env: { ...process.env, HOME: home } }
+		);
+		return { code: run.status, said: `${run.stdout ?? ''}${run.stderr ?? ''}` };
+	} finally {
+		rmSync(tree, { recursive: true, force: true });
+		rmSync(home, { recursive: true, force: true });
+	}
+}
+
+describe('the launcher refuses an unusable build', () => {
+	it('names build/index.js when NOTHING was built', () => {
+		const { code, said } = refuseWith('absent');
+		expect(code).toBe(1);
+		expect(said).toContain('build/index.js');
+		expect(said).toMatch(/no production build found/i);
+		expect(said).toContain('npm run build');
+	});
+
+	it('names the artifact that is ABSENT when the build is part-way, not the one sitting right there', () => {
+		// The regression this pins: the old message was `production build not found
+		// at <build/index.js>`, which for a `vite build` killed part-way points at a
+		// file that EXISTS — so the reader looks at it, finds it there, and the real
+		// cause (build/client) is never named. Asserting both halves is what makes
+		// the two states provably DIFFERENT rather than merely both non-empty.
+		const { code, said } = refuseWith('incomplete');
+		expect(code).toBe(1);
+		expect(said).toMatch(/incomplete/i);
+		expect(said).toContain('build/client');
+		expect(said).not.toContain('build/index.js');
+		expect(said).toContain('npm run build');
 	});
 });

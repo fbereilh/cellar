@@ -19,8 +19,9 @@
  * Node builtins only; no dev dependency of its own.
  */
 import { spawnSync } from 'node:child_process';
-import { dirname } from 'node:path';
-import { fileURLToPath, pathToFileURL } from 'node:url';
+import { realpathSync } from 'node:fs';
+import { dirname, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { buildFreshness, missingReason, stalenessReason } from '../src/lib/server/build-freshness.js';
 
 const REPO = dirname(dirname(fileURLToPath(import.meta.url)));
@@ -74,8 +75,42 @@ export function ensureFreshBuild({ repo = REPO, log = console.log } = {}) {
 	return { ok: true, state: result.state, rebuilt: true, reason: why };
 }
 
+const SELF = fileURLToPath(import.meta.url);
+
+/**
+ * A path resolved as far as the filesystem allows, so two spellings of one file
+ * compare equal. One that cannot be realpath'd (already gone) falls back to its
+ * lexical resolution rather than throwing, so the answer is still decided.
+ */
+function realOrResolved(path) {
+	try {
+		return realpathSync(path);
+	} catch {
+		return resolve(path);
+	}
+}
+
+/**
+ * Was this module RUN (`node scripts/ensure-build.js`, i.e. `make run`) rather
+ * than imported (globalSetup, the unit tests)?
+ *
+ * Compared by RESOLVED path, never by `pathToFileURL(process.argv[1])`: Node
+ * resolves an ESM entry through realpath but leaves `argv[1]` exactly as typed,
+ * so for a checkout reached through a symlinked directory (`~/code` ->
+ * `/Volumes/dev/code`) the two spellings differ and the equality is false. That
+ * fails in the SILENT direction - `make run` would import this module, match
+ * nothing, exit 0 having built nothing, and the user would meet the launcher's
+ * stale refusal instead of the rebuild `make run` advertises.
+ *
+ * @param {string | undefined} entry `process.argv[1]`
+ */
+export function invokedAsCli(entry) {
+	if (!entry) return false;
+	return realOrResolved(entry) === realOrResolved(SELF);
+}
+
 // CLI form (`make run`): same work, exit code carries the verdict.
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+if (invokedAsCli(process.argv[1])) {
 	const outcome = ensureFreshBuild();
 	if (!outcome.ok) {
 		console.error(`[cellar] ${outcome.reason}`);
