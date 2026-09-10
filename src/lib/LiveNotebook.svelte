@@ -287,9 +287,10 @@
 	//
 	// It is the ONE notebook-level condition every language-aware surface reads: the
 	// cell badge and type label, the export eligibility the row toggle asks about,
-	// and (in the follow-up) hiding the Python-only affordances. Nothing per-cell is
-	// written when it changes, so markdown, raw, SQL and chat cells are untouched by
-	// construction rather than by being skipped.
+	// the toolbar's Consolidate imports button, and - published up through
+	// `onLanguageChange` below - the two Python-only affordances the SHELL owns.
+	// Nothing per-cell is written when it changes, so markdown, raw, SQL and chat
+	// cells are untouched by construction rather than by being skipped.
 	let notebookLanguage = $state<NotebookLanguage>('python');
 	// Publish it up so the shell's own Python-only affordances - the sidebar's
 	// variable inspector and the palette's Consolidate imports - can be hidden for a

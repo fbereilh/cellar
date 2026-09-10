@@ -635,8 +635,11 @@ export function isPythonCodeCell(cell: LanguageCell, nbLang: NotebookLanguage = 
  * `staleness.ts` asks this to pick the cells the definer graph is built over;
  * every cell it excludes falls to that module's `n/a` verdict, which is why a
  * Mojo notebook's cells show no staleness chip without any chip-level special
- * case - and it is the ONE notebook-level condition the follow-up that HIDES the
- * remaining Python-only affordances hangs off.
+ * case. It is the CELL-level member of this family; the two NOTEBOOK-level
+ * questions that hide a whole affordance are `notebookHasPythonNamespace` below
+ * (the variable inspector) and `$lib/importsRole`'s `notebookUsesImportsCell`
+ * (the imports cell, and so Consolidate imports) - do not route either through
+ * this one, which answers about a cell.
  */
 export function hasPythonDataflow(cell: LanguageCell, nbLang: NotebookLanguage = 'python'): boolean {
 	return isPythonCodeCell(cell, nbLang) || isSqlCell(cell);

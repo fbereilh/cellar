@@ -40,6 +40,11 @@ export function isImportsCell(cell: RoleCell): boolean {
  * import routed into one would be stranded with nothing to execute them - which
  * is why `routeImports` and `consolidateImports` refuse such a notebook at their
  * own entry. Offering the mark there would be a dead control.
+ *
+ * Asked by every surface of that one fact, so they cannot drift: the per-cell
+ * mark in the ⋮ menu, and both surfaces of Consolidate imports (the notebook
+ * toolbar button and the command-palette entry), each of which is HIDDEN rather
+ * than disabled where this is false.
  */
 export function notebookUsesImportsCell(notebookLanguage: NotebookLanguage): boolean {
 	return notebookLanguage !== 'mojo';
