@@ -1090,24 +1090,42 @@ const OWNS_PROCESS_GROUP = process.platform !== 'win32';
  * Past that point the pid - and therefore the pgid that equals it - can be
  * recycled, so signalling it is no longer a positive match on anything of ours;
  * this repo refuses to kill without one (`pidReapDecision`), and the cost of
- * being wrong here is an unrelated process tree. The SIGTERM that does the work
- * is always sent while the child is provably alive.
+ * being wrong here is an unrelated process tree.
  *
- * STATED RESIDUAL: a descendant that IGNORES SIGTERM and whose group leader is
- * reaped before the 3s escalation therefore survives, since the SIGKILL is the
- * signal that guard withholds. It is narrow - the SIGTERM reaches the whole
- * group while it is provably ours, and ordinary tool subprocesses die on it -
- * and it is the deliberate side of the trade: a missed SIGKILL delays one
- * stubborn process, while a group-kill of a recycled pgid destroys someone
- * else's. It is also why `onLine` must go on dropping everything parsed after
- * the settle (covered in `chat-engine-safety.test.ts`).
+ * STATED RESIDUAL, and it is WIDER than the escalation window - do not restate
+ * it as "a descendant that ignores SIGTERM". Once `reaped` is true this sends
+ * NOTHING to the group, and `child.kill()` on a reaped child is itself a no-op,
+ * so no signal reaches the tree at all. Two ways in:
+ *
+ *   - the leader outlives the SIGTERM but is reaped before the 3s escalation, so
+ *     a descendant that IGNORES SIGTERM keeps the SIGKILL it would have died on;
+ *   - the leader was ALREADY reaped when `kill()` ran, which needs no stop at
+ *     all: the CLI exits, a descendant holds the inherited stdout so `close`
+ *     never fires, the run hangs to the chat timeout, and the kill that timeout
+ *     fires signals nothing.
+ *
+ * Narrowing the guard on "our stdio is still open" was considered and REFUSED:
+ * an open pipe proves only that SOME descendant holds a write end, and a
+ * descendant that called `setsid()` holds it from OUTSIDE our group - which is
+ * exactly the state in which the group is empty and its pgid recyclable, so it
+ * is not evidence the group is still ours. POSIX keeps a pgid reserved only
+ * while the group has members, and we have no way to observe that continuously
+ * from here. The leak is therefore PRE-EXISTING (the old `child.kill()` reached
+ * no descendant either) and is the deliberate side of the trade: a missed
+ * SIGKILL delays one stubborn process, while a group-kill of a recycled pgid
+ * destroys someone else's tree. It is also why `onLine` must go on dropping
+ * everything parsed after the settle (covered in `chat-engine-safety.test.ts`),
+ * and why promptness is settled on the verdict rather than on the pipe.
  *
  * A group kill that fails falls through to the single-process kill rather than
  * leaving the run unsignalled: less reach is better than none.
  */
 function signalRunTree(child: ChildProcess, signal: NodeJS.Signals, reaped: boolean): void {
 	const pid = child.pid;
-	if (OWNS_PROCESS_GROUP && pid != null && !reaped) {
+	// `pid > 0`, never merely `!= null`: `-0 === 0`, and `process.kill(0, sig)`
+	// signals the CALLER'S OWN group - this app, the launcher, the sidecar and
+	// every kernel. The sign IS the primitive here, so the guard is positive.
+	if (OWNS_PROCESS_GROUP && typeof pid === 'number' && pid > 0 && !reaped) {
 		try {
 			process.kill(-pid, signal);
 			return;
@@ -1331,8 +1349,10 @@ function runOnce({
 		// may be recycled by the OS, so it is no longer ours to signal: this repo's
 		// standing rule is that killing REQUIRES a positive match (`pidReapDecision`),
 		// and a group-kill of a recycled pgid would take down an unrelated process
-		// tree. The SIGTERM that matters always precedes this, since it is sent while
-		// the child is provably alive.
+		// tree. On the ordinary stop the SIGTERM precedes this and so reaches the
+		// whole group; where it does NOT (a leader already reaped when `kill()` ran)
+		// nothing is signalled at all - the residual is stated in full at
+		// `signalRunTree`, which owns the rule.
 		let reaped = false;
 		child.on('exit', () => {
 			reaped = true;

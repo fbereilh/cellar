@@ -34,7 +34,7 @@
  */
 import { describe, it, expect, beforeAll, afterAll, afterEach } from 'vitest';
 import { EventEmitter } from 'node:events';
-import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { claudeCliEngine } from '../../src/lib/server/chat/claude-cli';
@@ -66,6 +66,7 @@ beforeAll(() => {
 	BIN = mkdtempSync(join(tmpdir(), 'cellar-chat-stop-bin-'));
 	OUT = mkdtempSync(join(tmpdir(), 'cellar-chat-stop-out-'));
 	process.env.PATH = `${BIN}:${savedPath}`;
+	writeStub();
 });
 
 afterAll(() => {
@@ -90,8 +91,17 @@ afterEach(() => {
  * The grandchild `exec`s, so the pid in the file is the sleeper itself rather
  * than a shell that would exit on its own; and the stub `wait`s, so the direct
  * child does not exit first (which is what a CLI supervising its tools does).
+ *
+ * WRITTEN ONCE, and never rewritten while a run may still be executing it: a
+ * shell reads its script INCREMENTALLY and seeks back after each command, and
+ * `writeFileSync` truncates before it writes, so re-writing this file to give a
+ * concurrent run its own pidfile could hand the parked `sh` an EOF or a partial
+ * line. It would then exit early and orphan its grandchild outside a group whose
+ * leader is already reaped - a flake shaped exactly like the bug under test. So
+ * each INVOCATION names its own pidfile from its own `$$` instead, and the test
+ * collects whichever file is new (`nextGrandchildPid`).
  */
-function stubWithGrandchild(pidfile: string): void {
+function writeStub(): void {
 	writeFileSync(
 		join(BIN, 'claude'),
 		[
@@ -99,7 +109,9 @@ function stubWithGrandchild(pidfile: string): void {
 			'cat > /dev/null', // drain the prompt off stdin, as the real CLI does
 			`echo '${SAFE_INIT}'`,
 			`echo '{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"working"}}}'`,
-			`sh -c 'echo $$ > ${pidfile}; exec sleep 900' &`,
+			// The OUTER `$$` (this stub's pid) names the file; the escaped `\$\$` is
+			// left for the INNER shell and is the sleeper's own pid.
+			`sh -c "echo \\$\\$ > ${OUT}/$$.pid; exec sleep 900" &`,
 			'wait',
 			''
 		].join('\n')
@@ -127,12 +139,23 @@ const alive = (pid: number): boolean => {
 	}
 };
 
-/** Wait for the stub to record its grandchild's pid, and return it. */
-async function grandchildPid(pidfile: string): Promise<number> {
+/**
+ * Pidfiles already claimed by an earlier `nextGrandchildPid`. Every run in this
+ * file is started and then WAITED FOR before the next one begins, so "the file
+ * nobody has claimed yet" identifies the run that was just started.
+ */
+const claimed = new Set<string>();
+
+/** Wait for the run just started to record its grandchild's pid, and return it. */
+async function nextGrandchildPid(): Promise<number> {
 	for (let i = 0; i < 200; i++) {
-		if (existsSync(pidfile)) {
-			const pid = Number(readFileSync(pidfile, 'utf8').trim());
-			if (Number.isInteger(pid) && pid > 0 && alive(pid)) return pid;
+		for (const name of readdirSync(OUT)) {
+			if (!name.endsWith('.pid') || claimed.has(name)) continue;
+			const pid = Number(readFileSync(join(OUT, name), 'utf8').trim());
+			if (Number.isInteger(pid) && pid > 0 && alive(pid)) {
+				claimed.add(name);
+				return pid;
+			}
 		}
 		await new Promise((r) => setTimeout(r, 25));
 	}
@@ -161,11 +184,9 @@ function reap(pid: number | null): void {
 
 describe('stopping a chat run', () => {
 	it('kills what the CLI itself started, not just the CLI', async () => {
-		const pidfile = join(OUT, `tree-${Date.now()}.pid`);
-		stubWithGrandchild(pidfile);
 		const ctrl = new AbortController();
 		const run = startRun(ctrl.signal);
-		const gc = await grandchildPid(pidfile);
+		const gc = await nextGrandchildPid();
 		try {
 			expect(alive(gc)).toBe(true);
 
@@ -181,11 +202,9 @@ describe('stopping a chat run', () => {
 	}, 20_000);
 
 	it('settles PROMPTLY on the verdict, not on a pipe a descendant still holds', async () => {
-		const pidfile = join(OUT, `prompt-${Date.now()}.pid`);
-		stubWithGrandchild(pidfile);
 		const ctrl = new AbortController();
 		const run = startRun(ctrl.signal);
-		const gc = await grandchildPid(pidfile);
+		const gc = await nextGrandchildPid();
 		try {
 			const t0 = Date.now();
 			ctrl.abort();
@@ -204,17 +223,16 @@ describe('stopping a chat run', () => {
 	}, 20_000);
 
 	it('stops only the run that was stopped - a sibling keeps running', async () => {
-		const pidA = join(OUT, `a-${Date.now()}.pid`);
-		stubWithGrandchild(pidA);
 		const a = new AbortController();
 		const runA = startRun(a.signal);
-		const gcA = await grandchildPid(pidA);
+		const gcA = await nextGrandchildPid();
 
-		const pidB = join(OUT, `b-${Date.now()}.pid`);
-		stubWithGrandchild(pidB);
+		// B runs CONCURRENTLY with A - that is the point of this case - and the
+		// stub is never rewritten to make it possible: A's shell is parked at
+		// `wait` inside the very file B is about to execute.
 		const b = new AbortController();
 		const runB = startRun(b.signal);
-		const gcB = await grandchildPid(pidB);
+		const gcB = await nextGrandchildPid();
 
 		try {
 			expect(gcA).not.toBe(gcB);
@@ -280,11 +298,9 @@ describe('a stopping app process', () => {
 	});
 
 	it('kills the whole tree of a run that was still going when the process stopped', async () => {
-		const pidfile = join(OUT, `shutdown-${Date.now()}.pid`);
-		stubWithGrandchild(pidfile);
 		const ctrl = new AbortController();
 		const run = startRun(ctrl.signal);
-		const gc = await grandchildPid(pidfile);
+		const gc = await nextGrandchildPid();
 		try {
 			registerChatRun('/ws/live.ipynb', ctrl);
 			const signals = new EventEmitter();
