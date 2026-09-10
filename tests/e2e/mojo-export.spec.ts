@@ -369,30 +369,37 @@ test('a Mojo notebook with NO target still judges eligibility by the NOTEBOOK la
 	// explanation (which reads the notebook language) reporting nothing - and
 	// clicking that greyed toggle cleared a mark the server considers perfectly
 	// eligible. The server decides this against the notebook's language, full stop.
+	//
+	// Its OWN notebook name, deliberately: every test in this file shares one
+	// workspace, and the badge test above ENDS by giving its `no-target.ipynb` a
+	// `lib/late.mojo` target - so reusing that name made `create:true` open a
+	// notebook that already had one, and this test's whole premise (no target, so
+	// no module for the label to name) was false in file order while still passing
+	// alone.
 	const created = await request.post(`${baseURL}/api/notebooks`, {
-		data: { path: 'no-target.ipynb', create: true }
+		data: { path: 'untargeted.ipynb', create: true }
 	});
 	expect(created.ok(), await created.text()).toBeTruthy();
 	const lang = await request.post(`${baseURL}/api/notebooks/language`, {
-		data: { language: 'mojo', path: 'no-target.ipynb' }
+		data: { language: 'mojo', path: 'untargeted.ipynb' }
 	});
 	expect(lang.ok(), await lang.text()).toBeTruthy();
-	const view = await request.get(`${baseURL}/api/notebooks?path=no-target.ipynb`);
+	const view = await request.get(`${baseURL}/api/notebooks?path=untargeted.ipynb`);
 	const id = ((await view.json()).notebook.cells as Array<{ id: string }>)[0].id;
 	// A `%%mojo` cell: Mojo whichever notebook it sits in, so it is what tells the two
 	// readings apart (a plain code cell answers the same either way).
 	const patched = await request.patch(`${baseURL}/api/cells/${id}`, {
-		data: { source: MAGIC_MAIN, nb: 'no-target.ipynb' }
+		data: { source: MAGIC_MAIN, nb: 'untargeted.ipynb' }
 	});
 	expect(patched.ok(), await patched.text()).toBeTruthy();
 	const marked = await request.patch(`${baseURL}/api/cells/${id}`, {
-		data: { export: true, nb: 'no-target.ipynb' }
+		data: { export: true, nb: 'untargeted.ipynb' }
 	});
 	// The SERVER accepts the mark - which is the whole point: the row must not
 	// contradict it.
 	expect(marked.ok(), await marked.text()).toBeTruthy();
 
-	await openNotebook(page, 'no-target.ipynb');
+	await openNotebook(page, 'untargeted.ipynb');
 	const toggle = page.locator(`[data-cell-id="${id}"]`).getByTestId('toggle-export');
 	await expect(toggle).toHaveAttribute('aria-pressed', 'true');
 	await expect(toggle).not.toHaveAttribute('data-export-stranded', 'true');
