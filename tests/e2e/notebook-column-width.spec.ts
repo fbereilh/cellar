@@ -97,8 +97,13 @@ async function openNotebook(page: Page): Promise<void> {
 	// on every Linux CI run and never locally, because it turns on whether the
 	// session was already populated; accepting the loading state makes it
 	// order-independent rather than lucky.
+	//
+	// `.first()` on the WHOLE chain, not on the `loading…` locator: unlike a cell,
+	// `loading…` really can be on screen AT THE SAME TIME as the empty-state button
+	// (the shell paints the empty state while a restored tab is still loading), so
+	// the two-element match is a strict-mode violation rather than a race.
 	await expect(
-		empty.or(page.getByTestId('cell').first()).or(page.getByText('loading…').first())
+		empty.or(page.getByTestId('cell')).or(page.getByText('loading…')).first()
 	).toBeVisible({ timeout: 30_000 });
 	if (await empty.isVisible().catch(() => false)) await empty.click();
 }
