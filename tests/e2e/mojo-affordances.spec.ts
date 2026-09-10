@@ -135,6 +135,12 @@ async function paletteTitles(page: Page): Promise<string[]> {
 test.beforeAll(async () => {
 	test.skip(!runtimeAvailable(), 'kernel runtime (uv + python3 + host-venv) not available - E2E is local-only');
 	workspace = mkdtempSync(join(tmpdir(), 'cellar-mojo-affordances-'));
+	// The CANONICAL notebook must be seeded BEFORE the first page load, and moving
+	// this line is the trap: `loadDoc` materialises `notebook.ipynb` in memory when
+	// the file is absent, caches that document and never re-reads it (only an
+	// explorer delete/rename drops it), so the first SSR read wins and a seed
+	// written afterwards is invisible for the life of the instance.
+	seed('notebook.ipynb');
 	const booted = await bootCellar(workspace);
 	launcher = booted.proc;
 	baseURL = booted.url;
