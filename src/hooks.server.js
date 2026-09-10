@@ -11,6 +11,8 @@
  *    running (reparented to init) and serve stale code to agents (parent-watch.js).
  * 4. Bridge the external-file watcher (fileWatch.ts) onto the event bus, so an
  *    open file tab reflects an edit made to its file on disk from outside Cellar.
+ * 5. Stop every live chat run when this process stops, so no `claude` process
+ *    tree is left behind a Cellar that is gone (chat/active.ts).
  */
 import { stopChatRunsOnShutdown } from '$lib/server/chat/active';
 import { installConsoleCapture } from '$lib/server/logs';
