@@ -47,6 +47,19 @@ export interface AppCommandHandlers {
 export interface CommandContext {
 	notebook: NotebookCommandHandle | null;
 	app: AppCommandHandlers;
+	/**
+	 * Does the ACTIVE notebook offer Consolidate imports at all? False for a Mojo
+	 * notebook, whose cells hold no Python imports and which has no Python imports
+	 * cell to lift them into - so the command is OMITTED rather than listed
+	 * disabled. That is deliberate and is the one place this list hides an entry
+	 * rather than greying it: a disabled row is how the palette says "not right
+	 * now" (no notebook open, nothing to clear), while this action can never mean
+	 * anything here, and it carries no state a user would be stranded without -
+	 * a kept imports MARK is retired from the cell's own ⋮ menu.
+	 *
+	 * Defaults TRUE so an omitted context behaves exactly as before.
+	 */
+	offersConsolidateImports?: boolean;
 }
 
 /** The live bindings of a registry shortcut (respects user rebindings). */
@@ -59,7 +72,11 @@ export function keysForShortcut(id: string): string[] {
  * actions. Pure: reads the current binding of each shortcut and the app context,
  * so calling it inside a `$derived` keeps the palette in sync.
  */
-export function buildCommands({ notebook, app }: CommandContext): PaletteCommand[] {
+export function buildCommands({
+	notebook,
+	app,
+	offersConsolidateImports = true
+}: CommandContext): PaletteCommand[] {
 	const hasNotebook = !!notebook;
 
 	// A registry-backed notebook command: keybinding from the registry, handler
@@ -136,7 +153,14 @@ export function buildCommands({ notebook, app }: CommandContext): PaletteCommand
 
 		// ---- Application -----------------------------------------------------
 		cmd('new-notebook', 'New notebook', 'Application', () => app.newNotebook()),
-		cmd('consolidate-imports', 'Consolidate imports', 'Application', () => app.consolidateImports(), { disabled: !hasNotebook }),
+		// Omitted entirely on a Mojo notebook - see `offersConsolidateImports`.
+		...(offersConsolidateImports
+			? [
+					cmd('consolidate-imports', 'Consolidate imports', 'Application', () => app.consolidateImports(), {
+						disabled: !hasNotebook
+					})
+				]
+			: []),
 		cmd('open-settings', 'Open settings', 'Application', () => app.openSettings())
 	];
 }

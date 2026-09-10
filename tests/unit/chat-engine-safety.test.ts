@@ -1365,16 +1365,23 @@ describe('distinct, actionable failure states', () => {
 	}, 15_000);
 
 	it('a delta parsed after the run settled reaches nobody', async () => {
-		// The force-settle path the module documents: a GRANDCHILD holds stdout open
-		// past the kill, so the pipe never closes and the run settles on its own 5s
-		// timer - after which `run.ts` has already finished and persisted the
-		// accumulator, and a late delta would publish a phantom frame for a cell
-		// whose run:end fired.
+		// A stop settles on the VERDICT, not on the child's pipes - so the pipe can
+		// still be open, and still be written to, after `run.ts` has finished and
+		// persisted the accumulator. A late delta would then publish a phantom frame
+		// for a cell whose run:end already fired, which is what `onLine`'s
+		// settled-guard exists to prevent.
 		//
-		// The grandchild is GATED on a file this test creates only once the run has
-		// settled, and it touches a second file once it has finished writing - so
-		// "after the settle" is established by the test rather than by out-racing a
-		// 5s timer on a machine running the whole suite in parallel forks.
+		// The writer that proves it IGNORES SIGTERM, which is the one shape that
+		// genuinely outlives a stop: the kill signals the run's whole process GROUP,
+		// so an ordinary descendant is gone, and the SIGKILL escalation is skipped
+		// once the group leader has been reaped (its pgid may be recycled by then -
+		// see `signalRunTree`). That is the accepted residual stated there, and it is
+		// exactly why the guard this test covers has to hold.
+		//
+		// It is GATED on a file this test creates only once the run has settled, and
+		// touches a second file once it has finished writing - so "after the settle"
+		// is established by the test rather than by out-racing a timer on a machine
+		// running the whole suite in parallel forks.
 		const late = `{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"after-settle"}}}`;
 		const go = join(OUT, 'late-go.flag');
 		const wrote = join(OUT, 'late-wrote.flag');
@@ -1385,7 +1392,10 @@ describe('distinct, actionable failure states', () => {
 				`cat > /dev/null`,
 				`echo '${SAFE_INIT}'`,
 				`echo '{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"before"}}}'`,
-				`(while [ ! -f "${go}" ]; do sleep 0.05; done; for i in $(seq 1 20); do echo '${late}'; sleep 0.05; done; touch "${wrote}") &`,
+				// `trap '' TERM` sets SIG_IGN, which survives the exec into `sleep`, so
+				// the whole writer rides out the group SIGTERM. It ends on its own after
+				// its 20 lines, so nothing is left behind either way.
+				`(trap '' TERM; while [ ! -f "${go}" ]; do sleep 0.05; done; for i in $(seq 1 20); do echo '${late}'; sleep 0.05; done; touch "${wrote}") &`,
 				`sleep 60`
 			].join('\n')
 		);

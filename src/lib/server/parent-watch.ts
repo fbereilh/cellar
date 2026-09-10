@@ -14,6 +14,7 @@
  * reused by an unrelated process reads as "alive", which only makes us linger
  * (the safe direction) rather than exit a healthy server.
  */
+import { abortAllChatRuns } from './chat/active';
 import { readInstance, unregisterInstance } from './instances.js';
 
 const CHECK_MS = 5000;
@@ -60,6 +61,12 @@ export function startParentWatch(): void {
 		console.warn(
 			`[cellar] launcher pid ${launcherPid} confirmed gone (${strikes}/${CONFIRM_STRIKES} checks) - exiting orphaned server (trigger: orphan self-exit)`
 		);
+		// Stop every live chat run: this path calls `process.exit` directly, so the
+		// shutdown listeners in `hooks.server.js` never fire, and a chat child runs
+		// in its own process group - nothing else would reach it.
+		try {
+			abortAllChatRuns();
+		} catch {}
 		// Reap the (now also orphaned) Jupyter sidecar and drop the registry entry
 		// before we go, so nothing is left behind listening.
 		try {
