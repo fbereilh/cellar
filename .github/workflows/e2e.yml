@@ -67,10 +67,16 @@ name: E2E
 # needed to drive the flake rate down — per-test 99%+ against per-run 0-of-8
 # says the instability is broad and shallow, which is a thing to measure and fix
 # rather than to absorb. Flaky specs get FIXED here; several already were, and
-# the count is trending down across this branch's runs (7,5,3,2,2,3,1,2 of ~490)
-# while the failing SET rotates - no spec has failed two runs running since
-# virtualization-pinning was diagnosed, which is the signature of broad-shallow
-# rather than of a few bad specs to quarantine.
+# the count is trending down across this branch's runs (7,5,3,2,2,3,1,2,2 of
+# ~490) while the failing TESTS rotate. Do NOT read that as "no file repeats",
+# which is the easy summary and is wrong: `notebook-roots-worktree.spec.ts` has
+# failed 3 of 9 runs, at THREE DIFFERENT tests (:143, :160, :216), every time as
+# `apiRequestContext.post: Timeout 120000ms exceeded`, and every one of those
+# passes locally in seconds. Rotating tests inside ONE over-represented file is
+# a different thing from a uniformly shallow flake, and it is the better lead:
+# that file is the largest sample there is of the open-and-never-complete shape,
+# so it is where to start. It is still not a spec to QUARANTINE - the test that
+# fails changes, so skipping the named one would move the failure, not fix it.
 #
 # ── What is still true, and what is deferred ──────────────────────────────────
 # This runs on every PR and is visible to everyone. What is NOT yet decided is
