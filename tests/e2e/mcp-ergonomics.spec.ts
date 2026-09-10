@@ -1,11 +1,11 @@
 import { test, expect } from '@playwright/test';
 import { spawnSync, type ChildProcess } from 'node:child_process';
-import { mkdtempSync, existsSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, existsSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
-import { runtimeAvailable, bootCellar, killCellar, REPO } from './harness';
+import { runtimeAvailable, bootCellar, killCellar, REPO, removeWorkspace, MCP_CALL_TIMEOUT_MS } from './harness';
 
 /**
  * The agent-ergonomics fixes, over the wire an agent really uses: a
@@ -35,7 +35,7 @@ let hasPandas = false;
 
 /** A tool call's JSON payload, as the agent receives it. */
 async function call(name: string, args: Record<string, unknown>): Promise<any> {
-	const r = (await client!.callTool({ name, arguments: args })) as { content: Array<{ text: string }>; isError?: boolean };
+	const r = (await client!.callTool({ name, arguments: args }, undefined, { timeout: MCP_CALL_TIMEOUT_MS })) as { content: Array<{ text: string }>; isError?: boolean };
 	return JSON.parse(r.content[0].text);
 }
 
@@ -48,7 +48,7 @@ async function orderedSources(): Promise<string[]> {
 
 /** A tool call expected to FAIL: its text is the error message, not JSON. */
 async function callRaw(name: string, args: Record<string, unknown>) {
-	return (await client!.callTool({ name, arguments: args })) as { content: Array<{ text: string }>; isError?: boolean };
+	return (await client!.callTool({ name, arguments: args }, undefined, { timeout: MCP_CALL_TIMEOUT_MS })) as { content: Array<{ text: string }>; isError?: boolean };
 }
 
 test.beforeAll(async () => {
@@ -87,7 +87,7 @@ test.afterAll(async () => {
 	launcher = null;
 	if (workspace && existsSync(workspace)) {
 		try {
-			rmSync(workspace, { recursive: true, force: true });
+			removeWorkspace(workspace);
 		} catch {
 			/* best effort */
 		}

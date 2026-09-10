@@ -1,9 +1,9 @@
 import { test, expect, type Page, type Locator } from '@playwright/test';
 import { type ChildProcess } from 'node:child_process';
-import { mkdtempSync, existsSync, rmSync, mkdirSync } from 'node:fs';
+import { mkdtempSync, existsSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { runtimeAvailable, bootCellar, killCellar } from './harness';
+import { runtimeAvailable, bootCellar, killCellar, removeWorkspace } from './harness';
 
 /**
  * E2E for the P1 sidebar Search rewire (real match engine + per-cell cache).
@@ -16,9 +16,13 @@ import { runtimeAvailable, bootCellar, killCellar } from './harness';
  * when the kernel runtime is absent (local-only, like the other specs).
  */
 
+// Default to this machine's temp dir, never a captured absolute path: an
+// evidence run's `/var/folders/...` directory is specific to the machine AND
+// the run that produced it, so pinning one makes the spec unrunnable anywhere
+// else - on Linux CI it is not even creatable, and the screenshot fails ENOENT
+// while the assertions it was decorating had all passed.
 const EVIDENCE_DIR =
-	process.env.CELLAR_EVIDENCE_DIR ||
-	'/var/folders/ds/m71hq5ln637g23x6xmrwqg080000gn/T/no-mistakes-evidence/01KY4HQ93BTZYXPS0ZS55RW3VZ';
+	process.env.CELLAR_EVIDENCE_DIR || join(tmpdir(), 'cellar-evidence-sidebar-search');
 
 let launcher: ChildProcess | null = null;
 let workspace = '';
@@ -42,7 +46,7 @@ test.afterAll(async () => {
 	launcher = null;
 	if (workspace && existsSync(workspace)) {
 		try {
-			rmSync(workspace, { recursive: true, force: true });
+			removeWorkspace(workspace);
 		} catch {
 			/* best effort */
 		}

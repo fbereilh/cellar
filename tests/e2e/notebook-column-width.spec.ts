@@ -1,9 +1,9 @@
 import { test, expect, type Page } from '@playwright/test';
 import { type ChildProcess } from 'node:child_process';
-import { mkdtempSync, writeFileSync, existsSync, mkdirSync, rmSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, existsSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { runtimeAvailable, bootCellar, killCellar } from './harness';
+import { runtimeAvailable, bootCellar, killCellar, removeWorkspace } from './harness';
 
 /**
  * The notebook content column is FLUID with no upper bound: widening the window on
@@ -87,7 +87,24 @@ async function openNotebook(page: Page): Promise<void> {
 	// open notebook, and reading `isVisible()` before either arrives reports the
 	// button invisible, turns the click into a no-op, and then times out for 30s on
 	// a notebook nothing ever opened (see the openNotebook rule in AGENTS.md).
-	await expect(empty.or(page.getByTestId('cell').first())).toBeVisible({ timeout: 30_000 });
+	//
+	// `loading…` is the THIRD settled state, and it is this spec's own doing: the
+	// pre-render test HOLDS `/api/notebooks`, so when the server-owned tab session
+	// already has this notebook open (which is what the earlier test in this file
+	// leaves behind) the shell restores it and goes straight to the held load -
+	// no empty-state button, and no cell that can ever arrive. Waiting on only the
+	// first two then burns the full 30s on a notebook that IS open. It reproduced
+	// on every Linux CI run and never locally, because it turns on whether the
+	// session was already populated; accepting the loading state makes it
+	// order-independent rather than lucky.
+	//
+	// `.first()` on the WHOLE chain, not on the `loading…` locator: unlike a cell,
+	// `loading…` really can be on screen AT THE SAME TIME as the empty-state button
+	// (the shell paints the empty state while a restored tab is still loading), so
+	// the two-element match is a strict-mode violation rather than a race.
+	await expect(
+		empty.or(page.getByTestId('cell')).or(page.getByText('loading…')).first()
+	).toBeVisible({ timeout: 30_000 });
 	if (await empty.isVisible().catch(() => false)) await empty.click();
 }
 
@@ -149,7 +166,7 @@ test.afterAll(async () => {
 	launcher = null;
 	if (workspace && existsSync(workspace)) {
 		try {
-			rmSync(workspace, { recursive: true, force: true });
+			removeWorkspace(workspace);
 		} catch {
 			/* best effort */
 		}
@@ -221,7 +238,10 @@ test('the pre-render loading state is laid out like the notebook it becomes', as
 	await page.goto(`${baseURL}/?ws=${encodeURIComponent(workspace)}`);
 	await openNotebook(page);
 
-	await expect(page.getByText('loading…')).toBeVisible();
+	// `.first()`: the shell keeps every open notebook tab mounted, so a restored
+	// session renders one `loading…` per held tab and a bare locator is a strict-mode
+	// violation. The claim is "the loading view is on screen", which first() makes.
+	await expect(page.getByText('loading…').first()).toBeVisible();
 	await settle(page);
 	const pre = await measure(page);
 

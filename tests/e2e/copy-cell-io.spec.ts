@@ -1,9 +1,9 @@
 import { test, expect, type Page } from '@playwright/test';
 import { type ChildProcess } from 'node:child_process';
-import { mkdtempSync, writeFileSync, existsSync, rmSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { runtimeAvailable, bootCellar, killCellar } from './harness';
+import { runtimeAvailable, bootCellar, killCellar, removeWorkspace } from './harness';
 import { setScrollTop, isCellMounted } from './notebook-scroll';
 
 /**
@@ -316,7 +316,7 @@ test.beforeAll(async () => {
 
 test.afterAll(() => {
 	if (launcher) killCellar(launcher);
-	if (workspace && existsSync(workspace)) rmSync(workspace, { recursive: true, force: true });
+	removeWorkspace(workspace);
 });
 
 test.beforeEach(async ({ page }) => {

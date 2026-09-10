@@ -1,9 +1,9 @@
 import { test, expect, type Page } from '@playwright/test';
 import { type ChildProcess } from 'node:child_process';
-import { mkdtempSync, existsSync, rmSync } from 'node:fs';
+import { mkdtempSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { runtimeAvailable, bootCellar, killCellar } from './harness';
+import { runtimeAvailable, bootCellar, killCellar, removeWorkspace } from './harness';
 
 /**
  * Cut / copy / paste / undo must carry a cell's WHOLE identity, not just its
@@ -119,7 +119,7 @@ test.afterAll(async () => {
 	launcher = null;
 	if (workspace && existsSync(workspace)) {
 		try {
-			rmSync(workspace, { recursive: true, force: true });
+			removeWorkspace(workspace);
 		} catch {
 			/* best effort */
 		}

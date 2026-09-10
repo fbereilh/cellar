@@ -1,9 +1,9 @@
 import { test, expect, type Page } from '@playwright/test';
 import { type ChildProcess } from 'node:child_process';
-import { mkdtempSync, existsSync, rmSync } from 'node:fs';
+import { mkdtempSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { runtimeAvailable, bootCellar, killCellar, openSidebarSection } from './harness';
+import { runtimeAvailable, bootCellar, killCellar, openSidebarSection, removeWorkspace } from './harness';
 
 /**
  * WHERE the "no default profile" heads-up may appear - the gate, not the copy.
@@ -128,7 +128,7 @@ test.afterAll(async () => {
 	launcher = null;
 	if (workspace && existsSync(workspace)) {
 		try {
-			rmSync(workspace, { recursive: true, force: true });
+			removeWorkspace(workspace);
 		} catch {
 			/* best effort */
 		}

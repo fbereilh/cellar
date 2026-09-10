@@ -253,8 +253,10 @@ describe('the replacement range comes from the protocol, and is refused when it 
 	});
 });
 
-describe('every failure is silent - this runs on a keystroke', () => {
+describe('every EXPECTED failure is silent - this runs on a keystroke', () => {
 	it('returns null for a refusal the server reached', async () => {
+		// `busy_timeout` is deliberately absent: it is the one refusal that is NOT an
+		// expected state, and it gets its own block below.
 		for (const reason of ['no_kernel', 'busy', 'restarting', 'dead', 'not_connected', 'timeout', 'failed'] as const) {
 			expect(await query('myva', 4, fakeHandle({ ok: false, reason }).handle)).toBeNull();
 		}
@@ -263,6 +265,37 @@ describe('every failure is silent - this runs on a keystroke', () => {
 	it('returns null when the request never reached the server at all', async () => {
 		const f = fakeHandle(() => Promise.reject(new Error('NetworkError')));
 		expect(await query('myva', 4, f.handle)).toBeNull();
+	});
+});
+
+describe('the ONE refusal that is stated, because silence there is a lie', () => {
+	// `busy_timeout` means Cellar waited for its OWN background work on the kernel
+	// and stopped waiting. The user gets no kernel names for a reason that has
+	// nothing to do with what they typed, and returning null makes that
+	// indistinguishable from "nothing matched". That was a real, silent, 5-of-5
+	// deterministic failure on slower hardware before the wait followed the work.
+	it('returns a visible row instead of null', async () => {
+		const result = await query('myva', 4, fakeHandle({ ok: false, reason: 'busy_timeout' }).handle);
+		expect(result).not.toBeNull();
+		expect(result!.options).toHaveLength(1);
+		expect(`${result!.options[0].label} ${result!.options[0].detail ?? ''}`).toMatch(/kernel|background/i);
+	});
+
+	it('INSERTS NOTHING when it is accepted', async () => {
+		// A message the user can accept by reflex must not type itself into their
+		// cell - that would be worse than the silence it replaces. `apply` is the
+		// hook CodeMirror uses when an option is chosen, so it must be a no-op
+		// function rather than absent (absent means "insert the label").
+		const result = await query('myva', 4, fakeHandle({ ok: false, reason: 'busy_timeout' }).handle);
+		expect(typeof result!.options[0].apply).toBe('function');
+	});
+
+	it('does not filter itself away, and leaves the other sources theirs', async () => {
+		// It is not a match for what was typed, so CodeMirror would filter it out;
+		// and it is one source among several, so it must not claim to be the whole
+		// answer.
+		const result = await query('myva', 4, fakeHandle({ ok: false, reason: 'busy_timeout' }).handle);
+		expect(result!.filter).toBe(false);
 	});
 });
 

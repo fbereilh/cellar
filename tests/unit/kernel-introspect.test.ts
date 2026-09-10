@@ -47,7 +47,12 @@ const h = vi.hoisted(() => {
 					}),
 					dispose: vi.fn()
 				};
-				queueMicrotask(() => done({ content: { status: 'ok', execution_count: 1 } }));
+				const settle = () => done({ content: { status: 'ok', execution_count: 1 } });
+				// `holdExecute` lets a test keep an execute IN FLIGHT, which is the only
+				// way to hold the per-kernel exec lock and so the only way to drive the
+				// "Cellar is busy with its own work" signal the idle wait now follows.
+				if (h.holdExecute) void h.holdExecute.then(settle);
+				else queueMicrotask(settle);
 				return f;
 			},
 			requestComplete: vi.fn(async (content: { code: string; cursor_pos: number }) => {
@@ -73,6 +78,7 @@ const h = vi.hoisted(() => {
 		starts: 0,
 		executes: 0,
 		lastKernel: null as ReturnType<typeof makeFakeKernel> | null,
+		holdExecute: null as Promise<void> | null,
 		completeCalls: [] as { code: string; cursor_pos: number }[],
 		inspectCalls: [] as { code: string; cursor_pos: number; detail_level: number }[],
 		completeReply: (() => ({
@@ -121,6 +127,9 @@ const IDLE_WAIT_MS = 200;
 
 /** Timer slack, so a wall-clock lower bound is not a flake on a contended machine. */
 const INTROSPECT_SLACK_MS = 20;
+
+/** The bound cellar SHIPS with, mirrored from kernel.ts's `introspectIdleWaitMs`. */
+const SHIPPED_IDLE_WAIT_MS = 3000;
 
 /** Bring the notebook's kernel up the ordinary way: by running something in it. */
 async function startKernel(): Promise<void> {
@@ -379,10 +388,55 @@ describe('a kernel that cannot answer now is REFUSED, not queued behind', () => 
 		});
 	});
 
-	it('gives up on a status-busy kernel that never frees, and never sends', async () => {
+	it('waits out a probe LONGER than the bound it used to have', async () => {
+		// THE REGRESSION, in terms of the shipped numbers. The bound was 500ms, chosen
+		// against a namespace probe on a 15-core M5 Pro; on a machine measured 2.3-3x
+		// slower the probe outlived it, the completion was refused, and the user
+		// silently got no kernel names (deterministic: kernel-introspection.spec.ts:217
+		// failed 5 of 5 Linux CI runs). Here the kernel stays busy for longer than that
+		// old bound and the completion must still succeed - which it does only because
+		// the bound is now set by what a keystroke may sit through, not by an estimate
+		// of the probe.
+		const OLD_BOUND_MS = 500;
+		const BUSY_MS = OLD_BOUND_MS + 200;
+		process.env.CELLAR_KERNEL_INTROSPECT_IDLE_WAIT_MS = String(SHIPPED_IDLE_WAIT_MS);
+		try {
+			h.lastKernel!.status = 'busy';
+			setTimeout(() => (h.lastKernel!.status = 'idle'), BUSY_MS);
+			h.completeReply = () => ({
+				content: {
+					status: 'ok',
+					matches: ['after_slow_probe'],
+					cursor_start: 0,
+					cursor_end: 4,
+					metadata: {}
+				}
+			});
+			const started = Date.now();
+			expect(await kernelmod.completeInKernel(abs(), 'myva', 4)).toMatchObject({
+				ok: true,
+				matches: [{ text: 'after_slow_probe' }]
+			});
+			// It really did wait past the old bound rather than being answered early.
+			expect(Date.now() - started).toBeGreaterThanOrEqual(OLD_BOUND_MS - INTROSPECT_SLACK_MS);
+		} finally {
+			process.env.CELLAR_KERNEL_INTROSPECT_IDLE_WAIT_MS = String(IDLE_WAIT_MS);
+		}
+	});
+
+	it('gives up on a status-busy kernel that never frees - as `busy_timeout`, not `busy`', async () => {
+		// The give-up is its OWN fact and must not borrow the word for "a cell is
+		// running": no user run holds this kernel, Cellar's own background work does,
+		// and Cellar stopped waiting for it. That distinction is what $lib/
+		// kernelCompletion keys on to SAY something instead of returning silence, so a
+		// regression to `busy` here would restore the silent failure rather than break
+		// a name.
 		h.lastKernel!.status = 'busy';
 		const started = Date.now();
-		expect(await kernelmod.completeInKernel(abs(), 'myva', 4)).toEqual({ ok: false, reason: 'busy' });
+		expect(await kernelmod.completeInKernel(abs(), 'myva', 4)).toEqual({
+			ok: false,
+			reason: 'busy_timeout'
+		});
 		expect(Date.now() - started).toBeGreaterThanOrEqual(IDLE_WAIT_MS - INTROSPECT_SLACK_MS);
 		expect(h.completeCalls).toEqual([]);
 	});

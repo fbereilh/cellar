@@ -1,0 +1,256 @@
+name: E2E
+
+# The Playwright end-to-end suite, on EVERY pull request.
+#
+# ── Why this exists at all ────────────────────────────────────────────────────
+# The suite boots the real launcher (Node app + Jupyter sidecar + a python3
+# kernel) in a browser, so it is the only layer that sees what the full stack
+# does. It used to be a local, best-effort check, and the gap it left is a
+# matter of record: #115 changed an aria-label, `cell-row-toggles.spec.ts` still
+# pinned the old literal, and main sat red for 2h34m because nobody runs the
+# specs they did not write. Of the last 100 commits, 80 touched `src/` and 73 of
+# those also touched `tests/e2e/` — the suite is maintained, it just was not
+# gated. See data/cellar-ci-does-not-run-e2e/report.md.
+#
+# ── Why sharded, and why THIS shape ───────────────────────────────────────────
+# Unsharded and serial this is a 45-60 min job (19.8 min serial on an M5 Pro,
+# and `ubuntu-latest` measures 2.3-3x slower than that machine on this repo's
+# own build and unit steps). Against a 2m38s PR check that is a 15-25x latency
+# increase on every PR, which is why the investigation recommended NOT gating.
+# The shape below is what makes gating affordable instead:
+#
+#   * SHARDING (the big win). `--shard=i/N` splits the run across N runners.
+#     Sharding is safe here only because it splits at SPEC-FILE granularity —
+#     verified, not assumed: tests inside a file share one launcher, one
+#     workspace and one kernel and must stay ordered (`fullyParallel: false`),
+#     and no file appears in two shards. `tests/unit/e2e-ci-workflow.test.ts`
+#     pins that, because a Playwright change that started splitting files would
+#     break the suite in a way that reads as flakiness.
+#
+#   * TWO WORKERS per shard, and this one IS measured — in BOTH directions, so
+#     do not "restore" the 1. `playwright.config.ts` used to hardcode
+#     `workers: process.env.CI ? 1 : 2`; that `1` was never measured (e2e had
+#     never run in CI when #47 wrote it, so it was the old unconditional default
+#     left on a branch nobody had taken), so it is now `CELLAR_E2E_WORKERS`,
+#     set here. Both settings were then run: 6 shards x 2 workers was 6m26s with
+#     nine failures; 10 shards x 1 worker was 6m58s with six — fewer failures but
+#     SLOWER, because the heavy shards serialise and the makespan follows them.
+#     The failures turned out not to be contention at all: three of the four
+#     timing-sensitive real-kernel ones died at ~28-33s, i.e. AT the 30s `expect`
+#     budget rather than at anything the code did, and those budgets were chosen
+#     on a 15-core M5 Pro while this runner measures 2.3-3x slower. Scaling them
+#     (the env below) removes the contention argument for one worker, and 2
+#     halves the heavy shards, which is what the wall clock follows. So the
+#     parallelism lives in BOTH places: 10 shards x 2 workers, ~5 min.
+#
+#   * fail-fast: false — one red shard must not cancel the others, or a single
+#     failure hides the state of the rest of the suite and makes the flake rate
+#     unmeasurable.
+#
+# ── Why each shard builds, rather than one job building and sharing it ────────
+# It looks like obvious waste and it is not. The build is ~56s on this runner
+# and it is embarrassingly parallel across shards, so per-shard it costs 56s of
+# wall clock ONCE, concurrently. Hoisting it into a `needs:` job serialises it
+# in front of every shard: build job (~91s incl. checkout, npm ci and upload)
+# THEN shard (~53s setup + tests), against per-shard (~101s setup incl. build +
+# tests). Hoisting is ~43s SLOWER end to end. It would save runner-minutes,
+# which are free on a public repo. Do not "fix" this into a shared build job.
+#
+# ── Why not post-merge or nightly ─────────────────────────────────────────────
+# Because detection is not prevention: a post-merge job still lets the breakage
+# land, and its whole value depends on somebody reading a tab nobody opens.
+# Running on every PR is the point; the sharding above is what makes it minutes.
+#
+# ── No retries, deliberately ──────────────────────────────────────────────────
+# `playwright.config.ts` keeps `retries: 0`. A retry would make these numbers
+# look better without the suite being better, and would remove the very signal
+# needed to drive the flake rate down — per-test ~99.5% against no fully-green run
+# says the instability is broad and shallow, which is a thing to measure and fix
+# rather than to absorb. Flaky specs get FIXED here; several already were: the
+# count fell from 7 on the first Linux run to 1-3 of ~490 (per-test ~99.5%),
+# where it now sits, while the failing TESTS rotate. Do NOT read that as
+# "no file repeats",
+# which is the easy summary and is wrong: `notebook-roots-worktree.spec.ts` has
+# failed in roughly a third of runs, at THREE DIFFERENT tests so far (:143,
+# :160, :216), every time as
+# `apiRequestContext.post: Timeout 120000ms exceeded`, and every one of those
+# passes locally in seconds. Rotating tests inside ONE over-represented file is
+# a different thing from a uniformly shallow flake, and it is the better lead:
+# that file is the largest sample there is of the open-and-never-complete shape,
+# so it is where to start. It is still not a spec to QUARANTINE - the test that
+# fails changes, so skipping the named one would move the failure, not fix it.
+#
+# ── What is still true, and what is deferred ──────────────────────────────────
+# This runs on every PR and is visible to everyone. What is NOT yet decided is
+# whether it becomes hard-blocking via branch protection — which does not exist
+# on this repo today for any check, `build-check` included. The honest
+# precondition for that is a run that is fully green, which has not happened yet.
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  # On-demand runs from main — the cheap way to sample the suite's flake rate
+  # without pushing a commit. (GitHub only offers this for workflows that exist
+  # on the default branch, so it does nothing until this file has merged.)
+  workflow_dispatch:
+
+# Supersede an in-flight run when a new commit lands on the same ref, so a
+# force-push to a PR branch does not leave N shards burning on dead code.
+concurrency:
+  group: e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  e2e:
+    name: e2e (shard ${{ matrix.shard }}/${{ strategy.job-total }})
+    runs-on: ubuntu-latest
+    # A wedged launcher is bounded at 60s per spec file by the harness, so a
+    # systemic boot failure cannot run long — this is the backstop for a hang
+    # the harness cannot see, not the expected duration.
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+
+    env:
+      # Make a missing kernel runtime FAIL rather than skip. Every spec is
+      # guarded by `test.skip(!runtimeAvailable(), …)` and Playwright exits 0
+      # for a fully-skipped run, so without this a job whose provisioning
+      # silently broke would be a permanently green check that ran zero tests —
+      # strictly worse than no job, because it manufactures assurance. The guard
+      # lives in tests/e2e/global-setup.ts and shares the specs' own predicate.
+      CELLAR_E2E_REQUIRE_RUNTIME: '1'
+      # See the WORKERS note above. Raise or lower HERE, not in the config —
+      # and only with a measurement, because the failures it causes look like
+      # unrelated flakiness rather than like overload.
+      CELLAR_E2E_WORKERS: '2'
+      # The runner is 2.3-3x slower than the machine these budgets were tuned
+      # on, so they are scaled to keep the SAME real headroom rather than to
+      # paper over a flaky suite - see the note in playwright.config.ts.
+      CELLAR_E2E_EXPECT_TIMEOUT_MS: '75000'
+      CELLAR_E2E_TIMEOUT_MS: '300000'
+      # The MCP client's own request budget. Its calls RUN CELLS, so this is
+      # really "how long may a kernel take" — same scaling, same limit: these
+      # are HARNESS budgets, never product ones, so they cannot hide a slow
+      # tool from a user, only from a test measuring the runner.
+      CELLAR_E2E_MCP_TIMEOUT_MS: '150000'
+
+    steps:
+      - uses: actions/checkout@v5
+
+      # Node 20 DELIBERATELY, matching ci.yml and the `>=18` floor in
+      # package.json `engines` - not just "the same as the other job". The
+      # global `WebSocket` is Node 22+, so a Node 20 runner is what exercises
+      # the `ws` fallback in `kernel.ts`'s `makeSettings` that real Node-18/20
+      # users get. That is not hypothetical: this pin is what caught cellar
+      # being unable to execute ANY cell on its own declared floor, on the very
+      # first Linux run. Raising it here would retire that coverage, and the
+      # Node 22+ path is what every developer machine already runs.
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 20
+          cache: npm
+
+      # `uv` is how the launcher creates and populates every venv; the app
+      # fails fast without it rather than falling back to `python -m venv`.
+      #
+      # Pinned to an EXACT release, not a moving major: setup-uv's moving major
+      # tags stop at v7 while its releases are at v10, so `@v10` does not
+      # resolve and fails the job in `Set up job` before any step runs.
+      - uses: astral-sh/setup-uv@v10.0.1
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        run: npm ci
+
+      # Keyed on the resolved Playwright version, so a dependency bump gets a
+      # fresh browser instead of a silently stale one.
+      - name: Resolve Playwright version
+        id: pw
+        run: echo "version=$(node -p "require('@playwright/test/package.json').version")" >> "$GITHUB_OUTPUT"
+
+      # restore/save SPLIT rather than plain `actions/cache`, and the `if:
+      # always()` is the whole point: the combined action does NOT save when the
+      # job fails, and this is a GATE - the runs immediately after a red one are
+      # a fix plus a re-run, which is exactly when you want the cache warm.
+      # MEASURED: after a run whose shards failed, neither cache existed, so
+      # every shard paid the cold ~20s Chromium install again.
+      #
+      # All ten shards race to save the same key; the nine losers tar the
+      # directory, fail to reserve it, log a benign "another job may be creating
+      # this cache" and carry on. Restricting the save to shard 1 would spare
+      # that (~10s each, on a COLD run only - i.e. the first run and a
+      # Playwright bump), and is deliberately NOT done: any shard being able to
+      # warm the cache is the more robust arrangement for a gate, and this is
+      # the cheaper mistake of the two.
+      - name: Restore Playwright browsers
+        id: pw-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: ms-playwright-${{ runner.os }}-${{ steps.pw.outputs.version }}
+
+      - name: Install Chromium
+        run: npx playwright install --with-deps chromium
+
+      - name: Save Playwright browsers
+        # `!cancelled()`, NOT `always()`: cancel-in-progress fires on every
+        # force-push, and `always()` would save a HALF-EXTRACTED browser that
+        # later runs then restore and treat as installed. (The venv below is
+        # self-protecting - `ensureHostEnv` writes its `.cellar-host-ready`
+        # marker last - but it takes the same guard so the two read alike.)
+        if: ${{ !cancelled() && steps.pw-cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: ms-playwright-${{ runner.os }}-${{ steps.pw.outputs.version }}
+
+      # Cellar's private Jupyter host env (`~/.cellar/host-venv`, jupyter-server).
+      # 40MB / 123 packages. The launcher would create it lazily on first boot,
+      # which is too late: `runtimeAvailable()` reads it with existsSync when the
+      # FIRST test runs, so on a cold runner every spec would skip before the
+      # launcher that creates it ever booted.
+      - name: Restore cellar host venv
+        id: venv-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.cellar/host-venv
+          key: cellar-host-venv-${{ runner.os }}-v1
+
+      - name: Provision the kernel runtime
+        run: node scripts/ensure-e2e-runtime.js
+
+      - name: Save cellar host venv
+        if: ${{ !cancelled() && steps.venv-cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.cellar/host-venv
+          key: cellar-host-venv-${{ runner.os }}-v1
+
+      # Per shard, deliberately — see the header. The specs serve the production
+      # build, so this is not optional: `globalSetup` refuses a build that is
+      # stale, absent or incomplete.
+      - name: Build
+        run: npm run build
+
+      - name: Run E2E (shard ${{ matrix.shard }})
+        run: npx playwright test --shard=${{ matrix.shard }}/${{ strategy.job-total }}
+
+      # Traces are `retain-on-failure`, so this uploads only when there is
+      # something to look at — a red shard is diagnosable without re-running it
+      # locally against a runtime the reader may not have.
+      - name: Upload traces
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-traces-shard-${{ matrix.shard }}
+          path: test-results/
+          retention-days: 7
+          if-no-files-found: ignore

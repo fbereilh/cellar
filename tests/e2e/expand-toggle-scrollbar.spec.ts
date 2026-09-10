@@ -1,9 +1,9 @@
 import { test, expect, type Page, type Locator } from '@playwright/test';
 import { type ChildProcess } from 'node:child_process';
-import { mkdtempSync, writeFileSync, existsSync, rmSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { runtimeAvailable, bootCellar, killCellar } from './harness';
+import { runtimeAvailable, bootCellar, killCellar, removeWorkspace } from './harness';
 
 /**
  * E2E for the "keep the expand toggle clear of the scrollbar gutter" fix
@@ -30,9 +30,11 @@ let launcher: ChildProcess | null = null;
 let workspace = '';
 let baseURL = '';
 
+// Default to this machine's temp dir, never a captured absolute path — see the
+// note in databricks-header-pill.spec.ts: a pinned `/var/folders/...` evidence
+// directory is specific to the machine and the run that made it.
 const EVIDENCE =
-	process.env.CELLAR_EVIDENCE_DIR ||
-	'/var/folders/ds/m71hq5ln637g23x6xmrwqg080000gn/T/no-mistakes-evidence/01KY4J6341WTWSG0NPFSBW536Q';
+	process.env.CELLAR_EVIDENCE_DIR || join(tmpdir(), 'cellar-evidence-expand-toggle-scrollbar');
 
 // Cell 0: tall OUTPUT (200 lines) → auto-contracts into the output scroll box, so
 // its output-scroll-toggle shows. Cell 1: tall SOURCE (60 lines) → the editor
@@ -83,7 +85,7 @@ test.afterAll(async () => {
 	launcher = null;
 	if (workspace && existsSync(workspace)) {
 		try {
-			rmSync(workspace, { recursive: true, force: true });
+			removeWorkspace(workspace);
 		} catch {
 			/* best effort */
 		}

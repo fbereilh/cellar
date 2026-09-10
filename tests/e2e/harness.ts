@@ -1,6 +1,6 @@
 import { expect, type Page } from '@playwright/test';
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
-import { mkdirSync, writeFileSync, existsSync, chmodSync } from 'node:fs';
+import { mkdirSync, writeFileSync, existsSync, chmodSync, rmSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { buildFreshness, missingReason, stalenessReason } from '../../src/lib/server/build-freshness.js';
@@ -9,20 +9,49 @@ import { buildFreshness, missingReason, stalenessReason } from '../../src/lib/se
  * Shared launcher harness for cellar's Playwright E2E specs. Each spec boots the
  * REAL `cellar` launcher (Node app + Jupyter sidecar + a python3 kernel) against a
  * throwaway workspace; the app port is allocated dynamically per run, so the URL
- * is discovered from the launcher's stdout rather than a fixed `webServer`. The
- * runtime (uv + python3 + the cached host-venv) is not reliably present in CI, so
- * these are LOCAL, best-effort checks that SKIP when the runtime is missing — the
- * vitest unit suite is the must-pass gate.
+ * is discovered from the launcher's stdout rather than a fixed `webServer`.
+ *
+ * The runtime (uv + python3 + the cached host-venv) is provisioned in CI and the
+ * suite gates every PR (.github/workflows/e2e.yml). It still SKIPS when that
+ * runtime is missing, which is right for a developer machine without `uv` — but
+ * a skip is exactly wrong on a runner, so CI sets `CELLAR_E2E_REQUIRE_RUNTIME`
+ * and the run aborts instead. See `runtimeMissing` just below.
  */
 
 /** Repo root, resolved from this file's location (tests/e2e/harness.ts → ../..). */
 export const REPO = resolve(fileURLToPath(import.meta.url), '../../..');
 
+/**
+ * What the kernel runtime is MISSING, if anything - the one rule, stated as the
+ * list rather than as a boolean.
+ *
+ * `runtimeAvailable()` (the per-spec skip) and `assertRuntimePresent()` (the CI
+ * guard in tests/e2e/global-setup.ts) are both projections of THIS, because the
+ * two ask the same question and a second copy is how they come to disagree - and
+ * a disagreement here is the specific failure that makes a CI e2e job green while
+ * running nothing (every spec calls `test.skip(!runtimeAvailable(), …)`, and
+ * Playwright exits 0 for a fully-skipped run).
+ *
+ * Each entry names the thing to install rather than the check that failed, since
+ * the only reader who ever sees one is somebody fixing a runner.
+ */
+export function runtimeMissing(env: NodeJS.ProcessEnv = process.env): string[] {
+	const has = (cmd: string) =>
+		spawnSync(cmd, ['--version'], { stdio: 'ignore', env }).status === 0;
+	const hostVenv = join(env.HOME || '', '.cellar', 'host-venv', 'bin', 'python');
+	const missing: string[] = [];
+	if (!has('uv')) missing.push('uv (https://docs.astral.sh/uv/ - the launcher shells out to it for every venv op)');
+	if (!has('python3')) missing.push('python3');
+	if (!existsSync(hostVenv))
+		missing.push(
+			`cellar's Jupyter host venv at ${hostVenv} (create it with \`node scripts/ensure-e2e-runtime.js\`)`
+		);
+	return missing;
+}
+
 /** True only when the kernel runtime the E2E needs is actually present. */
-export function runtimeAvailable(): boolean {
-	const has = (cmd: string) => spawnSync(cmd, ['--version'], { stdio: 'ignore' }).status === 0;
-	const hostVenv = join(process.env.HOME || '', '.cellar', 'host-venv', 'bin', 'python');
-	return has('uv') && has('python3') && existsSync(hostVenv);
+export function runtimeAvailable(env: NodeJS.ProcessEnv = process.env): boolean {
+	return runtimeMissing(env).length === 0;
 }
 
 /**
@@ -64,6 +93,49 @@ export function bootDiagnostic(output: string, repo: string = REPO): string {
 		(parts.length ? `\n  build: ${parts.join('; ')}.` : '') +
 		(tail ? `\n  last launcher output:\n${tail.replace(/^/gm, '    ')}` : '')
 	);
+}
+
+/**
+ * How long an MCP tool call gets before the client gives up.
+ *
+ * The SDK's own default is 60s, and these calls are not RPC pings - they RUN
+ * CELLS (`add_and_run`, `clear_outputs` over a notebook full of output), so the
+ * budget is really "how long may a kernel take". It was set on a 15-core M5 Pro
+ * and `ubuntu-latest` measures 2.3-3x slower, so 60s there is 20-26s of the same
+ * headroom. MEASURED: `mcp-ergonomics` and both `mcp-agent-sees-figures` tests
+ * failed with `MCP error -32001: Request timed out` on the runner.
+ *
+ * Same reasoning as `CELLAR_E2E_EXPECT_TIMEOUT_MS` in playwright.config.ts, and
+ * the same limit: it scales a HARNESS budget to the hardware, never a product
+ * one, so it cannot hide a slow tool from a user - only from a test that was
+ * measuring the runner rather than the code.
+ */
+export const MCP_CALL_TIMEOUT_MS = Number(process.env.CELLAR_E2E_MCP_TIMEOUT_MS) || 60_000;
+
+/**
+ * Remove a spec's throwaway workspace, tolerating the teardown race.
+ *
+ * Every spec's `afterAll` kills its launcher and then deletes the workspace, and
+ * `killCellar` only SIGNALS - it cannot wait, because it is called from a
+ * synchronous hook. So the launcher's own SIGTERM cleanup (which rewrites
+ * `<ws>/.cellar/runtime.json`) can still be running while `rmSync` walks the
+ * tree, and the removal fails `ENOTEMPTY` on a directory it had just emptied.
+ * MEASURED on Linux CI, where it failed a test whose every assertion had
+ * PASSED - a false red, which on a PR gate is the expensive kind of failure.
+ *
+ * `maxRetries` is node's own remedy for exactly this (it retries EBUSY, EMFILE,
+ * ENFILE, ENOTEMPTY and EPERM), and it costs nothing when there is no race.
+ * Anything still failing after that is swallowed: this is a `mkdtemp` directory
+ * under the OS temp dir, so the worst case is one leftover directory the OS
+ * reclaims - never a reason to fail a green test.
+ */
+export function removeWorkspace(ws: string | undefined | null): void {
+	if (!ws) return;
+	try {
+		rmSync(ws, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+	} catch {
+		/* a temp dir that would not delete is not a test failure */
+	}
 }
 
 /**

@@ -1,11 +1,11 @@
 import { test, expect } from '@playwright/test';
 import { spawnSync, type ChildProcess } from 'node:child_process';
-import { mkdtempSync, existsSync, rmSync, mkdirSync } from 'node:fs';
+import { mkdtempSync, existsSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
-import { runtimeAvailable, bootCellar, killCellar, REPO } from './harness';
+import { runtimeAvailable, bootCellar, killCellar, REPO, removeWorkspace, MCP_CALL_TIMEOUT_MS } from './harness';
 
 /**
  * The agent can SEE the figures it draws — end to end over the real wire an agent
@@ -42,7 +42,7 @@ const shot = async (page: import('@playwright/test').Page, name: string) => {
 type ToolResult = { content: Array<{ type: string; text?: string; data?: string; mimeType?: string }> };
 
 /** Raw tool result — the content BLOCKS, which is what this spec is about. */
-const callRaw = (name: string, args: Record<string, unknown>) => client!.callTool({ name, arguments: args }) as Promise<ToolResult>;
+const callRaw = (name: string, args: Record<string, unknown>) => client!.callTool({ name, arguments: args }, undefined, { timeout: MCP_CALL_TIMEOUT_MS }) as Promise<ToolResult>;
 
 /** The JSON payload a tool result carries in its text block. */
 const payloadOf = (r: ToolResult) => JSON.parse(r.content.find((c) => c.type === 'text')!.text!);
@@ -68,7 +68,19 @@ function provisionVenv(ws: string): boolean {
 	if (mk.status !== 0) return false;
 	const py = join(venv, 'bin', 'python');
 	const install = spawnSync('uv', ['pip', 'install', '--python', py, 'ipykernel', 'matplotlib'], { stdio: 'ignore', timeout: 300_000 });
-	return install.status === 0 && existsSync(py);
+	if (install.status !== 0 || !existsSync(py)) return false;
+	// WARM matplotlib's font cache here, outside anything timed. The first
+	// `import matplotlib.pyplot` in a fresh venv builds it, and left to happen
+	// inside the run it is charged to the MCP call - whose client timeout is 60s.
+	// MEASURED on CI: both tests here failed with `MCP error -32001: Request
+	// timed out` on a 4-vCPU runner, where the cache build is far slower than on
+	// a dev machine. Best-effort: a failure here just leaves the old behaviour,
+	// so it can never turn a working machine into a skipped spec.
+	spawnSync(py, ['-c', 'import matplotlib; matplotlib.use("Agg"); import matplotlib.pyplot'], {
+		stdio: 'ignore',
+		timeout: 300_000
+	});
+	return true;
 }
 
 test.beforeAll(async () => {
@@ -101,7 +113,7 @@ test.afterAll(async () => {
 	launcher = null;
 	if (workspace && existsSync(workspace)) {
 		try {
-			rmSync(workspace, { recursive: true, force: true });
+			removeWorkspace(workspace);
 		} catch {
 			/* best effort */
 		}

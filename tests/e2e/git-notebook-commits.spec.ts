@@ -4,7 +4,7 @@ import { spawnSync } from 'node:child_process';
 import { mkdtempSync, existsSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { runtimeAvailable, bootCellar, killCellar, openSidebarSection } from './harness';
+import { runtimeAvailable, bootCellar, killCellar, openSidebarSection, removeWorkspace } from './harness';
 
 /**
  * E2E for the sidebar's Git section: several notebooks, several checkouts,
@@ -85,7 +85,7 @@ test.afterAll(async () => {
 	launcher = null;
 	if (workspace && existsSync(workspace)) {
 		try {
-			rmSync(workspace, { recursive: true, force: true });
+			removeWorkspace(workspace);
 		} catch {
 			/* best effort */
 		}

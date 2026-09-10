@@ -1,10 +1,10 @@
 import { test, expect, type Page, type Locator, type FrameLocator } from '@playwright/test';
 import { type ChildProcess } from 'node:child_process';
-import { mkdtempSync, writeFileSync, existsSync, mkdirSync, rmSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, existsSync, mkdirSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { runtimeAvailable, bootCellar, killCellar } from './harness';
+import { runtimeAvailable, bootCellar, killCellar, removeWorkspace } from './harness';
 import { horizontallyOverflowingBoxes, isCellMounted, paneMetric, setScrollTop } from './notebook-scroll';
 
 /**
@@ -185,7 +185,7 @@ test.afterAll(async () => {
 	launcher = null;
 	if (workspace && existsSync(workspace)) {
 		try {
-			rmSync(workspace, { recursive: true, force: true });
+			removeWorkspace(workspace);
 		} catch {
 			/* best effort */
 		}

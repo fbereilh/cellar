@@ -1,11 +1,11 @@
 import { test, expect } from '@playwright/test';
 import { spawnSync, type ChildProcess } from 'node:child_process';
-import { mkdtempSync, existsSync, rmSync } from 'node:fs';
+import { mkdtempSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
-import { runtimeAvailable, bootCellar, killCellar, REPO } from './harness';
+import { runtimeAvailable, bootCellar, killCellar, REPO, removeWorkspace, MCP_CALL_TIMEOUT_MS } from './harness';
 
 /**
  * The shell refreshes its panels after a FOREIGN action, not only after its own.
@@ -49,7 +49,7 @@ const AGENT_NB = 'agent-notes.ipynb';
 
 type Raw = { content: Array<{ type: string; text?: string }>; isError?: boolean };
 const call = async (name: string, args: Record<string, unknown> = {}) => {
-	const r = (await client!.callTool({ name, arguments: args })) as Raw;
+	const r = (await client!.callTool({ name, arguments: args }, undefined, { timeout: MCP_CALL_TIMEOUT_MS })) as Raw;
 	const payload = r.content
 		.filter((c) => c.type === 'text' && !(c.text ?? '').startsWith('[cellar] user activity:'))
 		.map((c) => c.text ?? '')
@@ -89,7 +89,7 @@ test.afterAll(async () => {
 	launcher = null;
 	if (workspace && existsSync(workspace)) {
 		try {
-			rmSync(workspace, { recursive: true, force: true });
+			removeWorkspace(workspace);
 		} catch {
 			/* best effort */
 		}

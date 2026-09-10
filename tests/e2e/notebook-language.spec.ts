@@ -1,9 +1,9 @@
 import { test, expect, type Page, type Locator } from '@playwright/test';
 import { type ChildProcess } from 'node:child_process';
-import { mkdtempSync, existsSync, rmSync, writeFileSync, readFileSync } from 'node:fs';
+import { mkdtempSync, existsSync, writeFileSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { runtimeAvailable, bootCellar, killCellar } from './harness';
+import { runtimeAvailable, bootCellar, killCellar, removeWorkspace } from './harness';
 
 /**
  * The NOTEBOOK LANGUAGE SELECTOR in the REAL browser, against a REAL kernel.
@@ -125,13 +125,7 @@ test.beforeAll(async () => {
 test.afterAll(async () => {
 	if (launcher) killCellar(launcher);
 	launcher = null;
-	if (workspace && existsSync(workspace)) {
-		try {
-			rmSync(workspace, { recursive: true, force: true });
-		} catch {
-			/* best effort */
-		}
-	}
+	removeWorkspace(workspace);
 });
 
 test('a NEW notebook is Python, and its metadata says nothing', async ({ page }) => {

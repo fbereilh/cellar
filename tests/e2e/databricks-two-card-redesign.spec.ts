@@ -1,9 +1,9 @@
 import { test, expect, type Page } from '@playwright/test';
 import { type ChildProcess } from 'node:child_process';
-import { mkdtempSync, existsSync, rmSync, mkdirSync } from 'node:fs';
+import { mkdtempSync, existsSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { runtimeAvailable, bootCellar, killCellar, openSidebarSection } from './harness';
+import { runtimeAvailable, bootCellar, killCellar, openSidebarSection, removeWorkspace } from './harness';
 
 /**
  * E2E for the Databricks sidebar TWO-CARD REDESIGN (target commit
@@ -24,9 +24,13 @@ import { runtimeAvailable, bootCellar, killCellar, openSidebarSection } from './
  * header-pill spec. Boots the REAL launcher; SKIPS when the runtime is absent.
  */
 
+// Default to this machine's temp dir, never a captured absolute path: an
+// evidence run's `/var/folders/...` directory is specific to the machine AND
+// the run that produced it, so pinning one makes the spec unrunnable anywhere
+// else - on Linux CI it is not even creatable, and the screenshot fails ENOENT
+// while the assertions it was decorating had all passed.
 const EVIDENCE_DIR =
-	process.env.CELLAR_EVIDENCE_DIR ||
-	'/var/folders/ds/m71hq5ln637g23x6xmrwqg080000gn/T/no-mistakes-evidence/01KY4RNR5SWSZ5TZGBV6MHHR3K';
+	process.env.CELLAR_EVIDENCE_DIR || join(tmpdir(), 'cellar-evidence-databricks-two-card');
 
 let launcher: ChildProcess | null = null;
 let workspace = '';
@@ -131,7 +135,7 @@ test.afterAll(async () => {
 	launcher = null;
 	if (workspace && existsSync(workspace)) {
 		try {
-			rmSync(workspace, { recursive: true, force: true });
+			removeWorkspace(workspace);
 		} catch {
 			/* best effort */
 		}
@@ -314,16 +318,36 @@ test('an env-FORCED runtime says the environment controls it and offers no Apply
 	await page.request.put(`${baseURL}/api/ui-state`, { data: { 'cellar-databricks-runtime': null } });
 });
 
+/**
+ * Forget the persisted tab session, so a test starts from an empty tab set.
+ *
+ * The key is read back from the store rather than rebuilt here: it is
+ * `cellar-tabs:<workspace>` and the workspace the server reports need not be the
+ * `mkdtemp` string this file holds (macOS resolves `/var` through `/private`).
+ */
+async function clearTabSession(page: Page): Promise<void> {
+	const state = await (await page.request.get(`${baseURL}/api/ui-state`)).json();
+	const cleared: Record<string, null> = {};
+	for (const key of Object.keys(state ?? {})) if (key.startsWith('cellar-tabs:')) cleared[key] = null;
+	if (Object.keys(cleared).length) await page.request.put(`${baseURL}/api/ui-state`, { data: cleared });
+}
+
 test('with no notebook open, Apply now is disabled and says so - never a silent no-op', async ({ page }) => {
 	await page.request.put(`${baseURL}/api/ui-state`, { data: { 'cellar-databricks-runtime': true } });
 	await mockDatabricksStatus(page, connectedStatus()); // pending: kernel started, no live runtime
 	await page.goto(`${baseURL}/?ws=${encodeURIComponent(workspace)}`);
 	// Deliberately leave NO notebook open: the sidebar then has no active notebook
 	// path, which is what makes the restart a no-op. The tab session is persisted
-	// per workspace SERVER-side, so an earlier test's notebook can be restored here -
-	// close whatever came back rather than assuming a clean slate.
-	const closers = page.getByTestId('tab-close');
-	for (let i = 0; i < 8 && (await closers.count()) > 0; i++) await closers.first().click();
+	// per workspace SERVER-side, so an earlier test's notebook is restored here and
+	// has to be forgotten first.
+	//
+	// Forgotten through the STORE, not by clicking the close buttons: that loop read
+	// a count, clicked `first()`, then re-read - racing the tab removal against its
+	// own persist, and capped at 8 besides. It held on a fast machine and failed on
+	// Linux CI, where it left a tab open and burned the full timeout on an empty
+	// state that could never come. (Same helper as toolbar-consolidate-imports.)
+	await clearTabSession(page);
+	await page.reload();
 	await expect(page.getByTestId('empty-state')).toBeVisible();
 	await openDatabricksSection(page);
 

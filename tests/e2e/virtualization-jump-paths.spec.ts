@@ -1,9 +1,9 @@
 import { test, expect, type Page } from '@playwright/test';
 import { type ChildProcess, spawnSync } from 'node:child_process';
-import { mkdtempSync, existsSync, rmSync } from 'node:fs';
+import { mkdtempSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { runtimeAvailable, bootCellar, killCellar, REPO } from './harness';
+import { runtimeAvailable, bootCellar, killCellar, REPO, removeWorkspace } from './harness';
 import { setScrollTop, isCellMounted, cellIsOnScreen, mountedCellIds } from './notebook-scroll';
 
 /**
@@ -59,7 +59,14 @@ async function openNotebook(page: Page, { virtualize = true } = {}): Promise<voi
 	// inheriting it.
 	await page.goto(`${baseURL}/?ws=${encodeURIComponent(workspace)}&virtualize=${virtualize ? '1' : '0'}`);
 	const openButton = page.getByTestId('empty-open-notebook');
-	if (await openButton.isVisible({ timeout: 10_000 }).catch(() => false)) await openButton.click();
+	// SETTLE before probing: the shell paints either the empty state or an already
+	// open notebook, and reading `isVisible()` before either arrives reports the
+	// button invisible, turns the click into a no-op, and then times out on a
+	// notebook nothing ever opened. The 10s here was papering over that - it is a
+	// race, not a slow machine, so a longer probe only moves the threshold. See the
+	// openNotebook rule in AGENTS.md.
+	await expect(openButton.or(page.getByTestId('cell').first())).toBeVisible();
+	if (await openButton.isVisible().catch(() => false)) await openButton.click();
 	await expect(page.getByTestId('cell').first()).toBeVisible({ timeout: 30_000 });
 	if (virtualize) {
 		// Windowing is engaged once off-screen cells have collapsed into spacers.
@@ -103,7 +110,7 @@ test.afterAll(async () => {
 	launcher = null;
 	if (workspace && existsSync(workspace)) {
 		try {
-			rmSync(workspace, { recursive: true, force: true });
+			removeWorkspace(workspace);
 		} catch {
 			/* best effort */
 		}

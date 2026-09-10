@@ -60,14 +60,27 @@ that use it out of the run, leaving vitest reporting every other file green
 beside an unhandled error. Pick dev-dependency versions that run on the declared
 floor rather than raising it for one test file.
 
-### Playwright E2E (best-effort, local)
+### Playwright E2E (gates every PR, and runs locally)
 
 The end-to-end suite (`tests/e2e/`) drives the real `cellar` launcher in a
 browser and needs the full kernel runtime (`uv` + `python3` + the cached
-host-venv). Because CI doesn't provide that runtime, E2E is **deliberately not
-run in CI** - it is a local, best-effort layer that skips itself when the runtime
-is absent. Run it locally when your change touches behavior only the full stack
-can show:
+host-venv). It **gates every PR** from `.github/workflows/e2e.yml`, which
+provisions that runtime and shards the run across ten runners (~5 min of wall clock) - unsharded and
+serial it is a 45-60 min job, which is why it was ungated until the sharding
+existed. Two rules there are worth knowing before you touch that workflow:
+
+- **A missing runtime FAILS the job, it does not skip it.** Every spec carries
+  `test.skip(!runtimeAvailable(), …)` and Playwright exits **0** for a run in
+  which everything skipped, so a job whose provisioning broke would be a
+  permanently green check that ran nothing. `CELLAR_E2E_REQUIRE_RUNTIME=1` turns
+  that skip into an abort, from the same predicate the specs use.
+- **Each shard builds for itself.** That looks like waste and is not: the build
+  is parallel across shards, so hoisting it into a shared `needs:` job
+  *serialises* it and measures ~43s slower end to end.
+
+Locally it still skips itself when the runtime is absent, which is right for a
+machine without `uv`. Run it when your change touches behavior only the full
+stack can show:
 
 ```sh
 npx playwright install chromium   # once

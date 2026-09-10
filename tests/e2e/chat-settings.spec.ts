@@ -1,9 +1,9 @@
 import { test, expect, type Page } from '@playwright/test';
 import { type ChildProcess } from 'node:child_process';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { runtimeAvailable, bootCellar, killCellar } from './harness';
+import { runtimeAvailable, bootCellar, killCellar, removeWorkspace } from './harness';
 import { CHAT_LEARNING_MODE_KEY, CHAT_MODEL_KEY, CHAT_MODEL_DEFAULT, CHAT_OTHER_NOTEBOOKS_KEY, CHAT_WEB_SEARCH_KEY, CHAT_WORKSPACE_READS_KEY } from '../../src/lib/chatCell';
 
 /**
@@ -65,7 +65,7 @@ test.beforeAll(async () => {
 test.afterAll(() => {
 	if (launcher) killCellar(launcher);
 	launcher = null;
-	if (workspace) rmSync(workspace, { recursive: true, force: true });
+	removeWorkspace(workspace);
 });
 
 test.beforeEach(() => {

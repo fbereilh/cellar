@@ -712,7 +712,13 @@ function abortActiveRuns(nbKernel: NotebookKernel, reason: string, only?: readon
 	}
 }
 
-function makeSettings(signal?: AbortSignal) {
+/**
+ * Server settings for @jupyterlab/services.
+ *
+ * Exported for ONE claim worth pinning: that the returned `WebSocket` is always
+ * a usable constructor. See `tests/unit/kernel-websocket-settings.test.ts`.
+ */
+export function makeSettings(signal?: AbortSignal) {
 	const baseUrl = process.env.CELLAR_JUPYTER_URL || 'http://127.0.0.1:8888';
 	const token = process.env.CELLAR_JUPYTER_TOKEN || '';
 	const wsUrl = baseUrl.replace(/^http/, 'ws');
@@ -723,10 +729,25 @@ function makeSettings(signal?: AbortSignal) {
 		// `init` REPLACES @jupyterlab's default rather than merging into it, so its
 		// defaults are restated here alongside the caller's optional abort signal.
 		init: { cache: 'no-store', credentials: 'same-origin', signal },
-		// Node 18+ ships global fetch/WebSocket; pass them explicitly so
-		// @jupyterlab/services does not reach for a browser-only shim.
+		// Node 18+ ships a global `fetch`, so passing it is always a real value.
 		fetch: globalThis.fetch,
-		WebSocket: globalThis.WebSocket
+		// `WebSocket` is NOT the same story, and passing it unconditionally broke
+		// every cell run on the Node versions `package.json` `engines` declares.
+		// The global WebSocket is **Node 22+** (Node 21 had it behind
+		// `--experimental-websocket`; 18 and 20 have none at all), while
+		// `Private.makeSettings` spreads `...options` OVER its defaults - so on
+		// Node 20 this key arrived as `undefined` and CLOBBERED @jupyterlab's own
+		// default, which in Node is the `ws` package it already depends on
+		// (`typeof window === 'undefined' ? require('ws') : WebSocket`). Every
+		// `new settings.WebSocket(...)` then threw `WebSocket is not a
+		// constructor`, so the kernel socket never opened and a cell's output was
+		// that message. Invisible for as long as it was: the only layer that boots
+		// a kernel is e2e, which had never run in CI, and every dev machine here is
+		// on Node 26. Found by the first Linux run of .github/workflows/e2e.yml.
+		//
+		// So OMIT the key rather than passing undefined: on Node 22+ the global is
+		// used exactly as before, and below it @jupyterlab falls back to `ws`.
+		...(globalThis.WebSocket ? { WebSocket: globalThis.WebSocket } : {})
 	});
 }
 
@@ -2615,11 +2636,11 @@ function introspectTimeoutMs(): number {
 }
 
 /**
- * How long to wait for a kernel that is busy with CELLAR'S OWN internal work
- * before giving up on it (`CELLAR_KERNEL_INTROSPECT_IDLE_WAIT_MS`, default 500).
+ * SAFETY NET on the wait for CELLAR'S OWN internal work
+ * (`CELLAR_KERNEL_INTROSPECT_IDLE_WAIT_MS`, default 3000) - **not** the mechanism.
  *
- * A USER cell run never waits - see `waitForIntrospectable`. This window exists for
- * the internal probes, which are what makes the kernel briefly busy at exactly the
+ * A USER cell run never waits - see `waitForIntrospectable`. This exists for the
+ * internal probes, which are what makes the kernel briefly busy at exactly the
  * moment a user reaches for completion: `onRunEnd` refreshes the variable inspector,
  * which is an `execute({internal:true})` on the same shell channel. Measured in a
  * real browser, that probe lands right on top of "run a cell, then type a name it
@@ -2627,16 +2648,44 @@ function introspectTimeoutMs(): number {
  * DEAD END rather than a delay, because CodeMirror does not re-run a completion
  * source on its own.
  *
- * Half a second is chosen against what it is waiting for (a namespace probe, tens
- * of milliseconds) rather than against typing latency: nothing is blocked while it
- * waits, and a wait that runs out still refuses rather than sending.
+ * It used to be 500ms and it used to be the WHOLE mechanism: a wall-clock guess at
+ * how long that probe takes. That guess is what broke, and it broke SILENTLY - on a
+ * machine measured 2.3-3x slower than the one it was chosen on, the probe outlived
+ * the window, the completion was refused as `busy`, and the user simply got no
+ * kernel names. Deterministic: `tests/e2e/kernel-introspection.spec.ts:217` failed
+ * 5 of 5 Linux CI runs, and `CELLAR_KERNEL_INTROSPECT_IDLE_WAIT_MS=1` reproduces it
+ * on any machine.
+ *
+ * The wait itself was never a sleep and still is not: `waitForIntrospectable` polls
+ * the REAL condition (the kernel actually being free) every
+ * `INTROSPECT_IDLE_POLL_MS`, so it returns as soon as that is true. The defect was
+ * only ever this BOUND - and specifically that it was a guess at how long the probe
+ * takes, on a machine that turned out not to be every machine.
+ *
+ * So it is no longer that kind of number. It is a UX bound on ONE KEYSTROKE: the
+ * longest a completion may go without answering before it says why. Do NOT re-derive
+ * it from a measurement of the probe; if it ever needs raising, raise it against
+ * what a user will sit through. A bound is genuinely required rather than merely
+ * cautious, because the same kernel is held by work that is legitimately long - a
+ * cold-cluster Databricks `CONNECT_CODE` holds it for MINUTES - and a keystroke may
+ * not wait on that.
+ *
+ * WAITING ON THE ACTUAL IN-FLIGHT WORK WAS TRIED AND REVERTED, so do not re-derive
+ * it: the exec lock gives a synchronous "is Cellar busy on this kernel" signal, but
+ * it reads ZERO in the window between a run ending and the `onRunEnd` probe starting
+ * - which is exactly the moment this wait exists for - so giving up on it made the
+ * headline case fail LOCALLY as well. The wait cannot see work that has not begun.
+ *
+ * And hitting the bound is now a distinct, SURFACED outcome (`busy_timeout`) rather
+ * than silence: see $lib/kernelCompletion.
  */
 function introspectIdleWaitMs(): number {
-	return envMs('CELLAR_KERNEL_INTROSPECT_IDLE_WAIT_MS', 500);
+	return envMs('CELLAR_KERNEL_INTROSPECT_IDLE_WAIT_MS', 3000);
 }
 
 /** How often to re-read the kernel while waiting out an internal probe. */
 const INTROSPECT_IDLE_POLL_MS = 20;
+
 
 /**
  * Is a USER cell run holding notebook `nbPath`'s kernel?
@@ -2678,6 +2727,10 @@ async function waitForIntrospectable(
 ): Promise<{ ok: true; kernel: KernelConnection } | { ok: false; reason: IntrospectRefusal }> {
 	let verdict = introspectTarget(abs);
 	if (verdict.ok || verdict.reason !== 'busy' || userRunHoldsKernel(abs)) return verdict;
+	// Poll the REAL condition - the kernel actually being free again - and give up
+	// only when the bound below says a keystroke has waited long enough. The queue is
+	// re-read each pass, so a user run STARTING during the wait converts this into the
+	// immediate refusal rather than being waited out.
 	const deadline = Date.now() + introspectIdleWaitMs();
 	while (Date.now() < deadline) {
 		await delay(INTROSPECT_IDLE_POLL_MS);
@@ -2685,7 +2738,11 @@ async function waitForIntrospectable(
 		verdict = introspectTarget(abs);
 		if (verdict.ok || verdict.reason !== 'busy') return verdict;
 	}
-	return verdict;
+	// The bound fired. That is NOT the same fact as "a cell is running", and calling
+	// it `busy` is what made this failure silent: the completion path swallows
+	// expected refusals, so the user got no kernel names and no way to tell that from
+	// "nothing matched". See $lib/kernelCompletion.
+	return { ok: false, reason: 'busy_timeout' };
 }
 
 /**

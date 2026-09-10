@@ -1,9 +1,9 @@
 import { test, expect, type Page } from '@playwright/test';
 import { type ChildProcess } from 'node:child_process';
-import { mkdtempSync, writeFileSync, readFileSync, existsSync, rmSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { runtimeAvailable, bootCellar, killCellar } from './harness';
+import { runtimeAvailable, bootCellar, killCellar, removeWorkspace } from './harness';
 
 /**
  * A notebook authored in nbdev, opened in Cellar: `#| export` in the SOURCE marks a
@@ -92,7 +92,7 @@ test.beforeAll(async () => {
 test.afterAll(() => {
 	if (launcher) killCellar(launcher);
 	launcher = null;
-	if (workspace && existsSync(workspace)) rmSync(workspace, { recursive: true, force: true });
+	removeWorkspace(workspace);
 });
 
 test.describe.configure({ mode: 'serial' });

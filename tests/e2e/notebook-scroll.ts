@@ -145,6 +145,38 @@ export async function mountedCellIds(page: Page): Promise<string[]> {
  * FRESH element, so a surviving marker proves the node was never unmounted — the
  * load-bearing assertion for pinning (a cell's editor state lives in that node).
  */
+/**
+ * Why a cell is still mounted, as a string, so a failure SAYS which pin held it.
+ *
+ * `pinnedCellIds` is the union of the running cell, the queued heads, the active
+ * cell, the focused cell and the transient scroll pins - so "it should have
+ * unmounted and did not" has five quite different causes, and a bare
+ * `expect(isCellMounted(...)).toBe(false)` names none of them. Everything read
+ * here is observable from the DOM, so this needs no hook into the component.
+ *
+ * Returns the literal `'unmounted'` on success, which is what makes it usable as
+ * the polled value rather than as an afterthought: the assertion reads
+ * `.toBe('unmounted')` and prints the diagnosis on the way out.
+ */
+export async function mountDiagnosis(page: Page, id: string): Promise<string> {
+	return page.evaluate((cellId) => {
+		const cell = document.querySelector(`[data-cell-id="${CSS.escape(cellId)}"]`);
+		if (!cell) return 'unmounted';
+		const active = document.activeElement;
+		const bits = [
+			`running=${!!cell.querySelector('[data-testid="running-bar"]')}`,
+			`queued=${cell.getAttribute('data-queued') ?? 'null'}`,
+			`selected=${cell.getAttribute('data-selected') ?? 'null'}`,
+			`focusWithin=${!!(active && cell.contains(active))}`,
+			`anyRunning=${!!document.querySelector('[data-testid="running-bar"]')}`,
+			`anyQueued=${document.querySelectorAll('[data-queued="true"]').length}`,
+			`mounted=${document.querySelectorAll('[data-testid="cell"]').length}`,
+			`spacers=${document.querySelectorAll('[data-testid="cell-spacer"]').length}`
+		];
+		return `mounted (${bits.join(' ')})`;
+	}, id);
+}
+
 export async function markCellNode(page: Page, id: string, marker: string): Promise<boolean> {
 	return page.evaluate(
 		({ cellId, m }) => {

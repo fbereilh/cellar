@@ -1,9 +1,9 @@
 import { test, expect, type Page } from '@playwright/test';
 import { type ChildProcess } from 'node:child_process';
-import { mkdtempSync, writeFileSync, existsSync, rmSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { runtimeAvailable, bootCellar, killCellar } from './harness';
+import { runtimeAvailable, bootCellar, killCellar, removeWorkspace } from './harness';
 import { isCellMounted, setScrollTop } from './notebook-scroll';
 
 /**
@@ -113,7 +113,7 @@ test.afterAll(async () => {
 	launcher = null;
 	if (workspace && existsSync(workspace)) {
 		try {
-			rmSync(workspace, { recursive: true, force: true });
+			removeWorkspace(workspace);
 		} catch {
 			/* best effort */
 		}
@@ -126,7 +126,14 @@ async function openWindowed(page: Page): Promise<void> {
 	// exercise the ON path regardless).
 	await page.goto(`${baseURL}/?ws=${encodeURIComponent(workspace)}&virtualize=1`);
 	const openButton = page.getByTestId('empty-open-notebook');
-	if (await openButton.isVisible({ timeout: 10_000 }).catch(() => false)) await openButton.click();
+	// SETTLE before probing: the shell paints either the empty state or an already
+	// open notebook, and reading `isVisible()` before either arrives reports the
+	// button invisible, turns the click into a no-op, and then times out on a
+	// notebook nothing ever opened. The 10s here was papering over that - it is a
+	// race, not a slow machine, so a longer probe only moves the threshold. See the
+	// openNotebook rule in AGENTS.md.
+	await expect(openButton.or(page.getByTestId('cell').first())).toBeVisible();
+	if (await openButton.isVisible().catch(() => false)) await openButton.click();
 	await expect(page.getByTestId('cell').first()).toBeVisible({ timeout: 30_000 });
 	await expect
 		.poll(() => page.locator('[data-testid="cell-spacer"]').count(), { timeout: 30_000 })

@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
-import { runtimeAvailable, bootCellar, killCellar, REPO, openSidebarSection } from './harness';
+import { runtimeAvailable, bootCellar, killCellar, REPO, openSidebarSection, removeWorkspace, MCP_CALL_TIMEOUT_MS } from './harness';
 
 /**
  * The agent-facing Databricks-runtime surface and `.py` notebook pinning, over the
@@ -28,9 +28,13 @@ import { runtimeAvailable, bootCellar, killCellar, REPO, openSidebarSection } fr
  * runtime is absent - the vitest suite is the must-pass gate.
  */
 
+// Default to this machine's temp dir, never a captured absolute path: an
+// evidence run's `/var/folders/...` directory is specific to the machine AND
+// the run that produced it, so pinning one makes the spec unrunnable anywhere
+// else - on Linux CI it is not even creatable, and the screenshot fails ENOENT
+// while the assertions it was decorating had all passed.
 const EVIDENCE_DIR =
-	process.env.CELLAR_EVIDENCE_DIR ||
-	'/var/folders/ds/m71hq5ln637g23x6xmrwqg080000gn/T/no-mistakes-evidence/01KZR9KRY38Q7YMDTWN611GD4Q';
+	process.env.CELLAR_EVIDENCE_DIR || join(tmpdir(), 'cellar-evidence-mcp-runtime-py-notebook');
 
 const TRANSCRIPT = join(EVIDENCE_DIR, 'mcp-agent-transcript.md');
 
@@ -41,7 +45,7 @@ let baseURL = '';
 
 /** A tool call's JSON payload, as the agent receives it. */
 async function call(name: string, args: Record<string, unknown>): Promise<any> {
-	const r = (await client!.callTool({ name, arguments: args })) as {
+	const r = (await client!.callTool({ name, arguments: args }, undefined, { timeout: MCP_CALL_TIMEOUT_MS })) as {
 		content: Array<{ text: string }>;
 		isError?: boolean;
 	};
@@ -52,7 +56,7 @@ async function call(name: string, args: Record<string, unknown>): Promise<any> {
 
 /** A tool call expected to FAIL: its text is the error message, not JSON. */
 async function callRaw(name: string, args: Record<string, unknown>) {
-	const r = (await client!.callTool({ name, arguments: args })) as {
+	const r = (await client!.callTool({ name, arguments: args }, undefined, { timeout: MCP_CALL_TIMEOUT_MS })) as {
 		content: Array<{ text: string }>;
 		isError?: boolean;
 	};
@@ -141,7 +145,7 @@ test.afterAll(async () => {
 	launcher = null;
 	if (workspace && existsSync(workspace)) {
 		try {
-			rmSync(workspace, { recursive: true, force: true });
+			removeWorkspace(workspace);
 		} catch {
 			/* best effort */
 		}

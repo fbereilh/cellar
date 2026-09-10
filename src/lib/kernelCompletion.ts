@@ -139,12 +139,24 @@ export function kernelCompletionSource(getHandle: () => KernelIntrospectHandle |
 			return null;
 		}
 		if (context.aborted) return null;
-		// EVERY failure is silent here - no kernel, a busy one, a timeout, an
-		// unreachable server. This runs on a keystroke and the file-local sources have
-		// already answered; surfacing a reason would be noise on the one path that must
-		// never interrupt typing. The Shift+Tab tooltip is where it is worth stating,
-		// because there the user asked a direct question and silence would read as a
-		// broken key.
+		// ONE refusal is stated; every other failure stays silent - no kernel, a busy
+		// one, a lost reply, an unreachable server. This runs on a keystroke and the
+		// file-local sources have already answered, so a reason for an EXPECTED state
+		// would be noise on the one path that must never interrupt typing (the
+		// Shift+Tab tooltip is where those are worth stating, because there the user
+		// asked a direct question and silence would read as a broken key).
+		//
+		// `busy_timeout` is not an expected state. It means Cellar waited for its OWN
+		// background work on this kernel and stopped waiting - so the user gets no
+		// kernel names for a reason that has nothing to do with what they typed, and
+		// silence there is indistinguishable from "nothing matched". That was a real
+		// defect, not a theoretical one: the wait used to be a wall-clock guess, and on
+		// a slower machine it expired on every completion right after a run while
+		// telling the user nothing at all. It is rare now by construction (see
+		// `waitForIntrospectable` - the wait is on the work itself, and this bound only
+		// fires for a holder that is legitimately long, like a cold-cluster Databricks
+		// connect), which is exactly what makes stating it worth the interruption.
+		if (!outcome.ok && outcome.reason === 'busy_timeout') return waitingNotice(context.pos);
 		if (!outcome.ok || outcome.matches.length === 0) return null;
 		const range = replacementRange(outcome.cursorStart, outcome.cursorEnd, code, context.pos, doc.length);
 		if (!range) return null;
@@ -169,6 +181,33 @@ export function kernelCompletionSource(getHandle: () => KernelIntrospectHandle |
  * document is REFUSED rather than clamped: a clamp would silently rewrite a
  * different span of the user's code than the kernel meant.
  */
+
+/**
+ * A completion result that SAYS why there are no kernel names, rather than looking
+ * like there were none to give.
+ *
+ * It INSERTS NOTHING (`apply` is a no-op), so accepting it by reflex costs the user
+ * nothing - the row exists to be read, not chosen. `filter: false` keeps it visible
+ * whatever has been typed, since it is not a match for the text; and because this is
+ * one source among several, the file-local names still appear beside it.
+ */
+function waitingNotice(pos: number): CompletionResult {
+	return {
+		from: pos,
+		filter: false,
+		options: [
+			{
+				label: 'kernel names unavailable',
+				detail: 'Cellar is finishing background work - try again in a moment',
+				type: 'text',
+				// Never insert: this is a message, and a completion that types itself
+				// into the user's cell when they press Enter would be worse than silence.
+				apply: () => {}
+			}
+		]
+	};
+}
+
 function replacementRange(
 	cursorStart: number,
 	cursorEnd: number,
