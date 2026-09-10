@@ -2633,7 +2633,10 @@
 						</span>
 						<!-- Stop control: interrupts this notebook's kernel (KeyboardInterrupt),
 						     which halts its currently-executing cell. Same handler as the
-						     Kernels sidebar's Interrupt button; shown only while running. -->
+						     Kernels sidebar's Interrupt button; shown only while running. A
+						     chat cell holds no kernel, so `interruptKernel` also aborts this
+						     notebook's live chat runs - which signals each run's whole process
+						     group (see `signalRunTree` in chat/claude-cli.ts). -->
 						<button
 							class="btn btn-ghost btn-xs h-5 min-h-0 w-5 p-0 text-error hover:bg-error/10 hover:text-error"
 							onclick={() => onInterrupt?.()}

@@ -1062,6 +1062,94 @@ export function chatCliCwd(policy: ChatToolPolicy): string {
 	return policy.readRoot ?? tmpdir();
 }
 
+/**
+ * Whether a chat child can be given a process GROUP of its own.
+ *
+ * POSIX `detached` calls `setsid()`, so the child leads a new session AND a new
+ * process group whose id equals its pid - which is the only handle that reaches
+ * what the child itself spawned. On Windows `detached` means a new CONSOLE
+ * instead, and negative pids are not a thing, so that platform keeps the
+ * single-process kill it always had.
+ *
+ * The COST of that session is stated at `abortAllChatRuns` (`chat/active.ts`):
+ * it takes the tree out of the TERMINAL's group permanently, and every route
+ * replacing that reach is HANDLER-based, so an app that dies without running one
+ * (a crash, a SIGKILL) orphans the tree where a later terminal close cannot
+ * reach it either. Read that residual - and the follow-up that closes it - before
+ * either "simplifying" this flag away or reaching for an `uncaughtException`
+ * listener, which is a worse trade than the leak it looks like it fixes.
+ */
+const OWNS_PROCESS_GROUP = process.platform !== 'win32';
+
+/**
+ * Signal a chat run's WHOLE process tree - the CLI and everything it started.
+ *
+ * `child.kill()` signals ONE pid. The claude CLI spawns its own children (a tool
+ * subprocess, a shell it ran), and those are what survived a stop: REPRODUCED end
+ * to end, a descendant of a stopped chat run outlived the Stop press, outlived
+ * the run settling, and outlived Cellar's own Ctrl-C shutdown (the launcher
+ * SIGTERMs its direct children too, so nothing anywhere reached it) - it simply
+ * ran on until it finished by itself. It also held the inherited stdout pipe
+ * open, which is what kept node's `close` from firing and left the run settling
+ * only on a 5s timer. So "stop" must address the GROUP, and the group is why the
+ * child is spawned `detached`.
+ *
+ * `reaped` is the caller's own record that the OS has reported the child's exit.
+ * Past that point the pid - and therefore the pgid that equals it - can be
+ * recycled, so signalling it is no longer a positive match on anything of ours;
+ * this repo refuses to kill without one (`pidReapDecision`), and the cost of
+ * being wrong here is an unrelated process tree.
+ *
+ * STATED RESIDUAL, and it is WIDER than the escalation window - do not restate
+ * it as "a descendant that ignores SIGTERM". Once `reaped` is true this sends
+ * NOTHING to the group, and `child.kill()` on a reaped child is itself a no-op,
+ * so no signal reaches the tree at all. Two ways in:
+ *
+ *   - the leader outlives the SIGTERM but is reaped before the 3s escalation, so
+ *     a descendant that IGNORES SIGTERM keeps the SIGKILL it would have died on;
+ *   - the leader was ALREADY reaped when `kill()` ran, which needs no stop at
+ *     all: the CLI exits, a descendant holds the inherited stdout so `close`
+ *     never fires, the run hangs to the chat timeout, and the kill that timeout
+ *     fires signals nothing.
+ *
+ * Narrowing the guard on "our stdio is still open" was considered and REFUSED:
+ * an open pipe proves only that SOME descendant holds a write end, and a
+ * descendant that called `setsid()` holds it from OUTSIDE our group - which is
+ * exactly the state in which the group is empty and its pgid recyclable, so it
+ * is not evidence the group is still ours. POSIX keeps a pgid reserved only
+ * while the group has members, and we have no way to observe that continuously
+ * from here. The leak is therefore PRE-EXISTING (the old `child.kill()` reached
+ * no descendant either) and is the deliberate side of the trade: a missed
+ * SIGKILL delays one stubborn process, while a group-kill of a recycled pgid
+ * destroys someone else's tree. It is also why `onLine` must go on dropping
+ * everything parsed after the settle (covered in `chat-engine-safety.test.ts`),
+ * and why promptness is settled on the verdict rather than on the pipe.
+ *
+ * A group kill that fails falls through to the single-process kill rather than
+ * leaving the run unsignalled: less reach is better than none.
+ */
+function signalRunTree(child: ChildProcess, signal: NodeJS.Signals, reaped: boolean): void {
+	const pid = child.pid;
+	// `pid > 0`, never merely `!= null`: `-0 === 0`, and `process.kill(0, sig)`
+	// signals the CALLER'S OWN group - this app, the launcher, the sidecar and
+	// every kernel. The sign IS the primitive here, so the guard is positive.
+	if (OWNS_PROCESS_GROUP && typeof pid === 'number' && pid > 0 && !reaped) {
+		try {
+			process.kill(-pid, signal);
+			return;
+		} catch {
+			// ESRCH: the group is already gone, and the fallback below is then a no-op
+			// too. Anything else (EPERM) is a reason to try the narrower kill, not to
+			// give up on stopping the run.
+		}
+	}
+	try {
+		child.kill(signal);
+	} catch {
+		// already gone
+	}
+}
+
 /** How many chat children may run at once, across all notebooks. */
 const MAX_CONCURRENT = 3;
 
@@ -1216,7 +1304,11 @@ function runOnce({
 			child = spawn(CLAUDE_BIN, chatCliArgs({ model, policy, learningMode }), {
 				env: chatChildEnv(configDir),
 				cwd,
-				stdio: ['pipe', 'pipe', 'pipe']
+				stdio: ['pipe', 'pipe', 'pipe'],
+				// Its OWN process group, which is what makes "stop" able to reach
+				// everything this run started - see `signalRunTree`. Never on Windows,
+				// where `detached` means a new CONSOLE rather than a new group.
+				detached: OWNS_PROCESS_GROUP
 			});
 		} catch (err) {
 			settleRun(spawnFailure(err, cwd));
@@ -1260,28 +1352,61 @@ function runOnce({
 			settleRun(value);
 		};
 
+		// True once the OS has reported our child's exit, i.e. once node has reaped
+		// it. Past that its pid - and therefore the process-GROUP id that equals it -
+		// may be recycled by the OS, so it is no longer ours to signal: this repo's
+		// standing rule is that killing REQUIRES a positive match (`pidReapDecision`),
+		// and a group-kill of a recycled pgid would take down an unrelated process
+		// tree. On the ordinary stop the SIGTERM precedes this and so reaches the
+		// whole group; where it does NOT (a leader already reaped when `kill()` ran)
+		// nothing is signalled at all - the residual is stated in full at
+		// `signalRunTree`, which owns the rule.
+		let reaped = false;
+		child.on('exit', () => {
+			reaped = true;
+		});
+
+		let killing = false;
 		const kill = () => {
-			try {
-				child.kill('SIGTERM');
-			} catch {
-				// already gone
-			}
+			// IDEMPOTENT, and that is load-bearing rather than tidy: `kill()` settles
+			// the run below, and `settleAfterExit` parses the buffered tail, which can
+			// re-enter `onLine` and reach a second `kill()` - the unsafe-init path does
+			// exactly that. It also keeps a second stop (an abort landing on an
+			// already-timed-out run) from arming a second escalation. The FIRST verdict
+			// wins, which is the same rule `settle()` itself follows.
+			if (killing) return;
+			killing = true;
+			signalRunTree(child, 'SIGTERM', reaped);
 			const hard = setTimeout(() => {
-				try {
-					child.kill('SIGKILL');
-				} catch {
-					// already gone
-				}
+				signalRunTree(child, 'SIGKILL', reaped);
 			}, 3_000);
 			if (typeof hard.unref === 'function') hard.unref();
-			// `close` waits for every stdio pipe to drain, and a grandchild the CLI
-			// left behind can hold stdout open past the kill - so a killed run also
-			// FORCE-settles shortly after, with whatever state it has. Without this a
-			// stop (interrupt / unsafe init / timeout) could hang on a pipe nobody
-			// will close, which is strictly worse than settling early: the verdict
-			// (cancelled/unsafe/timeout) is already decided by the time kill() runs.
-			const force = setTimeout(() => settleAfterExit(null), 5_000);
-			if (typeof force.unref === 'function') force.unref();
+			// Whatever is still buffered belongs to a run we have decided is over, and
+			// it is a MID-STREAM fragment rather than a final line: the stdout handler
+			// calls `onLine` before trimming `buf`, so at this point `buf` still holds
+			// the very line that triggered the kill. `settleAfterExit`'s trailing-line
+			// parse exists for the CLOSE path, where the stream really has ended, so
+			// discard here rather than re-parsing what we have already read.
+			buf = '';
+			// SETTLE ON THE VERDICT WE ALREADY HAVE, rather than on the child's pipes.
+			//
+			// `kill()` runs only once one of `unsafe`/`aborted`/`timedOut` is set, so
+			// the outcome is decided here and nothing the child could still say would
+			// change it. Waiting for `close` (which waits for every stdio pipe to
+			// drain) therefore bought nothing and cost the user real time: a stop used
+			// to sit behind a 5s force-settle timer whenever anything still held
+			// stdout open - MEASURED at 5.0-5.3s of spinner after the click - which is
+			// exactly what "stopping a chat cell does not stop it" looks like. The
+			// group kill above closes the common cause of that, but promptness must
+			// not DEPEND on the kill having worked: a descendant that ignores SIGTERM
+			// holds the pipe for the full escalation window, and the user asked for
+			// the run to end, not for us to win a race with it.
+			//
+			// Settling early is safe by construction: `settle()` is idempotent, a
+			// later `close` is a no-op, and `onLine` already drops everything parsed
+			// after the settle - the guard the old force-settle needed for the same
+			// reason. Reaping continues independently above.
+			settleAfterExit(null);
 		};
 
 		const onAbort = () => {
@@ -1310,9 +1435,10 @@ function runOnce({
 		let buf = '';
 		const onLine = (line: string) => {
 			// A settled run owns no accumulator any more: `run.ts` has finished and
-			// persisted it, so a delta parsed after the force-settle (a grandchild
-			// holding stdout open past the kill) would publish a phantom frame for a
-			// cell whose run:end already fired and diverge the in-memory doc from disk.
+			// persisted it. A stop settles on the VERDICT rather than on the child's
+			// pipes, so stdout can still be open and still be written to afterwards,
+			// and a late delta would publish a phantom frame for a cell whose run:end
+			// already fired and diverge the in-memory doc from disk.
 			if (settled) return;
 			const trimmed = line.trim();
 			if (!trimmed) return;
