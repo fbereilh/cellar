@@ -27,18 +27,21 @@ name: E2E
 #     pins that, because a Playwright change that started splitting files would
 #     break the suite in a way that reads as flakiness.
 #
-#   * ONE WORKER per shard, and this one IS measured. `playwright.config.ts`
-#     used to hardcode `workers: process.env.CI ? 1 : 2`; that `1` was never
-#     measured (e2e had never run in CI when #47 wrote it, so it was the old
-#     unconditional default left on a branch nobody had taken), so it was
-#     replaced by `CELLAR_E2E_WORKERS`, which CI sets here. At 6 shards x 2
-#     workers a full run was 6m26s with NINE failures, every one timeout-shaped
-#     — a page that never finished loading inside 30s, `virtualization-pinning`,
-#     the same timing-sensitive real-kernel family AGENTS.md records `workers: 4`
-#     breaking on a 15-core machine. Two workers on FOUR vCPUs is that same
-#     contention: each worker is a chromium + a launcher + a jupyter-server + a
-#     python kernel. So the parallelism moved OUT of the shard and INTO the
-#     matrix, where the runners are free and do not contend.
+#   * TWO WORKERS per shard, and this one IS measured — in BOTH directions, so
+#     do not "restore" the 1. `playwright.config.ts` used to hardcode
+#     `workers: process.env.CI ? 1 : 2`; that `1` was never measured (e2e had
+#     never run in CI when #47 wrote it, so it was the old unconditional default
+#     left on a branch nobody had taken), so it is now `CELLAR_E2E_WORKERS`,
+#     set here. Both settings were then run: 6 shards x 2 workers was 6m26s with
+#     nine failures; 10 shards x 1 worker was 6m58s with six — fewer failures but
+#     SLOWER, because the heavy shards serialise and the makespan follows them.
+#     The failures turned out not to be contention at all: three of the four
+#     timing-sensitive real-kernel ones died at ~28-33s, i.e. AT the 30s `expect`
+#     budget rather than at anything the code did, and those budgets were chosen
+#     on a 15-core M5 Pro while this runner measures 2.3-3x slower. Scaling them
+#     (the env below) removes the contention argument for one worker, and 2
+#     halves the heavy shards, which is what the wall clock follows. So the
+#     parallelism lives in BOTH places: 10 shards x 2 workers, ~5 min.
 #
 #   * fail-fast: false — one red shard must not cancel the others, or a single
 #     failure hides the state of the rest of the suite and makes the flake rate
@@ -168,7 +171,7 @@ jobs:
       # MEASURED: after a run whose shards failed, neither cache existed, so
       # every shard paid the cold ~20s Chromium install again.
       #
-      # All six shards race to save the same key; the five losers tar the
+      # All ten shards race to save the same key; the nine losers tar the
       # directory, fail to reserve it, log a benign "another job may be creating
       # this cache" and carry on. Restricting the save to shard 1 would spare
       # that (~10s each, on a COLD run only - i.e. the first run and a
