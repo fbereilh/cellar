@@ -38,6 +38,8 @@
 	import { kernelCardName } from '$lib/kernelBadge';
 	import { hazardReport, humanExportHazards } from '$lib/exportHazard';
 	import { reasonWithoutServerPath } from '$lib/serverMessage';
+	import { notebookHasPythonNamespace, type NotebookLanguage } from '$lib/cellLanguage';
+	import { notebookUsesImportsCell } from '$lib/importsRole';
 	import type { KernelInfo, KernelListEntry, KernelCard } from '$lib/kernelBadge';
 	import { isBlameUnavailable, activeBlameFor, type BlameReport } from '$lib/blame';
 	import { reorderTabs as reorderTabList } from '$lib/tabReorder';
@@ -164,6 +166,14 @@
 	let notebooksHideAll = $state<Record<string, boolean>>({});
 	function handleHideAllCodeChange(path: string, hidden: boolean) {
 		notebooksHideAll[path] = hidden;
+	}
+	// path → that notebook's LANGUAGE, published up from each LiveNotebook. The
+	// shell owns two of the Python-only affordances (the sidebar's variable
+	// inspector and the palette's Consolidate imports), so it needs the same fact
+	// the notebook decides its own from. Assign into the key, like above.
+	let notebooksLanguage = $state<Record<string, NotebookLanguage>>({});
+	function handleLanguageChange(path: string, language: NotebookLanguage) {
+		notebooksLanguage[path] = language;
 	}
 	// Imperative, not reactive: path → the notebook's numbering setter. The Outline's
 	// per-level checkboxes drive numbering through this, same shape as `foldTogglers`.
@@ -477,6 +487,35 @@
 	const activeFolds = $derived((activeNotebookPath && notebooksFolds[activeNotebookPath]) || null);
 	const activeNumbering = $derived((activeNotebookPath && notebooksNumbering[activeNotebookPath]) || null);
 	const activeHideAllCode = $derived(!!(activeNotebookPath && notebooksHideAll[activeNotebookPath]));
+	// The active notebook's LANGUAGE, and the two shell-owned affordances it decides.
+	// FAILS OPEN to `python`: with no notebook active, or before its LiveNotebook has
+	// reported, nothing is hidden - a Python notebook must be byte-for-byte
+	// unaffected, so an unknown language may only ever answer the way it always did.
+	//
+	// `activeTabIsNotebook` is part of the gate, not belt-and-braces. These two
+	// affordances answer about the SERVER's active notebook (the inspector probes
+	// its kernel), and that moves only when a LiveNotebook becomes `active` - so
+	// while a plain FILE tab holds focus it stays on the LAST-FOCUSED notebook while
+	// `activeNotebookPath` has already fallen back to the CANONICAL one. Trusting it
+	// there reads a language belonging to a notebook that is not the subject: a Mojo
+	// canonical notebook would hide the inspector over a live PYTHON namespace, i.e.
+	// fail CLOSED - the one direction this gate may never take. The sibling
+	// `foreignRunTouchesActiveNotebook` below makes the same call for the same
+	// reason; the two are one rule, not two coincidences.
+	const activeNotebookLanguage = $derived<NotebookLanguage>(
+		(activeTabIsNotebook && activeNotebookPath && notebooksLanguage[activeNotebookPath]) || 'python'
+	);
+	// The sidebar's variable inspector reports on the kernel's Python `user_ns`,
+	// which a Mojo notebook cannot contribute to at all (every cell is a whole
+	// program in a `mojo run` subprocess whose namespace dies with it), so the
+	// section is HIDDEN rather than left showing an empty table about something
+	// else. It holds no state of its own - it is a live view - so there is nothing
+	// to strand, which is what makes hiding the right side of the captain's
+	// hide-vs-grey test here.
+	const showVariablesSection = $derived(notebookHasPythonNamespace(activeNotebookLanguage));
+	// The palette twin of the notebook toolbar's Consolidate imports button; same
+	// shared rule, so the two surfaces of one action cannot disagree.
+	const offersConsolidateImports = $derived(notebookUsesImportsCell(activeNotebookLanguage));
 	const activeRunState = $derived((activeNotebookPath && notebooksRunState[activeNotebookPath]) || null);
 
 	// Per-tab run indicator for the tab strip: 'running' (a cell is executing in that
@@ -1378,6 +1417,14 @@
 	let varsReqSeq = 0;
 
 	async function refreshVariables() {
+		// A Mojo notebook has no Python namespace to report on, and its section is not
+		// rendered, so the probe would be a real kernel `execute` (serialized on that
+		// kernel's exec lock, between the user's own cells) for a panel nobody can
+		// see. Gated on the SAME rule that hides it, so the two can never disagree -
+		// and the gate is here rather than at each caller, because every trigger (the
+		// mount restore, a run ending, a foreign run, a Databricks session change)
+		// would otherwise have to remember it.
+		if (!showVariablesSection) return;
 		const seq = ++varsReqSeq;
 		varsLoading = true;
 		varsError = '';
@@ -1397,6 +1444,22 @@
 			if (seq === varsReqSeq) varsLoading = false;
 		}
 	}
+
+	/**
+	 * Probe once when the gate OPENS - a switch back to Python, or tabbing from a
+	 * Mojo notebook to a Python one. Nothing else would: every other trigger is a
+	 * run or kernel event that may never come, so the section would return empty
+	 * and stay empty until the user ran a cell or pressed Refresh. `varsGateOpen`
+	 * starts TRUE so the mount-time probe in `onMount` is never doubled, and it is a
+	 * plain `let` rather than `$state` precisely so this effect depends on the gate
+	 * alone.
+	 */
+	let varsGateOpen = true;
+	$effect(() => {
+		const open = showVariablesSection;
+		if (open && !varsGateOpen) refreshVariables();
+		varsGateOpen = open;
+	});
 
 	/**
 	 * The active notebook's namespace is gone (a restart / shutdown wiped it), so
@@ -1648,6 +1711,7 @@
 	const paletteCommands = $derived(
 		buildCommands({
 			notebook: notebookCommandHandle,
+			offersConsolidateImports,
 			app: {
 				toggleTheme,
 				toggleSidebar: () => (sidebarOpen = !sidebarOpen),
@@ -1839,6 +1903,7 @@
 					{activeNotebookPath}
 					{fsRefreshSignal}
 					nbdev={data.nbdev}
+					{showVariablesSection}
 					onRefreshVars={refreshVariables}
 					onRefreshKernel={refreshKernel}
 					onInterruptKernel={interruptKernel}
@@ -1903,6 +1968,7 @@
 						onFoldsChange={handleFoldsChange}
 						onNumberingChange={handleNumberingChange}
 						onHideAllCodeChange={handleHideAllCodeChange}
+						onLanguageChange={handleLanguageChange}
 						onRunStateChange={handleRunStateChange}
 						onSelectionChange={handleSelectionChange}
 						onNotice={showNotice}
@@ -1939,6 +2005,7 @@
 						onFoldsChange={handleFoldsChange}
 						onNumberingChange={handleNumberingChange}
 						onHideAllCodeChange={handleHideAllCodeChange}
+						onLanguageChange={handleLanguageChange}
 						onRunStateChange={handleRunStateChange}
 						onSelectionChange={handleSelectionChange}
 						onNotice={showNotice}

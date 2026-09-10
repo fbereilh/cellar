@@ -8,6 +8,7 @@
 		NOTEBOOK_LANGUAGE_LABELS,
 		type NotebookLanguage
 	} from '$lib/cellLanguage';
+	import { notebookUsesImportsCell } from '$lib/importsRole';
 	import type { CellActivation, KeyMode, CellRegisterApi, SegHidden, UICell } from '$lib/types';
 	import type { StalenessEntry } from '$lib/staleness';
 	import type { CellChangeStatus } from '$lib/gitdiff';
@@ -709,6 +710,11 @@
 		const next = (e.currentTarget as HTMLSelectElement).value;
 		if (isNotebookLanguage(next)) onSetLanguage(next);
 	}
+	// Whether the toolbar offers Consolidate imports at all - see the button's own
+	// comment. Derived from `notebookLanguage`, which is mirrored over SSE and
+	// updated by this tab's own commit, so a language switch takes the button away
+	// (and brings it back) with no reload.
+	const offersConsolidateImports = $derived(notebookUsesImportsCell(notebookLanguage));
 	// The base select is DRIVEN by `exportBase`, never by the click (the
 	// `selectedRoot` idiom below): with a stored target a base change is applied
 	// non-optimistically - the server RE-EXPRESSES the same file under the new
@@ -1246,32 +1252,45 @@
 				</svg>
 				Clear all outputs
 			</button>
-			<!-- Disabled only while a sweep is in flight, so it cannot be fired twice.
-			     There is no "nothing to consolidate" gate here and there was none on the
-			     menu item this replaces: the sweep is idempotent (a notebook with nothing
-			     to move rewrites nothing), so predicting emptiness would be a new claim,
-			     not the same button in a new place. -->
-			<button
-				class="btn btn-ghost btn-sm gap-1.5"
-				onclick={() => onConsolidateImports?.()}
-				disabled={consolidating}
-				title="Move every top-level import into one pinned cell at the top of the notebook, and run it"
-				aria-label="Consolidate imports"
-				data-testid="consolidate-imports"
-			>
-				{#if consolidating}
-					<span class="loading loading-spinner loading-xs"></span>
-				{:else}
-					<!-- Arrow UP into a line at the TOP: imports are gathered into the pinned
-					     cell at the top of the notebook. The menu item this replaces used the
-					     mirrored glyph (down onto a bottom line), which in this bar is the same
-					     picture as the "Export to" download arrow sitting directly below it —
-					     two adjacent affordances reading as one action. This way is both
-					     distinct and the right direction. -->
-					<svg class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 3h14" /><path d="M12 21V9" /><path d="m7 14 5-5 5 5" /></svg>
-				{/if}
-				Consolidate imports
-			</button>
+			<!-- HIDDEN outright on a Mojo notebook, not disabled: the sweep lifts
+			     top-level PYTHON imports into the Python-kernel imports cell, and a Mojo
+			     notebook has neither - `planConsolidate` asks the same
+			     `isPythonCodeCell` and comes back empty, so the button could only ever
+			     be a control that does nothing. That is the captain's hide-vs-grey test:
+			     grey only where STATE the user still has to reach would otherwise be
+			     stranded, and this action carries none (it creates and fills, it never
+			     clears - a kept imports MARK is retired from the cell's own ⋮ menu,
+			     which is greyed rather than hidden for exactly that reason).
+			     The rule is the shared `notebookUsesImportsCell`, the same one that menu
+			     item asks, so the two cannot drift.
+			     When shown, it is disabled only while a sweep is in flight, so it cannot
+			     be fired twice. There is no "nothing to consolidate" gate and there was
+			     none on the menu item this replaces: the sweep is idempotent (a notebook
+			     with nothing to move rewrites nothing), so predicting emptiness would be
+			     a new claim, not the same button in a new place. -->
+			{#if offersConsolidateImports}
+				<button
+					class="btn btn-ghost btn-sm gap-1.5"
+					onclick={() => onConsolidateImports?.()}
+					disabled={consolidating}
+					title="Move every top-level import into one pinned cell at the top of the notebook, and run it"
+					aria-label="Consolidate imports"
+					data-testid="consolidate-imports"
+				>
+					{#if consolidating}
+						<span class="loading loading-spinner loading-xs"></span>
+					{:else}
+						<!-- Arrow UP into a line at the TOP: imports are gathered into the pinned
+						     cell at the top of the notebook. The menu item this replaces used the
+						     mirrored glyph (down onto a bottom line), which in this bar is the same
+						     picture as the "Export to" download arrow sitting directly below it —
+						     two adjacent affordances reading as one action. This way is both
+						     distinct and the right direction. -->
+						<svg class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 3h14" /><path d="M12 21V9" /><path d="m7 14 5-5 5 5" /></svg>
+					{/if}
+					Consolidate imports
+				</button>
+			{/if}
 		</div>
 		{#if showLanguageBar}
 			<!-- The notebook's LANGUAGE: what every plain code cell in it is written in.

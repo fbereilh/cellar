@@ -105,6 +105,15 @@
 		onNumberingChange?: (path: string, numbers: Record<string, string>, levels: number[]) => void;
 		/** (path, hidden): the notebook-wide "hide all code" state, for the navbar toggle. */
 		onHideAllCodeChange?: (path: string, hidden: boolean) => void;
+		/**
+		 * (path, language): this notebook's LANGUAGE, so the shell can hide the
+		 * Python-only affordances it owns rather than this notebook does - the
+		 * sidebar's variable inspector and the palette's Consolidate imports. The
+		 * notebook-local ones (the staleness chip, the imports-role menu item, the
+		 * toolbar's Consolidate button) are decided from `notebookLanguage` in place
+		 * and need none of this.
+		 */
+		onLanguageChange?: (path: string, language: NotebookLanguage) => void;
 		/** (path, handle|null): lets the Outline toggle this notebook's numbering levels. */
 		onRegisterNumbering?: (path: string, handle: NumberingRegistryHandle | null) => void;
 		/** (path, runningId, queued): the sidebar Outline's per-section run/queue badges. */
@@ -220,6 +229,7 @@
 		onFoldsChange,
 		onNumberingChange,
 		onHideAllCodeChange,
+		onLanguageChange,
 		onRunStateChange,
 		onSelectionChange,
 		onNotice,
@@ -277,10 +287,21 @@
 	//
 	// It is the ONE notebook-level condition every language-aware surface reads: the
 	// cell badge and type label, the export eligibility the row toggle asks about,
-	// and (in the follow-up) hiding the Python-only affordances. Nothing per-cell is
-	// written when it changes, so markdown, raw, SQL and chat cells are untouched by
-	// construction rather than by being skipped.
+	// the toolbar's Consolidate imports button, and - published up through
+	// `onLanguageChange` below - the two Python-only affordances the SHELL owns.
+	// Nothing per-cell is written when it changes, so markdown, raw, SQL and chat
+	// cells are untouched by construction rather than by being skipped.
 	let notebookLanguage = $state<NotebookLanguage>('python');
+	// Publish it up so the shell's own Python-only affordances - the sidebar's
+	// variable inspector and the palette's Consolidate imports - can be hidden for a
+	// Mojo notebook. The same reporting shape as `onHideAllCodeChange` one block up,
+	// and it fires on every path that moves the language (the mount load, the
+	// `notebook:language` SSE event, and this tab's own commit), so criterion "the
+	// switch updates what is shown without a reload" holds for those two surfaces
+	// exactly as it already does for the notebook-local ones.
+	$effect(() => {
+		onLanguageChange?.(path, notebookLanguage);
+	});
 	// Does this notebook's target name a MODULE at all (`.py`/`.mojo`, versus a
 	// hand-edited `notes.txt` or nothing configured)? Read off the server's
 	// RESOLUTION where there is one and the stored form otherwise, so a target

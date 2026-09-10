@@ -102,6 +102,22 @@
 		/** Soft cap on live kernels; past it the section warns (0 = disabled). */
 		maxKernels?: number;
 		variables?: VariableInfo[];
+		/**
+		 * Does the ACTIVE notebook have a Python namespace the inspector can report
+		 * on? False for a Mojo notebook, whose every cell runs in a `mojo run`
+		 * subprocess that contributes nothing to the kernel's `user_ns` - so the whole
+		 * Variables SECTION is not rendered, header included, rather than left showing
+		 * an empty table about a namespace the notebook cannot reach. Nothing is
+		 * stranded by hiding it: the panel is a live view of the kernel and holds no
+		 * state of its own.
+		 *
+		 * Only the RENDER is skipped - the persisted section ORDER is untouched, so the
+		 * section returns to exactly its place when the notebook switches back.
+		 *
+		 * Defaults TRUE so the shell is the only thing that can hide it, and every
+		 * other mount behaves exactly as before.
+		 */
+		showVariablesSection?: boolean;
 		varsLoading?: boolean;
 		varsError?: string;
 		onRefreshVars?: () => void;
@@ -165,6 +181,7 @@
 		openNotebooks = [],
 		maxKernels = 8,
 		variables,
+		showVariablesSection = true,
 		varsLoading,
 		varsError,
 		onRefreshVars,
@@ -324,6 +341,20 @@
 	// ---- Persisted section order (drag to reorder) --------------------------
 	const ORDER_KEY = 'cellar-sidebar-order';
 	let sectionOrder = $state([...DEFAULT_SECTION_ORDER]);
+
+	/**
+	 * Is this section rendered at all right now? Only the RENDER is skipped - the
+	 * persisted ORDER above is untouched - so a section hidden for the active
+	 * notebook comes back in exactly its place when it applies again, and a drag
+	 * can never target one that is not on screen.
+	 *
+	 * The only rule today is the variable inspector on a Mojo notebook; the
+	 * DECISION itself lives in `$lib/cellLanguage`'s `notebookHasPythonNamespace`
+	 * and reaches here as a prop, so this is wiring rather than a second copy of it.
+	 */
+	function sectionApplies(key: string): boolean {
+		return key === 'vars' ? showVariablesSection : true;
+	}
 
 	// Persisted in the per-project UI-state store (port-independent), not
 	// `localStorage` - see `$lib/uiState.js`.
@@ -1600,18 +1631,20 @@
 		     it applies, so a project that is not nbdev's pays no chrome. -->
 		<NbdevNotice initial={nbdev} {fsRefreshSignal} />
 		{#each sectionOrder as key (key)}
-			<section
-				class="relative border-b border-base-300 {dragKey === key ? 'opacity-40' : ''}"
-				ondragover={(e) => onSecDragOver(e, key)}
-				ondrop={(e) => onSecDrop(e, key)}
-				data-testid="sidebar-section"
-				data-section={key}
-			>
-				{#if dragKey != null && dropKey === key}
-					<div class="pointer-events-none absolute left-0 right-0 z-10 h-0.5 bg-primary {dropAfter ? 'bottom-0' : 'top-0'}" data-testid="section-drop-indicator"></div>
-				{/if}
-				{@render sectionBody(key)}
-			</section>
+			{#if sectionApplies(key)}
+				<section
+					class="relative border-b border-base-300 {dragKey === key ? 'opacity-40' : ''}"
+					ondragover={(e) => onSecDragOver(e, key)}
+					ondrop={(e) => onSecDrop(e, key)}
+					data-testid="sidebar-section"
+					data-section={key}
+				>
+					{#if dragKey != null && dropKey === key}
+						<div class="pointer-events-none absolute left-0 right-0 z-10 h-0.5 bg-primary {dropAfter ? 'bottom-0' : 'top-0'}" data-testid="section-drop-indicator"></div>
+					{/if}
+					{@render sectionBody(key)}
+				</section>
+			{/if}
 		{/each}
 	</div>
 </aside>
