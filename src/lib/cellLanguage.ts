@@ -641,3 +641,27 @@ export function isPythonCodeCell(cell: LanguageCell, nbLang: NotebookLanguage = 
 export function hasPythonDataflow(cell: LanguageCell, nbLang: NotebookLanguage = 'python'): boolean {
 	return isPythonCodeCell(cell, nbLang) || isSqlCell(cell);
 }
+
+/**
+ * Does a notebook of this language have a live PYTHON NAMESPACE worth inspecting?
+ *
+ * The question a NOTEBOOK-level affordance asks, where `hasPythonDataflow` asks
+ * it of one cell - and it is asked of the notebook alone, because there is no
+ * per-cell answer to give: the namespace is the KERNEL's, one per notebook.
+ *
+ * A Mojo notebook still has a Python kernel (Modular ships none of its own, so
+ * `server/mojo.ts` compiles each cell to a `%%mojo` magic that the PYTHON kernel
+ * runs) - but every one of those cells is a whole program executed in a `mojo
+ * run` SUBPROCESS whose namespace dies with it, so nothing a user wrote ever
+ * reaches the kernel's `user_ns`. The variable inspector over such a notebook
+ * therefore reports on a namespace the notebook cannot contribute to: it is not
+ * merely empty, it is answering about something else.
+ *
+ * Stated POSITIVELY and over the NOTEBOOK's language, the same shape as its two
+ * cell-level siblings, so a seventh language is out by construction rather than
+ * by remembering a `!== 'mojo'` clause at each surface. Its `python` default is
+ * what makes every existing caller answer exactly as before.
+ */
+export function notebookHasPythonNamespace(nbLang: NotebookLanguage = 'python'): boolean {
+	return nbLang === 'python';
+}
