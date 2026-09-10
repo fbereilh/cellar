@@ -1427,9 +1427,10 @@ function runOnce({
 		let buf = '';
 		const onLine = (line: string) => {
 			// A settled run owns no accumulator any more: `run.ts` has finished and
-			// persisted it, so a delta parsed after the force-settle (a grandchild
-			// holding stdout open past the kill) would publish a phantom frame for a
-			// cell whose run:end already fired and diverge the in-memory doc from disk.
+			// persisted it. A stop settles on the VERDICT rather than on the child's
+			// pipes, so stdout can still be open and still be written to afterwards,
+			// and a late delta would publish a phantom frame for a cell whose run:end
+			// already fired and diverge the in-memory doc from disk.
 			if (settled) return;
 			const trimmed = line.trim();
 			if (!trimmed) return;
