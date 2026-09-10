@@ -80,14 +80,40 @@ export function abortChatRunsUnder(deletedAbs: string, sep: string): number {
  * group a TERMINAL signals - which is a real loss on the hang-up path, and why
  * SIGHUP is handled below rather than left to node's default.
  *
- * It is NOT a loss against Cellar's own teardown, and the earlier claim that it
- * was is corrected here: nothing of Cellar's ever group-killed. A take-over reap
- * and `cellar cleanup` both go through `killPid` (`instances.js`), which signals
- * POSITIVE pids one at a time, and the launcher's own cascade `kill`s its DIRECT
- * children - so a chat descendant already survived an ordinary Ctrl-C before any
- * of this (REPRODUCED: a plain SIGTERM to the launcher left it alive). The one
- * external group-kill in the tree is `tests/e2e/harness.ts`. So this listener is
- * not restoring an accident, it closes a pre-existing leak.
+ * It is NOT a loss against Cellar's own teardown: nothing of Cellar's ever
+ * group-killed. A take-over reap and `cellar cleanup` both go through `killPid`
+ * (`instances.js`), which signals POSITIVE pids one at a time, and the
+ * launcher's own cascade `kill`s its DIRECT children - so a chat descendant
+ * already survived an ordinary Ctrl-C before any of this (REPRODUCED: a plain
+ * SIGTERM to the launcher left it alive). The one external group-kill in the
+ * tree is `tests/e2e/harness.ts`. So this listener is not restoring an accident,
+ * it closes a pre-existing leak.
+ *
+ * STATED RESIDUAL - the coverage is HANDLER-based, so an app that LEAVES WITHOUT
+ * RUNNING ONE orphans the tree. Every route in is a handler: the two signals
+ * below, `CHAT_HANGUP_SIGNAL`, and `parent-watch`'s explicit call. An uncaught
+ * exception, an OOM kill or a SIGKILL runs none of them - and SIGKILL is
+ * reachable, since `killPid` escalates to it after a 4s grace - so the tree is
+ * left in a session of its OWN, where a later terminal close cannot reach it
+ * either. Before `detached` that tree sat in the terminal's group and a terminal
+ * close swept it up, so this is a genuine NARROWING and not the old leak
+ * restated.
+ *
+ * Two MEASURED mitigations bound it, so do not overstate it either: `killPid`
+ * sends SIGTERM FIRST and that listener aborts SYNCHRONOUSLY, so the SIGKILL
+ * half only bites an app already wedged for 4s; and an orphaned REAL `claude`
+ * finishes its turn and exits rather than running forever - the endless `sleep`
+ * is a property of the test STUB, not of what a user's machine leaves behind.
+ *
+ * It is CLOSED by the filed follow-up `cellar-chat-pgid-registry-orphan-reap`:
+ * an out-of-process pgid registry mirroring `instances.js`, reaped on the next
+ * launch or `cellar cleanup`, with pid-reuse verification (`verifyPidIdentity`).
+ *
+ * DO NOT reach for an `uncaughtException` listener instead. It SUPPRESSES node's
+ * default crash-exit exactly as a SIGHUP listener suppresses the default
+ * terminate - the trap this file already closed once - so it trades a
+ * possibly-orphaned chat tree for a possibly-IMMORTAL APPLICATION, a bigger hole
+ * than the one it closes, and it still cannot see SIGKILL at all.
  */
 export function abortAllChatRuns(): number {
 	let aborted = 0;

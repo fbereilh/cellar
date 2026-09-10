@@ -1070,6 +1070,14 @@ export function chatCliCwd(policy: ChatToolPolicy): string {
  * what the child itself spawned. On Windows `detached` means a new CONSOLE
  * instead, and negative pids are not a thing, so that platform keeps the
  * single-process kill it always had.
+ *
+ * The COST of that session is stated at `abortAllChatRuns` (`chat/active.ts`):
+ * it takes the tree out of the TERMINAL's group permanently, and every route
+ * replacing that reach is HANDLER-based, so an app that dies without running one
+ * (a crash, a SIGKILL) orphans the tree where a later terminal close cannot
+ * reach it either. Read that residual - and the follow-up that closes it - before
+ * either "simplifying" this flag away or reaching for an `uncaughtException`
+ * listener, which is a worse trade than the leak it looks like it fixes.
  */
 const OWNS_PROCESS_GROUP = process.platform !== 'win32';
 

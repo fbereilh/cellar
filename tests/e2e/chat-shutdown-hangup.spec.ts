@@ -1,10 +1,10 @@
-import { test, expect, type Page } from '@playwright/test';
-import { execFileSync } from 'node:child_process';
-import { type ChildProcess } from 'node:child_process';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { test, expect } from '@playwright/test';
+import { execFileSync, type ChildProcess } from 'node:child_process';
+import { existsSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { runtimeAvailable, bootCellar, killCellar } from './harness';
+import { alive, grandchildPid, installStubClaude, openChatNotebook, reapPids } from './chat-run-fixture';
 
 /**
  * CLOSING THE TERMINAL must not leave a `claude` process tree behind, and must
@@ -35,28 +35,20 @@ import { runtimeAvailable, bootCellar, killCellar } from './harness';
  *
  * Both are asked of the OS by pid, because the subject is what a signal reaches.
  *
+ * The run-with-a-real-descendant fixture is shared with `chat-stop.spec.ts` (see
+ * `./chat-run-fixture`); what stays here is what is genuinely this spec's - the
+ * app-pid lookup and the two bounds below.
+ *
  * This instance is KILLED BY THE TEST, so it gets a launcher of its own rather
  * than sharing `chat-stop.spec.ts`'s.
  */
 
-const CHAT_ID = 'chatcell0';
 const NB = 'chat-hangup.ipynb';
 
 let launcher: ChildProcess | null = null;
 let workspace = '';
 let baseURL = '';
 const started: number[] = [];
-
-const cellBy = (page: Page, id: string) => page.locator(`[data-testid="cell"][data-cell-id="${id}"]`);
-
-const alive = (pid: number): boolean => {
-	try {
-		process.kill(pid, 0);
-		return true;
-	} catch {
-		return false;
-	}
-};
 
 /**
  * The app server's pid: the launcher's own child running the production build.
@@ -76,73 +68,6 @@ function appPidOf(launcherPid: number): number {
 	throw new Error('the app server is not a child of the launcher - the fixture is broken, not the code');
 }
 
-/** A stub `claude` whose run leaves a long-lived GRANDCHILD, as a tool call does. */
-function installStubClaude(ws: string, pidfile: string): void {
-	const shim = join(ws, '.shim');
-	mkdirSync(shim, { recursive: true });
-	const init = JSON.stringify({
-		type: 'system',
-		subtype: 'init',
-		tools: [],
-		mcp_servers: [],
-		slash_commands: [],
-		skills: [],
-		claude_code_version: '9.9.9-stub'
-	});
-	const bin = join(shim, 'claude');
-	writeFileSync(
-		bin,
-		[
-			'#!/bin/sh',
-			'if [ "$1" = "auth" ]; then',
-			`  echo '{"loggedIn":true,"authMethod":"claude.ai","email":"stub@example.com"}'`,
-			'  exit 0',
-			'fi',
-			'cat > /dev/null',
-			`echo '${init}'`,
-			`echo '{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"thinking about it"}}}'`,
-			`sh -c 'echo $$ > ${pidfile}; exec sleep 900' &`,
-			'wait',
-			''
-		].join('\n')
-	);
-	chmodSync(bin, 0o755);
-}
-
-function seedNotebook(name: string, ws: string): void {
-	writeFileSync(
-		join(ws, name),
-		JSON.stringify(
-			{
-				cells: [
-					{
-						cell_type: 'code',
-						id: CHAT_ID,
-						metadata: { cellar: { language: 'chat' } },
-						source: ['what is 2+2?'],
-						outputs: [],
-						execution_count: null
-					}
-				],
-				metadata: {},
-				nbformat: 4,
-				nbformat_minor: 5
-			},
-			null,
-			1
-		)
-	);
-}
-
-async function grandchildPid(pidfile: string): Promise<number> {
-	await expect
-		.poll(() => (existsSync(pidfile) ? Number(readFileSync(pidfile, 'utf8').trim()) : 0), { timeout: 60_000 })
-		.toBeGreaterThan(0);
-	const pid = Number(readFileSync(pidfile, 'utf8').trim());
-	started.push(pid);
-	return pid;
-}
-
 test.beforeAll(async () => {
 	test.skip(!runtimeAvailable(), 'kernel runtime (uv + python3 + host-venv) not available - E2E is local-only');
 	workspace = mkdtempSync(join(tmpdir(), 'cellar-chat-hangup-e2e-'));
@@ -157,13 +82,7 @@ test.afterAll(() => {
 	// case that failed before it got there.
 	if (launcher) killCellar(launcher);
 	launcher = null;
-	for (const pid of started) {
-		try {
-			process.kill(pid, 'SIGKILL');
-		} catch {
-			/* already gone */
-		}
-	}
+	reapPids(started);
 	if (workspace && existsSync(workspace)) {
 		try {
 			rmSync(workspace, { recursive: true, force: true });
@@ -182,16 +101,12 @@ test('closing the terminal stops Cellar AND takes the chat tree with it', async 
 
 	const pidfile = join(workspace, 'grandchild.pid');
 	rmSync(pidfile, { force: true });
-	seedNotebook(NB, workspace);
-	await page.goto(`${baseURL}/?ws=${encodeURIComponent(workspace)}`);
-	await page.locator(`[data-testid="tree-file"][data-path="${NB}"]`).click();
-	const chat = cellBy(page, CHAT_ID);
-	await expect(chat).toBeVisible({ timeout: 30_000 });
+	const chat = await openChatNotebook(page, { baseURL, workspace, name: NB });
 
 	await chat.getByTestId('run').click();
 	await expect(chat.getByTestId('running-indicator')).toBeVisible({ timeout: 60_000 });
 
-	const gc = await grandchildPid(pidfile);
+	const gc = await grandchildPid(pidfile, started);
 	expect(alive(gc)).toBe(true);
 
 	// A hard terminal close, faithfully: the shell SIGHUPs its job's process
