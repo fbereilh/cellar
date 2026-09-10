@@ -12,6 +12,7 @@
  * 4. Bridge the external-file watcher (fileWatch.ts) onto the event bus, so an
  *    open file tab reflects an edit made to its file on disk from outside Cellar.
  */
+import { stopChatRunsOnShutdown } from '$lib/server/chat/active';
 import { installConsoleCapture } from '$lib/server/logs';
 import { startMcpServer } from '$lib/server/mcp/server';
 import { startParentWatch } from '$lib/server/parent-watch';
@@ -37,6 +38,13 @@ for (const sig of ['SIGTERM', 'SIGINT']) {
 		console.log(`[cellar] app server received ${sig} - shutting down (kernel will stop)`);
 	});
 }
+
+// 5. Stop every live chat run when this process is asked to stop. A chat child
+//    runs in its own process group so a stop can reach what the CLI itself
+//    started, which is also what takes it out of the group an external teardown
+//    signals - so leaving with one still running would leave a `claude` process
+//    tree behind a Cellar that is gone. Additive, like the listeners above.
+stopChatRunsOnShutdown();
 
 startMcpServer();
 startParentWatch();

@@ -71,6 +71,58 @@ export function abortChatRunsUnder(deletedAbs: string, sep: string): number {
 	return aborted;
 }
 
+/**
+ * Abort every live chat run, in every notebook - what THIS PROCESS STOPPING
+ * needs, since a chat child outlives the app unless something reaches it.
+ *
+ * A chat child is spawned into its own process group (see `signalRunTree`) so a
+ * stop can reach what the CLI itself started. That is also what takes it OUT of
+ * the group Cellar's own teardown signals: before it, an external group-kill of
+ * the launcher (a take-over reap, `cellar cleanup`, the e2e harness) swept chat
+ * children up by accident. This is that coverage made deliberate, and it is
+ * strictly wider - the launcher's ordinary shutdown only SIGTERMs its direct
+ * children, so an orphaned chat descendant survived Ctrl-C too (REPRODUCED).
+ */
+export function abortAllChatRuns(): number {
+	let aborted = 0;
+	for (const nb of [...active.keys()]) aborted += abortChatRuns(nb);
+	return aborted;
+}
+
+/** The signals a stopping app process is told to stop by. */
+export const CHAT_SHUTDOWN_SIGNALS = ['SIGTERM', 'SIGINT'] as const;
+
+/**
+ * Stop every live chat run when this process is asked to stop, so no CLI child
+ * is left running behind a Cellar that is gone.
+ *
+ * Additive and never fatal, like the app's other shutdown listeners: it only
+ * aborts (which the engine turns into a signal to each run's process group) and
+ * never calls `process.exit` - adapter-node owns that. Aborting is SYNCHRONOUS
+ * all the way to `process.kill`, so the signals are out before the process can
+ * leave, with no async step to lose the race on.
+ *
+ * `signals` is injected for the same reason `releaseOnShutdown` injects its own:
+ * a test must drive this without touching the runner's signal handling. Returns
+ * an unsubscribe.
+ */
+export function stopChatRunsOnShutdown(
+	signals: Pick<NodeJS.EventEmitter, 'on' | 'off'> = process
+): () => void {
+	const stop = () => {
+		try {
+			abortAllChatRuns();
+		} catch {
+			// A shutdown listener may never throw; a run we could not abort is worse
+			// reported than escalated into an uncaught exception on the way out.
+		}
+	};
+	for (const sig of CHAT_SHUTDOWN_SIGNALS) signals.on(sig, stop);
+	return () => {
+		for (const sig of CHAT_SHUTDOWN_SIGNALS) signals.off(sig, stop);
+	};
+}
+
 /** Test seam: forget everything (controllers are the tests' to settle). */
 export function __resetChatRuns(): void {
 	active.clear();
