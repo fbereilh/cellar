@@ -144,63 +144,67 @@ describe('nothing hidden here can strand state the user cannot clear', () => {
 		expect(importsRoleStranded(marked, 'python')).toBe(false);
 	});
 
-	it('the two HIDDEN affordances write no per-cell key, so there is nothing to reach', () => {
-		// Consolidate is the only one of the two that writes anything at all, and
-		// what it writes is the imports ROLE - which is covered above and remains
-		// clearable from the cell menu. The variable inspector writes nothing: it is
-		// a live read of the kernel. Pinned as a SOURCE fact, because "this surface
-		// persists nothing" is not observable from its output.
+	// SOURCE GUARD - it witnesses ONE line of the shell's wiring and proves no
+	// behaviour. The reasoning it sits beside is STATED, not asserted here:
+	// consolidate is the only one of the two that writes anything at all, and what
+	// it writes is the imports ROLE - covered above, and still clearable from the
+	// cell menu - while the variable inspector is a live read of the kernel and
+	// persists nothing. What the assertion establishes is narrower than that: the
+	// shell's variables gate is written as a `$derived` READ of the rule.
+	it('SOURCE GUARD: the shell reads the rule into a $derived variables gate', () => {
 		const shell = src('routes/+page.svelte');
-		// The gate is a read of the rule, never a write of any notebook state.
 		expect(shell).toMatch(/const showVariablesSection = \$derived\(\s*notebookHasPythonNamespace\(/);
 	});
 });
 
 describe('the wiring exists and reaches the shared rules (source guards)', () => {
-	it('LiveNotebook publishes its language up, so the shell can decide', () => {
+	it('SOURCE GUARD: LiveNotebook is wired to publish its language up, so the shell can decide', () => {
 		const nb = src('lib/LiveNotebook.svelte');
 		expect(nb).toMatch(/onLanguageChange\?: \(path: string, language: NotebookLanguage\) => void;/);
-		// Reported from an EFFECT on the state itself, so every path that moves the
-		// language (the mount load, the SSE event, this tab's own commit) reports it -
-		// which is what makes the switch update the shell with no reload.
+		// Written as an EFFECT on the state itself, so that every path which moves the
+		// language (the mount load, the SSE event, this tab's own commit) reports it.
+		// That the switch then updates the shell with no reload is what the e2e proves;
+		// this only witnesses that the effect is there.
 		expect(nb).toMatch(/\$effect\(\(\) => \{\s*onLanguageChange\?\.\(path, notebookLanguage\);/);
 	});
 
-	it('the shell derives both affordances from the ACTIVE notebook language, failing OPEN', () => {
+	it('SOURCE GUARD: the shell derives both affordances from the ACTIVE notebook language, with a fail-OPEN default', () => {
 		const shell = src('routes/+page.svelte');
 		// `|| 'python'` is the fail-open: no notebook active, or one that has not
 		// reported yet, must hide nothing.
 		expect(shell).toMatch(/notebooksLanguage\[activeNotebookPath\]\) \|\| 'python'/);
 		expect(shell).toMatch(/notebookHasPythonNamespace\(activeNotebookLanguage\)/);
 		expect(shell).toMatch(/notebookUsesImportsCell\(activeNotebookLanguage\)/);
-		// Both derived values really reach their surface.
+		// Both derived values are threaded to their surface in the markup.
 		expect(shell).toMatch(/^\s*\{showVariablesSection\}$/m);
 		expect(shell).toMatch(/offersConsolidateImports,/);
-		// EVERY LiveNotebook mount reports, or one of the two tabs would never decide.
+		// Both LiveNotebook mounts are wired to report, or one of the two tabs would
+		// have nothing to decide from.
 		expect(shell.match(/onLanguageChange=\{handleLanguageChange\}/g)?.length).toBe(2);
 	});
 
-	it('the variables PROBE is gated on the same rule that hides the panel', () => {
+	it('SOURCE GUARD: the variables probe is gated on the same rule that hides the panel', () => {
 		const shell = src('routes/+page.svelte');
 		// A real kernel `execute` for a panel nobody can see - and gated inside
 		// `refreshVariables` rather than at each caller, so no trigger can forget it.
 		const fn = shell.slice(shell.indexOf('async function refreshVariables()'));
 		expect(fn.slice(0, fn.indexOf('++varsReqSeq'))).toMatch(/if \(!showVariablesSection\) return;/);
-		// ...and it probes again when the gate re-OPENS, or the panel would come back
-		// empty and stay empty until the next run.
+		// ...and a re-probe is wired for when the gate re-OPENS, or the panel would
+		// come back empty and stay empty until the next run.
 		expect(shell).toMatch(/if \(open && !varsGateOpen\) refreshVariables\(\);/);
 	});
 
-	it('the Sidebar skips the RENDER of the vars section, leaving the persisted order alone', () => {
+	it('SOURCE GUARD: the Sidebar skips the RENDER of the vars section and filters no order', () => {
 		const sb = src('lib/Sidebar.svelte');
 		expect(sb).toMatch(/function sectionApplies\(key: string\): boolean \{\s*return key === 'vars' \? showVariablesSection : true;/);
 		expect(sb).toMatch(/\{#if sectionApplies\(key\)\}/);
-		// The order itself is never filtered - only the render is skipped - so the
-		// section returns to exactly its place, and a persisted order is not rewritten.
+		// No filter over the order is written - only the render is skipped - which is
+		// what leaves the section's place in a persisted order alone. That it really
+		// returns to its slot is asserted in the e2e.
 		expect(sb).not.toMatch(/sectionOrder\s*=\s*sectionOrder\.filter\(\(k\) => sectionApplies/);
 	});
 
-	it("the toolbar's Consolidate button is gated, and by the shared rule", () => {
+	it("SOURCE GUARD: the toolbar's Consolidate button sits inside a gate on the shared rule", () => {
 		const nb = src('lib/Notebook.svelte');
 		expect(nb).toMatch(
 			/import \{ notebookUsesImportsCell \} from '\$lib\/importsRole';/
@@ -222,7 +226,7 @@ describe('the wiring exists and reaches the shared rules (source guards)', () =>
 		expect(inside).toContain('data-testid="consolidate-imports"');
 	});
 
-	it('no surface re-derives the rules with its own mojo check', () => {
+	it('SOURCE GUARD: neither surface names a mojo check of its own', () => {
 		// The whole point of stating them positively: a `!== "mojo"` or
 		// `isMojoCell(...)` clause at a call site is how the NEXT language gets
 		// forgotten at exactly one of these four surfaces.
