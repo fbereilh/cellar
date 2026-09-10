@@ -44,6 +44,9 @@ import {
 	registerChatRun,
 	stopChatRunsOnShutdown,
 	unregisterChatRun,
+	CHAT_HANGUP_SIGNAL,
+	HANGUP_EXIT_CODE,
+	type HangupExit,
 	__resetChatRuns
 } from '../../src/lib/server/chat/active';
 
@@ -296,6 +299,101 @@ describe('a stopping app process', () => {
 		expect(third.signal.aborted).toBe(false);
 		unregisterChatRun('/ws/a.ipynb', third);
 	});
+
+	/**
+	 * A stand-in for the REAL process on the hang-up path, so the abort half can
+	 * be driven without killing the runner. `raise` RETURNS here, which the real
+	 * one never does - which is exactly what the `exit` backstop is for.
+	 */
+	function recordingExit(remaining: number): HangupExit & { raised: string[]; exited: number[] } {
+		const raised: string[] = [];
+		const exited: number[] = [];
+		return {
+			raised,
+			exited,
+			listenerCount: () => remaining,
+			raise: (sig) => {
+				raised.push(sig);
+			},
+			exit: (code) => {
+				exited.push(code);
+			}
+		};
+	}
+
+	it('aborts on a hang-up and then re-raises it, so the process still dies', () => {
+		const signals = new EventEmitter();
+		const host = recordingExit(0);
+		const off = stopChatRunsOnShutdown(signals, host);
+
+		const ctrl = new AbortController();
+		registerChatRun('/ws/a.ipynb', ctrl);
+		signals.emit(CHAT_HANGUP_SIGNAL);
+
+		expect(ctrl.signal.aborted).toBe(true);
+		// Our own listener is gone, so the default disposition is back - which is
+		// what makes re-raising terminate rather than re-enter us.
+		expect(signals.listenerCount(CHAT_HANGUP_SIGNAL)).toBe(0);
+		expect(host.raised).toEqual([CHAT_HANGUP_SIGNAL]);
+		// The real `raise` never returns; this one does, so the backstop shows.
+		expect(host.exited).toEqual([HANGUP_EXIT_CODE]);
+
+		off();
+		unregisterChatRun('/ws/a.ipynb', ctrl);
+	});
+
+	it('exits explicitly rather than spinning when the default is still suppressed', () => {
+		const signals = new EventEmitter();
+		// A listener some OTHER module registered: node still suppresses the default,
+		// so a re-raise would be delivered right back to it (measured to spin).
+		const host = recordingExit(1);
+		const off = stopChatRunsOnShutdown(signals, host);
+
+		const ctrl = new AbortController();
+		registerChatRun('/ws/a.ipynb', ctrl);
+		signals.emit(CHAT_HANGUP_SIGNAL);
+
+		expect(ctrl.signal.aborted).toBe(true);
+		expect(host.raised).toEqual([]);
+		expect(host.exited).toEqual([HANGUP_EXIT_CODE]);
+
+		off();
+		unregisterChatRun('/ws/a.ipynb', ctrl);
+	});
+
+	it('stops answering a hang-up once removed', () => {
+		const signals = new EventEmitter();
+		const host = recordingExit(0);
+		const off = stopChatRunsOnShutdown(signals, host);
+		off();
+
+		const ctrl = new AbortController();
+		registerChatRun('/ws/a.ipynb', ctrl);
+		signals.emit(CHAT_HANGUP_SIGNAL);
+
+		expect(ctrl.signal.aborted).toBe(false);
+		expect(host.exited).toEqual([]);
+		unregisterChatRun('/ws/a.ipynb', ctrl);
+	});
+
+	it('kills the whole tree of a run that was still going when the terminal closed', async () => {
+		const ctrl = new AbortController();
+		const run = startRun(ctrl.signal);
+		const gc = await nextGrandchildPid();
+		try {
+			registerChatRun('/ws/live.ipynb', ctrl);
+			const signals = new EventEmitter();
+			const off = stopChatRunsOnShutdown(signals, recordingExit(0));
+			signals.emit(CHAT_HANGUP_SIGNAL);
+			off();
+
+			await run;
+			expect(await goneWithin(gc, 8_000)).toBe(true);
+		} finally {
+			reap(gc);
+			unregisterChatRun('/ws/live.ipynb', ctrl);
+		}
+	}, 20_000);
 
 	it('kills the whole tree of a run that was still going when the process stopped', async () => {
 		const ctrl = new AbortController();

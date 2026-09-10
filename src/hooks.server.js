@@ -43,9 +43,13 @@ for (const sig of ['SIGTERM', 'SIGINT']) {
 
 // 5. Stop every live chat run when this process is asked to stop. A chat child
 //    runs in its own process group so a stop can reach what the CLI itself
-//    started, which is also what takes it out of the group an external teardown
-//    signals - so leaving with one still running would leave a `claude` process
-//    tree behind a Cellar that is gone. Additive, like the listeners above.
+//    started, which is also what takes it out of the group the TERMINAL signals
+//    - so leaving with one still running would leave a `claude` process tree
+//    behind a Cellar that is gone. Additive on SIGTERM/SIGINT, like the
+//    listeners above; SIGHUP is the one signal nothing else here answers, so
+//    that path owns its own exit (see `CHAT_HANGUP_SIGNAL`) - which is also why
+//    SIGHUP is deliberately absent from the logging loop above, whose listener
+//    would suppress the default disposition it re-raises into.
 stopChatRunsOnShutdown();
 
 startMcpServer();
