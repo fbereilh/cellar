@@ -171,8 +171,14 @@ describe('the wiring exists and reaches the shared rules (source guards)', () =>
 	it('SOURCE GUARD: the shell derives both affordances from the ACTIVE notebook language, with a fail-OPEN default', () => {
 		const shell = src('routes/+page.svelte');
 		// `|| 'python'` is the fail-open: no notebook active, or one that has not
-		// reported yet, must hide nothing.
-		expect(shell).toMatch(/notebooksLanguage\[activeNotebookPath\]\) \|\| 'python'/);
+		// reported yet, must hide nothing. The `activeTabIsNotebook` term is pinned
+		// with it because it is load-bearing rather than belt-and-braces: while a plain
+		// FILE tab holds focus `activeNotebookPath` has already fallen back to the
+		// CANONICAL notebook, which is not the notebook these affordances answer about,
+		// so dropping the term makes the gate fail CLOSED over a live Python namespace.
+		expect(shell).toMatch(
+			/activeTabIsNotebook && activeNotebookPath && notebooksLanguage\[activeNotebookPath\]\) \|\| 'python'/
+		);
 		expect(shell).toMatch(/notebookHasPythonNamespace\(activeNotebookLanguage\)/);
 		expect(shell).toMatch(/notebookUsesImportsCell\(activeNotebookLanguage\)/);
 		// Both derived values are threaded to their surface in the markup.

@@ -3,7 +3,7 @@ import { type ChildProcess } from 'node:child_process';
 import { mkdtempSync, existsSync, rmSync, writeFileSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { runtimeAvailable, bootCellar, killCellar } from './harness';
+import { runtimeAvailable, bootCellar, killCellar, openSidebarSection } from './harness';
 
 /**
  * The Python-only AFFORDANCES a Mojo notebook does not offer, in the REAL browser.
@@ -132,13 +132,6 @@ async function paletteTitles(page: Page): Promise<string[]> {
 	return titles.map((t) => t.trim());
 }
 
-/** Make sure the Variables section is EXPANDED, so "visible" is about the gate. */
-async function openVarsSection(page: Page): Promise<void> {
-	if (await page.getByTestId('vars-body').isVisible().catch(() => false)) return;
-	await page.getByTestId('section-vars').click();
-	await expect(page.getByTestId('vars-body')).toBeVisible({ timeout: 15_000 });
-}
-
 test.beforeAll(async () => {
 	test.skip(!runtimeAvailable(), 'kernel runtime (uv + python3 + host-venv) not available - E2E is local-only');
 	workspace = mkdtempSync(join(tmpdir(), 'cellar-mojo-affordances-'));
@@ -165,7 +158,7 @@ test('a Mojo notebook drops both shell-owned affordances, and a switch restores 
 	test.setTimeout(180_000);
 	const errors = watchErrors(page);
 	await openFresh(page, 'aff-switch.ipynb');
-	await openVarsSection(page);
+	await openSidebarSection(page, 'vars', 'vars-body');
 
 	// (1) THE CASE THAT MATTERS MOST: a Python notebook is exactly as it was.
 	await expect(varsSection(page)).toBeVisible();
@@ -214,7 +207,7 @@ test('the ACTIVE notebook decides: tabbing between a Mojo and a Python notebook 
 	// BOTH seeded before the page loads, so the tree lists them without a refresh.
 	seed('aff-python.ipynb');
 	await openFresh(page, 'aff-mojo.ipynb');
-	await openVarsSection(page);
+	await openSidebarSection(page, 'vars', 'vars-body');
 	await chooseLanguage(page, 'mojo');
 	await expect(varsSection(page)).toHaveCount(0, { timeout: 15_000 });
 
@@ -231,6 +224,41 @@ test('the ACTIVE notebook decides: tabbing between a Mojo and a Python notebook 
 	await expect(languageSelect(page)).toHaveValue('mojo', { timeout: 15_000 });
 	await expect(varsSection(page)).toHaveCount(0, { timeout: 15_000 });
 	expect(await paletteTitles(page)).not.toContain('Consolidate imports');
+
+	expect(errors.filter((e) => !/Failed to load resource/.test(e))).toEqual([]);
+});
+
+test('a plain FILE tab keeps both: the gate only trusts a language while a NOTEBOOK tab is active', async ({
+	page
+}) => {
+	test.setTimeout(180_000);
+	const errors = watchErrors(page);
+	// The shell's `activeNotebookPath` falls back to the CANONICAL notebook whenever a
+	// plain file tab holds focus, but these two affordances answer about the SERVER's
+	// active notebook - which stays on the last-focused one. So a MOJO canonical
+	// notebook must not take the inspector away from a live PYTHON namespace: that is
+	// the fail-CLOSED direction, and it costs a Python user an affordance with nothing
+	// failing, which is precisely why it needs a browser to catch.
+	writeFileSync(join(workspace, 'aff-notes.md'), '# notes\n');
+	seed('aff-live.ipynb');
+	await openFresh(page, 'notebook.ipynb');
+	await openSidebarSection(page, 'vars', 'vars-body');
+	await chooseLanguage(page, 'mojo');
+	await expect(varsSection(page)).toHaveCount(0, { timeout: 15_000 });
+
+	// A PYTHON notebook is now the active one, so both come back...
+	await openFile(page, 'aff-live.ipynb');
+	await expect(languageSelect(page)).toHaveValue('python', { timeout: 30_000 });
+	await expect(varsSection(page)).toBeVisible({ timeout: 15_000 });
+
+	// ...and focusing a plain FILE tab must not hand the gate to the canonical Mojo
+	// notebook: nothing about the kernel being inspected changed.
+	await page.locator('[data-testid="tree-file"][data-path="aff-notes.md"]').click();
+	await expect(page.locator('[data-testid="file-view-source"]:visible')).toBeVisible({
+		timeout: 30_000
+	});
+	await expect(varsSection(page)).toBeVisible({ timeout: 15_000 });
+	expect(await paletteTitles(page)).toContain('Consolidate imports');
 
 	expect(errors.filter((e) => !/Failed to load resource/.test(e))).toEqual([]);
 });

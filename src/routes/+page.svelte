@@ -488,12 +488,22 @@
 	const activeNumbering = $derived((activeNotebookPath && notebooksNumbering[activeNotebookPath]) || null);
 	const activeHideAllCode = $derived(!!(activeNotebookPath && notebooksHideAll[activeNotebookPath]));
 	// The active notebook's LANGUAGE, and the two shell-owned affordances it decides.
-	// FAILS OPEN to `python`: with no notebook active (a plain file tab), or before
-	// its LiveNotebook has reported, nothing is hidden - a Python notebook must be
-	// byte-for-byte unaffected, so an unknown language may only ever answer the way
-	// it always did.
+	// FAILS OPEN to `python`: with no notebook active, or before its LiveNotebook has
+	// reported, nothing is hidden - a Python notebook must be byte-for-byte
+	// unaffected, so an unknown language may only ever answer the way it always did.
+	//
+	// `activeTabIsNotebook` is part of the gate, not belt-and-braces. These two
+	// affordances answer about the SERVER's active notebook (the inspector probes
+	// its kernel), and that moves only when a LiveNotebook becomes `active` - so
+	// while a plain FILE tab holds focus it stays on the LAST-FOCUSED notebook while
+	// `activeNotebookPath` has already fallen back to the CANONICAL one. Trusting it
+	// there reads a language belonging to a notebook that is not the subject: a Mojo
+	// canonical notebook would hide the inspector over a live PYTHON namespace, i.e.
+	// fail CLOSED - the one direction this gate may never take. The sibling
+	// `foreignRunTouchesActiveNotebook` below makes the same call for the same
+	// reason; the two are one rule, not two coincidences.
 	const activeNotebookLanguage = $derived<NotebookLanguage>(
-		(activeNotebookPath && notebooksLanguage[activeNotebookPath]) || 'python'
+		(activeTabIsNotebook && activeNotebookPath && notebooksLanguage[activeNotebookPath]) || 'python'
 	);
 	// The sidebar's variable inspector reports on the kernel's Python `user_ns`,
 	// which a Mojo notebook cannot contribute to at all (every cell is a whole
