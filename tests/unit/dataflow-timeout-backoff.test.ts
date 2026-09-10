@@ -69,7 +69,12 @@ vi.mock('node:child_process', () => ({
 	}
 }));
 vi.mock('../../src/lib/server/databricks', () => ({ projectPython: () => 'python3' }));
-vi.mock('../../src/lib/server/notebook', () => ({ listCells: () => h.cells }));
+vi.mock('../../src/lib/server/notebook', () => ({
+	listCells: () => h.cells,
+	// The probe and the staleness verdict are both scoped by the notebook's language
+	// (a Mojo notebook holds no Python for `ast` to read); these fixtures are Python.
+	getNotebookLanguage: () => 'python'
+}));
 vi.mock('../../src/lib/server/kernel', () => ({ currentSessionId: () => h.sid }));
 
 // Imported AFTER the mocks are registered (vitest hoists vi.mock above imports).

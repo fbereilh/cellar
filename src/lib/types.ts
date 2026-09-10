@@ -215,7 +215,8 @@ export interface CellRegisterApi {
 	/**
 	 * Shift+Tab: show this cell's kernel documentation tooltip, or expand the one
 	 * already open. Returns false for a cell that has no live-kernel docs to show
-	 * (markdown, raw, chat, SQL, mojo), so the keystroke is not swallowed there.
+	 * (markdown, raw, chat, SQL, or any cell of a Mojo notebook), so the keystroke
+	 * is not swallowed there.
 	 */
 	showKernelDocs: () => boolean;
 	/**

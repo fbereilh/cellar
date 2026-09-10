@@ -333,7 +333,10 @@ describe('the run reports its own start (run.ts)', () => {
 			setOutputsLive: () => {},
 			setLastRun: () => {},
 			clearOutputsLive: () => {},
-			getCell: () => ({ cell_type: 'code', metadata: {} })
+			getCell: () => ({ cell_type: 'code', metadata: {} }),
+			// A run reads the NOTEBOOK's language to know what it is executing (there is
+			// no per-cell mojo tag); these runs are all Python.
+			getNotebookLanguage: () => 'python'
 		}));
 		const [run, queue, events] = await Promise.all([
 			import('../../src/lib/server/run'),

@@ -1,7 +1,13 @@
 <script lang="ts">
 	import Cell from '$lib/Cell.svelte';
 	import type { LogicalCellType } from '$lib/server/types';
-	import { offersCellType } from '$lib/cellLanguage';
+	import {
+		offersCellType,
+		isNotebookLanguage,
+		NOTEBOOK_LANGUAGES,
+		NOTEBOOK_LANGUAGE_LABELS,
+		type NotebookLanguage
+	} from '$lib/cellLanguage';
 	import type { CellActivation, KeyMode, CellRegisterApi, SegHidden, UICell } from '$lib/types';
 	import type { StalenessEntry } from '$lib/staleness';
 	import type { CellChangeStatus } from '$lib/gitdiff';
@@ -14,6 +20,7 @@
 	import { hazardSummaryClause, humanExportHazards, type ExportHazard } from '$lib/exportHazard';
 	import {
 		exportStrandedExplanation,
+		orphanedModuleExplanation,
 		type ExportLanguage,
 		type ExportStrandedSummary
 	} from '$lib/exportRole';
@@ -114,30 +121,33 @@
 		exportTarget?: string | null;
 		/**
 		 * The MODULE LANGUAGE this notebook's target names (`.py` -> python, `.mojo`
-		 * -> mojo), or **null when no target is configured at all**. It decides which
-		 * cells may be marked, so each Cell needs it to draw its export toggle.
+		 * -> mojo), or **null when no target is configured at all**.
 		 *
-		 * NULLABLE on purpose: eligibility falls back to `python` with nothing
-		 * configured (the legacy default), so a bare language cannot tell "this
-		 * notebook targets a `.py` module" from "this notebook targets nothing", and
-		 * any copy that says the first over the second names a file that does not
-		 * exist. The fallback is applied where ELIGIBILITY is asked and nowhere else.
+		 * FOR SENTENCES THAT NAME A MODULE, and for nothing else - the export button's
+		 * label, the stranded explanation, the unsaved-edit notice. ELIGIBILITY is
+		 * judged by the NOTEBOOK's language through the shared
+		 * `exportEligibilityLanguage`, whose header owns the reason; reading THIS
+		 * nullable value for eligibility is the defect it exists to name.
+		 *
+		 * NULLABLE on purpose: a bare language cannot tell "this notebook targets a
+		 * `.py` module" from "this notebook targets nothing", and any copy that says
+		 * the first over the second names a file that does not exist.
 		 */
 		exportLanguage?: ExportLanguage | null;
 		/**
 		 * The cells whose top-level `def main()` a `.mojo` export will DROP, because a
 		 * later exported cell defines one too and a Mojo module can hold only one
-		 * (`$lib/mojoExport`). Always empty for a `.py` target. Read per cell rather
-		 * than pinned, like `selectedIds`.
+		 * (`$lib/mojoExport`). Always empty in a PYTHON notebook, whose module is a
+		 * `.py` one. Read per cell rather than pinned, like `selectedIds`.
 		 */
 		mojoMainDropped?: ReadonlySet<string>;
 		/** How many cells are currently marked for export. */
 		exportCount?: number;
 		/**
-		 * The cells carrying an export flag the current target cannot honour - the
-		 * target's extension moved under a mark nothing rewrites, the cell was
-		 * converted to a type that contributes no module source, or there is no target
-		 * at all. Reported ONCE here, since it is a notebook-wide fact; each affected
+		 * The cells carrying an export flag this notebook's module cannot honour - the
+		 * cell's own source is Mojo under a `.py` module, or it was converted to a
+		 * type that contributes no module source. Reported ONCE here, since it is a
+		 * notebook-wide fact; each affected
 		 * cell carries only a short marker (`EXPORT_STRANDED_BADGE`). It is a SUMMARY
 		 * rather than a count because the remedy turns on how many of those cells have
 		 * a module language at all (`$lib/exportRole`).
@@ -173,15 +183,35 @@
 		 *  than "a module that fails `compile`" - so the copy names the construct it
 		 *  found and no surface may word an empty list as "this module compiles". */
 		exportHazards?: ExportHazard[];
+		/** A module Cellar generated from THIS notebook that its target no longer names,
+		 *  workspace-relative, else null. What a LANGUAGE switch leaves behind: it
+		 *  re-expresses `utils.py` as `utils.mojo` and renames nothing on disk, so the
+		 *  old file stays - git-tracked in an nbdev repo, still importable, and no
+		 *  longer written. Named once for the notebook so the user can delete it. */
+		exportOrphanedModule?: string | null;
 		/** True while a base re-expression is in flight (the base select is disabled). */
 		exportBaseBusy?: boolean;
 		/** Re-express the stored target under a new base (or record a pre-target choice). */
 		onSetExportBase?: (base: string) => void;
+		/**
+		 * The NOTEBOOK's language: what every plain `code` cell in it is written in.
+		 * The ONE authority for python-vs-mojo (`$lib/cellLanguage`) - there is no
+		 * per-cell tag, so this is what the language selector sets and what every
+		 * language-aware surface below reads.
+		 */
+		notebookLanguage?: NotebookLanguage;
+		/** True while a language change is in flight (the selector is disabled). */
+		languageBusy?: boolean;
+		/** Outcome of the last language change (applied / refused), beside the selector. */
+		languageFeedback?: string;
+		/** Set the notebook's language. */
+		onSetLanguage?: (language: NotebookLanguage) => void;
 		/** This notebook's declared code root (kernel cwd + sys.path), or null for the workspace. */
 		root?: string | null;
 		/** True for a `.py` text notebook, which stores no notebook metadata (no root
-		 *  picker) and, being rebuilt from its cells on save, cannot hold a raw, Mojo
-		 *  or chat cell (no Raw/Mojo/Chat entry in a cell's type menu). */
+		 *  picker, no language selector - it can only ever be Python) and, being
+		 *  rebuilt from its cells on save, cannot hold a raw or chat cell (no
+		 *  Raw/Chat entry in a cell's type menu). */
 		isPy?: boolean;
 		/** The workspace's code roots — an empty list renders no root control at all. */
 		availableRoots?: WorkspaceRootOption[];
@@ -302,8 +332,13 @@
 		exportResolved = null,
 		exportResolveError = null,
 		exportHazards = [],
+		exportOrphanedModule = null,
 		exportBaseBusy = false,
 		onSetExportBase,
+		notebookLanguage = 'python',
+		languageBusy = false,
+		languageFeedback = '',
+		onSetLanguage = () => {},
 		root = null,
 		isPy = false,
 		availableRoots = [],
@@ -651,6 +686,29 @@
 	let exportFeedback = $state('');
 	let exporting = $state(false);
 	const showExportBar = $derived(!isPy);
+	// The LANGUAGE selector. Shown on every `.ipynb`, unlike the code-root bar's
+	// opt-in chrome: every notebook HAS a language and it decides how every code cell
+	// in it runs, so the one place that says which is not something to make the user
+	// go and enable. A `.py` text notebook is excluded for the reason it has no root
+	// picker either - it stores no notebook metadata, so it can only ever be Python
+	// and a control offering otherwise would be refused on click.
+	const showLanguageBar = $derived(!isPy);
+	// The select KEEPS the user's pick while the change is in flight and RESYNCS to
+	// what the document holds the moment it settles - the export BASE select's idiom
+	// exactly, and for the same reason: the write is non-optimistic (it can be
+	// REFUSED on a `.py` notebook reached through a stale tab), so the control must
+	// end up showing what the document really holds whichever way the attempt went,
+	// without snapping back and forth while it is on the wire.
+	let selectedLanguage = $state<NotebookLanguage>('python');
+	$effect(() => {
+		const settled = notebookLanguage;
+		if (languageBusy) return;
+		selectedLanguage = settled;
+	});
+	function onLanguageSelect(e: Event) {
+		const next = (e.currentTarget as HTMLSelectElement).value;
+		if (isNotebookLanguage(next)) onSetLanguage(next);
+	}
 	// The base select is DRIVEN by `exportBase`, never by the click (the
 	// `selectedRoot` idiom below): with a stored target a base change is applied
 	// non-optimistically - the server RE-EXPRESSES the same file under the new
@@ -692,6 +750,13 @@
 	// nothing" are different facts and only the nullable value can tell them apart.
 	const strandedExplanation = $derived(
 		exportStranded.count > 0 ? exportStrandedExplanation(exportStranded, exportLanguage) : null
+	);
+	// A module this notebook generated and no longer writes - see the prop. The
+	// wording is shared (`$lib/exportRole`) like the stranded one beside it, and it
+	// NAMES both paths, since "a stale module may exist" is not something anyone can
+	// act on. Null on every ordinary notebook, so it costs no chrome.
+	const orphanExplanation = $derived(
+		exportOrphanedModule ? orphanedModuleExplanation(exportOrphanedModule, exportResolved) : null
 	);
 	// Whether the notebook has any runnable (code) cell — gates the "Run all" button.
 	const hasCodeCell = $derived(cells.some((c) => c.cell_type === 'code'));
@@ -1080,6 +1145,7 @@
 				onSetType={onSetType}
 				onSetRole={onSetRole}
 				{exportLanguage}
+				{notebookLanguage}
 				mainDropped={mojoMainDropped.has(cell.id)}
 				onSetExport={onSetExport}
 				onSetScrolled={onSetScrolled}
@@ -1207,6 +1273,51 @@
 				Consolidate imports
 			</button>
 		</div>
+		{#if showLanguageBar}
+			<!-- The notebook's LANGUAGE: what every plain code cell in it is written in.
+			     First of the notebook-level bars because it is the most fundamental of
+			     them - it decides how every code cell RUNS, and the export bar's own
+			     module extension FOLLOWS it. Same visual family as the two bars below,
+			     and deliberately as quiet: it is a property of the notebook, not a
+			     call to action. -->
+			<div
+				class="mb-4 flex flex-wrap items-center gap-2 rounded-box border border-base-300 bg-base-100 px-3 py-2 text-sm"
+				data-testid="language-bar"
+			>
+				<span class="flex items-center gap-1.5 font-medium text-base-content/70">
+					<svg class="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m8 8-4 4 4 4" /><path d="m16 8 4 4-4 4" /><path d="m13 5-2 14" /></svg>
+					Language
+				</span>
+				<select
+					class="select select-bordered select-xs w-auto pr-7"
+					bind:value={selectedLanguage}
+					onchange={onLanguageSelect}
+					disabled={languageBusy}
+					data-testid="language-select"
+					aria-label="The language this notebook's code cells are written in"
+				>
+					{#each NOTEBOOK_LANGUAGES as l (l)}
+						<option value={l}>{NOTEBOOK_LANGUAGE_LABELS[l]}</option>
+					{/each}
+				</select>
+				<!-- What it reaches, and what it does NOT cost - the code-root bar states
+				     its kernel-restart price here, and the honest thing to say about this
+				     one is that it has none: nothing per-cell is written and no kernel is
+				     restarted, so markdown, raw, SQL and chat cells are untouched. The
+				     export clause is here because that target is the one OTHER setting
+				     this moves. -->
+				<span class="text-xs text-base-content/55">
+					every code cell runs as {NOTEBOOK_LANGUAGE_LABELS[notebookLanguage]}; markdown, raw,
+					SQL and chat cells are unaffected. The export target's extension follows it. No
+					kernel restart - the Python kernel keeps its variables.
+				</span>
+				{#if languageFeedback}
+					<span class="text-xs text-base-content/70" data-testid="language-feedback"
+						>{languageFeedback}</span
+					>
+				{/if}
+			</div>
+		{/if}
 		{#if showRootBar}
 			<!-- Code root: the directory THIS notebook's kernel runs in and imports from
 			     (normally a git worktree under `roots/`). WHEN it is rendered is
@@ -1374,6 +1485,22 @@
 					<span class="flex items-center gap-1 text-xs text-base-content/70" data-testid="export-stranded">
 						<svg class="h-3.5 w-3.5 shrink-0 text-warning" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3" /><path d="M12 9v4" /><path d="M12 17h.01" /></svg>
 						{strandedExplanation}
+					</span>
+				{/if}
+				{#if orphanExplanation}
+					<!-- A module Cellar generated from this notebook that its target no
+					     longer names: the leftover a LANGUAGE switch creates, since
+					     re-expressing the extension renames nothing on disk. Said ONCE for
+					     the notebook, in the same line family as the stranded explanation
+					     above and OUTSIDE the warning chain, because it is a fact about a
+					     FILE rather than about the module these marks build - both can be
+					     true at once. Cellar never deletes a generated module the user's
+					     repository holds, so the path is named and the decision is theirs.
+					     Warning tint on the ICON, `base-content` copy (the GitNotebooks
+					     contrast rule). -->
+					<span class="flex items-center gap-1 text-xs text-base-content/70" data-testid="export-orphan">
+						<svg class="h-3.5 w-3.5 shrink-0 text-warning" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3" /><path d="M12 9v4" /><path d="M12 17h.01" /></svg>
+						{orphanExplanation}
 					</span>
 				{/if}
 				{#if exportFeedback}

@@ -157,7 +157,7 @@ function renderDom(state: Omit<DocState, 'tooltip'>): HTMLElement {
  * Shift+Tab: open the tooltip, or expand the one already open.
  *
  * Returns false ONLY when there is no kernel handle at all (a markdown, SQL, raw,
- * chat or mojo cell), so the keystroke keeps its default behaviour there instead of
+ * or chat cell, or any cell of a Mojo notebook), so the keystroke keeps its default behaviour there instead of
  * being swallowed by a feature that does not apply. Every other outcome - including
  * every refusal - is handled, because the tooltip states it.
  */

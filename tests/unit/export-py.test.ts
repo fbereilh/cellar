@@ -223,3 +223,73 @@ describe('a `#|default_exp` outside the leading block is REPORTED, not silently 
 		expect(resolveExportTarget(d)).toMatchObject({ ok: true, source: 'metadata', target: 'utils.py' });
 	});
 });
+
+/**
+ * A `#|default_exp` naming the OTHER language's module extension.
+ *
+ * The dotting is what makes this different from its stored-target sibling: nbdev
+ * writes a dotted MODULE name, so every `.` becomes a separator and the extension
+ * is appended - which turned `#|default_exp utils.py` in a Mojo notebook into the
+ * stray path `utils/py.mojo`, a file nobody named, silently. Refusing is the same
+ * refuse-never-degrade rule the stored target already follows, and it is applied
+ * SYMMETRICALLY so neither language is the privileged one.
+ */
+describe('a `#|default_exp` naming the other language module extension is REFUSED', () => {
+	const doc = (source: string, mojo: boolean): NotebookDoc => ({
+		path: '/ws/n.ipynb',
+		metadata: mojo ? { cellar: { language: 'mojo' } } : {},
+		cells: [{ id: 'a', cell_type: 'code', source }]
+	});
+
+	it('refuses `.py` in a Mojo notebook, naming both languages, and invents no path', () => {
+		const info = resolveExportTarget(doc('#|default_exp utils.py\nX = 1', true));
+		expect(info).toMatchObject({ ok: false, source: 'default_exp' });
+		const error = (info as { error: string }).error;
+		expect(error).toContain('utils.py');
+		expect(error).toContain('.py');
+		expect(error).toContain('Mojo');
+		// The stray path this replaces. Asserted on the whole record, since the
+		// refusal must not carry it under any field either.
+		expect(JSON.stringify(info)).not.toContain('utils/py.mojo');
+	});
+
+	it('refuses `.mojo` in a Python notebook - the mirror, so neither language is privileged', () => {
+		const info = resolveExportTarget(doc('#|default_exp utils.mojo\nX = 1', false));
+		expect(info).toMatchObject({ ok: false, source: 'default_exp' });
+		const error = (info as { error: string }).error;
+		expect(error).toContain('utils.mojo');
+		expect(error).toContain('.mojo');
+		expect(error).toContain('Python');
+		expect(JSON.stringify(info)).not.toContain('utils/mojo.py');
+	});
+
+	it('leaves the ordinary Python dotted cases byte-identical', () => {
+		// The ONE Python-path change is the contradicting `.mojo` spelling above; every
+		// directive a Python notebook can ordinarily carry resolves exactly as before.
+		for (const [mod, target] of [
+			['pkg.utils', 'pkg/utils.py'],
+			['core', 'core.py'],
+			['core.py', 'core.py'],
+			['pkg.core.py', 'pkg.core.py']
+		] as Array<[string, string]>)
+			expect(resolveExportTarget(doc(`#|default_exp ${mod}\nX = 1`, false))).toMatchObject({
+				ok: true,
+				base: 'workspace',
+				source: 'default_exp',
+				target
+			});
+	});
+
+	it("leaves a Mojo notebook's own .mojo spellings alone", () => {
+		for (const [mod, target] of [
+			['pkg.utils', 'pkg/utils.mojo'],
+			['core', 'core.mojo'],
+			['core.mojo', 'core.mojo']
+		] as Array<[string, string]>)
+			expect(resolveExportTarget(doc(`#|default_exp ${mod}\nX = 1`, true))).toMatchObject({
+				ok: true,
+				source: 'default_exp',
+				target
+			});
+	});
+});

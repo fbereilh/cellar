@@ -1,25 +1,31 @@
 /**
- * Cellar - what language a NEWLY INSERTED code cell takes (pure, browser-safe).
+ * Cellar - what KIND a NEWLY INSERTED code cell takes (pure, browser-safe).
  *
  * "Add a code cell" is one gesture with two possible meanings, and until a
- * notebook could hold more than one code LANGUAGE the difference never showed:
- * the user means "another cell like the ones I am writing", not "a Python cell".
- * In a Mojo notebook - or a SQL one - the literal reading makes every second cell
- * the wrong language and forces a trip through the type menu after every insert.
- * So a plain code insertion INHERITS: it takes the language of the nearest
- * preceding code cell, and falls back to Python when there is none.
+ * notebook could hold more than one kind of code cell the difference never
+ * showed: the user means "another cell like the ones I am writing", not "a plain
+ * Python cell". Writing a run of SQL cells, the literal reading makes every second
+ * cell the wrong kind and forces a trip through the type menu after every insert.
+ * So a plain code insertion INHERITS: it takes the KIND of the nearest preceding
+ * code cell, and falls back to the caller's default when there is none.
+ *
+ * IT CARRIES A CELL KIND, NEVER A LANGUAGE. python-vs-mojo is the NOTEBOOK's own
+ * axis (`metadata.cellar.language`), so a plain "+ Code" insertion in a Mojo
+ * notebook is already Mojo with nothing to inherit - there is no per-cell spelling
+ * of it to carry, and adding one back would be the second contradictable setting
+ * that axis exists to remove. What is genuinely per-cell is `sql`, and that is the
+ * whole of what this rule moves.
  *
  * THE RULE, and why each clause is the way it is:
  *  - **Nearest PRECEDING code cell wins.** Scanning upward is what makes the
- *    common gesture (write a cell, add another below it) land on the language the
+ *    common gesture (write a cell, add another below it) land on the kind the
  *    user is visibly working in. Nothing BELOW the insertion point is consulted:
- *    inserting above a Mojo cell in a Python notebook must not turn the new cell
- *    Mojo.
+ *    inserting above a SQL cell must not turn the new cell into one.
  *  - **Markdown, raw and chat cells are SKIPPED, not stopped at.** A prose cell
- *    between two Mojo cells is exactly the shape a documented notebook has, and
- *    stopping there would make the language flip back to Python at every heading.
+ *    between two SQL cells is exactly the shape a documented notebook has, and
+ *    stopping there would make a SQL run flip back to code at every heading.
  *    Chat is skipped for the same reason it can never be INHERITED (below).
- *  - **No preceding code cell ⇒ the caller's default**, which is Python
+ *  - **No preceding code cell ⇒ the caller's default**, which is `code`
  *    everywhere today. The first cell of an empty notebook is unchanged.
  *
  * WHAT MAY BE INHERITED IS AN ALLOWLIST (`INHERITABLE_CODE_TYPES`), not
@@ -28,15 +34,15 @@
  * let a click on "+ Code" create a cell whose Run button spends money on a model
  * turn. Cellar already refuses to let AGENTS create chat cells for that reason
  * (`chat` is absent from every MCP write enum); creating one from a gesture that
- * says "code" would be the same surprise from the other direction. A seventh
- * language is likewise NOT inheritable until it is named here.
+ * says "code" would be the same surprise from the other direction. A sixth
+ * logical type is likewise NOT inheritable until it is named here.
  *
  * WHY THIS IS CLIENT-SIDE AND NOT A RULE INSIDE `addCell`. Three server-side
  * callers legitimately mean the LITERAL "a Python cell" and would break under a
  * blanket rule: `imports-cell.ts` creates the pinned imports cell (which must hold
  * Python or every routed import is stranded), `LiveNotebook`'s `insertAndRunCode`
  * appends the Databricks table preview (which IS `spark.read.table(...).toPandas()`,
- * Python, and is appended at the END of whatever notebook is open), and every MCP
+ * an ordinary code cell, and is appended at the END of whatever notebook is open), and every MCP
  * write tool states its `cell_type` explicitly because an agent has already
  * decided what it is writing. Inheritance is a property of the HUMAN insertion
  * GESTURE, so it is resolved where that gesture is - and `tests/unit/cell-inherit.test.ts`
@@ -54,8 +60,13 @@ type InheritCell = { cell_type?: string; metadata?: CellMetadata | null } | null
  * The code languages a plain "+ Code" insertion may take from the cell above.
  * An ALLOWLIST: `chat` is deliberately absent (see the module header), and so is
  * every non-code type, so an unlisted logical type falls back to the default.
+ *
+ * Mojo needs no entry and must not gain one: it is the NOTEBOOK's language
+ * (`$lib/cellLanguage`), so a plain `code` cell created in a Mojo notebook is
+ * already Mojo. The only thing left for this rule to carry across is SQL, which
+ * really is a per-cell kind.
  */
-export const INHERITABLE_CODE_TYPES: readonly LogicalCellType[] = ['code', 'sql', 'mojo'];
+export const INHERITABLE_CODE_TYPES: readonly LogicalCellType[] = ['code', 'sql'];
 
 /** May a plain code insertion inherit this logical type? */
 export function isInheritableCodeType(cellType: unknown): cellType is LogicalCellType {

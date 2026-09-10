@@ -48,9 +48,10 @@
  *     one would claim a lookup Cellar never performed.
  *   - It does not transform any cell source. `?` is IPython's own input
  *     transformation, so this only ever renders what IPython CHOSE to answer -
- *     which is why a SQL, mojo, markdown, raw or chat cell is untouched by
- *     construction rather than by a check: their source never reaches IPython's
- *     transformer as Python, so no `page` payload is ever produced for them.
+ *     which is why a SQL, markdown, raw or chat cell - and every cell of a Mojo
+ *     notebook, whose source reaches IPython as the `%%mojo` magic's argument -
+ *     is untouched by construction rather than by a check: none of them reaches
+ *     IPython's transformer as Python, so no `page` payload is ever produced.
  *   - It handles ONLY `source: 'page'`. The other payload sources a kernel may
  *     send (`set_next_input` from `%load`/`%recall`, `ask_exit`) are ignored
  *     exactly as they are today - never rendered, and never a throw.

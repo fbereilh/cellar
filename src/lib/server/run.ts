@@ -18,7 +18,14 @@
  *   finally { ticket.done(); }
  */
 import { execute, ensureMojoMagic, KernelExecuteAborted } from './kernel';
-import { setOutputs, setOutputsLive, setLastRun, clearOutputsLive, getCell } from './notebook';
+import {
+	setOutputs,
+	setOutputsLive,
+	setLastRun,
+	clearOutputsLive,
+	getCell,
+	getNotebookLanguage
+} from './notebook';
 import { publish } from './events';
 import { isChatCell, isMojoCell, isSqlCell } from '../cellLanguage';
 import { sqlToPython } from './sql';
@@ -90,7 +97,9 @@ export async function executeCellRun({ nb, cellId, actor, source, originId, onEv
 	// A CHAT cell never reaches the kernel at all: its source is a question the
 	// ChatEngine answers (see chat/run-chat.ts), streamed through this same
 	// accumulator so the wire, persist and clear behavior stay identical.
-	// A MOJO cell stores bare Mojo and compiles to the `%%mojo` cell magic, which
+	// A MOJO cell - a plain code cell in a notebook whose declared language is
+	// `mojo`, since the language is the NOTEBOOK's and never a per-cell tag -
+	// stores bare Mojo and compiles to the `%%mojo` cell magic, which
 	// exists only after `import mojo.notebook` has run in this session - so the run
 	// is preceded by a lazy, once-per-session setup (see mojo.ts for why it is not
 	// an `initKernel` injection). A setup that did not take is reported as the
@@ -99,7 +108,11 @@ export async function executeCellRun({ nb, cellId, actor, source, originId, onEv
 	// found`, which says nothing about the toolchain.
 	const cell = getCell(cellId, nb);
 	const isChat = isChatCell(cell);
-	const isMojo = isMojoCell(cell);
+	// The notebook decides, so it is read here - this is the ONE place a run learns
+	// what language the cell it is about to execute is written in, and it is what
+	// makes "the selector's code cells run as Mojo" true for every run path (the UI
+	// route, MCP `run_cell` and the imports cell all funnel through this function).
+	const isMojo = isMojoCell(cell, getNotebookLanguage(nb));
 	// NULL means NO VERDICT - the kernel could not be reached, or the bounded setup
 	// did not settle in time. Either way we fall through to `execute()`, which owns
 	// the run watchdog and reports honestly (`kernel_unavailable` where that is what

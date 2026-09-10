@@ -29,31 +29,43 @@ const raw = (id: string): C => ({ id, cell_type: 'raw', metadata: {} });
 
 describe('the rule', () => {
 	it('inherits the nearest PRECEDING code cell', () => {
-		const cells = [code('a'), tagged('b', 'mojo')];
-		expect(inheritedCodeType(cells, 2)).toBe('mojo'); // appended below the mojo cell
+		const cells = [code('a'), tagged('b', 'sql')];
+		expect(inheritedCodeType(cells, 2)).toBe('sql'); // appended below the sql cell
 		expect(inheritedCodeType(cells, 1)).toBe('code'); // inserted between them
 		expect(inheritedCodeType(cells, 0)).toBe('code'); // above everything ⇒ fallback
 	});
 
 	it('never looks BELOW the insertion point', () => {
-		// Inserting above a Mojo cell in a Python notebook must stay Python.
-		expect(inheritedCodeType([code('a'), tagged('b', 'mojo')], 1)).toBe('code');
-		expect(inheritedCodeType([tagged('m', 'mojo')], 0)).toBe('code');
+		// Inserting above a SQL cell must stay an ordinary code cell.
+		expect(inheritedCodeType([code('a'), tagged('b', 'sql')], 1)).toBe('code');
+		expect(inheritedCodeType([tagged('s', 'sql')], 0)).toBe('code');
 	});
 
 	it('SKIPS markdown and raw cells rather than stopping at them', () => {
 		// A documented notebook has prose between its code cells; stopping would flip
-		// the language back to Python at every heading.
-		expect(inheritedCodeType([tagged('m', 'mojo'), md('h'), raw('r')], 3)).toBe('mojo');
+		// a SQL run back to code at every heading.
+		expect(inheritedCodeType([tagged('s', 'sql'), md('h'), raw('r')], 3)).toBe('sql');
 		expect(inheritedCodeType([tagged('s', 'sql'), md('h'), md('h2')], 3)).toBe('sql');
 	});
 
 	it('NEVER inherits chat - "+ Code" may not create a billed model turn', () => {
 		expect(inheritedCodeType([tagged('c', 'chat')], 1)).toBe('code');
-		// ...and a chat cell is SKIPPED, so a mojo cell above it still wins.
-		expect(inheritedCodeType([tagged('m', 'mojo'), tagged('c', 'chat')], 2)).toBe('mojo');
+		// ...and a chat cell is SKIPPED, so a sql cell above it still wins.
+		expect(inheritedCodeType([tagged('s', 'sql'), tagged('c', 'chat')], 2)).toBe('sql');
 		expect(isInheritableCodeType('chat')).toBe(false);
 		expect(INHERITABLE_CODE_TYPES).not.toContain('chat');
+	});
+
+	it('has NOTHING to say about Mojo - that is the NOTEBOOK\'s language', () => {
+		// There is no per-cell mojo tag any more, so a plain "+ Code" insertion in a
+		// Mojo notebook is already Mojo without this rule carrying anything across -
+		// which is why `mojo` must never be added back to the allowlist.
+		expect(isInheritableCodeType('mojo')).toBe(false);
+		expect(INHERITABLE_CODE_TYPES).not.toContain('mojo');
+		// A legacy per-cell tag left by an older Cellar is inert: it is not a logical
+		// type, so it neither propagates nor stops the scan.
+		expect(inheritedCodeType([tagged('m', 'mojo')], 1)).toBe('code');
+		expect(inheritedCodeType([code('a'), tagged('m', 'mojo')], 2)).toBe('code');
 	});
 
 	it('falls back to python with nothing above, which is the common case unchanged', () => {
@@ -69,11 +81,11 @@ describe('the rule', () => {
 	it('never throws on an out-of-range index or a malformed list - it runs inside a $derived', () => {
 		expect(inheritedCodeType(null, 3)).toBe('code');
 		expect(inheritedCodeType(undefined, -5)).toBe('code');
-		expect(inheritedCodeType([tagged('m', 'mojo')], 99)).toBe('mojo');
-		expect(inheritedCodeType([tagged('m', 'mojo')], -1)).toBe('code');
-		expect(inheritedCodeType([null as never, tagged('m', 'mojo')], 2)).toBe('mojo');
-		expect(inheritedCodeType([tagged('m', 'mojo')], 1.7)).toBe('mojo'); // floors to 1
-		expect(inheritedCodeType([tagged('m', 'mojo')], Number.NaN)).toBe('code');
+		expect(inheritedCodeType([tagged('s', 'sql')], 99)).toBe('sql');
+		expect(inheritedCodeType([tagged('s', 'sql')], -1)).toBe('code');
+		expect(inheritedCodeType([null as never, tagged('s', 'sql')], 2)).toBe('sql');
+		expect(inheritedCodeType([tagged('s', 'sql')], 1.7)).toBe('sql'); // floors to 1
+		expect(inheritedCodeType([tagged('s', 'sql')], Number.NaN)).toBe('code');
 	});
 
 	it('honours an explicit fallback (so a caller that means Python can say so)', () => {
@@ -82,19 +94,19 @@ describe('the rule', () => {
 });
 
 describe('the anchor form, which is how the add API names a position', () => {
-	const cells = [code('a'), md('h'), tagged('m', 'mojo'), md('h2')];
+	const cells = [code('a'), md('h'), tagged('m', 'sql'), md('h2')];
 
 	it('scans upward from the cell the insert is anchored AFTER', () => {
-		expect(inheritedCodeTypeAfter(cells, 'm')).toBe('mojo');
-		expect(inheritedCodeTypeAfter(cells, 'h2')).toBe('mojo'); // skips the prose
+		expect(inheritedCodeTypeAfter(cells, 'm')).toBe('sql');
+		expect(inheritedCodeTypeAfter(cells, 'h2')).toBe('sql'); // skips the prose
 		expect(inheritedCodeTypeAfter(cells, 'a')).toBe('code');
 		expect(inheritedCodeTypeAfter(cells, 'h')).toBe('code'); // only `a` is above it
 	});
 
 	it('an absent/unknown anchor APPENDS, so it reads the end of the notebook', () => {
-		expect(inheritedCodeTypeAfter(cells, null)).toBe('mojo');
-		expect(inheritedCodeTypeAfter(cells, undefined)).toBe('mojo');
-		expect(inheritedCodeTypeAfter(cells, 'gone')).toBe('mojo');
+		expect(inheritedCodeTypeAfter(cells, null)).toBe('sql');
+		expect(inheritedCodeTypeAfter(cells, undefined)).toBe('sql');
+		expect(inheritedCodeTypeAfter(cells, 'gone')).toBe('sql');
 		expect(inheritedCodeTypeAfter([], null)).toBe('code');
 	});
 });

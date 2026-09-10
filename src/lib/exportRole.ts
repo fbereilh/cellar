@@ -11,11 +11,11 @@
  * `.ipynb` is worse than a stale key they can see and clear. `isExportCell`
  * ignores a stranded mark, so nothing stranded ever reaches a generated module.
  *
- * ELIGIBILITY IS TARGET-AWARE: the export target's extension names the module's
- * LANGUAGE (`.py` or `.mojo`, see `exportTargetLanguage`) and a cell is eligible
- * for it iff the cell's own language matches (`exportLanguageOf`). That is one
- * sentence covering both languages, rather than a `.py` rule with a Mojo
- * exclusion bolted on - see `canExportCell`.
+ * ELIGIBILITY IS LANGUAGE-AWARE: the module's LANGUAGE is the NOTEBOOK's (see
+ * `server/export-py.ts`'s `docExportLanguage`; the target path's extension merely
+ * has to agree with it) and a cell is eligible for it iff the cell's own language
+ * matches (`exportLanguageOf`). That is one sentence covering both languages,
+ * rather than a `.py` rule with a Mojo exclusion bolted on - see `canExportCell`.
  *
  * Both halves of the app read this identity — the server (`notebook.ts`,
  * `export-py.ts`) and the browser (`Cell.svelte`) — so it lives in one pure,
@@ -24,7 +24,7 @@
  */
 
 import type { CellMetadata } from '$lib/server/types';
-import { isLogicalCellType, isMojoCell } from '$lib/cellLanguage';
+import { isLogicalCellType, type NotebookLanguage } from '$lib/cellLanguage';
 import { hasMojoHeader } from '$lib/cellMagic';
 import { hasBareNbdevDirective } from '$lib/nbdevDirectives';
 
@@ -57,19 +57,44 @@ export function exportTargetLanguage(target: string | null | undefined): ExportL
 }
 
 /**
+ * The file extension a module of this language is written to - the INVERSE of
+ * `exportTargetLanguage`.
+ *
+ * It exists because the notebook's language now DECIDES the extension rather than
+ * the other way round, so several RULES have to produce one: `setExportTarget`
+ * validates against it, `setNotebookLanguage` re-expresses the stored target
+ * through it, `resolveExportTarget` words its mismatch refusal with it, and the
+ * `#|default_exp` directive builds its path with it. Every rule that DERIVES an
+ * extension goes through here.
+ *
+ * The DISPLAY ternaries that merely NAME the extension to a reader
+ * (`Cell.svelte`'s toggle label, `Notebook.svelte`'s export button, MCP's
+ * `moduleExt`) are deliberately left alone: each sits inside a larger sentence
+ * with its own null branch, and several are pinned by source guards, so folding
+ * them in would be churn for no correctness gain.
+ */
+export function moduleExtension(lang: ExportLanguage): string {
+	return lang === 'mojo' ? '.mojo' : '.py';
+}
+
+/**
  * The language of the module source this cell WOULD contribute, or null when it
  * contributes none.
  *
  * Two things make a cell Mojo, and the second is why this is not simply the
- * logical cell type:
+ * notebook's language:
  *
- *   - Cellar's own `mojo` cell type (`metadata.cellar.language = 'mojo'`).
+ *   - The NOTEBOOK's declared language (`$lib/cellLanguage`), which is what a
+ *     plain `code` cell is written in. Passed in rather than read off the cell:
+ *     there is no per-cell mojo tag, by design.
  *   - A plain `code` cell whose source opens with a `%%mojo` cell magic - what a
- *     user gets by pasting an example out of Modular's own documentation without
- *     converting the cell's type. Such a cell reads as Python to every type-based
- *     test while its body is Mojo, and it is the LIVE DEFECT this rule closes:
- *     marked for export it had its Mojo body concatenated into a `.py` module
- *     that nbdev commits to git.
+ *     user gets by pasting an example out of Modular's own documentation into a
+ *     PYTHON notebook. Such a cell reads as Python to every type-based test while
+ *     its body is Mojo, and it is the LIVE DEFECT this rule closes: marked for
+ *     export it had its Mojo body concatenated into a `.py` module that nbdev
+ *     commits to git. It is deliberately kept: a `%%mojo` magic is the user's own
+ *     source, which Cellar does not control, so this guard is about what a cell
+ *     really CONTAINS and is orthogonal to the notebook's language axis.
  *
  * Deliberately scoped to `%%mojo` and to no other cell magic. A `%%bash` or
  * `%%html` cell is equally not-Python, and exporting one equally produces a module
@@ -79,17 +104,18 @@ export function exportTargetLanguage(target: string | null | undefined): ExportL
  * decision; claiming a `%%mojo` cell belongs in a `.mojo` module is not, because
  * that module is exactly where its body compiles.
  */
-export function exportLanguageOf(cell: ExportCell): ExportLanguage | null {
-	if (isMojoCell(cell)) return 'mojo';
+export function exportLanguageOf(
+	cell: ExportCell,
+	nbLang: NotebookLanguage = 'python'
+): ExportLanguage | null {
 	if (!isLogicalCellType(cell, 'code')) return null;
-	return hasMojoHeader(cell?.source) ? 'mojo' : 'python';
+	return hasMojoHeader(cell?.source) ? 'mojo' : nbLang;
 }
 
 /**
  * MAY this cell carry the export flag for a module of this language? Only a code
- * cell whose own language MATCHES the target's - a markdown/SQL/raw cell has no
- * module source at all, a Mojo cell has no place in a `.py` module, and a Python
- * cell has none in a `.mojo` one.
+ * cell whose own language MATCHES the module's - a markdown/SQL/raw cell has no
+ * module source at all, and a `%%mojo` cell has no place in a `.py` module.
  *
  * The Python half is `isLogicalCellType(cell, 'code')`, never a bare nbformat
  * `cell_type === 'code'`: a SQL cell IS an nbformat `code` cell tagged
@@ -105,22 +131,88 @@ export function exportLanguageOf(cell: ExportCell): ExportLanguage | null {
  * `isLogicalCellType` and agreeing only by coincidence. A cell can then never be
  * marked into a state the exporter ignores.
  *
- * ## Why `lang` is TARGET-AWARE rather than a flat "Mojo is not exportable"
+ * ## Why `lang` is a PARAMETER rather than a flat "Mojo is not exportable"
  *
  * Stated as an exclusion, this rule would have to be UNPICKED the moment a
- * `.mojo` target existed. Stated as a match, the `.mojo` export is an ADDITION:
- * the same sentence - a cell is exportable to a target iff its language matches
- * the target's extension - gives both answers, and a third language would inherit
- * it. `exportLanguageOf` is where a language is decided, once.
+ * `.mojo` module existed. Stated as a match, the `.mojo` export is an ADDITION:
+ * the same sentence - a cell is exportable to a module iff its language matches
+ * the module's - gives both answers, and a third language would inherit it.
+ * `exportLanguageOf` is where a cell's language is decided, once.
+ *
+ * ## ONE parameter answers BOTH halves, and that is the point
+ *
+ * `lang` is the module's language - and since `docExportLanguage` now returns the
+ * NOTEBOOK's, it is also the language a plain `code` cell is written in. So it is
+ * threaded into `exportLanguageOf` as the cell's language too. That is not a
+ * coincidence being exploited: it is "no second setting that can contradict the
+ * notebook's language" expressed in the signature, and it is why the only cell
+ * this can now find INELIGIBLE is one whose SOURCE disagrees with its notebook (a
+ * `%%mojo` magic in a Python notebook) or that contributes no module source at all.
  *
  * `lang` DEFAULTS to `'python'`, which is the legacy question and byte-for-byte
- * the previous behaviour: every export target that existed before `.mojo` was a
- * `.py` one. Every caller that has a target in scope passes the real value; the
- * one that cannot is `storedExportTarget`'s marked-cell gate, which is about an
- * nbdev `#|default_exp` directive - Python vocabulary - and says so.
+ * the previous behaviour: every notebook was a Python notebook before this axis
+ * existed. Every caller that has a notebook in scope passes the real value.
  */
 export function canExportCell(cell: ExportCell, lang: ExportLanguage = 'python'): boolean {
-	return exportLanguageOf(cell) === lang;
+	return exportLanguageOf(cell, lang) === lang;
+}
+
+/**
+ * WHICH language eligibility is judged by, given the two the browser has in hand:
+ * the NOTEBOOK's language, and the nullable MODULE language (`exportLanguage` /
+ * `exportModuleLanguage` - null until a target names a module Cellar can build).
+ *
+ * It is the NOTEBOOK's, full stop - the same rule the server decides eligibility
+ * against (`docExportLanguage`, which returns `notebookLanguageOf` and nothing
+ * else). That is the notebook-language axis expressed once more: the module's
+ * language FOLLOWS the notebook's, so there is no second setting that could
+ * answer differently, and where a target DOES name a module the two values are
+ * equal anyway.
+ *
+ * THE NULLABLE ONE MAY ONLY BE READ BY A SENTENCE THAT NAMES A MODULE, never by
+ * eligibility, and this function exists to state that where it can be tested. It
+ * is null until a target names a module, so a rule reading it (`module ?? 'python'`)
+ * answers `python` for a MOJO notebook that has not been given a target yet: the
+ * row then greys a perfectly valid mark as STRANDED while the notebook-wide
+ * explanation - derived from the notebook's language - reports none, and clicking
+ * that greyed toggle CLEARS a mark the server considers eligible.
+ *
+ * `moduleLanguage` is therefore taken and deliberately NOT read: the caller has
+ * both values, so the answer has to say which of them decides rather than leave
+ * the choice at the call site, where it was got wrong once per surface.
+ */
+export function exportEligibilityLanguage(
+	notebookLanguage: ExportLanguage,
+	moduleLanguage: ExportLanguage | null
+): ExportLanguage {
+	void moduleLanguage;
+	return notebookLanguage;
+}
+
+/**
+ * The OTHER half of that split, stated here beside it so the pair is one rule
+ * rather than two call-site choices: WHICH language a surface that SPEAKS ABOUT A
+ * MODULE reads.
+ *
+ * It is the notebook's language, but only once a target actually names a module -
+ * `null` otherwise, because with no module there is nothing for such a surface to
+ * be about. That is the gate the server's own hazard rule applies (`docHazards`
+ * returns `[]` with no target configured, "warning there would be noise on a
+ * notebook that exports nothing"), so a client surface reading the notebook
+ * language instead speaks while the once-per-notebook fact it pairs with stays
+ * silent, over an export that cannot happen at all.
+ *
+ * It is derived from the NOTEBOOK's language and never from the target's
+ * extension: the extension FOLLOWS the language (`setNotebookLanguage`
+ * re-expresses it, `setExportTarget` refuses a mismatch), so reading it back would
+ * reintroduce the second, contradictable spelling this axis removes. All
+ * `targetNamesModule` contributes is whether there IS a module.
+ */
+export function exportModuleLanguage(
+	notebookLanguage: ExportLanguage,
+	targetNamesModule: boolean
+): ExportLanguage | null {
+	return targetNamesModule ? notebookLanguage : null;
 }
 
 /**
@@ -254,15 +346,17 @@ export function isExportCell(cell: ExportCell, lang: ExportLanguage = 'python'):
  * Does this cell carry Cellar's own export FLAG while being INELIGIBLE for the
  * module the notebook currently targets?
  *
- * Reachable and ordinary: mark some Python cells for a `.py` target, then point
- * the target at a `.mojo` one (or the reverse). Nothing rewrites the notebook -
- * silently editing the user's committed `.ipynb` because a setting moved is worse
- * than the stale flag - so `metadata.cellar.export` stays where it is, `isExportCell`
- * reads false, the cell contributes to no module and the export count drops.
+ * Reachable in two shapes, and no longer by the target moving: mark a code cell and
+ * then paste `%%mojo` into it (its own SOURCE now disagrees with its notebook), or
+ * convert it to a type that contributes no module source at all. Nothing rewrites
+ * the notebook - silently editing the user's committed `.ipynb` because a setting
+ * moved is worse than the stale flag - so `metadata.cellar.export` stays where it
+ * is, `isExportCell` reads false, the cell contributes to no module and the export
+ * count drops.
  *
  * It exists because a row toggle that is merely ABSENT there leaves that flag with
  * no surface at all: invisible in the notebook, still in the committed file, and
- * clearable only by pointing the target back. So the toggle is RENDERED for such a
+ * clearable only by undoing the edit that stranded it. So the toggle is RENDERED for such a
  * cell - greyed, saying why, and still able to clear the flag, which the server
  * allows (`setCellExports` gates only MARKING on eligibility, never unmarking).
  *
@@ -295,11 +389,12 @@ export const EXPORT_STRANDED_CELL_TITLE = 'Not exported - click to clear this st
  * many of them are on a cell that CONTRIBUTES module source at all.
  *
  * The second number is what makes the remedy honest. A stranded cell is either a
- * code cell in the other language - which a different target extension WOULD
- * take - or a cell that contributes no module source in ANY language, for which
- * no target could ever work; and since a conversion now keeps the mark
- * (`applyCellType`), the second is the commonest kind there is. One remedy for
- * both told half the users to change a setting that cannot help them.
+ * code cell in the other language - which a different NOTEBOOK LANGUAGE would
+ * take, the module's language being the notebook's - or a cell that contributes
+ * no module source in ANY language, for which no setting could ever work; and
+ * since a conversion now keeps the mark (`applyCellType`), the second is the
+ * commonest kind there is. One remedy for both told half the users to change a
+ * setting that cannot help them.
  */
 export interface ExportStrandedSummary {
 	/** Stranded marks in the notebook. Zero means the bar says nothing. */
@@ -318,7 +413,7 @@ export function exportStrandedSummary(
 	for (const c of cells ?? []) {
 		if (!exportMarkStranded(c, lang)) continue;
 		count++;
-		if (exportLanguageOf(c) !== null) withLanguage++;
+		if (exportLanguageOf(c, lang) !== null) withLanguage++;
 	}
 	return { count, withLanguage };
 }
@@ -336,10 +431,11 @@ export function exportStrandedCount(
  *
  * `moduleLanguage` is the language the CONFIGURED target names, or **null when no
  * target is configured at all** - and the two are different facts that may not be
- * worded as one. `canExportCell` falls back to `python` with nothing configured,
- * so a language alone cannot tell "this notebook targets a `.py` module" from
- * "this notebook targets nothing", and asserting the first over the second names a
- * file that does not exist.
+ * worded as one. It is read HERE because this sentence NAMES a module; eligibility
+ * is judged by the notebook's language instead (`exportEligibilityLanguage`). A
+ * language alone cannot tell "this notebook targets a `.py` module" from "this
+ * notebook targets nothing", and asserting the first over the second names a file
+ * that does not exist.
  *
  * ## THE REMEDY MAY NOT NAME AN ACTION THAT CANNOT HELP
  *
@@ -350,6 +446,15 @@ export function exportStrandedCount(
  * (`applyCellType`), so a marked code cell turned into markdown or raw lands
  * exactly there. With none of the stranded cells carrying a language, clearing the
  * mark is the ONLY thing that resolves them, and the sentence says so and stops.
+ *
+ * A cell that DOES have a language is resolved by changing the NOTEBOOK's
+ * language, never by repointing the target: the module's language FOLLOWS the
+ * notebook's, so `setExportTarget` REFUSES a `.mojo` path on a Python notebook.
+ * "Point the target at a module that takes them" therefore named an action the
+ * setter rejects - the same defect as the no-module-source case, reached from the
+ * other side - and the only reachable shape it applies to is a `%%mojo`-source
+ * cell in a Python notebook, which switching the notebook to Mojo makes eligible
+ * (it re-expresses `utils.py` as `utils.mojo` with it).
  *
  * No wording claims what LANGUAGE the stranded cells ARE - the set can be mixed (a
  * Mojo cell under a `.py` target beside a markdown cell carrying a hand-edited
@@ -368,9 +473,29 @@ export function exportStrandedExplanation(
 	if (withLanguage === 0)
 		return `${subject}, but ${count === 1 ? 'contributes' : 'contribute'} no module source, so ${them} exported nowhere whatever the target is. To resolve it, ${clear}.`;
 	if (moduleLanguage === null)
-		return `${subject}, but this notebook has no target module, so ${them} exported nowhere. Set a target path above, or ${clear}.`;
-	const ext = moduleLanguage === 'mojo' ? '.mojo' : '.py';
-	return `${subject}, but cannot go in a ${ext} module, so ${them} exported nowhere. Point the target at a module that takes them, or ${clear}.`;
+		return `${subject}, but this notebook has no target module, so ${them} exported nowhere. Set a target path above (a module is written in the notebook's own language, so a cell in another one needs that changed too), or ${clear}.`;
+	const ext = moduleExtension(moduleLanguage);
+	return `${subject}, but cannot go in a ${ext} module, so ${them} exported nowhere. A module is written in the notebook's own language, so change the notebook's language above, or ${clear}.`;
+}
+
+/**
+ * The one sentence naming a generated module this notebook no longer writes -
+ * left behind when the notebook's LANGUAGE moved the target's extension
+ * (`utils.py` -> `utils.mojo`), which renames nothing on disk.
+ *
+ * Stated ONCE for the notebook, in the export bar, beside its sibling
+ * `exportStrandedExplanation` and for the same reason: this is a notebook-wide
+ * fact about one file, so a per-cell copy would repeat it on every marked row.
+ *
+ * It NAMES both paths, because "a stale module may exist somewhere" is not
+ * something anyone can act on, and it claims only what was observed - Cellar
+ * generated that file from this notebook, and this notebook has stopped writing
+ * it. It does not claim the file is unused (something else may import it), so the
+ * remedy is offered rather than asserted: delete it when nothing needs it.
+ */
+export function orphanedModuleExplanation(orphan: string, current: string | null): string {
+	const now = current ? ` This notebook now exports to ${current}.` : '';
+	return `${orphan} is a module Cellar generated from this notebook and no longer writes.${now} Delete it when nothing imports it - Cellar will not remove it for you.`;
 }
 
 /** Count of cells currently marked for export to a module of this language. */

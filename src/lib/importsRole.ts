@@ -13,6 +13,7 @@
  */
 
 import type { CellMetadata } from '$lib/server/types';
+import type { NotebookLanguage } from '$lib/cellLanguage';
 
 /**
  * The minimal cell shape this rule reads. `Cell`/`CellView` are structurally
@@ -31,6 +32,44 @@ export const IMPORTS_ROLE = 'imports';
 export function isImportsCell(cell: RoleCell): boolean {
 	return !!cell && cell.cell_type === 'code' && cell.metadata?.cellar?.role === IMPORTS_ROLE;
 }
+
+/**
+ * Can a notebook in this LANGUAGE use an imports cell at all?
+ *
+ * The imports cell is RUN by the PYTHON kernel, so on a Mojo notebook every
+ * import routed into one would be stranded with nothing to execute them - which
+ * is why `routeImports` and `consolidateImports` refuse such a notebook at their
+ * own entry. Offering the mark there would be a dead control.
+ */
+export function notebookUsesImportsCell(notebookLanguage: NotebookLanguage): boolean {
+	return notebookLanguage !== 'mojo';
+}
+
+/**
+ * The cell CARRIES the role, but the notebook's language means it can never do
+ * anything - a designation made while the notebook was Python and kept when it
+ * switched to Mojo, since a language change touches no cell (which is the design).
+ *
+ * The mark is deliberately NOT cleared for the user: silently editing their
+ * committed `.ipynb` because they changed a setting is the loss the nbdev export
+ * mark's own stranded rule exists to prevent, and they cannot tell that apart
+ * from Cellar losing their work. So it is SURFACED instead - the badge keeps
+ * rendering and the control stays reachable, greyed, able only to CLEAR. That is
+ * the hidden-vs-greyed distinction the export toggle already draws: a control
+ * that can never mean anything is hidden, while one that retires stale state the
+ * user would otherwise have no way to reach is shown.
+ */
+export function importsRoleStranded(cell: RoleCell, notebookLanguage: NotebookLanguage): boolean {
+	return isImportsCell(cell) && !notebookUsesImportsCell(notebookLanguage);
+}
+
+/**
+ * Why the greyed control can only clear, said on the control itself. Short and
+ * per-cell like `EXPORT_STRANDED_CELL_TITLE`: it is a fact about THIS cell's
+ * stale mark, so it needs no notebook-wide sentence beside it.
+ */
+export const IMPORTS_ROLE_STRANDED_TITLE =
+	"This notebook is Mojo, and the imports cell is run by the Python kernel - it does nothing here. Clearing the mark is the only action.";
 
 /** Index of the notebook's imports cell, or -1. */
 export function importsCellIndex(cells: readonly RoleCell[] | null | undefined): number {

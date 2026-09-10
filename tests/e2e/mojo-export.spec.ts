@@ -29,6 +29,14 @@ let baseURL = '';
 
 const MAIN = 'def main():\n    print("hi")';
 const HELPER = 'def helper() -> Int:\n    return 1';
+/**
+ * The one cell that is Mojo REGARDLESS of its notebook: a plain code cell whose
+ * SOURCE opens with the magic, which is what a user gets by pasting an example out
+ * of Modular's docs. It is the only reachable language mismatch now that the
+ * language itself is the notebook's, so it is what the `.py`-module refusal below
+ * is driven with.
+ */
+const MAGIC_MAIN = `%%mojo\n${MAIN}`;
 
 test.beforeAll(async () => {
 	test.skip(!runtimeAvailable(), 'kernel runtime (uv + python3 + host-venv) not available - E2E is local-only');
@@ -53,15 +61,21 @@ test.afterAll(async () => {
 const readModule = (rel: string) => (existsSync(join(workspace, rel)) ? readFileSync(join(workspace, rel), 'utf8') : null);
 
 /**
- * Build a notebook of Mojo cells with a `.mojo` target, every cell marked.
+ * Build a MOJO NOTEBOOK with a `.mojo` target, every cell marked.
  *
- * The target is named BEFORE the cells are marked, deliberately: eligibility is a
- * language MATCH, so a Mojo cell can only be marked once the notebook names a
- * `.mojo` module for the marks to describe.
+ * The LANGUAGE is set first, then the target: the module's language is the
+ * notebook's, so its extension has to agree - a `.mojo` path on a Python notebook
+ * is refused by design. Its code cells are then Mojo cells by virtue of the
+ * notebook alone; there is no per-cell type to set.
  */
 async function mojoNotebook(api: APIRequestContext, rel: string, sources: string[], target: string): Promise<string[]> {
 	const created = await api.post(`${baseURL}/api/notebooks`, { data: { path: rel, create: true } });
 	expect(created.ok(), await created.text()).toBeTruthy();
+
+	const lang = await api.post(`${baseURL}/api/notebooks/language`, {
+		data: { language: 'mojo', path: rel }
+	});
+	expect(lang.ok(), await lang.text()).toBeTruthy();
 
 	const set = await api.post(`${baseURL}/api/notebooks/export-py`, {
 		data: { op: 'set-target', target, base: 'workspace', path: rel }
@@ -73,17 +87,16 @@ async function mojoNotebook(api: APIRequestContext, rel: string, sources: string
 	// The starter notebook holds ONE empty cell; add the rest after it.
 	for (let i = 1; i < sources.length; i++) {
 		const added = await api.post(`${baseURL}/api/cells`, {
-			data: { afterId: ids[ids.length - 1], cellType: 'mojo', source: sources[i], nb: rel }
+			data: { afterId: ids[ids.length - 1], cellType: 'code', source: sources[i], nb: rel }
 		});
 		expect(added.ok(), await added.text()).toBeTruthy();
 		ids.push((await added.json()).cell.id as string);
 	}
 	for (const [i, id] of ids.entries()) {
-		// The TYPE lands first because eligibility is a language MATCH: under a `.mojo`
-		// target the server refuses a mark on an untagged code cell, which the starter
-		// notebook's first cell still is. Conversion itself KEEPS an existing mark.
+		// Only the SOURCE has to land - every code cell of this notebook is already a
+		// Mojo cell, because the notebook is.
 		const patched = await api.patch(`${baseURL}/api/cells/${id}`, {
-			data: { cell_type: 'mojo', source: sources[i], nb: rel }
+			data: { source: sources[i], nb: rel }
 		});
 		expect(patched.ok(), await patched.text()).toBeTruthy();
 		const marked = await api.patch(`${baseURL}/api/cells/${id}`, { data: { export: true, nb: rel } });
@@ -188,9 +201,10 @@ test('the warning appears and clears as the user edits a LATER cell', async ({ p
 	await expect(page.locator('[data-testid="export-hazard"]:visible')).toHaveCount(0);
 });
 
-test('a .py target shows no Mojo warning and takes no Mojo cell', async ({ page, request }) => {
-	// The same three cells under a `.py` target: a Mojo cell is not eligible, so
-	// none is marked, nothing is dropped and nothing warns.
+test('a .py module shows no Mojo warning and takes no Mojo cell', async ({ page, request }) => {
+	// A PYTHON notebook, so its module is a `.py` one - and a cell whose own source
+	// is Mojo is not eligible for it, so it is never marked, nothing is dropped and
+	// nothing warns.
 	const rel = 'pytarget.ipynb';
 	const created = await request.post(`${baseURL}/api/notebooks`, { data: { path: rel, create: true } });
 	expect(created.ok(), await created.text()).toBeTruthy();
@@ -200,7 +214,7 @@ test('a .py target shows no Mojo warning and takes no Mojo cell', async ({ page,
 	expect(set.ok(), await set.text()).toBeTruthy();
 	const view = await request.get(`${baseURL}/api/notebooks?path=${encodeURIComponent(rel)}`);
 	const id = ((await view.json()).notebook.cells as Array<{ id: string }>)[0].id;
-	await request.patch(`${baseURL}/api/cells/${id}`, { data: { source: MAIN, cell_type: 'mojo', nb: rel } });
+	await request.patch(`${baseURL}/api/cells/${id}`, { data: { source: MAGIC_MAIN, nb: rel } });
 	// The server REFUSES the mark - a Mojo cell has no place in a `.py` module - and
 	// SAYS SO: `not-code` is one of the two refusals the PATCH handler reports as a
 	// 409, precisely because the browser applies this mark optimistically and would
@@ -223,6 +237,52 @@ test('a .py target shows no Mojo warning and takes no Mojo cell', async ({ page,
 	await expect(page.locator(`[data-cell-id="${id}"]`).getByTestId('toggle-export')).toHaveCount(0);
 });
 
+test('with NO target the badge stays silent - there is no module for it to be about', async ({
+	page,
+	request
+}) => {
+	// The badge SPEAKS ABOUT A MODULE, so it must be gated the way the server's
+	// once-per-notebook twin is (`docHazards` returns nothing with no target
+	// configured, "warning there would be noise on a notebook that exports nothing").
+	// Fed the NOTEBOOK's language instead it warned that a `main` would be dropped
+	// from an export that cannot happen at all, while the bar beside it said nothing.
+	const rel = 'no-target.ipynb';
+	const created = await request.post(`${baseURL}/api/notebooks`, { data: { path: rel, create: true } });
+	expect(created.ok(), await created.text()).toBeTruthy();
+	const lang = await request.post(`${baseURL}/api/notebooks/language`, {
+		data: { language: 'mojo', path: rel }
+	});
+	expect(lang.ok(), await lang.text()).toBeTruthy();
+
+	// TWO marked cells that each define `main` - exactly the shape that badges the
+	// earlier one once a `.mojo` target exists.
+	const view = await request.get(`${baseURL}/api/notebooks?path=${encodeURIComponent(rel)}`);
+	const ids = ((await view.json()).notebook.cells as Array<{ id: string }>).map((c) => c.id);
+	const added = await request.post(`${baseURL}/api/cells`, {
+		data: { afterId: ids[0], cellType: 'code', source: MAIN, nb: rel }
+	});
+	expect(added.ok(), await added.text()).toBeTruthy();
+	ids.push((await added.json()).cell.id as string);
+	for (const id of ids) {
+		expect((await request.patch(`${baseURL}/api/cells/${id}`, { data: { source: MAIN, nb: rel } })).ok()).toBeTruthy();
+		expect((await request.patch(`${baseURL}/api/cells/${id}`, { data: { export: true, nb: rel } })).ok()).toBeTruthy();
+	}
+
+	await openNotebook(page, rel);
+	// Both cells really ARE marked - so the silence is the gate, not an empty set.
+	await expect(page.locator('[data-testid="export-count"]:visible')).toHaveText('2 cells marked');
+	await expect(page.locator('[data-testid="main-dropped-badge"]:visible')).toHaveCount(0);
+
+	// Naming a `.mojo` target is the ONLY thing that changes, and now it speaks -
+	// which is what makes the assertion above about the gate rather than the rule.
+	const set = await request.post(`${baseURL}/api/notebooks/export-py`, {
+		data: { op: 'set-target', target: 'lib/late.mojo', base: 'workspace', path: rel }
+	});
+	expect(set.ok(), await set.text()).toBeTruthy();
+	await expect(badgeIn(page, ids[0])).toBeVisible({ timeout: 15_000 });
+	await expect(badgeIn(page, ids[1])).toHaveCount(0);
+});
+
 test('the export toggle names the target language, and a stranded mark stays clearable', async ({
 	page,
 	request
@@ -238,13 +298,16 @@ test('the export toggle names the target language, and a stranded mark stays cle
 	await expect(toggle).toHaveAttribute('aria-pressed', 'true');
 	await expect(toggle).not.toHaveAttribute('data-export-stranded', 'true');
 
-	// Repoint the target at a `.py` module. Nothing rewrites the notebook, so the
-	// Mojo cell keeps a flag it is now eligible for nowhere - and that key would be
-	// invisible if the toggle were simply omitted.
-	const repoint = await request.post(`${baseURL}/api/notebooks/export-py`, {
-		data: { op: 'set-target', target: 'lib/labels.py', base: 'workspace', path: 'labels.ipynb' }
+	// Now STRAND the mark. Repointing the target cannot do it any more - the module's
+	// language follows the notebook, so the two can never disagree - and that is the
+	// improvement. What CAN strand a mark is converting the cell to a type that
+	// contributes no module source: `applyCellType` deliberately KEEPS the flag
+	// rather than silently deleting a key from the user's committed `.ipynb`, which
+	// is precisely why the toggle has to stay reachable for it.
+	const converted = await request.patch(`${baseURL}/api/cells/${ids[0]}`, {
+		data: { cell_type: 'markdown', nb: 'labels.ipynb' }
 	});
-	expect(repoint.ok(), await repoint.text()).toBeTruthy();
+	expect(converted.ok(), await converted.text()).toBeTruthy();
 	await page.reload();
 	await openNotebook(page, 'labels.ipynb');
 
@@ -259,11 +322,15 @@ test('the export toggle names the target language, and a stranded mark stays cle
 	const bar = page.locator('[data-testid="export-stranded"]:visible');
 	await expect(bar).toHaveCount(1);
 	await expect(bar).toHaveText(/1 cell is marked for export/);
-	await expect(bar).toHaveText(/\.py module/);
+	// A markdown cell contributes no module source in ANY language, so the one
+	// explanation names CLEARING the mark and no target action at all - pointing the
+	// target elsewhere could never resolve it.
+	await expect(bar).toHaveText(/no module source/);
+	await expect(bar).toHaveText(/clear the mark/);
 	await expect(page.locator('[data-testid="export-count"]:visible')).toHaveText('0 cells marked');
 
 	// CLEARING the target is a different fact and may not be worded as the first: the
-	// notebook then targets nothing, so nothing may name a `.py` module.
+	// notebook then targets nothing, so nothing may name a module at all.
 	const cleared = await request.post(`${baseURL}/api/notebooks/export-py`, {
 		data: { op: 'set-target', target: '', base: 'workspace', path: 'labels.ipynb' }
 	});
@@ -271,8 +338,8 @@ test('the export toggle names the target language, and a stranded mark stays cle
 	await page.reload();
 	await openNotebook(page, 'labels.ipynb');
 	const noTarget = page.locator('[data-testid="export-stranded"]:visible');
-	await expect(noTarget).toHaveText(/no target module/);
-	await expect(noTarget).not.toHaveText(/\.py/);
+	await expect(noTarget).toHaveText(/no module source/);
+	await expect(noTarget).not.toHaveText(/\.mojo/);
 	await expect(page.locator(`[data-cell-id="${ids[0]}"]`).getByTestId('export-stranded-badge')).toBeVisible();
 
 	// Clicking it CLEARS the flag rather than trying to re-mark a cell the server
@@ -290,3 +357,100 @@ test('the export toggle names the target language, and a stranded mark stays cle
 		})
 		.toBeUndefined();
 });
+
+test('a Mojo notebook with NO target still judges eligibility by the NOTEBOOK language', async ({
+	page,
+	request
+}) => {
+	// The client evaluated eligibility with `exportLanguage ?? 'python'`, and
+	// `exportLanguage` is the MODULE language - null until a target names a module.
+	// So a Mojo notebook that has not been given a target yet had its cells judged as
+	// Python: a `%%mojo` cell came out STRANDED, greyed, with the notebook-wide
+	// explanation (which reads the notebook language) reporting nothing - and
+	// clicking that greyed toggle cleared a mark the server considers perfectly
+	// eligible. The server decides this against the notebook's language, full stop.
+	//
+	// Its OWN notebook name, deliberately: every test in this file shares one
+	// workspace, and the badge test above ENDS by giving its `no-target.ipynb` a
+	// `lib/late.mojo` target - so reusing that name made `create:true` open a
+	// notebook that already had one, and this test's whole premise (no target, so
+	// no module for the label to name) was false in file order while still passing
+	// alone.
+	const created = await request.post(`${baseURL}/api/notebooks`, {
+		data: { path: 'untargeted.ipynb', create: true }
+	});
+	expect(created.ok(), await created.text()).toBeTruthy();
+	const lang = await request.post(`${baseURL}/api/notebooks/language`, {
+		data: { language: 'mojo', path: 'untargeted.ipynb' }
+	});
+	expect(lang.ok(), await lang.text()).toBeTruthy();
+	const view = await request.get(`${baseURL}/api/notebooks?path=untargeted.ipynb`);
+	const id = ((await view.json()).notebook.cells as Array<{ id: string }>)[0].id;
+	// A `%%mojo` cell: Mojo whichever notebook it sits in, so it is what tells the two
+	// readings apart (a plain code cell answers the same either way).
+	const patched = await request.patch(`${baseURL}/api/cells/${id}`, {
+		data: { source: MAGIC_MAIN, nb: 'untargeted.ipynb' }
+	});
+	expect(patched.ok(), await patched.text()).toBeTruthy();
+	const marked = await request.patch(`${baseURL}/api/cells/${id}`, {
+		data: { export: true, nb: 'untargeted.ipynb' }
+	});
+	// The SERVER accepts the mark - which is the whole point: the row must not
+	// contradict it.
+	expect(marked.ok(), await marked.text()).toBeTruthy();
+
+	await openNotebook(page, 'untargeted.ipynb');
+	const toggle = page.locator(`[data-cell-id="${id}"]`).getByTestId('toggle-export');
+	await expect(toggle).toHaveAttribute('aria-pressed', 'true');
+	await expect(toggle).not.toHaveAttribute('data-export-stranded', 'true');
+	await expect(page.locator(`[data-cell-id="${id}"]`).getByTestId('export-stranded-badge')).toHaveCount(0);
+	await expect(page.locator('[data-testid="export-stranded"]:visible')).toHaveCount(0);
+	// With no target there is still no module to NAME, so the sentence stays honest.
+	await expect(toggle).toHaveAttribute('aria-label', "Export this cell to the notebook's module");
+});
+
+test('switching the language NAMES the generated module it leaves behind', async ({ page, request }) => {
+	// The switch re-expresses the stored target (`.py` -> `.mojo`) and renames nothing
+	// on disk: Cellar never deletes a generated module the user's repository holds. In
+	// an nbdev repo that file is git-tracked and still importable while this notebook
+	// has stopped writing it, so the path is named ONCE in the export bar and the
+	// decision is the user's.
+	const created = await request.post(`${baseURL}/api/notebooks`, {
+		data: { path: 'orphan.ipynb', create: true }
+	});
+	expect(created.ok(), await created.text()).toBeTruthy();
+	const set = await request.post(`${baseURL}/api/notebooks/export-py`, {
+		data: { op: 'set-target', target: 'lib/orphan.py', base: 'workspace', path: 'orphan.ipynb' }
+	});
+	expect(set.ok(), await set.text()).toBeTruthy();
+	const view = await request.get(`${baseURL}/api/notebooks?path=orphan.ipynb`);
+	const id = ((await view.json()).notebook.cells as Array<{ id: string }>)[0].id;
+	await request.patch(`${baseURL}/api/cells/${id}`, {
+		data: { source: 'def one():\n    return 1', nb: 'orphan.ipynb' }
+	});
+	const marked = await request.patch(`${baseURL}/api/cells/${id}`, {
+		data: { export: true, nb: 'orphan.ipynb' }
+	});
+	expect(marked.ok(), await marked.text()).toBeTruthy();
+	expect(readModule('lib/orphan.py')).toContain('def one()');
+
+	await openNotebook(page, 'orphan.ipynb');
+	// Nothing left behind yet, so an ordinary notebook shows no such line.
+	await expect(page.locator('[data-testid="export-orphan"]:visible')).toHaveCount(0);
+
+	await page.locator('[data-testid="language-select"]:visible').selectOption('mojo');
+	await expect(page.locator('[data-testid="export-target-input"]:visible')).toHaveValue(
+		'lib/orphan.mojo',
+		{ timeout: 30_000 }
+	);
+	// The FILE is still there - that is the fact being reported, not a prediction.
+	expect(readModule('lib/orphan.py')).not.toBeNull();
+	const orphan = page.locator('[data-testid="export-orphan"]:visible');
+	await expect(orphan).toHaveCount(1, { timeout: 30_000 });
+	// It NAMES the path, so the user can find and delete it, and names where the
+	// notebook writes now.
+	await expect(orphan).toContainText('lib/orphan.py');
+	await expect(orphan).toContainText('lib/orphan.mojo');
+	await expect(orphan).toContainText(/will not remove it for you/i);
+});
+

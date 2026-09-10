@@ -194,7 +194,7 @@ describe(`the REAL %%mojo path${why}`, () => {
 describe('the probe reports HONESTLY when the toolchain is absent', () => {
 	it('a bare interpreter with IPython but no max reports not-ready with the real reason', () => {
 		const bare = process.env.CELLAR_BARE_PYTHON ?? '';
-		if (!bare) return; // covered by the parse-level tests in mojo-cell-type.test.ts
+		if (!bare) return; // covered by the parse-level tests in notebook-language.test.ts
 		const out = runInIPython(bare, [MOJO_SETUP_CODE]);
 		const marker = out.split('\n').find((l) => l.startsWith(MOJO_SETUP_MARKER)) ?? '';
 		const setup = parseMojoSetup(marker);
