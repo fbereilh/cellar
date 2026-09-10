@@ -35,9 +35,9 @@
 // it while a CUT one does.
 //
 // `cell_type` is the nbformat type, so `raw` is covered by the type itself, and
-// the LOGICAL type - which a `cellar.language` tag can make `sql`, `chat` or
-// `mojo` - is read back through `clipboardCellType` rather than guessed from
-// `cell_type` alone.
+// the LOGICAL type - which a `cellar.language` tag can make `sql` or `chat` - is
+// read back through `clipboardCellType` rather than guessed from `cell_type`
+// alone.
 
 import { logicalCellType } from '$lib/cellLanguage';
 import type { CellarNamespace, CellMetadata, CellType, LogicalCellType } from '$lib/server/types';
@@ -71,7 +71,7 @@ export function clipboardCellFrom(
 }
 
 /**
- * The LOGICAL type an entry describes - `sql` / `chat` / `mojo` for a tagged code
+ * The LOGICAL type an entry describes - `sql` / `chat` for a tagged code
  * cell, else the nbformat type. Read through `$lib/cellLanguage`'s one rule, so a
  * paste asks the same question every other surface asks; `cell_type` alone reads
  * every tagged cell as plain `code`, which is what a `.py` notebook's paste

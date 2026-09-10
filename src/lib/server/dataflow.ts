@@ -84,10 +84,10 @@
 import { spawn, type ChildProcess } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { currentSessionId } from './kernel';
-import { listCells } from './notebook';
+import { listCells, getNotebookLanguage } from './notebook';
 import { projectPython } from './databricks';
 import { computeStaleness } from '../staleness';
-import { isPythonCodeCell, isSqlCell } from '../cellLanguage';
+import { isPythonCodeCell, isSqlCell, type NotebookLanguage } from '../cellLanguage';
 import { hasAutoreloadMagic, normalizeForAnalysis } from './magics';
 import { parseSqlCell } from './sql';
 import { importBindingNames } from './importBindings';
@@ -666,7 +666,10 @@ interface DataflowResult {
  * `analyzeDataflow` exposes just the map; `getNotebookStaleness` uses `unavailable` to
  * mark those cells conservative-stale rather than let empty dataflow read as `fresh`.
  */
-async function analyzeDataflowDetailed(cells: CellView[]): Promise<DataflowResult> {
+async function analyzeDataflowDetailed(
+	cells: CellView[],
+	nbLang: NotebookLanguage = 'python'
+): Promise<DataflowResult> {
 	// SQL cells are code cells on disk but their source is SQL, not Python - `ast` /
 	// `symtable` would misparse them, so they stay OUT of the probe and get a
 	// SYNTHETIC contribution instead (below): their run really does bind names in the
@@ -683,11 +686,15 @@ async function analyzeDataflowDetailed(cells: CellView[]): Promise<DataflowResul
 	// The Python bucket is `isPythonCodeCell` - stated POSITIVELY rather than as the
 	// `!isSqlCell(c) && !isChatCell(c)` chain it replaced, so a new tagged language
 	// is out of the probe by construction instead of by remembering a fourth `&&`.
-	// Measured on real Mojo, that omission is not benign: the probe reads
+	//  Measured on real Mojo, that omission is not benign: the probe reads
 	// `def main(): print(...)` as Python and reports `defines=['main']`, a wholly
 	// fabricated edge, and the batch still says ok - so it is CACHED as authoritative.
-	const sql = cells.filter(isSqlCell);
-	const code = cells.filter(isPythonCodeCell);
+	//
+	// In a MOJO NOTEBOOK that is true of every code cell, so `isPythonCodeCell` is
+	// asked with the notebook's language and the whole probe is empty - which is
+	// exactly right: nothing in such a notebook holds Python for `ast` to read.
+	const sql = cells.filter((c) => isSqlCell(c));
+	const code = cells.filter((c) => isPythonCodeCell(c, nbLang));
 	// `%autoreload` is a KERNEL-GLOBAL setting, so its effect on the import-binding
 	// exemption is notebook-wide, not cell-local: with it armed, re-running `import
 	// mymod` re-imports a changed module instead of handing back the `sys.modules`
@@ -774,8 +781,11 @@ async function analyzeDataflowDetailed(cells: CellView[]): Promise<DataflowResul
  * @param cells the notebook's cells (code + markdown)
  * @returns per-code-cell `{ id: { defines, uses, imports? } }`
  */
-export async function analyzeDataflow(cells: CellView[]): Promise<DataflowMap> {
-	return (await analyzeDataflowDetailed(cells)).dataflow;
+export async function analyzeDataflow(
+	cells: CellView[],
+	nbLang: NotebookLanguage = 'python'
+): Promise<DataflowMap> {
+	return (await analyzeDataflowDetailed(cells, nbLang)).dataflow;
 }
 
 /**
@@ -792,7 +802,11 @@ export async function cellsDefiningNames(names: readonly string[], nb?: string |
 	const wanted = new Set(names);
 	if (wanted.size === 0) return [];
 	const cells = listCells(nb);
-	const dataflow = await analyzeDataflow(cells);
+	// Threaded, never defaulted: in a Mojo notebook no cell holds Python, so the
+	// probe must not be handed one (the `getNotebookStaleness` rule - a defaulted
+	// `python` there reports fabricated `defines` and would attribute a wiped
+	// variable to a cell that never bound it).
+	const dataflow = await analyzeDataflow(cells, getNotebookLanguage(nb));
 	return cells
 		.filter((c) => c.cell_type === 'code' && (dataflow[c.id]?.defines ?? []).some((d) => wanted.has(d)))
 		.map((c) => c.id);
@@ -814,9 +828,15 @@ export async function getNotebookStaleness(
 	nb?: string | null
 ): Promise<{ sid: SessionId | null; cells: ReturnType<typeof computeStaleness> }> {
 	const cells = listCells(nb);
-	const { dataflow, unavailable } = await analyzeDataflowDetailed(cells);
+	// The notebook's own language decides which cells hold Python at all: in a Mojo
+	// notebook none do, so the probe is empty and every cell reports `n/a` - the same
+	// answer a single `mojo`-tagged cell used to get, now stated once for the
+	// notebook. Read here rather than inside the probe so both halves (the analysis
+	// and the verdict) are asked the same question about the same document.
+	const nbLang = getNotebookLanguage(nb);
+	const { dataflow, unavailable } = await analyzeDataflowDetailed(cells, nbLang);
 	// Reconcile against THIS notebook's kernel epoch (each notebook has its own),
 	// not the active one — so staleness is correct even for a non-active notebook.
 	const sid = currentSessionId(nb);
-	return { sid, cells: computeStaleness(cells, dataflow, sid, unavailable) };
+	return { sid, cells: computeStaleness(cells, dataflow, sid, unavailable, nbLang) };
 }

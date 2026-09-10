@@ -150,12 +150,14 @@ let runmod: typeof import('../../src/lib/server/run');
 let kernelmod: typeof import('../../src/lib/server/kernel');
 
 const NB = 'mojo-preflight.ipynb';
+/** A PYTHON notebook beside it, so the control below is a real second document. */
+const PY_NB = 'python-preflight.ipynb';
 const abs = () => nbmod.resolveNotebookPath(NB);
+const pyAbs = () => nbmod.resolveNotebookPath(PY_NB);
 const MOJO_SOURCE = 'def main():\n    print("hi")';
 
 /** The documented owner pattern: take the slot, run, release in finally. */
-async function runViaOwner(cellId: string, source: string) {
-	const nb = abs();
+async function runViaOwner(cellId: string, source: string, nb: string = abs()) {
 	const ticket = queue.enqueueRun({ nb, cellId, actor: 'user', source });
 	if (ticket.duplicate) throw new Error('unreachable: fresh ticket expected');
 	await ticket.wait();
@@ -178,6 +180,11 @@ beforeAll(async () => {
 	kernelmod = await import('../../src/lib/server/kernel');
 	nbmod.createNotebook(NB, null, { focus: false });
 	nbmod.setActiveNotebook(NB);
+	// The notebook is what makes its code cells Mojo - there is no per-cell tag, so
+	// every `addCell(..., 'code', ...)` below produces a Mojo cell by virtue of this
+	// one declaration (`$lib/cellLanguage`).
+	nbmod.setNotebookLanguage('mojo', abs());
+	nbmod.createNotebook(PY_NB, null, { focus: false });
 });
 
 beforeEach(async () => {
@@ -191,8 +198,8 @@ beforeEach(async () => {
 
 describe('a READY setup dispatches the compiled magic', () => {
 	it('sends `%%mojo` + the cell source, and probes exactly once per session', async () => {
-		const a = nbmod.addCell(null, 'mojo', abs(), null, MOJO_SOURCE).id;
-		const b = nbmod.addCell(null, 'mojo', abs(), null, 'def main():\n    print("two")').id;
+		const a = nbmod.addCell(null, 'code', abs(), null, MOJO_SOURCE).id;
+		const b = nbmod.addCell(null, 'code', abs(), null, 'def main():\n    print("two")').id;
 		const first = await runViaOwner(a, MOJO_SOURCE);
 		expect(first.status).toBe('ok');
 		expect(h.executed.some((c) => c.startsWith(`${MOJO_MAGIC_HEADER}\n${MOJO_SOURCE}`))).toBe(true);
@@ -203,7 +210,7 @@ describe('a READY setup dispatches the compiled magic', () => {
 	});
 
 	it('re-probes after a RESTART, because the namespace that held the magic is gone', async () => {
-		const id = nbmod.addCell(null, 'mojo', abs(), null, MOJO_SOURCE).id;
+		const id = nbmod.addCell(null, 'code', abs(), null, MOJO_SOURCE).id;
 		await runViaOwner(id, MOJO_SOURCE);
 		expect(h.setupRuns).toBe(1);
 		await kernelmod.restartKernel(abs());
@@ -211,9 +218,11 @@ describe('a READY setup dispatches the compiled magic', () => {
 		expect(h.setupRuns).toBe(2);
 	});
 
-	it('leaves a PYTHON cell alone: no probe, no magic, source sent verbatim', async () => {
-		const id = nbmod.addCell(null, 'code', abs(), null, 'x = 1').id;
-		await runViaOwner(id, 'x = 1');
+	it('leaves a PYTHON NOTEBOOK\'s cell alone: no probe, no magic, source sent verbatim', async () => {
+		// The control, and it has to be a second DOCUMENT now: the language is the
+		// notebook's, so an identical cell is Mojo in one and Python in the other.
+		const id = nbmod.addCell(null, 'code', pyAbs(), null, 'x = 1').id;
+		await runViaOwner(id, 'x = 1', pyAbs());
 		expect(h.setupRuns).toBe(0);
 		expect(h.executed).toContain('x = 1');
 		expect(h.executed.every((c) => !c.includes(MOJO_MAGIC_HEADER))).toBe(true);
@@ -223,7 +232,7 @@ describe('a READY setup dispatches the compiled magic', () => {
 describe('THE WEDGE GUARD: a setup that cannot answer must not hang the run', () => {
 	it('gives up on the bound, falls through to execute(), and FREES the queue slot', async () => {
 		h.setupMode = 'hang';
-		const id = nbmod.addCell(null, 'mojo', abs(), null, MOJO_SOURCE).id;
+		const id = nbmod.addCell(null, 'code', abs(), null, MOJO_SOURCE).id;
 		const started = Date.now();
 		const res = await runViaOwner(id, MOJO_SOURCE);
 		// It COMPLETED. Unbounded, this await would never return and the notebook could
@@ -253,7 +262,7 @@ describe('THE WEDGE GUARD: a setup that cannot answer must not hang the run', ()
 		const holder = kernelmod.execute(abs(), h.HOLD_CODE, () => {}, { internal: true }).catch(() => {});
 		await vi.waitFor(() => expect(h.executed).toContain(h.HOLD_CODE));
 
-		const id = nbmod.addCell(null, 'mojo', abs(), null, MOJO_SOURCE).id;
+		const id = nbmod.addCell(null, 'code', abs(), null, MOJO_SOURCE).id;
 		const run = runViaOwner(id, MOJO_SOURCE);
 		// Long enough for the probe's 120ms bound to elapse and the run to register.
 		await new Promise((r) => setTimeout(r, 400));
@@ -304,7 +313,7 @@ describe('THE WEDGE GUARD: a setup that cannot answer must not hang the run', ()
 			// and then waits on a kernel that never replies.
 			setTimeout(() => h.holdFuture?._resolve('ok'), HOLD);
 
-			const id = nbmod.addCell(null, 'mojo', abs(), null, MOJO_SOURCE).id;
+			const id = nbmod.addCell(null, 'code', abs(), null, MOJO_SOURCE).id;
 			const started = Date.now();
 			const res = await runViaOwner(id, MOJO_SOURCE);
 			const elapsed = Date.now() - started;
@@ -327,7 +336,7 @@ describe('THE WEDGE GUARD: a setup that cannot answer must not hang the run', ()
 		// That observed NOTHING about the toolchain, so it must take the SAME exit the
 		// timeout takes rather than prescribing a 534 MB install for a cause nobody saw.
 		h.setupMode = 'throw';
-		const id = nbmod.addCell(null, 'mojo', abs(), null, MOJO_SOURCE).id;
+		const id = nbmod.addCell(null, 'code', abs(), null, MOJO_SOURCE).id;
 		const res = await runViaOwner(id, MOJO_SOURCE);
 		const text = JSON.stringify(res.outputs);
 		expect(text).not.toContain('uv pip install max');
@@ -345,7 +354,7 @@ describe('THE WEDGE GUARD: a setup that cannot answer must not hang the run', ()
 		// 534 MB install for a cell the user simply cancelled. The probe now says NO
 		// VERDICT on its own marker line, which takes the timeout's exit.
 		h.setupMode = 'interrupted';
-		const id = nbmod.addCell(null, 'mojo', abs(), null, MOJO_SOURCE).id;
+		const id = nbmod.addCell(null, 'code', abs(), null, MOJO_SOURCE).id;
 		const res = await runViaOwner(id, MOJO_SOURCE);
 		const text = JSON.stringify(res.outputs);
 		expect(text).not.toContain('uv pip install max');
@@ -363,7 +372,7 @@ describe('THE WEDGE GUARD: a setup that cannot answer must not hang the run', ()
 describe('a NOT-READY setup reports the instruction and never sends an unregistered magic', () => {
 	it('fails the cell with the install command, stamped with the LIVE session', async () => {
 		h.setupMode = 'missing';
-		const id = nbmod.addCell(null, 'mojo', abs(), null, MOJO_SOURCE).id;
+		const id = nbmod.addCell(null, 'code', abs(), null, MOJO_SOURCE).id;
 		const res = await runViaOwner(id, MOJO_SOURCE);
 		expect(res.status).toBe('error');
 		const text = JSON.stringify(res.outputs);
@@ -379,7 +388,7 @@ describe('a NOT-READY setup reports the instruction and never sends an unregiste
 
 	it('RE-PROBES on the next run, so `uv pip install max` then re-run actually works', async () => {
 		h.setupMode = 'missing';
-		const id = nbmod.addCell(null, 'mojo', abs(), null, MOJO_SOURCE).id;
+		const id = nbmod.addCell(null, 'code', abs(), null, MOJO_SOURCE).id;
 		await runViaOwner(id, MOJO_SOURCE);
 		expect(h.setupRuns).toBe(1);
 		// The user installs it; the SAME session must pick it up (the probe calls

@@ -15,23 +15,28 @@
 import type { ImportChangeStamps } from './importBindings';
 import type { ExportHazard } from '../exportHazard';
 import type { ExportLanguage } from '../exportRole';
+import type { NotebookLanguage } from '../cellLanguage';
 
 export type { ImportChangeStamps };
 
 // --- cells + notebook document --------------------------------------------
 
 /** nbformat cell type as stored on disk. All THREE nbformat 4.5 types are real
- * Cellar types; `sql`, `chat` and `mojo` are logical Cellar types that map onto a
+ * Cellar types; `sql` and `chat` are logical Cellar types that map onto a
  * `code` cell tagged `cellar.language` (see `$lib/cellLanguage` for why the
  * reasoning inverts between those and `raw`). */
 export type CellType = 'code' | 'markdown' | 'raw';
 
 /** The logical cell types the UI chooses between (the agent write tools speak
- * all but `chat`). `sql`, `chat` and `mojo` are `code` cells;
+ * all but `chat`). `sql` and `chat` are `code` cells;
  * `code`/`markdown`/`raw` are nbformat types of their own. Keep `CellType` a
  * SUBSET of this - the clipboard, the undo stack and the insert specs all assign
- * one into the other. */
-export type LogicalCellType = 'code' | 'markdown' | 'sql' | 'raw' | 'chat' | 'mojo';
+ * one into the other.
+ *
+ * There is deliberately no `mojo` member: a code cell's LANGUAGE is the
+ * NOTEBOOK's (`metadata.cellar.language`), not a property of the cell, so Mojo is
+ * chosen once at the top rather than per cell. See `$lib/cellLanguage`. */
+export type LogicalCellType = 'code' | 'markdown' | 'sql' | 'raw' | 'chat';
 
 /** Who initiated a run: a human via the UI, or an agent via MCP. */
 export type Actor = 'user' | 'agent';
@@ -80,7 +85,11 @@ export interface CellarNamespace {
 	 * only - the cell's source is never touched and it still runs.
 	 */
 	hide_input?: boolean;
-	/** Logical cell language ('sql' | 'chat' | 'mojo'). Absent = Python. */
+	/**
+	 * Logical cell KIND ('sql' | 'chat'). Absent = an ordinary code cell, whose
+	 * language is the NOTEBOOK's (`NotebookCellarNamespace.language`) - Mojo is
+	 * never tagged per cell.
+	 */
 	language?: string;
 	/** Cell role, e.g. the pinned imports cell ('imports'). */
 	role?: string | null;
@@ -237,6 +246,14 @@ export interface NotebookView {
 	 */
 	exportHazards: ExportHazard[];
 	/**
+	 * A module Cellar generated from THIS notebook that its target no longer names -
+	 * the leftover a LANGUAGE switch creates, since re-expressing `utils.py` as
+	 * `utils.mojo` renames nothing on disk. Workspace-relative, or null (every
+	 * ordinary notebook). Provenance-checked, so a hand-written module or one
+	 * another notebook generated is never reported (`orphanedGeneratedModule`).
+	 */
+	exportOrphanedModule: string | null;
+	/**
 	 * Declared code root: the workspace-relative directory this notebook's KERNEL
 	 * resolves code from (cwd + `sys.path`), or null for the workspace root.
 	 */
@@ -252,6 +269,12 @@ export interface NotebookView {
 	headerNumbering: number[];
 	/** Notebook-wide "hide all code inputs" (report view) default. */
 	hideAllCode: boolean;
+	/**
+	 * The language this notebook's plain `code` cells are written in - what the
+	 * selector at the top of the notebook sets. `python` for every notebook that
+	 * declares nothing, so a pre-selector notebook reports exactly what it is.
+	 */
+	language: NotebookLanguage;
 }
 
 /** nbformat kernelspec. */
@@ -283,6 +306,19 @@ export interface NotebookCellarNamespace {
 	 * as an explicit `workspace` - so legacy notebooks resolve unchanged forever.
 	 */
 	export_base?: string;
+	/**
+	 * The language every plain `code` cell in this notebook is written in:
+	 * `'mojo'`, or ABSENT for Python. Absence is the only spelling of the default -
+	 * `setNotebookLanguage` deletes the key rather than writing `'python'` - so a
+	 * notebook that never chose stays byte-identical and needs no migration.
+	 *
+	 * This is the ONE authority for python-vs-mojo. It decides how a code cell is
+	 * executed (`server/run.ts` compiles one to a `%%mojo` magic in a Mojo
+	 * notebook), which cells the Python dataflow/staleness/imports engines see, and
+	 * which module language the nbdev export writes - so the export target's
+	 * extension FOLLOWS it and cannot contradict it (`setExportTarget`).
+	 */
+	language?: string;
 	/**
 	 * Code root: the workspace-relative directory this notebook's kernel runs in
 	 * and imports from. Absent = the workspace root. See `$lib/notebookRoot`.

@@ -26,10 +26,16 @@
 	import HtmlOutput from '$lib/HtmlOutput.svelte';
 	import WidgetOutput from '$lib/WidgetOutput.svelte';
 	import { foldKey, numberHeadingLine, splitHeadingSegments } from '$lib/headings';
-	import { isImportsCell } from '$lib/importsRole';
+	import {
+		isImportsCell,
+		importsRoleStranded,
+		notebookUsesImportsCell,
+		IMPORTS_ROLE_STRANDED_TITLE
+	} from '$lib/importsRole';
 	import {
 		canExportCell,
 		isExportCell,
+		exportEligibilityLanguage,
 		exportDirectiveOwnsCell,
 		exportMarkStranded,
 		exportMarkedTwice,
@@ -46,10 +52,12 @@
 		isSqlCell,
 		isRawCell,
 		isChatCell,
+		codeTypeMenuLabel,
 		isMojoCell,
 		isPythonCodeCell,
 		offersCellType,
-		logicalCellType
+		logicalCellType,
+		type NotebookLanguage
 	} from '$lib/cellLanguage';
 	import { relativeTime, formatDuration, formatElapsed } from '$lib/relativeTime';
 	import { nowMs, subscribeNow, runNowMs, subscribeRunNow } from '$lib/now.svelte';
@@ -108,16 +116,26 @@
 		staleState?: StalenessEntry | null;
 		/**
 		 * The MODULE LANGUAGE the notebook's export target names (`$lib/exportRole`),
-		 * or **null when no target is configured at all**. A cell is eligible for the
-		 * export toggle only when its own language matches, so this is what decides
-		 * whether the toggle is drawn at all.
+		 * or **null when no target is configured at all**.
 		 *
-		 * NULLABLE on purpose: eligibility falls back to `python` with nothing
-		 * configured, so a bare language cannot tell a `.py` target from no target,
-		 * and copy built on it named a module that does not exist. The fallback is
-		 * applied to ELIGIBILITY only; every sentence reads the nullable value.
+		 * FOR SENTENCES THAT NAME A MODULE, and for nothing else. ELIGIBILITY is judged
+		 * by the NOTEBOOK's language (`notebookLanguage`, below) through the shared
+		 * `exportEligibilityLanguage`, whose header owns the reason - reading THIS
+		 * nullable value for eligibility is the defect, not the rule.
+		 *
+		 * NULLABLE on purpose: a bare language cannot tell a `.py` target from no
+		 * target, and copy built on it named a module that does not exist.
 		 */
 		exportLanguage?: ExportLanguage | null;
+		/**
+		 * The NOTEBOOK's language - what a plain `code` cell in it is written in.
+		 * Threaded down rather than read off the cell, because there is no per-cell
+		 * mojo tag: the notebook is the ONE authority (`$lib/cellLanguage`).
+		 *
+		 * Defaults to `python`, so a standalone mount - and every Python notebook -
+		 * renders exactly as it did before the selector existed.
+		 */
+		notebookLanguage?: NotebookLanguage;
 		/**
 		 * This cell is marked for a `.mojo` export AND a LATER exported cell also
 		 * defines a top-level `def main()`, so this one's `main` will not be written
@@ -216,6 +234,7 @@
 		keyMode = 'command',
 		staleState = null,
 		exportLanguage = null,
+		notebookLanguage = 'python',
 		mainDropped = false,
 		dragging = false,
 		foldedIds = new Set(),
@@ -315,12 +334,13 @@
 	// kernel; the reply arrives as a markdown display_data output. Runnable like
 	// SQL - the run button IS "ask".
 	const isChat = $derived(isChatCell(cell));
-	// A MOJO cell: a code cell tagged cellar.language='mojo'. Its source is Mojo,
-	// compiled to a `%%mojo` cell magic at run time and executed by the PYTHON
-	// kernel (Modular ships no Mojo kernel - see server/mojo.ts). Runnable like SQL;
-	// its Python-only affordances (export, imports role, staleness) are HIDDEN, each
-	// by the shared rule that already excludes it rather than by a check here.
-	const isMojo = $derived(isMojoCell(cell));
+	// A MOJO cell: a plain code cell in a notebook whose LANGUAGE is Mojo (there is
+	// no per-cell tag - `$lib/cellLanguage`). Its source is Mojo, compiled to a
+	// `%%mojo` cell magic at run time and executed by the PYTHON kernel (Modular
+	// ships no Mojo kernel - see server/mojo.ts). Runnable like SQL; its Python-only
+	// affordances (imports role, staleness) are HIDDEN, each by the shared rule that
+	// already excludes it rather than by a check here.
+	const isMojo = $derived(isMojoCell(cell, notebookLanguage));
 	// An nbformat `raw` cell: verbatim text Cellar never executes and never renders
 	// (Quarto/nbdev frontmatter, nbconvert directives). It has NO rendered mode -
 	// the deliberate contrast with markdown - so it is always shown as its source.
@@ -330,22 +350,45 @@
 	// shorthand is what rendered a Run button on a raw cell and posted YAML
 	// frontmatter to Python.
 	const isRunnable = $derived(!isMarkdown && !isRaw);
-	// The logical cell type the type menu speaks: code | sql | mojo | chat | markdown | raw.
+	// The logical cell type the type menu speaks: code | sql | chat | markdown | raw.
 	const logicalType = $derived(logicalCellType(cell));
 	const TYPE_LABELS: Record<LogicalCellType, string> = {
 		sql: 'SQL',
 		chat: 'chat',
-		mojo: 'mojo',
 		markdown: 'markdown',
 		raw: 'raw',
 		code: 'python3'
 	};
-	const typeLabel = $derived(TYPE_LABELS[logicalType] ?? 'python3');
+	// A `code` cell is labelled by the NOTEBOOK's language, since that is what it is
+	// written in - so a Mojo notebook's cells read `mojo` while its SQL, chat,
+	// markdown and raw cells keep their own labels, which the language never touches.
+	const typeLabel = $derived(
+		logicalType === 'code' && isMojo ? 'mojo' : (TYPE_LABELS[logicalType] ?? 'python3')
+	);
 	// The notebook's designated imports cell: user-choosable, marked in the toolbar
 	// with the "imports" badge, and free to live at any index. Only a Python code
 	// cell can hold the role, so the mark action is offered only when `canBeImports`.
 	const isImports = $derived(isImportsCell(cell));
-	const canBeImports = $derived(logicalType === 'code');
+	// The mark is set but the notebook's language means it can never do anything -
+	// a designation made while the notebook was Python and kept when it switched,
+	// since a language change touches no cell. The rule is the shared, unit-tested
+	// `importsRoleStranded`, whose header owns the reason.
+	const importsStranded = $derived(importsRoleStranded(cell, notebookLanguage));
+	// Only a PYTHON code cell can hold the role - the imports cell is RUN by the
+	// Python kernel, so every import routed into one on a Mojo notebook would be
+	// stranded with nothing to execute them (and `routeImports`/`consolidateImports`
+	// refuse such a notebook at their entry, so MARKING there would be a dead
+	// control and stays hidden).
+	//
+	// A cell that ALREADY carries the mark is the exception, and it is the same
+	// hidden-vs-greyed rule the export toggle one control along follows: the item is
+	// RENDERED, greyed and able only to CLEAR, because this menu is the one surface
+	// that can retire a key the user would otherwise be left with in their committed
+	// `.ipynb` under a badge still asserting it. Hidden there, the state is
+	// unreachable except by switching the notebook back.
+	const canBeImports = $derived(
+		logicalType === 'code' && (notebookUsesImportsCell(notebookLanguage) || isImports)
+	);
 	// nbdev-style export: this code cell is written to the notebook's `.py` module.
 	// The row toggle asks `canExportCell` - the SAME eligibility rule the setters and
 	// `isExportCell` ask - rather than re-deriving one: `canBeImports` is
@@ -354,11 +397,16 @@
 	// is the strict test, so such a cell got a toggle whose `aria-pressed` could
 	// never move and whose setter always skipped it. An always-visible control that
 	// can never apply is worse than one behind a menu, so it is GATED, not disabled.
-	// The legacy default, applied to ELIGIBILITY and nowhere else: with no target
-	// configured a Python code cell is still markable, exactly as it always was.
-	// Every SENTENCE below reads the nullable prop instead, so none of them claims a
-	// module the notebook does not have.
-	const exportCellLanguage = $derived(exportLanguage ?? 'python');
+	// WHICH language eligibility is judged by is the shared, unit-tested
+	// `exportEligibilityLanguage` rather than an expression here: vitest runs
+	// without the SvelteKit plugin so this component cannot be mounted, and e2e
+	// runs in neither CI nor the gate, so a rule left as a template expression can
+	// regress and merge green (the `defaultProfileNoticeApplies` precedent). It
+	// answers the NOTEBOOK's language - what the server decides it against too -
+	// and the reason the nullable module language may not be read here lives with
+	// it. Every SENTENCE below reads that nullable prop instead, so none of them
+	// claims a module the notebook does not have.
+	const exportCellLanguage = $derived(exportEligibilityLanguage(notebookLanguage, exportLanguage));
 	const canExport = $derived(canExportCell(cell, exportCellLanguage));
 	const isExport = $derived(isExportCell(cell, exportCellLanguage));
 	// How this control NAMES the module it writes to. With a target it is that
@@ -369,8 +417,8 @@
 		exportLanguage === null ? 'module' : `${exportLanguage === 'mojo' ? '.mojo' : '.py'} module`
 	);
 	// Cellar's own flag is set, but this cell can go in no module the notebook
-	// currently names - the target's extension moved under a mark nothing rewrites,
-	// or the target was cleared (`exportMarkStranded`). The toggle is RENDERED for
+	// currently names - its own source is Mojo under a `.py` module, or it was
+	// converted to a type with no module source (`exportMarkStranded`). The toggle is RENDERED for
 	// such a cell rather than omitted, greyed, and it still CLEARS the flag: the
 	// server gates marking on eligibility and unmarking on nothing, so this is the
 	// one surface that can retire an otherwise invisible key from the user's
@@ -1150,32 +1198,46 @@
 		typeMenuEl.style.left = Math.max(8, Math.min(r.right - mw, window.innerWidth - mw - 8)) + 'px';
 		typeMenuEl.style.top = r.bottom + 4 + 'px';
 	}
-	// The cell-type menu options (Python / SQL / Mojo / Chat / Markdown / Raw). This
-	// menu is the ONLY create path for raw AND for mojo - there is deliberately no
-	// "+ Raw" or "+ Mojo" insert button, neither being worth a button on every gap
-	// (raw is once-per-notebook; a second mojo cell comes for free from the
-	// language a plain "+ Code" insertion INHERITS - see `$lib/cellInherit`). Chat
+	// The cell-type menu options (Code / SQL / Chat / Markdown / Raw). This
+	// menu is the ONLY create path for raw - there is deliberately no
+	// "+ Raw" insert button, it not being worth a button on every gap
+	// (raw is once-per-notebook). Mojo is NOT here at all: a code cell's language is
+	// the NOTEBOOK's, chosen once in the selector at the top, so offering it per cell
+	// is exactly how a notebook ends up holding two languages. Chat
 	// is different: asking a question recurs through a session the way code and
 	// markdown do, so it IS also creatable directly from the add affordances (the
 	// bottom add row and the hover-between strip in `Notebook.svelte`, both gated
 	// off `$lib/cellLanguage` on a `.py` notebook exactly like `typeOptions`
 	// below). Converting an existing cell stays here for every type.
 	//
-	// Raw, mojo AND chat are DROPPED on a `.py` text notebook: such a document is
+	// Raw AND chat are DROPPED on a `.py` text notebook: such a document is
 	// rebuilt from its cells on every save, carrying neither the raw marker nor any
-	// `cellar` metadata or outputs, so the server refuses all three
+	// `cellar` metadata or outputs, so the server refuses both
 	// (`assertCanHoldType`) - and a notebook that cannot hold a cell type must not
 	// be offered a control for one. WHICH types those are is read from
 	// `$lib/cellLanguage`, so the menu cannot drift from the writers' rule.
+	//
+	// The `code` option is LABELLED by the notebook's language, since that is what
+	// choosing it produces - `Mojo` in a Mojo notebook - while its VALUE stays
+	// `code`: converting a SQL cell back to an ordinary code cell is one action
+	// whatever language the notebook is written in. The label comes from the shared,
+	// unit-tested `codeTypeMenuLabel`, which takes the NOTEBOOK language and nothing
+	// else: read from this cell's `isMojo` it was false for every markdown, raw, SQL
+	// and chat cell, so a Mojo notebook offered `Python` on exactly the cells this
+	// menu exists to convert (vitest runs without the SvelteKit plugin, so a rule
+	// left as an expression here could not be tested at all).
 	const ALL_TYPE_OPTIONS: { v: LogicalCellType; label: string; hint: string }[] = [
 		{ v: 'code', label: 'Python', hint: 'python3' },
 		{ v: 'sql', label: 'SQL', hint: 'spark.sql' },
-		{ v: 'mojo', label: 'Mojo', hint: '%%mojo' },
 		{ v: 'chat', label: 'Chat', hint: 'claude' },
 		{ v: 'markdown', label: 'Markdown', hint: 'text' },
 		{ v: 'raw', label: 'Raw', hint: 'verbatim' }
 	];
-	const typeOptions = $derived(ALL_TYPE_OPTIONS.filter((o) => offersCellType(o.v, isPy)));
+	const typeOptions = $derived(
+		ALL_TYPE_OPTIONS.filter((o) => offersCellType(o.v, isPy)).map((o) =>
+			o.v === 'code' ? { ...o, ...codeTypeMenuLabel(notebookLanguage) } : o
+		)
+	);
 	function chooseType(type: LogicalCellType) {
 		typeMenuEl?.hidePopover();
 		if (type !== logicalType) onSetType(cell.id, type);
@@ -1396,15 +1458,17 @@
 	 * foreign nbformat `cell_type` must not be read as code), because the kernel's
 	 * completer and `token_at_cursor` speak Python about the Python namespace:
 	 * markdown and raw are prose, a chat cell's source is a question for a model, a
-	 * SQL cell's source is SQL that only becomes Python at RUN time, and a mojo
-	 * cell's is Mojo compiled by a `%%mojo` subprocess. Answering any of those with
-	 * Python names would be confidently wrong rather than merely unhelpful.
+	 * SQL cell's source is SQL that only becomes Python at RUN time, and in a MOJO
+	 * notebook a code cell's source is Mojo compiled by a `%%mojo` subprocess.
+	 * Answering any of those with Python names would be confidently wrong rather than
+	 * merely unhelpful - which is why the notebook's language is threaded in here
+	 * too: it is what decides whether a plain code cell holds Python at all.
 	 *
 	 * A function, not a derived value: the CodeMirror extensions are installed once
 	 * per editor and must read the CURRENT prop on every use.
 	 */
 	const kernelIntrospectFor = (): KernelIntrospectHandle | null =>
-		isPythonCodeCell(cell) ? (kernelIntrospect ?? null) : null;
+		isPythonCodeCell(cell, notebookLanguage) ? (kernelIntrospect ?? null) : null;
 
 	/**
 	 * Tab. Accepts the open suggestion if there is one (so a second Tab commits what
@@ -2215,7 +2279,8 @@
 					     where it cannot apply rather than permanently disabled. Presence
 					     follows the cell TYPE, never the flag - with ONE exception, which is
 					     about a flag that is already there: a STRANDED mark (`exportStranded`,
-					     the target's extension moved under it, or the target cleared) renders
+					     its own source disagrees with the notebook, or it was converted to a
+					     type with no module source) renders
 					     the toggle greyed beside a SHORT marker, so the key is visible in the
 					     notebook and clearable in place instead of sitting invisible in the
 					     committed `.ipynb`. The reason itself is a notebook-wide fact and is
@@ -2529,8 +2594,10 @@
 							</button>
 							{#if canBeImports}
 							<button
-								class="flex items-center gap-2 rounded px-2 py-1.5 text-left hover:bg-base-200 {isImports ? 'text-base-content' : 'text-primary'}"
+								class="flex items-center gap-2 rounded px-2 py-1.5 text-left hover:bg-base-200 {importsStranded ? 'text-base-content/50' : isImports ? 'text-base-content' : 'text-primary'}"
 								onclick={toggleImportsRole}
+								title={importsStranded ? IMPORTS_ROLE_STRANDED_TITLE : undefined}
+								data-imports-stranded={importsStranded ? 'true' : undefined}
 								data-testid="toggle-imports-role"
 							>
 								<svg class="h-3.5 w-3.5 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 17v5" /><path d="M9 10.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24V16a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V7a1 1 0 0 1 1-1 2 2 0 0 0 0-4H8a2 2 0 0 0 0 4 1 1 0 0 1 1 1z" /></svg>

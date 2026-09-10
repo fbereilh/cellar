@@ -32,6 +32,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
 	canExportCell,
+	exportEligibilityLanguage,
+	exportModuleLanguage,
 	exportLanguageOf,
 	exportCellCount,
 	exportMarkStranded,
@@ -118,35 +120,43 @@ describe('exportTargetLanguage', () => {
 // ---------------------------------------------------------------------------
 
 describe('eligibility is a language MATCH, not a Python rule with a Mojo hole', () => {
-	it('reads a cell language from its type OR its %%mojo magic', () => {
-		expect(exportLanguageOf(cell('p', 'x = 1'))).toBe('python');
-		expect(exportLanguageOf(mojoCell('m', MAIN))).toBe('mojo');
-		// THE LIVE DEFECT this closes: a plain code cell pasted out of Modular's docs
-		// reads as Python to every type-based test while its body is Mojo.
-		expect(exportLanguageOf(cell('g', `%%mojo\n${MAIN}`))).toBe('mojo');
-		expect(exportLanguageOf(cell('g2', `\n\n%%mojo build --emit shared-lib\n${MAIN}`))).toBe('mojo');
+	it('reads a cell language from its NOTEBOOK, or from its own %%mojo magic', () => {
+		// A plain code cell is written in whatever language its notebook is - that IS
+		// the language axis, so it is passed in rather than read off the cell.
+		expect(exportLanguageOf(cell('p', 'x = 1'), 'python')).toBe('python');
+		expect(exportLanguageOf(cell('p', 'x = 1'), 'mojo')).toBe('mojo');
+		// THE LIVE DEFECT this closes, and the ONE thing that is not the notebook's:
+		// a plain code cell pasted out of Modular's docs reads as Python to every
+		// type-based test while its body is Mojo. It stays Mojo under either notebook.
+		expect(exportLanguageOf(cell('g', `%%mojo\n${MAIN}`), 'python')).toBe('mojo');
+		expect(exportLanguageOf(cell('g', `%%mojo\n${MAIN}`), 'mojo')).toBe('mojo');
+		expect(exportLanguageOf(cell('g2', `\n\n%%mojo build --emit shared-lib\n${MAIN}`), 'python')).toBe('mojo');
 		// ...and only on the FIRST non-blank line, IPython's own rule.
-		expect(exportLanguageOf(cell('g3', 'x = 1\n%%mojo'))).toBe('python');
-		expect(exportLanguageOf(cell('s', 'select 1', { language: 'sql' }))).toBeNull();
-		expect(exportLanguageOf({ cell_type: 'markdown', source: '# hi' })).toBeNull();
-		expect(exportLanguageOf({ cell_type: 'raw', source: '---' })).toBeNull();
+		expect(exportLanguageOf(cell('g3', 'x = 1\n%%mojo'), 'python')).toBe('python');
+		// A cell with no module source at all answers null under either language.
+		for (const lang of ['python', 'mojo'] as const) {
+			expect(exportLanguageOf(cell('s', 'select 1', { language: 'sql' }), lang)).toBeNull();
+			expect(exportLanguageOf({ cell_type: 'markdown', source: '# hi' }, lang)).toBeNull();
+			expect(exportLanguageOf({ cell_type: 'raw', source: '---' }, lang)).toBeNull();
+		}
 	});
 
-	it('refuses a Mojo cell for .py and a Python cell for .mojo, in both directions', () => {
-		const py = cell('p', 'def f(): ...');
-		const mo = mojoCell('m', MAIN);
+	it('matches a cell against its own notebook\'s module, and refuses the %%mojo mismatch', () => {
+		const code = cell('p', 'def f(): ...');
 		const magic = cell('g', `%%mojo\n${MAIN}`);
-		expect(canExportCell(py, 'python')).toBe(true);
-		expect(canExportCell(py, 'mojo')).toBe(false);
-		expect(canExportCell(mo, 'mojo')).toBe(true);
-		expect(canExportCell(mo, 'python')).toBe(false);
+		// ONE parameter answers both halves - the module's language IS the notebook's -
+		// so an ordinary code cell always matches its own notebook's module.
+		expect(canExportCell(code, 'python')).toBe(true);
+		expect(canExportCell(code, 'mojo')).toBe(true);
+		// The magic cell is the exception, and the only one: its SOURCE disagrees with
+		// a Python notebook, so it can go in no `.py` module.
 		expect(canExportCell(magic, 'python')).toBe(false);
 		expect(canExportCell(magic, 'mojo')).toBe(true);
 	});
 
-	it('defaults to the legacy Python question, so every pre-.mojo caller is unchanged', () => {
+	it('defaults to the legacy Python question, so every pre-language caller is unchanged', () => {
 		expect(canExportCell(cell('p', 'x = 1'))).toBe(true);
-		expect(canExportCell(mojoCell('m', MAIN))).toBe(false);
+		expect(canExportCell(cell('g', `%%mojo\n${MAIN}`))).toBe(false);
 		expect(isExportCell(cell('p', 'x = 1', { export: true }))).toBe(true);
 	});
 
@@ -690,8 +700,12 @@ describe('a notebook whose target is .mojo exports its Mojo cells to one module'
 	async function mojoNotebook(name: string, sources: string[], target = `lib/${name.replace('.ipynb', '')}.mojo`) {
 		const nb = nbmod.resolveNotebookPath(name);
 		svc.useNotebook(`sess-${name}`, name);
+		// The NOTEBOOK is what makes these Mojo cells, and it must be declared BEFORE
+		// the target: the target's extension has to agree with the language, so a
+		// `.mojo` path on a Python notebook is refused by design.
+		nbmod.setNotebookLanguage('mojo', nb);
 		const { ids } = await svc.addCells(
-			sources.map((source) => ({ cell_type: 'mojo' as const, source })),
+			sources.map((source) => ({ cell_type: 'code' as const, source })),
 			null,
 			{ nb, routeImports: false }
 		);
@@ -741,25 +755,29 @@ describe('a notebook whose target is .mojo exports its Mojo cells to one module'
 		expect(readModule('lib/hand.mojo')).toBe('def hand_written(): ...\n');
 	});
 
-	it('a PYTHON cell contributes nothing to a .mojo module', async () => {
+	it('a cell with NO module source contributes nothing to a .mojo module', async () => {
+		// In a Mojo notebook every plain code cell IS Mojo, so what is left ineligible
+		// is a cell that contributes no module source in any language - a SQL cell
+		// here, whose raw SQL would otherwise be concatenated into a file git tracks.
 		const nb = nbmod.resolveNotebookPath('mixed.ipynb');
 		svc.useNotebook('sess-mixed', 'mixed.ipynb');
+		nbmod.setNotebookLanguage('mojo', nb);
 		const { ids } = await svc.addCells(
 			[
-				{ cell_type: 'mojo', source: 'def only_mojo(): ...' },
-				{ cell_type: 'code', source: 'import os\nPY_ONLY = 1' }
+				{ cell_type: 'code', source: 'def only_mojo(): ...' },
+				{ cell_type: 'sql', source: 'select SQL_ONLY from t' }
 			],
 			null,
 			{ nb, routeImports: false }
 		);
 		nbmod.setExportTarget('lib/mixed.mojo', nb);
 		const full = ids.map((id) => svc.resolveRef(nb, id));
-		// The Python cell is REFUSED, so it is never even marked.
+		// The SQL cell is REFUSED, so it is never even marked.
 		expect(nbmod.setCellExport(full[1], true, nb)).toEqual({ ok: false, reason: 'not-code' });
 		nbmod.setCellExports(full, true, nb);
 		const text = readModule('lib/mixed.mojo')!;
 		expect(text).toContain('def only_mojo');
-		expect(text).not.toContain('PY_ONLY');
+		expect(text).not.toContain('SQL_ONLY');
 	});
 
 	it('THE REGRESSION: a %%mojo cell can never reach a .py module', async () => {
@@ -784,25 +802,33 @@ describe('a notebook whose target is .mojo exports its Mojo cells to one module'
 	});
 });
 
-describe('a mark stranded by a target-language change stays clearable', () => {
-	const py = { cell_type: 'code', source: 'x = 1', metadata: { cellar: { export: true } } };
-	const mojo = {
+describe('a stranded mark stays clearable', () => {
+	const code = { cell_type: 'code', source: 'x = 1', metadata: { cellar: { export: true } } };
+	const magic = {
 		cell_type: 'code',
-		source: 'def main(): ...',
-		metadata: { cellar: { language: 'mojo', export: true } }
+		source: `%%mojo\n${MAIN}`,
+		metadata: { cellar: { export: true } }
 	};
+	const md = { cell_type: 'markdown', source: '# hi', metadata: { cellar: { export: true } } };
 
-	it('is the FLAG on an ineligible cell, in both directions', () => {
-		// Point the target at the other language and the flag stays where it is -
-		// nothing rewrites the user's committed `.ipynb` - so the cell contributes to
-		// no module while the key is still there.
-		expect(exportMarkStranded(py, 'mojo')).toBe(true);
-		expect(exportMarkStranded(mojo, 'python')).toBe(true);
-		// Eligible again: an ordinary mark, not a stranded one.
-		expect(exportMarkStranded(py, 'python')).toBe(false);
-		expect(exportMarkStranded(mojo, 'mojo')).toBe(false);
+	it('a plain code mark is NEVER stranded by the language - it moves WITH the notebook', () => {
+		// This is what "no second setting that can contradict" buys: the module's
+		// language is the notebook's, so switching moves BOTH and a marked code cell
+		// stays in the module. There is no stranding to undo on the way back either.
+		expect(exportMarkStranded(code, 'python')).toBe(false);
+		expect(exportMarkStranded(code, 'mojo')).toBe(false);
+		expect(isExportCell(code, 'python')).toBe(true);
+		expect(isExportCell(code, 'mojo')).toBe(true);
+	});
+
+	it('is the FLAG on a cell whose SOURCE or TYPE cannot contribute', () => {
+		// The two reachable shapes: a `%%mojo` cell under a `.py` module (its source
+		// disagrees with its notebook), and a cell with no module source at all.
+		expect(exportMarkStranded(magic, 'python')).toBe(true);
+		expect(exportMarkStranded(magic, 'mojo')).toBe(false);
+		expect(exportMarkStranded(md, 'python')).toBe(true);
+		expect(exportMarkStranded(md, 'mojo')).toBe(true);
 		// An ineligible cell with NO flag has no state to clear.
-		expect(exportMarkStranded({ cell_type: 'code', source: 'x = 1' }, 'mojo')).toBe(false);
 		expect(exportMarkStranded({ cell_type: 'markdown', source: '# hi' }, 'python')).toBe(false);
 	});
 
@@ -810,9 +836,9 @@ describe('a mark stranded by a target-language change stays clearable', () => {
 		// The bar states this notebook-wide fact ONCE, so it needs the count rather
 		// than a per-cell sentence.
 		const clean = { cell_type: 'code', source: 'x = 1' };
-		expect(exportStrandedCount([py, mojo, clean], 'mojo')).toBe(1);
-		expect(exportStrandedCount([py, mojo, clean], 'python')).toBe(1);
-		expect(exportStrandedCount([py, clean], 'python')).toBe(0);
+		expect(exportStrandedCount([code, magic, md, clean], 'python')).toBe(2);
+		expect(exportStrandedCount([code, magic, md, clean], 'mojo')).toBe(1);
+		expect(exportStrandedCount([code, clean], 'python')).toBe(0);
 		expect(exportStrandedCount([], 'mojo')).toBe(0);
 		expect(exportStrandedCount(null)).toBe(0);
 	});
@@ -821,11 +847,10 @@ describe('a mark stranded by a target-language change stays clearable', () => {
 		// The second number is what decides which REMEDY the bar may name: a cell that
 		// contributes no module source in ANY language is stranded whatever the target
 		// says, so pointing the target elsewhere cannot resolve it.
-		const md = { cell_type: 'markdown', source: '# hi', metadata: { cellar: { export: true } } };
-		expect(exportStrandedSummary([py, md], 'mojo')).toEqual({ count: 2, withLanguage: 1 });
+		expect(exportStrandedSummary([magic, md], 'python')).toEqual({ count: 2, withLanguage: 1 });
 		expect(exportStrandedSummary([md], 'python')).toEqual({ count: 1, withLanguage: 0 });
-		expect(exportStrandedSummary([mojo], 'python')).toEqual({ count: 1, withLanguage: 1 });
-		expect(exportStrandedSummary([py], 'python')).toEqual({ count: 0, withLanguage: 0 });
+		expect(exportStrandedSummary([magic], 'python')).toEqual({ count: 1, withLanguage: 1 });
+		expect(exportStrandedSummary([code], 'python')).toEqual({ count: 0, withLanguage: 0 });
 		expect(exportStrandedSummary(null)).toEqual({ count: 0, withLanguage: 0 });
 	});
 
@@ -872,19 +897,27 @@ describe('a mark stranded by a target-language change stays clearable', () => {
 			expect(say).not.toMatch(/is not (Python|Mojo)|their own language/);
 		}
 
-		// A cell that DOES have a language keeps the target remedy, since changing the
-		// extension really would take it - and the sentence still names no language.
+		// A cell that DOES have a language is resolved by moving the NOTEBOOK's
+		// language, never by repointing the target: the module's language follows the
+		// notebook's, so `setExportTarget` REFUSES the other extension (driven against
+		// the real setter below). The sentence still names no language.
 		for (const lang of ['python', 'mojo'] as const) {
 			const say = exportStrandedExplanation({ count: 1, withLanguage: 1 }, lang);
-			expect(say).toContain('Point the target at a module that takes them');
+			expect(say).toContain("change the notebook's language");
+			expect(say).not.toMatch(/Point the target/);
 			expect(say).not.toContain('their own language');
 			expect(say).not.toContain('no module source');
 		}
-		// A MIXED set keeps it too: the target remedy applies to the cells that have a
-		// language, and clearing covers the rest.
+		// A MIXED set keeps it too: the language remedy applies to the cells that have
+		// one, and clearing covers the rest.
 		const mixed = exportStrandedExplanation({ count: 3, withLanguage: 1 }, 'python');
-		expect(mixed).toContain('Point the target');
+		expect(mixed).toContain("change the notebook's language");
 		expect(mixed).toContain("clear each mark from the cell's toolbar");
+		// With NO target the notebook still needs one named, but naming one alone
+		// cannot resolve a cell written in another language, so the sentence says both.
+		const none = exportStrandedExplanation({ count: 1, withLanguage: 1 }, null);
+		expect(none).toContain('Set a target path above');
+		expect(none).toContain("the notebook's own language");
 	});
 
 	it('the per-cell marker stays a MARKER, never the notebook-wide sentence', () => {
@@ -903,6 +936,11 @@ describe('a mark stranded by a target-language change stays clearable', () => {
 		// The whole point of rendering the toggle for such a cell: marking is gated on
 		// eligibility and UNMARKING is gated on nothing, so this is the one surface
 		// that can retire an otherwise invisible key.
+		//
+		// Stranded HERE by the cell's own SOURCE rather than by a target flip: the
+		// module's language follows the notebook now, so a plain code cell can no
+		// longer be stranded by the setting moving under it. A `%%mojo` cell in a
+		// PYTHON notebook is the reachable shape (a paste from Modular's docs).
 		const rel = 'stranded.ipynb';
 		const nb = nbmod.resolveNotebookPath(rel);
 		svc.useNotebook('sess-stranded', rel);
@@ -913,18 +951,61 @@ describe('a mark stranded by a target-language change stays clearable', () => {
 		const id = svc.resolveRef(nb, ids[0]);
 		nbmod.setExportTarget('lib/stranded.py', nb);
 		nbmod.setCellExports([id], true, nb);
-		// Repoint at a `.mojo` module: the Python cell is now eligible for nothing.
-		nbmod.setExportTarget('lib/stranded.mojo', nb);
+		// The cell becomes Mojo by its own source: eligible for nothing this notebook has.
+		nbmod.setSource(id, `%%mojo\n${MAIN}`, nb);
 		const stranded = nbmod.listCells(nb).find((c) => c.id === id)!;
-		expect(exportMarkStranded(stranded, 'mojo')).toBe(true);
-		expect(isExportCell(stranded, 'mojo')).toBe(false);
+		expect(exportMarkStranded(stranded, 'python')).toBe(true);
+		expect(isExportCell(stranded, 'python')).toBe(false);
 		// Re-MARKING is refused, which is why the toggle sends `false`...
 		expect(nbmod.setCellExport(id, true, nb)).toEqual({ ok: false, reason: 'not-code' });
 		// ...and clearing works, leaving no key behind in the committed notebook.
 		expect(nbmod.setCellExport(id, false, nb)).toEqual({ ok: true });
 		const cleared = nbmod.listCells(nb).find((c) => c.id === id)!;
 		expect('export' in (cleared.metadata?.cellar ?? {})).toBe(false);
-		expect(exportMarkStranded(cleared, 'mojo')).toBe(false);
+		expect(exportMarkStranded(cleared, 'python')).toBe(false);
+	});
+
+	it('the remedy the bar names is one the setters ACCEPT, and the old one is refused', async () => {
+		// The rule `exportStrandedExplanation`'s header states: the remedy may not name
+		// an action that cannot help. Inverting the authority (a module's language now
+		// FOLLOWS the notebook's) turned the old "point the target at a module that
+		// takes them" into exactly that - `setExportTarget` REFUSES the other extension
+		// - so both halves are driven against the real setters here rather than read
+		// off the sentence.
+		const rel = 'stranded-remedy.ipynb';
+		const nb = nbmod.resolveNotebookPath(rel);
+		svc.useNotebook('sess-stranded-remedy', rel);
+		const { ids } = await svc.addCells([{ cell_type: 'code', source: 'x = 1' }], null, {
+			nb,
+			routeImports: false
+		});
+		const id = svc.resolveRef(nb, ids[0]);
+		nbmod.setExportTarget('lib/stranded-remedy.py', nb);
+		nbmod.setCellExports([id], true, nb);
+		// Marked while eligible, then stranded by its own SOURCE - the reachable order
+		// (marking a `%%mojo` cell is refused, which is why the toggle only clears).
+		nbmod.setSource(id, `%%mojo\n${MAIN}`, nb);
+
+		const strandedNow = () =>
+			exportStrandedSummary(nbmod.listCells(nb), nbmod.getNotebookLanguage(nb));
+		expect(strandedNow()).toEqual({ count: 1, withLanguage: 1 });
+
+		// THE DEAD REMEDY: repointing the target at the module that would take this
+		// cell is refused outright, so a sentence naming it sends the user nowhere.
+		expect(() => nbmod.setExportTarget('lib/stranded-remedy.mojo', nb)).toThrow(
+			/this notebook's language is Python/
+		);
+
+		// THE NAMED REMEDY: the sentence points at the notebook's language, and moving
+		// it really does resolve the cell - it re-expresses the target with it.
+		expect(
+			exportStrandedExplanation(strandedNow(), nbmod.getNotebook(nb).exportLanguage)
+		).toContain("change the notebook's language");
+		nbmod.setNotebookLanguage('mojo', nb);
+		expect(nbmod.getExportTarget(nb)).toBe('lib/stranded-remedy.mojo');
+		expect(strandedNow()).toEqual({ count: 0, withLanguage: 0 });
+		const eligible = nbmod.listCells(nb).find((c) => c.id === id)!;
+		expect(isExportCell(eligible, 'mojo')).toBe(true);
 	});
 });
 
@@ -933,6 +1014,9 @@ describe('converting a cell never deletes its export mark', () => {
 	async function marked(rel: string, source: string, target: string) {
 		const nb = nbmod.resolveNotebookPath(rel);
 		svc.useNotebook(`sess-${rel}`, rel);
+		// The target's extension has to agree with the notebook's language, so a
+		// `.mojo` target means a Mojo notebook.
+		if (target.endsWith('.mojo')) nbmod.setNotebookLanguage('mojo', nb);
 		const { ids } = await svc.addCells([{ cell_type: 'code' as const, source }], null, {
 			nb,
 			routeImports: false
@@ -944,31 +1028,31 @@ describe('converting a cell never deletes its export mark', () => {
 	}
 	const cellOf = (nb: string, id: string) => nbmod.listCells(nb).find((c) => c.id === id)!;
 
-	it('THE HAPPY PATH: a %%mojo code cell marked for a .mojo target survives the conversion', async () => {
-		// A pasted Modular example is a plain `code` cell whose source opens with
-		// `%%mojo`, which is exactly what `exportLanguageOf` was widened to recognise -
-		// so under a `.mojo` target it is eligible and marking succeeds. The agent
-		// doctrine then tells the user to convert it to the `mojo` TYPE, and that
-		// conversion used to delete the flag, dropping the cell out of the module with
-		// no notice and no stranded marker, because the key itself was gone.
-		const { nb, id } = await marked('mojo-convert.ipynb', '%%mojo\ndef helper() -> Int:\n    return 1', 'lib/mc.mojo');
+	it('THE HAPPY PATH: a marked cell survives a NOTEBOOK LANGUAGE switch, both ways', async () => {
+		// A conversion used to delete the flag, dropping the cell out of the module
+		// with no notice and no stranded marker, because the key itself was gone. The
+		// LANGUAGE is the equivalent move now, and it must be even safer: the module's
+		// language follows the notebook, so a marked code cell stays marked AND stays
+		// eligible - there is nothing stale left on the way back either.
+		const { nb, id } = await marked('mojo-convert.ipynb', 'def helper() -> Int:\n    return 1', 'lib/mc.mojo');
 		expect(isExportCell(cellOf(nb, id), 'mojo')).toBe(true);
 
-		nbmod.setCellType(id, 'mojo', nb);
-		const converted = cellOf(nb, id);
-		expect(converted.metadata?.cellar?.export).toBe(true);
+		nbmod.setNotebookLanguage('python', nb);
+		expect(nbmod.getExportTarget(nb)).toBe('lib/mc.py');
+		const asPython = cellOf(nb, id);
+		expect(asPython.metadata?.cellar?.export).toBe(true);
 		// Still eligible, so it is still IN the module - not merely still flagged.
-		expect(isExportCell(converted, 'mojo')).toBe(true);
-		expect(exportMarkStranded(converted, 'mojo')).toBe(false);
-		expect(readFileSync(join(WS, 'lib/mc.mojo'), 'utf8')).toContain('def helper()');
+		expect(isExportCell(asPython, 'python')).toBe(true);
+		expect(exportMarkStranded(asPython, 'python')).toBe(false);
+		expect(readFileSync(join(WS, 'lib/mc.py'), 'utf8')).toContain('def helper()');
 	});
 
-	it('a mojo -> code -> mojo round trip keeps the mark and the module', async () => {
-		const { nb, id } = await marked('mojo-round.ipynb', '%%mojo\ndef ring() -> Int:\n    return 2', 'lib/mr.mojo');
-		nbmod.setCellType(id, 'mojo', nb);
-		nbmod.setCellType(id, 'code', nb);
-		nbmod.setCellType(id, 'mojo', nb);
+	it('a mojo -> python -> mojo round trip keeps the mark, the target and the module', async () => {
+		const { nb, id } = await marked('mojo-round.ipynb', 'def ring() -> Int:\n    return 2', 'lib/mr.mojo');
+		nbmod.setNotebookLanguage('python', nb);
+		nbmod.setNotebookLanguage('mojo', nb);
 		expect(cellOf(nb, id).metadata?.cellar?.export).toBe(true);
+		expect(nbmod.getExportTarget(nb)).toBe('lib/mr.mojo');
 		expect(readFileSync(join(WS, 'lib/mr.mojo'), 'utf8')).toContain('def ring()');
 	});
 
@@ -1034,6 +1118,7 @@ describe('setExportTarget accepts .mojo and still refuses anything else', () => 
 		const nb = nbmod.resolveNotebookPath('target.ipynb');
 		svc.useNotebook('sess-target', 'target.ipynb');
 		await svc.addCells([{ cell_type: 'code', source: 'x = 1' }], null, { nb, routeImports: false });
+		nbmod.setNotebookLanguage('mojo', nb); // the extension follows the language
 		expect(nbmod.setExportTarget('lib/k.mojo', nb).target).toBe('lib/k.mojo');
 		expect(() => nbmod.setExportTarget('src/app.ts', nb)).toThrow(/not a \.py or \.mojo file/);
 		expect(nbmod.getExportTarget(nb)).toBe('lib/k.mojo');
@@ -1048,25 +1133,76 @@ describe('the wiring the browser ships', () => {
 	const read = (p: string) => readFileSync(new URL(`../../src/lib/${p}`, import.meta.url), 'utf8');
 
 	it('eligibility is a MATCH in both directions, for every cell language', () => {
-		// One sentence - a cell is exportable to a target iff its language matches the
-		// target's extension - gives every answer, so neither language is a special case
-		// of the other, and a `&& !isMojoCell(cell)` exclusion could not produce this
-		// table (it has no `.mojo` target to answer for).
-		const py = { cell_type: 'code', source: 'x = 1' };
-		const mojoTyped = { cell_type: 'code', source: 'def main(): ...', metadata: { cellar: { language: 'mojo' } } };
+		// One sentence - a cell is exportable to its notebook's module iff its language
+		// matches - gives every answer, so neither language is a special case of the
+		// other and a `&& !isMojoCell(cell)` exclusion could not produce this table (it
+		// has no `.mojo` module to answer for).
+		const code = { cell_type: 'code', source: 'x = 1' };
 		const mojoMagic = { cell_type: 'code', source: '%%mojo\ndef main(): ...' };
 		const md = { cell_type: 'markdown', source: '# hi' };
-		for (const [cell, lang] of [
-			[py, 'python'],
-			[mojoTyped, 'mojo'],
-			[mojoMagic, 'mojo']
-		] as const) {
-			expect(canExportCell(cell, lang)).toBe(true);
-			expect(canExportCell(cell, lang === 'mojo' ? 'python' : 'mojo')).toBe(false);
-		}
-		// A cell that contributes no module source at all matches NEITHER target.
+		// A plain code cell belongs to its OWN notebook's module, whichever that is:
+		// the module's language IS the notebook's, so there is nothing to mismatch.
+		expect(canExportCell(code, 'python')).toBe(true);
+		expect(canExportCell(code, 'mojo')).toBe(true);
+		// A cell whose SOURCE names its own language is the one real mismatch.
+		expect(canExportCell(mojoMagic, 'mojo')).toBe(true);
+		expect(canExportCell(mojoMagic, 'python')).toBe(false);
+		// A cell that contributes no module source at all matches NEITHER.
 		expect(canExportCell(md, 'python')).toBe(false);
 		expect(canExportCell(md, 'mojo')).toBe(false);
+	});
+
+	it('eligibility is judged by the NOTEBOOK, not by the nullable module language', () => {
+		// The cell row has BOTH values in hand - the notebook's language and the
+		// module's, which is null until a target names one - and only one of them may
+		// decide eligibility. `exportEligibilityLanguage` is where that choice lives,
+		// so it can be driven here at all: vitest runs without the SvelteKit plugin, so
+		// the component cannot be mounted, and e2e runs in neither CI nor the gate.
+		//
+		// THE CASE THAT MATTERS is a Mojo notebook with NO target yet. Judged by the
+		// module language (`module ?? 'python'`) it answers `python`, so the row greys a
+		// perfectly valid mark as STRANDED while the notebook-wide explanation - derived
+		// from the notebook's language - reports none, and clicking that greyed toggle
+		// CLEARS a mark the server considers eligible.
+		expect(exportEligibilityLanguage('mojo', null)).toBe('mojo');
+		expect(exportEligibilityLanguage('python', null)).toBe('python');
+		// Where a target DOES name a module the two values are equal (the module's
+		// language FOLLOWS the notebook's), so nothing else moves.
+		expect(exportEligibilityLanguage('mojo', 'mojo')).toBe('mojo');
+		expect(exportEligibilityLanguage('python', 'python')).toBe('python');
+
+		// And that is what the eligibility rule then ANSWERS, which is the consequence
+		// the row renders: a plain code cell of an untargeted Mojo notebook is
+		// exportable and NOT stranded, where the old form made it both ineligible and
+		// stranded at once.
+		const code = { cell_type: 'code', source: 'def main(): ...', metadata: { cellar: { export: true } } };
+		const lang = exportEligibilityLanguage('mojo', null);
+		expect(canExportCell(code, lang)).toBe(true);
+		expect(isExportCell(code, lang)).toBe(true);
+		expect(exportMarkStranded(code, lang)).toBe(false);
+	});
+
+	it('a surface that SPEAKS ABOUT A MODULE reads the nullable one instead', () => {
+		// The other half of that same split, and the two must disagree exactly where a
+		// call site got it wrong: with no target configured, ELIGIBILITY still answers
+		// the notebook's language while anything naming a module answers null.
+		expect(exportModuleLanguage('mojo', false)).toBeNull();
+		expect(exportModuleLanguage('python', false)).toBeNull();
+		expect(exportEligibilityLanguage('mojo', exportModuleLanguage('mojo', false))).toBe('mojo');
+		// Once a target names a module the two coincide - the module's language FOLLOWS
+		// the notebook's - so nothing else in the bar or the row moves.
+		expect(exportModuleLanguage('mojo', true)).toBe('mojo');
+		expect(exportModuleLanguage('python', true)).toBe('python');
+
+		// The consequence the badge renders. Fed the NOTEBOOK's language, a Mojo
+		// notebook with no target warns that a `main` will be dropped from an export
+		// that cannot happen at all - while the server's once-per-notebook twin, gated
+		// on a configured target, says nothing.
+		const cells = [cell('a', MAIN, { export: true }), cell('b', MAIN, { export: true })];
+		expect([...mojoMainDroppedIds(cells, exportModuleLanguage('mojo', false))]).toEqual([]);
+		// With a module to be about it speaks, and names the earlier cell - so the gate
+		// is what changed, not the rule.
+		expect([...mojoMainDroppedIds(cells, exportModuleLanguage('mojo', true))]).toEqual(['a']);
 	});
 
 	it('the client half KEEPS the export mark on a type change, like the server', () => {
@@ -1126,13 +1262,19 @@ describe('the wiring the browser ships', () => {
 		expect(bar).toContain('{strandedExplanation}');
 	});
 
-	it('the nullable module language reaches the bar and the cells unchanged', () => {
+	it('the nullable module language reaches the bar, and it is the NOTEBOOK\'s', () => {
 		// `exportLanguage` is null when NO target is configured, and only the nullable
-		// value can tell that from a `.py` target. The eligibility fallback is applied
-		// where eligibility is asked, never before the prop is passed down.
+		// value can tell that from a configured one - every SENTENCE reads it, so a
+		// fallback applied before the prop is passed down would name a module the
+		// notebook does not have.
+		//
+		// Its VALUE is the notebook's language, never the path's extension: deriving it
+		// from the path here would put back the second spelling able to contradict the
+		// notebook, which is exactly what this axis removes. BOTH halves of that split
+		// now live in `exportRole` (`exportModuleLanguage` / `exportEligibilityLanguage`)
+		// and are driven against their real inputs above, so what is left for source to
+		// say is only that the nullable one is what reaches the bar.
 		const live = read('LiveNotebook.svelte');
-		expect(live).toContain('const exportModuleLanguage = $derived(exportTargetLanguage(exportResolved ?? exportTarget));');
-		expect(live).toContain("const exportLanguage = $derived(exportModuleLanguage ?? 'python');");
 		expect(live).toContain('exportLanguage={exportModuleLanguage}');
 		expect(live).toContain('exportStranded={exportStranded}');
 	});
@@ -1177,7 +1319,10 @@ describe('the wiring the browser ships', () => {
 	});
 
 	it('the notebook derives the badge set from the shared rule, per cell', () => {
-		expect(read('LiveNotebook.svelte')).toMatch(/mojoMainDropped = \$derived\(mojoMainDroppedIds\(cells, exportLanguage\)\)/);
+		// WHICH language it is fed is the split asserted behaviourally above (a
+		// module-speaking surface reads the nullable one); what only source can say is
+		// that the set is derived from the shared rule and handed down per cell.
+		expect(read('LiveNotebook.svelte')).toMatch(/mojoMainDropped = \$derived\(\s*mojoMainDroppedIds\(/);
 		expect(read('Notebook.svelte')).toContain('mainDropped={mojoMainDropped.has(cell.id)}');
 	});
 });

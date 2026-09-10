@@ -679,9 +679,14 @@ describe('the wiring the browser ships (source guards - see the file header)', (
 		expect(openGates(cell, 'data-testid="toggle-export"')).toEqual(['{#if canExport || exportStranded}']);
 		expect(cell).toContain('const canExport = $derived(canExportCell(cell, exportCellLanguage));');
 		expect(cell).toContain('const exportStranded = $derived(exportMarkStranded(cell, exportCellLanguage));');
-		// ELIGIBILITY applies the legacy `python` default; every SENTENCE reads the
-		// nullable prop, so none of them can name a module the notebook does not have.
-		expect(cell).toContain("const exportCellLanguage = $derived(exportLanguage ?? 'python');");
+		// WHICH language eligibility is judged by is not chosen here at all: it is the
+		// shared `exportEligibilityLanguage`, whose answer (the NOTEBOOK's, never the
+		// nullable module language) is driven against its real inputs in
+		// `mojo-export.test.ts`. Every SENTENCE still reads the nullable prop, so none
+		// of them can name a module the notebook does not have.
+		expect(cell).toContain(
+			'const exportCellLanguage = $derived(exportEligibilityLanguage(notebookLanguage, exportLanguage));'
+		);
 		expect(openGates(cell, 'data-testid="toggle-agent-hidden"')).toEqual([]);
 	});
 

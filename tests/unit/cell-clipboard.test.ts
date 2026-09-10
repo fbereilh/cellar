@@ -88,8 +88,11 @@ describe('clipboardCellType - the LOGICAL type an entry describes', () => {
 	it('reads a tagged code cell as its language, and an untagged one as code', () => {
 		expect(of('code', { language: 'sql' })).toBe('sql');
 		expect(of('code', { language: 'chat' })).toBe('chat');
-		expect(of('code', { language: 'mojo' })).toBe('mojo');
 		expect(of('code')).toBe('code');
+		// `mojo` is the NOTEBOOK's language, never a cell tag, so a legacy tag left by
+		// an older Cellar reads as the ordinary code cell it is on disk - which is
+		// also what keeps a paste of one from claiming a language its notebook is not.
+		expect(of('code', { language: 'mojo' })).toBe('code');
 	});
 
 	it('reads the nbformat types straight through', () => {

@@ -37,8 +37,16 @@ function fromLines(src: string | string[] | undefined | null): string {
 	return Array.isArray(src) ? src.join('') : (src ?? '');
 }
 
-/** Default kernelspec for a fresh notebook. */
-function defaultMetadata(): NotebookMetadata {
+/**
+ * Default notebook metadata for a fresh notebook - the kernelspec `serialize`
+ * writes when a document carries none of its own.
+ *
+ * Exported because MATERIALIZING `doc.metadata` has to produce the same thing:
+ * a setter that seeds a bare `{}` makes `serialize`'s `?? defaultMetadata()`
+ * fall through, so the very first notebook-level setting a user chooses silently
+ * DELETES the notebook's kernelspec from disk. See `notebook.ts`'s `notebookCellar`.
+ */
+export function defaultMetadata(): NotebookMetadata {
 	return { kernelspec: { name: 'python3', display_name: 'python3', language: 'python' } };
 }
 

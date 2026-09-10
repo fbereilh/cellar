@@ -71,10 +71,21 @@ vi.mock('../../src/lib/server/export-py', async () => {
 		resolves.n++;
 		return fn(...args);
 	};
+	// `docExportTargetInfo` is the one that can be HANDED an already-resolved answer
+	// (`exportTargetView` does exactly that), so it is counted only when it would
+	// really resolve - otherwise the counter would report a resolution that never
+	// happened and the budgets below would stop meaning what they say.
+	const info = (
+		doc: Parameters<typeof actual.docExportTargetInfo>[0],
+		resolved?: Parameters<typeof actual.docExportTargetInfo>[1]
+	) => {
+		if (resolved === undefined) resolves.n++;
+		return actual.docExportTargetInfo(doc, resolved);
+	};
 	return {
 		...actual,
 		resolveExportTarget: counted(actual.resolveExportTarget),
-		docExportTargetInfo: counted(actual.docExportTargetInfo),
+		docExportTargetInfo: info,
 		docExportTargetLanguage: counted(actual.docExportTargetLanguage),
 		docExportLanguage: counted(actual.docExportLanguage)
 	};
@@ -107,7 +118,10 @@ describe('docHumanExportHazards narrows BEFORE the foreign-module read', () => {
 	async function mojoNotebook(rel: string, source: string, target: string) {
 		const nb = nbmod.resolveNotebookPath(rel);
 		svc.useNotebook(`sess-${rel}`, rel);
-		const { ids } = await svc.addCells([{ cell_type: 'mojo' as const, source }], null, {
+		// The NOTEBOOK is what makes its code cells Mojo, and the target's extension
+		// follows it - so the language is declared before the target is named.
+		nbmod.setNotebookLanguage('mojo', nb);
+		const { ids } = await svc.addCells([{ cell_type: 'code' as const, source }], null, {
 			nb,
 			routeImports: false
 		});
@@ -132,7 +146,7 @@ describe('docHumanExportHazards narrows BEFORE the foreign-module read', () => {
 		// all: a kind the bar really shows must still be suppressed over a module Cellar
 		// did not generate, which is exactly what that read decides.
 		const nb = await mojoNotebook('dropped.ipynb', 'def main():\n    print(1)', 'out/dropped.mojo');
-		const { ids } = await svc.addCells([{ cell_type: 'mojo' as const, source: 'def main():\n    print(2)' }], null, {
+		const { ids } = await svc.addCells([{ cell_type: 'code' as const, source: 'def main():\n    print(2)' }], null, {
 			nb,
 			routeImports: false
 		});
@@ -143,10 +157,11 @@ describe('docHumanExportHazards narrows BEFORE the foreign-module read', () => {
 });
 
 describe('get_notebook_map adds no export-target resolution of its own', () => {
-	async function notebook(rel: string, cellType: 'code' | 'mojo', source: string) {
+	async function notebook(rel: string, language: 'python' | 'mojo', source: string) {
 		const nb = nbmod.resolveNotebookPath(rel);
 		svc.useNotebook(`sess-${rel}`, rel);
-		const { ids } = await svc.addCells([{ cell_type: cellType, source }], null, {
+		if (language === 'mojo') nbmod.setNotebookLanguage('mojo', nb);
+		const { ids } = await svc.addCells([{ cell_type: 'code' as const, source }], null, {
 			nb,
 			routeImports: false
 		});
@@ -168,7 +183,7 @@ describe('get_notebook_map adds no export-target resolution of its own', () => {
 		// hottest read tool, so the budget is measured against the surfaces the map
 		// composes rather than against a number: the view, plus the ONE resolution
 		// `display.export_target` needs to report where the marks land.
-		const { nb, id } = await notebook('map-cost.ipynb', 'code', 'def one():\n    return 1');
+		const { nb, id } = await notebook('map-cost.ipynb', 'python', 'def one():\n    return 1');
 		nbmod.setExportTarget('lib/map-cost.py', nb);
 		nbmod.setCellExports([id], true, nb);
 
@@ -185,29 +200,54 @@ describe('get_notebook_map adds no export-target resolution of its own', () => {
 		expect(leaves(map.sections).find((l) => l.id === svc.resolveRef(nb, id).slice(0, 8))?.export ?? true).toBe(true);
 	});
 
-	it('still reads the LANGUAGE, so a cell in the other language is not reported exported', async () => {
+	it('still reads the LANGUAGE, so a switch is reflected in what the map reports', async () => {
 		// The half a bare call-count could not see: the value derived from the view has
-		// to be the same answer the doc layer gives, or `export: true` would appear on a
-		// cell the module leaves out.
+		// to be the same answer the doc layer gives.
 		const { nb, id } = await notebook('map-lang.ipynb', 'mojo', 'def m() -> Int:\n    return 1');
 		nbmod.setExportTarget('lib/map-lang.mojo', nb);
 		nbmod.setCellExports([id], true, nb);
 		expect(nbmod.getNotebook(nb).exportLanguage).toBe('mojo');
-		const marked = leaves((await svc.getNotebookMap(nb)).sections).filter((l) => l.export === true);
-		expect(marked).toHaveLength(1);
+		expect(leaves((await svc.getNotebookMap(nb)).sections).filter((l) => l.export === true)).toHaveLength(1);
 
-		// Repoint at a `.py` module: the same cell contributes nothing to it now, so
-		// the map must stop reporting it as exported.
-		nbmod.setExportTarget('lib/map-lang.py', nb);
+		// Switch the NOTEBOOK to Python: the target's extension follows it, and the
+		// marked cell follows too - so it stays exported, now to `lib/map-lang.py`.
+		// That is the point of one setting: the mark cannot be stranded by the module
+		// language moving, because the module language IS the notebook's.
+		nbmod.setNotebookLanguage('python', nb);
+		expect(nbmod.getExportTarget(nb)).toBe('lib/map-lang.py');
 		expect(nbmod.getNotebook(nb).exportLanguage).toBe('python');
-		expect(leaves((await svc.getNotebookMap(nb)).sections).filter((l) => l.export === true)).toEqual([]);
+		expect(leaves((await svc.getNotebookMap(nb)).sections).filter((l) => l.export === true)).toHaveLength(1);
+	});
+
+	it('getNotebook resolves the target ONCE, language included', async () => {
+		// `exportTargetView` reports FOUR things off one resolution - the base, the
+		// module language, the hazards and the orphaned module - and it reads the
+		// language through the shared `docExportTargetInfo` rather than re-deriving the
+		// rule inline, HANDING it the `info` it already has. This is the half the map
+		// budget above cannot see: it measures `getNotebook` as a baseline, so a second
+		// sweep added here would simply raise the baseline and pass.
+		const { nb, id } = await notebook('view-cost.ipynb', 'python', 'def one():\n    return 1');
+		nbmod.setExportTarget('lib/view-cost.py', nb);
+		nbmod.setCellExports([id], true, nb);
+
+		resolves.n = 0;
+		const view = nbmod.getNotebook(nb);
+		expect(resolves.n).toBe(1);
+		// ...and the value that one resolution produced is the right one.
+		expect(view.exportLanguage).toBe('python');
+		expect(view.exportResolved).toBe('lib/view-cost.py');
 	});
 
 	it('a notebook with NO target reports the language as null, never as python', async () => {
-		// The honest nullable the refusal wording rests on: eligibility falls back to
-		// `python`, the VIEW does not.
-		const { nb } = await notebook('map-none.ipynb', 'code', 'x = 1');
+		// The honest nullable the refusal wording rests on: it reports the MODULE, and
+		// there is none. ELIGIBILITY is the separate, non-nullable field beside it -
+		// the NOTEBOOK's language - so no caller has to default the null into one.
+		const { nb } = await notebook('map-none.ipynb', 'python', 'x = 1');
 		expect(nbmod.getNotebook(nb).exportLanguage).toBeNull();
-		expect(nbmod.exportTargetInfoFor(nb)).toEqual({ configured: false, language: null });
+		expect(nbmod.exportTargetInfoFor(nb)).toEqual({
+			configured: false,
+			language: null,
+			eligibility: 'python'
+		});
 	});
 });

@@ -125,8 +125,16 @@ test('an agent reads and sets header numbering; the human sees numbered headings
 	// --- the agent's read: numbering is OFF and it can tell -------------------
 	await call('use_notebook', { name: 'report.ipynb' });
 	const before = await call('get_notebook_map', {});
-	// The `display` block also carries the nbdev-style `.py` export target (unset here).
-	expect(before.display).toEqual({ header_numbering: [], report_view: false, export_target: null });
+	// The `display` block also carries the nbdev-style export target (unset here) and
+	// the notebook's LANGUAGE - which is not display at all, but is the other thing an
+	// agent must read before it writes: what language to write, and where marked cells
+	// land, are the same decision (doctrine clause 12).
+	expect(before.display).toEqual({
+		language: 'python',
+		header_numbering: [],
+		report_view: false,
+		export_target: null
+	});
 
 	// --- the agent turns it on ------------------------------------------------
 	const set = await call('set_header_numbering', { levels: [2, 1, 2] });
@@ -135,7 +143,12 @@ test('an agent reads and sets header numbering; the human sees numbered headings
 
 	// --- the agent reads back the numbers the HUMAN sees -----------------------
 	const after = (await call('get_notebook_map', {})) as { display: unknown; sections: any[] };
-	expect(after.display).toEqual({ header_numbering: [1, 2], report_view: false, export_target: null });
+	expect(after.display).toEqual({
+		language: 'python',
+		header_numbering: [1, 2],
+		report_view: false,
+		export_target: null
+	});
 	const h1 = after.sections[0];
 	expect({ title: h1.title, number: h1.number }).toEqual({ title: 'Sales Analysis', number: '1' });
 	expect(h1.children.filter((c: any) => c.type === 'markdown').map((c: any) => [c.number, c.title])).toEqual([

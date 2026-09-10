@@ -25,6 +25,7 @@ import {
 	getHeaderNumbering,
 	setHeaderNumbering as setHeaderNumberingDoc,
 	setHideAllCode as setHideAllCodeDoc,
+	setNotebookLanguage as setNotebookLanguageDoc,
 	setHideInput as setHideInputDoc,
 	setExportTarget as setExportTargetDoc,
 	InvalidExportTargetError,
@@ -39,8 +40,12 @@ import {
 	workspaceRelative,
 	createNotebook as createNotebookDoc,
 	notebookExists,
-	getNotebookRoot
+	getNotebookRoot,
+	getNotebookLanguage,
+	isNotebookUnavailable,
+	NotebookUnavailableError
 } from '../notebook';
+import { reasonWithoutServerPath } from '../../serverMessage';
 import { setNotebookRootAndRestart, listWorkspaceRoots } from '../notebook-root-actions';
 import { resolveRootDir } from '../notebookRoot';
 import { ROOTS_DIR, normalizeRootPath, textNotebookRootError } from '../../notebookRoot';
@@ -59,13 +64,14 @@ import { getNotebookStaleness, analyzeDataflow } from '../dataflow';
 import { STALE_STATE, staleIdsInOrder } from '../../staleness';
 import type { StalenessEntry, StalenessMap } from '../../staleness';
 import { resolveSymbol, resolveImpact } from '../../symbolGraph';
-import { isPyUnsupportedType, isSqlCell, nbCellType, isRawCell, isChatCell, languageTagFor, logicalCellType, textNotebookCellTypeError, textNotebookTypeMessage } from '../../cellLanguage';
+import { isPyUnsupportedType, isSqlCell, nbCellType, isRawCell, isChatCell, languageTagFor, logicalCellType, textNotebookCellTypeError, textNotebookTypeMessage, InvalidNotebookLanguageError, TextNotebookLanguageError } from '../../cellLanguage';
 import { isCodeHidden, hideInputExplicit } from '../../hideInput';
 import {
 	isExportCell,
 	canExportCell,
 	exportCellCount,
 	exportDirectiveOwnsCell,
+	exportEligibilityLanguage,
 	exportLanguageOf,
 	exportMarkedTwice,
 	exportTargetLanguage
@@ -807,8 +813,10 @@ function staleFields(
 
 /**
  * The `language` field an agent-facing cell projection carries: the `cellar.language`
- * tag for a tagged code cell (`sql`, `chat`, `mojo`), and NOTHING for a plain code,
- * markdown or raw cell - whose type field already says what they are.
+ * tag for a tagged code cell (`sql`, `chat`), and NOTHING for a plain code,
+ * markdown or raw cell - whose type field already says what they are. A plain code
+ * cell's LANGUAGE is the NOTEBOOK's (`get_notebook_map`'s `display.language`), so
+ * nothing per-cell reports it.
  *
  * Read through `languageTagFor` rather than as a ternary per projection: the two
  * projections that report it (`readForm` and `getNotebookMap`'s `leaf`) each carried
@@ -936,13 +944,19 @@ export async function getNotebookMap(nb?: string | null) {
 	const stack: { node: MapSection; level: number }[] = [];
 	const toHandle = handleFn(nb);
 	const view = getNotebook(nb);
-	// Which module language this notebook's target names, so `export: true` marks the
-	// cells that really go into it - a Python cell under a `.mojo` target contributes
-	// nothing and must not be reported as exported. Read off the view `getNotebook`
-	// already resolved rather than resolved again: this is the most frequently called
-	// agent read tool, and with no target stored `resolveExportTarget` sweeps every
-	// cell looking for a `#|default_exp` directive, so a second call doubles it.
-	const exportLang = view.exportLanguage ?? 'python';
+	// Which language this notebook's marks are judged by, so `export: true` names the
+	// cells that really go into its module - a Python cell under a `.mojo` target
+	// contributes nothing and must not be reported as exported. Asked of the shared
+	// `exportEligibilityLanguage`, which is the SAME answer `setCellExports` gates
+	// marking on (`docExportLanguage`): read off the nullable module language
+	// instead, an untargeted MOJO notebook was judged as Python, so a `%%mojo` cell
+	// `set_cell_export` had just accepted came back unmarked here - the two agent
+	// surfaces disagreeing about one document. Both fields are read off the view
+	// `getNotebook` already resolved rather than resolved again: this is the most
+	// frequently called agent read tool, and with no target stored
+	// `resolveExportTarget` sweeps every cell looking for a `#|default_exp`
+	// directive, so a second call doubles it.
+	const exportLang = exportEligibilityLanguage(view.language, view.exportLanguage);
 	// The number each section renders with, so the agent reads the SAME heading the
 	// human does ("1. Setup", not "Setup") and can see the numbering is already
 	// being done for it - which is what stops it hardcoding a number into the source.
@@ -1015,6 +1029,11 @@ export async function getNotebookMap(nb?: string | null) {
 		// says which branch it is taking.
 		databricks: { connected: dbx.connected === true, runtime: agentRuntimeBlock(nb) },
 		display: {
+			// Not display at all, and deliberately reported here anyway: `language` is the
+			// notebook's ONE python-vs-mojo authority (doctrine clause 12), so it belongs
+			// beside `export_target` in the block an agent reads BEFORE it writes - what
+			// language to write, and where marked cells land, are the same decision.
+			language: view.language,
 			header_numbering: view.headerNumbering,
 			report_view: view.hideAllCode,
 			...exportTargetFields(nb)
@@ -1252,7 +1271,16 @@ async function liveKernelNames(nb?: string | null): Promise<Set<string> | null> 
  */
 export async function findSymbol(name: string, nb?: string | null) {
 	const cells = listCells(nb); // ALL cells (incl. hidden) so a hidden definer still counts
-	const [dataflow, kernelNames] = await Promise.all([analyzeDataflow(cells), liveKernelNames(nb)]);
+	// The NOTEBOOK's language decides which cells hold Python at all, exactly as it
+	// does for staleness (`getNotebookStaleness`) - it is not a default this caller
+	// may leave to `analyzeDataflow`. In a Mojo notebook every plain code cell would
+	// otherwise be handed to the `ast`/`symtable` probe, which parses `def main():
+	// print(...)` happily and reports `defines: ['main']` with the batch marked ok:
+	// this tool would then tell an agent a Mojo `main` is a defined Python symbol.
+	const [dataflow, kernelNames] = await Promise.all([
+		analyzeDataflow(cells, getNotebookLanguage(nb)),
+		liveKernelNames(nb)
+	]);
 	return resolveSymbol({
 		name,
 		cells: cells.map((c) => ({
@@ -1295,7 +1323,10 @@ export async function findSymbol(name: string, nb?: string | null) {
  */
 export async function cellImpact(id: string, nb?: string | null) {
 	const cells = listCells(nb); // ALL cells (incl. hidden) so the graph stays complete
-	const dataflow = await analyzeDataflow(cells);
+	// The notebook's language, for the reason `findSymbol` states: left to the
+	// default, a Mojo notebook's cells reach the Python probe and this tool reports
+	// fabricated dependents off names no Python cell ever defined.
+	const dataflow = await analyzeDataflow(cells, getNotebookLanguage(nb));
 	return resolveImpact({
 		id: asFullId(nb, id),
 		cells: cells.map((c) => ({ id: c.id, cell_type: c.cell_type, hidden: isHidden(c) })),
@@ -1531,7 +1562,7 @@ export function exportHtml({
  * cell: its imports are in the imports cell, and an empty cell beside them is
  * litter. An explicitly empty source still creates its empty cell.
  *
- * A spec of a type a `.py` TEXT notebook cannot hold ('raw', 'chat', 'mojo')
+ * A spec of a type a `.py` TEXT notebook cannot hold ('raw', 'chat')
  * throws `TextNotebookCellTypeError` for the WHOLE batch before anything is
  * written - `addCell` would throw on it anyway (the doc layer owns the rule),
  * but only once routing had already merged the earlier specs' imports into the
@@ -1585,9 +1616,11 @@ export async function editCell(id: string, source: string, { routeImports: route
 	if (!cell) return null;
 	autoCheckpointBeforeAgentAction(nb);
 	// A SQL cell is a `code` cell on disk, but its source is SQL - never route
-	// "imports" out of it, and the same holds for a mojo cell's Mojo source and a
-	// raw cell's verbatim text. Pass the LOGICAL type so routeOne's `!== 'code'`
-	// guard skips all three.
+	// "imports" out of it, and the same holds for a raw cell's verbatim text. Pass
+	// the LOGICAL type so routeOne's `!== 'code'` guard skips both. A MOJO
+	// notebook's cells are skipped a level up instead - there is no mojo logical
+	// type to test, so `routeImports` refuses on the NOTEBOOK's language at its own
+	// entry (`imports-cell.ts`).
 	const logicalType = logicalCellType(cell);
 	const routed = routeOne(source, nb, { routeEnabled, cellType: logicalType, skipCellId: id });
 	setSource(id, routed ? routed.source : source, nb);
@@ -1935,7 +1968,7 @@ export function moveCell(id: string, dest: MoveDest, nb?: string | null) {
 
 /**
  * MCP `set_cell_type`. A `.py` TEXT notebook REFUSES the types it cannot hold
- * ('raw', 'chat', 'mojo') - the doc layer's rule (`assertCanHoldType`), looked
+ * ('raw', 'chat') - the doc layer's rule (`assertCanHoldType`), looked
  * up here through the SAME `isPyTextNotebook` predicate the export tools use
  * so the agent gets a refusal NAMING the cause rather than a throw, and so
  * nothing is written: checked BEFORE the pre-action checkpoint, because a
@@ -1978,8 +2011,8 @@ export function setType(
 /**
  * Would this conversion destroy saved outputs? Only a cell that HAS outputs and is
  * leaving `code` for a type that cannot hold them - `applyCellType`'s own rule
- * (`cell_type !== 'code'` ⇒ outputs cleared), read through `nbCellType` so the
- * logical types that stay nbformat `code` (sql, mojo) are correctly not destructive.
+ * (`cell_type !== 'code'` ⇒ outputs cleared), read through `nbCellType` so a
+ * logical type that stays nbformat `code` (sql) is correctly not destructive.
  */
 function dropsOutputs(cell: CellView | null, type: LogicalCellType): boolean {
 	return !!cell?.outputs?.length && cell.cell_type === 'code' && nbCellType(type) !== 'code';
@@ -2019,6 +2052,78 @@ export function setHeaderNumbering(levels: readonly number[] | null | undefined,
 export function setReportView(enabled: boolean, nb?: string | null) {
 	const target = nb ?? getActiveNotebookPath();
 	return { report_view: setHideAllCodeDoc(enabled, target) };
+}
+
+/**
+ * MCP `set_notebook_language`. The notebook's ONE python-vs-mojo authority: it
+ * decides what every plain `code` cell in it IS - how it runs, whether it has
+ * Python dataflow, and which module language the export writes.
+ *
+ * It touches NO cell (there is no per-cell language tag to rewrite), so markdown,
+ * raw, SQL and chat cells are unaffected by construction. The stored export
+ * target's extension FOLLOWS it, which is what keeps the two from disagreeing -
+ * see `setNotebookLanguage`, which owns both halves and the `.py`-notebook
+ * refusal.
+ *
+ * The result reports the target back BECAUSE it may have moved: an agent holding
+ * `utils.py` needs to know it is now `utils.mojo` before it names it again.
+ *
+ * A REFUSAL and a FAILED WRITE are told apart BY TYPE, never by matching message
+ * text - the `setExportTarget` split, for the identical reason. The doc layer
+ * VALIDATES before it mutates (an unknown language, or `mojo` on a `.py` text
+ * notebook - both typed), so its one other throw is the `persist`: a disk failure
+ * over a language the live document already HOLDS and that `run.ts` is already
+ * compiling every plain code cell as. Reported as a refusal, the agent is told the
+ * call failed and goes on writing Python into a notebook now executing Mojo, so
+ * the persist case is its OWN outcome carrying what IS true - the language that
+ * took, and the export target it moved to.
+ *
+ * OPENING the document is a THIRD outcome and is checked FIRST, because it happens
+ * BEFORE anything is applied (`isNotebookUnavailable`: the notebook is gone,
+ * unreadable or unparseable - what an agent's pinned session meets when the file
+ * is deleted or renamed outside Cellar). Folded into `writeFailed` it claimed a
+ * language that never took. It is also why that branch may not re-enter the doc
+ * layer: `getNotebookLanguage`/`exportTargetFields` both call `docFor`, so on this
+ * very path they throw AGAIN and the tool escapes its own result union entirely -
+ * `setExportTarget`'s catch deliberately returns without asking the document
+ * anything, and this one now does the same.
+ */
+/**
+ * The `unavailable` message a caller reads, decided HERE because this is the last
+ * place that still holds the error OBJECT - everything downstream sees a string.
+ *
+ * `isNotebookUnavailable` covers TWO classes and only ONE carries a path:
+ * `NotebookUnavailableError` is `notebook not found: <abs>`, so it is stripped;
+ * `NotebookReadError` is path-free by construction (the leak is fixed AT THE READ)
+ * and its detail is the FILE'S OWN CONTENT, which the blunt stripper eats - a
+ * corrupt notebook reporting `Unexpected token '/', "{"a": / }" is not valid JSON`
+ * came back with the very `/` identifying the corruption removed. Stripping
+ * downstream is recorded as tried and WITHDRAWN for that reason, so the decision
+ * may not be left to a handler that has only the text.
+ */
+export function unavailableReason(err: unknown): string {
+	const msg = String((err as Error)?.message ?? err);
+	return err instanceof NotebookUnavailableError ? reasonWithoutServerPath(msg) : msg;
+}
+
+export function setNotebookLanguage(language: string, nb?: string | null) {
+	const target = nb ?? getActiveNotebookPath();
+	try {
+		return { language: setNotebookLanguageDoc(language, target), ...exportTargetFields(target) };
+	} catch (err) {
+		if (isNotebookUnavailable(err))
+			return { ok: false as const, unavailable: unavailableReason(err) };
+		if (err instanceof TextNotebookLanguageError)
+			return { ok: false as const, refused: 'py-notebook' as const };
+		if (err instanceof InvalidNotebookLanguageError)
+			return { ok: false as const, invalid: err.message };
+		return {
+			ok: false as const,
+			writeFailed: String((err as Error)?.message ?? err),
+			language: getNotebookLanguage(target),
+			...exportTargetFields(target)
+		};
+	}
 }
 
 /**
@@ -2078,13 +2183,43 @@ export function setReportView(enabled: boolean, nb?: string | null) {
  * targeted any more" - a directive lives in a cell, so no notebook-level setter
  * can clear it.
  */
+/**
+ * The FIRST question both export write tools ask of a notebook, answered so that
+ * OPENING it cannot escape their result union.
+ *
+ * `isPyTextNotebook` reaches `docFor`, which throws for a notebook that is gone,
+ * unreadable or unparseable - what a pinned agent session meets when the file is
+ * deleted or renamed outside Cellar. Called bare, that throw left the tool
+ * entirely and reached the agent as `notebook not found: <abs>`, an absolute
+ * server path in a result whose union claims to be exhaustive.
+ *
+ * It is the same THREE-outcome split the language pair already makes, through the
+ * same shared `isNotebookUnavailable`: opening FAILED (nothing was applied - never
+ * `writeFailed`, which claims the change took and points at a save that was never
+ * the problem), the document cannot HOLD the setting (`py-notebook`), or the call
+ * may proceed. Returning null is the last of those.
+ *
+ * One call is enough for the whole tool: `docFor` CACHES, so every later read of
+ * the same notebook in that call is a hit and cannot throw this again.
+ */
+function exportWriteGuard(nb: string) {
+	try {
+		return isPyTextNotebook(nb) ? { ok: false as const, refused: 'py-notebook' as const } : null;
+	} catch (err) {
+		if (isNotebookUnavailable(err))
+			return { ok: false as const, unavailable: unavailableReason(err) };
+		throw err;
+	}
+}
+
 export function setExportTarget(
 	target: string | null | undefined,
 	nb?: string | null,
 	base?: string | null
 ) {
 	const nbTarget = nb ?? getActiveNotebookPath();
-	if (isPyTextNotebook(nbTarget)) return { ok: false as const, refused: 'py-notebook' as const };
+	const guard = exportWriteGuard(nbTarget);
+	if (guard) return guard;
 	try {
 		setExportTargetDoc(target ?? null, nbTarget, undefined, base ?? null);
 	} catch (err) {
@@ -2092,6 +2227,10 @@ export function setExportTarget(
 		// generate nothing on every later export (see `setExportTarget` in notebook.ts).
 		if (err instanceof InvalidExportTargetError)
 			return { ok: false as const, invalid: err.message };
+		// Opening the document is its own outcome and is checked before the write one:
+		// nothing was applied there, so `writeFailed` would claim the target took.
+		if (isNotebookUnavailable(err))
+			return { ok: false as const, unavailable: unavailableReason(err) };
 		// NOT a refusal: the doc layer validates before it mutates, so the only other
 		// throw is the notebook write (EACCES, ENOSPC, a read-only checkout). The target
 		// was accepted and the live document HOLDS it - reporting that as an invalid path
@@ -2182,16 +2321,23 @@ export function setExportTarget(
  */
 export function setCellExport(ids: string[], exported: boolean, nb?: string | null) {
 	const target = nb ?? getActiveNotebookPath();
-	if (isPyTextNotebook(target)) return { ok: false as const, refused: 'py-notebook' as const };
-	// Eligibility is a MATCH against the target's module language, not a fixed
-	// "is this Python" - see `exportRole`'s `canExportCell`. Kept NULLABLE here and
-	// defaulted only where eligibility is asked, and carried alongside whether a
-	// target is CONFIGURED at all: there are three states, and the refusal must be
-	// able to say which one it saw rather than naming a `.py` module the notebook
-	// does not have.
+	const guard = exportWriteGuard(target);
+	if (guard) return guard;
+	// Eligibility is a MATCH against the module's language, not a fixed "is this
+	// Python" - see `exportRole`'s `canExportCell` - and WHICH language that is is
+	// the NOTEBOOK's, which `ExportTargetLanguageInfo.eligibility` answers so this
+	// call site cannot choose. Defaulting the nullable `language` instead answered
+	// `python` for a Mojo notebook with no target yet, so this tool refused a
+	// `%%mojo` cell the row toggle, `PATCH /api/cells/[id]` and `get_notebook_map`
+	// all treat as eligible - one document, four surfaces, one of them disagreeing.
+	//
+	// `targetLang` stays NULLABLE and is read only by the refusal's WORDING, beside
+	// whether a target is CONFIGURED at all: there are three states, and the refusal
+	// must be able to say which one it saw rather than naming a `.py` module the
+	// notebook does not have.
 	const targetInfo = exportTargetInfoFor(target);
 	const targetLang = targetInfo.language;
-	const lang = targetLang ?? 'python';
+	const lang = targetInfo.eligibility;
 	const full: string[] = [];
 	const seen = new Set<string>();
 	for (const ref of ids) {
@@ -2397,7 +2543,10 @@ function moduleFailure(target: string, exportTarget: string | null) {
 function moduleForeign(target: string, exportTarget: string | null) {
 	if (
 		!exportTarget ||
-		!exportCellCount(listCells(target), exportTargetLanguage(exportTarget) ?? 'python') ||
+		!exportCellCount(
+			listCells(target),
+			exportEligibilityLanguage(getNotebookLanguage(target), exportTargetLanguage(exportTarget))
+		) ||
 		!foreignModuleAt(exportTarget)
 	)
 		return {};
@@ -2534,7 +2683,12 @@ function moduleWarning(target: string, where: ExportTargetFields, wrote: boolean
 	const failed = moduleFailure(target, exportTarget);
 	if ('module' in failed) return failed;
 	if (!exportTarget) return {};
-	if (exportCellCount(listCells(target), exportTargetLanguage(exportTarget) ?? 'python')) {
+	if (
+		exportCellCount(
+			listCells(target),
+			exportEligibilityLanguage(getNotebookLanguage(target), exportTargetLanguage(exportTarget))
+		)
+	) {
 		// Asked FIRST, because every branch below describes a module a later export
 		// could write, and here none ever can: a file Cellar did not generate occupies
 		// the target, so the clobber guard declines it and re-calling `set_export_target`
