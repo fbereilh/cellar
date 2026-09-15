@@ -153,6 +153,7 @@ import {
 } from '../src/lib/server/instances.js';
 import { CONFIRM_PHRASE, planCleanup, resolveCallerWorkspace, workspaceKey } from '../src/lib/server/cleanup-plan.js';
 import { resolveWorkspacePorts } from '../src/lib/server/ports.js';
+import { jupyterRuntimeDir, sidecarInfoFile, sidecarPortConflict, waitForHttp, waitForSidecarPort } from '../src/lib/server/jupyter-sidecar.js';
 import {
 	buildFreshness,
 	missingReason,
@@ -354,7 +355,10 @@ process.on('exit', () => {
 });
 
 // Known TOCTOU: the probe socket is closed before the returned port is handed to
-// the app's real listen(), so the port is briefly unclaimed. Per-run instances use
+// the app's real listen(), so the port is briefly unclaimed. For the Jupyter
+// sidecar this window is CLOSED rather than tolerated: Jupyter walks to another
+// port when its requested one was taken, and the launcher reads the port it
+// actually bound back (see src/lib/server/jupyter-sidecar.js). Per-run instances use
 // mkdtemp workspaces + dynamic ports, so collisions are near-impossible in practice;
 // e2e runs at workers:2 (do NOT drop below 2). If a port-collision flake ever
 // surfaces here, harden by holding the probe socket open until the child has bound,
@@ -369,18 +373,6 @@ function freePort() {
 			srv.close(() => resolvePort(port));
 		});
 	});
-}
-
-async function waitFor(url, { headers = {}, timeoutMs = 30000 } = {}) {
-	const start = Date.now();
-	while (Date.now() - start < timeoutMs) {
-		try {
-			const res = await fetch(url, { headers });
-			if (res.ok || res.status === 403) return; // 403 = up but auth-gated
-		} catch {}
-		await new Promise((r) => setTimeout(r, 300));
-	}
-	throw new Error(`timed out waiting for ${url}`);
 }
 
 // Known, pre-existing: `inForegroundJob()` guards the harness prompt only, so a
@@ -1535,7 +1527,7 @@ async function main() {
 	//    `CELLAR_ISOLATED` implies): isolated / --new launches exist so concurrent
 	//    instances never collide, and a remembered port is exactly the port another
 	//    instance is most likely to be holding.
-	const { appPort, mcpPort, jupyterPort } = await resolveWorkspacePorts({
+	const { appPort, mcpPort, jupyterPort: requestedJupyterPort, jupyter: jupyterChoice } = await resolveWorkspacePorts({
 		workspace: WORKSPACE,
 		sticky: !forceNew,
 		dev: useDev,
@@ -1546,7 +1538,9 @@ async function main() {
 		log: (m) => console.log(m)
 	});
 	const token = randomBytes(24).toString('hex');
-	const jupyterUrl = `http://127.0.0.1:${jupyterPort}`;
+	// Only a PROVISIONAL Jupyter port: the sidecar may bind a different one (see
+	// the read-back below), and every record is corrected once it reports.
+	let jupyterPort = requestedJupyterPort;
 
 	// Zero-config agent wiring: record the live port map so `cellar mcp` can
 	// discover this instance, and point the project's .mcp.json at that bridge
@@ -1604,6 +1598,18 @@ async function main() {
 	// CELLAR_KERNEL_IDLE_TIMEOUT_MS: that is kernel.ts's per-RUN liveness-probe
 	// interval (it never culls anything), while this culls a whole idle kernel process.
 	const cullArgs = cullingArgs();
+	// The port below is a REQUEST. Between freePort() closing its probe and the
+	// sidecar binding, another process can take it, and jupyter_server's
+	// port_retries then quietly walks to a nearby port - so the launcher reads the
+	// port Jupyter actually bound back out of its server-info file
+	// (jpserver-<pid>.json) instead of polling the one it asked for
+	// (src/lib/server/jupyter-sidecar.js). A PINNED port is an instruction, so it
+	// gets port_retries=0: fail on that port rather than silently serve on another.
+	const jupyterPinned = jupyterChoice.source === 'pinned';
+	const sidecarEnv = { ...process.env, JUPYTER_PATH: jupyterDir };
+	// Asked in parallel with the sidecar's own (much slower) boot.
+	const runtimeDirP = jupyterRuntimeDir(hostPython, sidecarEnv);
+	runtimeDirP.catch(() => {}); // surfaced by the await below, never as an unhandled rejection
 	const jupyter = spawn(
 		hostPython,
 		[
@@ -1615,6 +1621,7 @@ async function main() {
 			'--ServerApp.open_browser=False',
 			`--ServerApp.root_dir=${WORKSPACE}`,
 			'--ServerApp.disable_check_xsrf=True',
+			...(jupyterPinned ? ['--ServerApp.port_retries=0'] : []),
 			...cullArgs
 		],
 		// cwd must agree with root_dir: a kernel started without a path (kernel.ts
@@ -1625,21 +1632,48 @@ async function main() {
 		// notebook that DOES declare a code root sends it as `path`, which
 		// jupyter_server resolves under this same root_dir. All args/env here are
 		// absolute paths (host python, JUPYTER_PATH temp dir), so they still resolve.
-		{ cwd: WORKSPACE, env: { ...process.env, JUPYTER_PATH: jupyterDir }, stdio: ['ignore', 'inherit', 'inherit'] }
+		{ cwd: WORKSPACE, env: sidecarEnv, stdio: ['ignore', 'inherit', 'inherit'] }
 	);
 	children.push(jupyter);
 	// Skip under isolation — updateInstance would re-create the registry entry we
 	// deliberately never wrote (it falls back to registerInstance when none exists).
 	if (!isolated)
 		updateInstance(process.pid, { jupyterPid: jupyter.pid, jupyterStart: processStartTime(jupyter.pid) });
+	// Until the sidecar has reported its port, an exit is reported by
+	// waitForSidecarPort (naming the port it was asked for) through main()'s
+	// catch; shutting down here first would race that message off the screen.
+	let sidecarStarted = false;
 	jupyter.on('exit', (c) => {
+		if (!sidecarStarted) return;
 		console.error(`[cellar] jupyter sidecar exited (${c})`);
 		shutdown(1, `jupyter sidecar exited (${c})`);
 	});
 
-	console.log(`[cellar] starting Jupyter sidecar on ${jupyterUrl} …`);
-	await waitFor(`${jupyterUrl}/api`, { headers: { Authorization: `token ${token}` } });
-	console.log('[cellar] Jupyter sidecar up.');
+	console.log(`[cellar] starting Jupyter sidecar (asking for port ${requestedJupyterPort}) …`);
+	jupyterPort = await waitForSidecarPort({
+		infoFile: sidecarInfoFile(await runtimeDirP, jupyter.pid),
+		token,
+		child: jupyter,
+		requestedPort: requestedJupyterPort,
+		isPinned: jupyterPinned
+	});
+	sidecarStarted = true;
+	const conflict = sidecarPortConflict(jupyterPort, requestedJupyterPort, { app: appPort, MCP: mcpPort });
+	if (conflict) throw new Error(conflict);
+	if (jupyterPort !== requestedJupyterPort) {
+		console.log(
+			`[cellar] port ${requestedJupyterPort} was taken before the Jupyter sidecar could bind it; it is serving on port ${jupyterPort} instead.`
+		);
+		writeRuntime(WORKSPACE, { mcpPort, appPort, jupyterPort });
+		if (!isolated) updateInstance(process.pid, { jupyterPort });
+	}
+	const jupyterUrl = `http://127.0.0.1:${jupyterPort}`;
+	await waitForHttp(`${jupyterUrl}/api`, {
+		headers: { Authorization: `token ${token}` },
+		describe: (last) =>
+			`the Jupyter sidecar reported it bound port ${jupyterPort}, but ${jupyterUrl}/api did not answer within 30s (last attempt: ${last}).`
+	});
+	console.log(`[cellar] Jupyter sidecar up on ${jupyterUrl}.`);
 
 	// 6) SvelteKit server. The venv/kernelspec env vars let the Settings API
 	//    re-resolve, create, and rebind venvs at runtime.
@@ -1693,7 +1727,9 @@ async function main() {
 
 	const appUrl = `http://localhost:${appPort}`;
 	console.log(`[cellar] starting SvelteKit app on ${appUrl} …`);
-	await waitFor(appUrl);
+	await waitForHttp(appUrl, {
+		describe: (last) => `the app server did not answer at ${appUrl} within 30s (last attempt: ${last}).`
+	});
 	const openUrl = `${appUrl}/?ws=${encodeURIComponent(WORKSPACE)}`;
 	console.log(`[cellar] ready:`);
 	console.log(`[cellar]   app → ${openUrl}`);
