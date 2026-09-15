@@ -153,7 +153,7 @@ import {
 } from '../src/lib/server/instances.js';
 import { CONFIRM_PHRASE, planCleanup, resolveCallerWorkspace, workspaceKey } from '../src/lib/server/cleanup-plan.js';
 import { resolveWorkspacePorts } from '../src/lib/server/ports.js';
-import { jupyterRuntimeDir, sidecarInfoFile, sidecarPortConflict, waitForHttp, waitForSidecarPort } from '../src/lib/server/jupyter-sidecar.js';
+import { jupyterRuntimeDir, sidecarPortConflict, waitForHttp, waitForSidecarPort } from '../src/lib/server/jupyter-sidecar.js';
 import {
 	buildFreshness,
 	missingReason,
@@ -1602,7 +1602,7 @@ async function main() {
 	// sidecar binding, another process can take it, and jupyter_server's
 	// port_retries then quietly walks to a nearby port - so the launcher reads the
 	// port Jupyter actually bound back out of its server-info file
-	// (jpserver-<pid>.json) instead of polling the one it asked for
+	// (the jpserver-*.json carrying this launch's token) instead of polling the one it asked for
 	// (src/lib/server/jupyter-sidecar.js). A PINNED port is an instruction, so it
 	// gets port_retries=0: fail on that port rather than silently serve on another.
 	const jupyterPinned = jupyterChoice.source === 'pinned';
@@ -1651,7 +1651,7 @@ async function main() {
 
 	console.log(`[cellar] starting Jupyter sidecar (asking for port ${requestedJupyterPort}) …`);
 	jupyterPort = await waitForSidecarPort({
-		infoFile: sidecarInfoFile(await runtimeDirP, jupyter.pid),
+		runtimeDir: await runtimeDirP,
 		token,
 		child: jupyter,
 		requestedPort: requestedJupyterPort,

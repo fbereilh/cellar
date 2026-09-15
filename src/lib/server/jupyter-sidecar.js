@@ -19,10 +19,12 @@
  * can break it. The path is not configurable (`ServerApp.info_file` and
  * `runtime_dir` are plain traits, and a `--ServerApp.info_file` flag is ignored
  * with a warning - measured), so the runtime dir is asked of the host python
- * with the sidecar's own environment rather than re-derived here, and the file
- * is accepted only when it carries THIS launch's random token - a stale file
- * left by an earlier, killed server whose pid was reused cannot be mistaken for
- * it. Jupyter writes the file in `start_app`, AFTER `_find_http_port` has settled
+ * with the sidecar's own environment rather than re-derived here. The file is
+ * found by the one fact that identifies it - THIS launch's random token - and
+ * never by the spawned pid: on Windows a venv `python.exe` is a launcher that
+ * runs the real interpreter as a CHILD process, so the file is named after a pid
+ * the launcher never sees. Matching on the token also means a stale file left by
+ * an earlier, killed server (whatever its pid) cannot be mistaken for it. Jupyter writes the file in `start_app`, AFTER `_find_http_port` has settled
  * the port and BEFORE the io loop runs the real listen, so the HTTP poll that
  * follows can see a refused connection for a beat; `waitForHttp` retries through
  * that, and if that final listen fails Jupyter exits.
@@ -35,7 +37,7 @@
  * Node builtins only (plus global fetch), so `bin/cellar.js` can import it like
  * `ports.js`; it is in `package.json` `files` for the same reason.
  */
-import { readFileSync } from 'node:fs';
+import { readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { spawn } from 'node:child_process';
 
@@ -43,13 +45,15 @@ import { spawn } from 'node:child_process';
  * The directory jupyter_server writes its server-info file into, asked of the
  * interpreter that runs the sidecar, with the sidecar's environment (it honours
  * JUPYTER_RUNTIME_DIR / JUPYTER_DATA_DIR / platform dirs, which is exactly why it
- * is asked rather than re-derived).
+ * is asked rather than re-derived). Bounded: a probe that does not answer within
+ * `timeoutMs` is killed and reported, so it can never hang the launch.
  *
  * @param {string} python
  * @param {NodeJS.ProcessEnv} env
+ * @param {{ timeoutMs?: number }} [opts]
  * @returns {Promise<string>}
  */
-export function jupyterRuntimeDir(python, env) {
+export function jupyterRuntimeDir(python, env, { timeoutMs = 15_000 } = {}) {
 	return new Promise((resolveDir, reject) => {
 		const child = spawn(python, ['-c', 'from jupyter_core.paths import jupyter_runtime_dir; print(jupyter_runtime_dir())'], {
 			env,
@@ -57,20 +61,29 @@ export function jupyterRuntimeDir(python, env) {
 		});
 		let out = '';
 		let err = '';
+		let settled = false;
+		const settle = (fn, v) => {
+			if (settled) return;
+			settled = true;
+			clearTimeout(timer);
+			fn(v);
+		};
+		const timer = setTimeout(() => {
+			child.kill('SIGKILL');
+			settle(
+				reject,
+				new Error(`could not ask ${python} for Jupyter's runtime dir: it did not answer within ${Math.round(timeoutMs / 1000)}s.`)
+			);
+		}, timeoutMs);
 		child.stdout.on('data', (d) => (out += d));
 		child.stderr.on('data', (d) => (err += d));
-		child.on('error', (e) => reject(new Error(`could not ask ${python} for Jupyter's runtime dir: ${e.message}`)));
+		child.on('error', (e) => settle(reject, new Error(`could not ask ${python} for Jupyter's runtime dir: ${e.message}`)));
 		child.on('close', (code) => {
 			const dir = out.trim();
-			if (code === 0 && dir) resolveDir(dir);
-			else reject(new Error(`could not ask ${python} for Jupyter's runtime dir (exit ${code}): ${err.trim() || 'no output'}`));
+			if (code === 0 && dir) settle(resolveDir, dir);
+			else settle(reject, new Error(`could not ask ${python} for Jupyter's runtime dir (exit ${code}): ${err.trim() || 'no output'}`));
 		});
 	});
-}
-
-/** The server-info file a jupyter_server with this pid writes into `runtimeDir`. */
-export function sidecarInfoFile(runtimeDir, pid) {
-	return join(runtimeDir, `jpserver-${pid}.json`);
 }
 
 /** A usable TCP port number, or null. */
@@ -78,38 +91,53 @@ function portOf(v) {
 	return Number.isInteger(v) && v > 0 && v < 65536 ? v : null;
 }
 
+/** A jupyter_server server-info file name (not its `-open.html` sibling). */
+const INFO_FILE = /^jpserver-.+\.json$/;
+
 /**
- * The port recorded in a Jupyter server-info file, or null when the file is
- * absent, half-written, unparseable, was written by a different server (its
- * token is not ours), or carries no usable port. Never throws: an unreadable
- * file is "not reported yet".
+ * The port recorded by the server-info file in `runtimeDir` that carries this
+ * launch's token, or null when no such file exists yet. Files written by other
+ * servers (another token), half-written or unparseable files, and files with
+ * no usable port are skipped. Never throws: an unreadable directory or file is
+ * "not reported yet".
  *
- * @param {string} file
+ * @param {string} runtimeDir
  * @param {string} token this launch's `--ServerApp.token`
  * @returns {number | null}
  */
-export function readSidecarPort(file, token) {
-	let info;
+export function readSidecarPort(runtimeDir, token) {
+	let names;
 	try {
-		info = JSON.parse(readFileSync(file, 'utf8'));
+		names = readdirSync(runtimeDir);
 	} catch {
 		return null;
 	}
-	if (!info || typeof info !== 'object' || info.token !== token) return null;
-	return portOf(info.port);
+	for (const name of names) {
+		if (!INFO_FILE.test(name)) continue;
+		let info;
+		try {
+			info = JSON.parse(readFileSync(join(runtimeDir, name), 'utf8'));
+		} catch {
+			continue;
+		}
+		if (!info || typeof info !== 'object' || info.token !== token) continue;
+		const port = portOf(info.port);
+		if (port != null) return port;
+	}
+	return null;
 }
 
 /**
  * Wait for the sidecar to report the port it bound.
  *
- * Settles on the FIRST of: a port read from the info file (resolves), the child
+ * Settles on the FIRST of: a port read from this launch's info file (resolves), the child
  * exiting (rejects - it exited before it started serving), or the timeout
  * (rejects - it never said which port it took). `isPinned` only changes the
  * wording of the exit case: a pinned port runs with `port_retries=0`, so an exit
  * there most likely means that exact port was unavailable.
  *
  * @param {{
- *   infoFile: string,
+ *   runtimeDir: string,
  *   token: string,
  *   child: import('node:child_process').ChildProcess,
  *   requestedPort: number,
@@ -119,7 +147,7 @@ export function readSidecarPort(file, token) {
  * }} opts
  * @returns {Promise<number>}
  */
-export function waitForSidecarPort({ infoFile, token, child, requestedPort, isPinned = false, timeoutMs = 30_000, pollMs = 100 }) {
+export function waitForSidecarPort({ runtimeDir, token, child, requestedPort, isPinned = false, timeoutMs = 30_000, pollMs = 100 }) {
 	return new Promise((resolvePort, reject) => {
 		let timer = null;
 		let deadline = null;
@@ -142,7 +170,7 @@ export function waitForSidecarPort({ infoFile, token, child, requestedPort, isPi
 			);
 		};
 		const poll = () => {
-			const port = readSidecarPort(infoFile, token);
+			const port = readSidecarPort(runtimeDir, token);
 			if (port != null) return finish(resolvePort, port);
 			timer = setTimeout(poll, pollMs);
 		};
@@ -153,7 +181,7 @@ export function waitForSidecarPort({ infoFile, token, child, requestedPort, isPi
 				finish(
 					reject,
 					new Error(
-						`the Jupyter sidecar did not report which port it bound within ${Math.round(timeoutMs / 1000)}s (it was asked for port ${requestedPort}; no server-info file carrying this launch's token appeared at ${infoFile}).`
+						`the Jupyter sidecar did not report which port it bound within ${Math.round(timeoutMs / 1000)}s (it was asked for port ${requestedPort}; no server-info file carrying this launch's token appeared in ${runtimeDir}).`
 					)
 				),
 			timeoutMs

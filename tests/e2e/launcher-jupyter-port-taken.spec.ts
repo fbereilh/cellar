@@ -4,7 +4,7 @@ import { chmodSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from '
 import { createServer, type Server } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { REPO, killCellar, removeWorkspace, runtimeAvailable } from './harness';
+import { BOOT_TIMEOUT_MS, REPO, killCellar, removeWorkspace, runtimeAvailable } from './harness';
 
 /**
  * The launcher must connect to the port the Jupyter sidecar ACTUALLY bound.
@@ -26,7 +26,7 @@ import { REPO, killCellar, removeWorkspace, runtimeAvailable } from './harness';
 
 test.skip(!runtimeAvailable(), 'needs uv + python3 + the cached Jupyter host venv');
 
-const LAUNCH_TIMEOUT_MS = 45_000;
+const LAUNCH_TIMEOUT_MS = BOOT_TIMEOUT_MS;
 
 function launch(ws: string, env: Record<string, string>, onLine: (buf: string) => void) {
 	const shim = join(ws, '.shim');
@@ -101,7 +101,7 @@ function waitForOutput(
 }
 
 test.describe('launcher and a Jupyter port taken before the sidecar binds it', () => {
-	test.describe.configure({ timeout: 120_000 });
+	test.describe.configure({ timeout: Math.max(120_000, BOOT_TIMEOUT_MS + 60_000) });
 
 	let ws: string | undefined;
 	let proc: ChildProcess | undefined;
@@ -116,16 +116,26 @@ test.describe('launcher and a Jupyter port taken before the sidecar binds it', (
 
 	test('connects to the port Jupyter actually bound, and a cell runs through it', async ({ request }) => {
 		ws = mkdtempSync(join(tmpdir(), 'cellar-e2e-jport-'));
-		let arming: Promise<Server> | undefined;
+		let arming: Promise<{ server: Server } | { error: string }> | undefined;
 		const l = launch(ws, {}, (buf) => {
 			const m = buf.match(/starting Jupyter sidecar \(asking for port (\d+)\)/);
-			if (m && !arming) arming = squat(Number(m[1]));
+			if (m && !arming) {
+				const port = Number(m[1]);
+				arming = squat(port).then(
+					(server) => {
+						squatter = server;
+						return { server };
+					},
+					(err: Error) => ({ error: `squatter could not take port ${port} before the sidecar did: ${err.message}` })
+				);
+			}
 		});
 		proc = l.proc;
 
 		const url = (await waitForOutput(l, /app → (http:\/\/localhost:\d+)/, LAUNCH_TIMEOUT_MS))[1];
 		expect(arming, 'the launcher never announced the Jupyter port it asked for').toBeDefined();
-		squatter = await arming!;
+		const armed = await arming!;
+		if ('error' in armed) throw new Error(armed.error);
 		const requested = Number(l.output().match(/asking for port (\d+)/)![1]);
 
 		// The sidecar really did walk, and the launcher says where to.
