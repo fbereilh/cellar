@@ -15,6 +15,28 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 
 type Status = 'connecting' | 'connected' | 'disconnected';
+type StatusListener = (sender: unknown, s: Status) => void;
+type Mock = ReturnType<typeof vi.fn>;
+
+interface FakeConnection {
+	id: string;
+	name: string;
+	status: 'idle';
+	dead: boolean;
+	executed: string[];
+	isDisposed: boolean;
+	connectionStatus: Status;
+	connectionStatusChanged: { connect: (fn: StatusListener) => void; disconnect: (fn: StatusListener) => void };
+	info: Promise<unknown>;
+	registerCommTarget: Mock;
+	statusChanged: { connect: Mock; disconnect: Mock };
+	iopubMessage: { connect: Mock };
+	requestExecute: Mock;
+	restart: Mock;
+	interrupt: Mock;
+	shutdown: Mock;
+	dispose: Mock;
+}
 
 const h = vi.hoisted(() => {
 	const connections: FakeConnection[] = [];
@@ -22,23 +44,21 @@ const h = vi.hoisted(() => {
 	const plan = { deadConnections: 0 };
 	let seq = 0;
 
-	type FakeConnection = ReturnType<typeof makeConnection>;
-
-	function makeConnection(id: string) {
+	function makeConnection(id: string): FakeConnection {
 		const dead = connections.length < plan.deadConnections;
-		const listeners = new Set<(sender: unknown, s: Status) => void>();
+		const listeners = new Set<StatusListener>();
 		const executed: string[] = [];
-		const conn = {
+		const conn: FakeConnection = {
 			id,
 			name: 'python3',
-			status: 'idle' as const,
+			status: 'idle',
 			dead,
 			executed,
 			isDisposed: false,
-			connectionStatus: 'connecting' as Status,
+			connectionStatus: 'connecting',
 			connectionStatusChanged: {
-				connect: (fn: (sender: unknown, s: Status) => void) => listeners.add(fn),
-				disconnect: (fn: (sender: unknown, s: Status) => void) => listeners.delete(fn)
+				connect: (fn) => void listeners.add(fn),
+				disconnect: (fn) => void listeners.delete(fn)
 			},
 			// Resolved by the connect-time kernel_info_reply - which a dead shell never sends.
 			info: dead ? new Promise(() => {}) : Promise.resolve({ status: 'ok' }),

@@ -57,7 +57,13 @@ function notebook(prefix: string, sources: string[]): string {
 	});
 }
 
-/** Run a cell from the page's own fetch so the notebook's kernel boots. */
+/**
+ * Run a cell from the page's own fetch so the notebook's kernel boots, and return
+ * only once that kernel is UP. The run's NDJSON body is read to its end (the fetch
+ * alone resolves on headers, while the kernel is still starting), and the kernel's
+ * list entry must carry an id: an entry exists from the moment a start begins, but
+ * reads `id: null` / `status: 'starting'` until its connection has answered.
+ */
 async function bootKernel(page: Page, nb: string, cellId: string, source: string): Promise<void> {
 	await page.evaluate(
 		async ({ nb, cellId, source }) => {
@@ -65,7 +71,9 @@ async function bootKernel(page: Page, nb: string, cellId: string, source: string
 				method: 'POST',
 				headers: { 'content-type': 'application/json' },
 				body: JSON.stringify({ nb, source })
-			}).catch(() => {});
+			})
+				.then((r) => r.text())
+				.catch(() => {});
 		},
 		{ nb, cellId, source }
 	);
@@ -74,7 +82,7 @@ async function bootKernel(page: Page, nb: string, cellId: string, source: string
 			async () =>
 				page.evaluate(async (p) => {
 					const r = await fetch('/api/kernel').then((x) => x.json());
-					return (r.kernels as Array<{ path: string }>).some((k) => k.path === p);
+					return (r.kernels as Array<{ path: string; id: string | null }>).some((k) => k.path === p && !!k.id);
 				}, nb),
 			{ timeout: 60_000 }
 		)
