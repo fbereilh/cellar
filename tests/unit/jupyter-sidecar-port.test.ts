@@ -110,10 +110,77 @@ describe('waitForSidecarPort', () => {
 	it('gives up after the timeout, saying the sidecar never reported a port', async () => {
 		const child = fakeChild();
 		const t0 = Date.now();
-		const p = waitForSidecarPort({ runtimeDir: tmp(), token: TOKEN, child: child as never, requestedPort: 39655, timeoutMs: 150, pollMs: 10 });
+		const p = waitForSidecarPort({ runtimeDir: tmp(), token: TOKEN, child: child as never, requestedPort: 39655, timeoutMs: 150, pollMs: 10, probeTimeoutMs: 50 });
 		await expect(p).rejects.toThrow(/did not report which port it bound .* asked for port 39655/);
 		expect(Date.now() - t0).toBeLessThan(2000);
 		expect(child.listenerCount('exit')).toBe(0);
+	});
+});
+
+describe('waitForSidecarPort confirming the requested port directly', () => {
+	/** A Jupyter stand-in: 200 on /api for the right token, 403 otherwise. */
+	async function jupyterLike(token: string) {
+		const { createServer: httpServer } = await import('node:http');
+		const srv = httpServer((req, res) => {
+			res.statusCode = req.headers.authorization === `token ${token}` ? 200 : 403;
+			res.end('{}');
+		});
+		await new Promise<void>((r) => srv.listen(0, '127.0.0.1', () => r()));
+		return { srv, port: (srv.address() as { port: number }).port };
+	}
+
+	it('accepts the requested port when it answers this launch token, with no server-info file', async () => {
+		const { srv, port } = await jupyterLike(TOKEN);
+		try {
+			const child = fakeChild();
+			const p = waitForSidecarPort({ runtimeDir: tmp(), token: TOKEN, child: child as never, requestedPort: port, pollMs: 10, timeoutMs: 2000 });
+			await expect(p).resolves.toBe(port);
+			expect(child.listenerCount('exit')).toBe(0);
+		} finally {
+			srv.close();
+		}
+	});
+
+	it('still works when the runtime dir could not be determined', async () => {
+		const { srv, port } = await jupyterLike(TOKEN);
+		try {
+			const p = waitForSidecarPort({ runtimeDir: null, token: TOKEN, child: fakeChild() as never, requestedPort: port, pollMs: 10, timeoutMs: 2000 });
+			await expect(p).resolves.toBe(port);
+		} finally {
+			srv.close();
+		}
+	});
+
+	it('never accepts a server that refuses this launch token (another Jupyter on the requested port)', async () => {
+		const { srv, port } = await jupyterLike('b'.repeat(48));
+		try {
+			const p = waitForSidecarPort({ runtimeDir: tmp(), token: TOKEN, child: fakeChild() as never, requestedPort: port, pollMs: 10, timeoutMs: 300 });
+			await expect(p).rejects.toThrow(new RegExp(`port ${port} did not accept this launch's token - last attempt: HTTP 403`));
+		} finally {
+			srv.close();
+		}
+	});
+
+	it('does not let a silent squatter on the requested port stall the wait', async () => {
+		const srv = createServer(() => {});
+		servers.push(srv);
+		await new Promise<void>((r) => srv.listen(0, '127.0.0.1', () => r()));
+		const port = (srv.address() as { port: number }).port;
+		const t0 = Date.now();
+		const p = waitForSidecarPort({ runtimeDir: tmp(), token: TOKEN, child: fakeChild() as never, requestedPort: port, pollMs: 10, timeoutMs: 400, probeTimeoutMs: 100 });
+		await expect(p).rejects.toThrow(/last attempt: no response within 100ms/);
+		expect(Date.now() - t0).toBeLessThan(3000);
+	});
+
+	it('prefers the walked port from the server-info file over a silent requested port', async () => {
+		const srv = createServer(() => {});
+		servers.push(srv);
+		await new Promise<void>((r) => srv.listen(0, '127.0.0.1', () => r()));
+		const requested = (srv.address() as { port: number }).port;
+		const dir = tmp();
+		const p = waitForSidecarPort({ runtimeDir: dir, token: TOKEN, child: fakeChild() as never, requestedPort: requested, pollMs: 10, timeoutMs: 2000, probeTimeoutMs: 100 });
+		setTimeout(() => writeFileSync(join(dir, 'jpserver-7.json'), JSON.stringify({ port: requested + 1, token: TOKEN })), 40);
+		await expect(p).resolves.toBe(requested + 1);
 	});
 });
 

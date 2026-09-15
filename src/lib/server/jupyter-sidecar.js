@@ -130,29 +130,57 @@ export function readSidecarPort(runtimeDir, token) {
 /**
  * Wait for the sidecar to report the port it bound.
  *
- * Settles on the FIRST of: a port read from this launch's info file (resolves), the child
- * exiting (rejects - it exited before it started serving), or the timeout
- * (rejects - it never said which port it took). `isPinned` only changes the
- * wording of the exit case: a pinned port runs with `port_retries=0`, so an exit
- * there most likely means that exact port was unavailable.
+ * Two signals, whichever confirms first:
+ * - the server-info file in `runtimeDir` carrying this launch's token (the
+ *   primary one: it names the port even after a walk), and
+ * - the REQUESTED port answering `GET /api` with a 2xx under this launch's
+ *   token. jupyter_server writes the info file best-effort (a filesystem that
+ *   refuses its permission check only logs a warning), so a sidecar that did not
+ *   walk must not depend on that write. Only a 2xx counts: the token is this
+ *   launch's secret, so a 2xx proves it is our server, while a 403 from another
+ *   Jupyter or a squatter that never answers proves nothing. Every probe is
+ *   bounded so a silent squatter cannot stall this loop.
+ *
+ * Rejects when the child exits first (it exited before it started serving) or
+ * when the timeout passes (it never confirmed a port). `isPinned` only changes
+ * the wording of the exit case: a pinned port runs with `port_retries=0`, so an
+ * exit there most likely means that exact port was unavailable.
  *
  * @param {{
- *   runtimeDir: string,
+ *   runtimeDir: string | null,
  *   token: string,
  *   child: import('node:child_process').ChildProcess,
  *   requestedPort: number,
+ *   host?: string,
  *   isPinned?: boolean,
  *   timeoutMs?: number,
- *   pollMs?: number
+ *   pollMs?: number,
+ *   probeTimeoutMs?: number
  * }} opts
  * @returns {Promise<number>}
  */
-export function waitForSidecarPort({ runtimeDir, token, child, requestedPort, isPinned = false, timeoutMs = 30_000, pollMs = 100 }) {
+export function waitForSidecarPort({
+	runtimeDir,
+	token,
+	child,
+	requestedPort,
+	host = '127.0.0.1',
+	isPinned = false,
+	timeoutMs = 30_000,
+	pollMs = 100,
+	probeTimeoutMs = 1_000
+}) {
 	return new Promise((resolvePort, reject) => {
+		let settled = false;
 		let timer = null;
+		let probeTimer = null;
 		let deadline = null;
+		let lastProbe = 'not attempted';
 		const finish = (fn, v) => {
+			if (settled) return;
+			settled = true;
 			clearTimeout(timer);
+			clearTimeout(probeTimer);
 			clearTimeout(deadline);
 			child.off('exit', onExit);
 			fn(v);
@@ -170,23 +198,41 @@ export function waitForSidecarPort({ runtimeDir, token, child, requestedPort, is
 			);
 		};
 		const poll = () => {
-			const port = readSidecarPort(runtimeDir, token);
+			if (settled) return;
+			const port = runtimeDir ? readSidecarPort(runtimeDir, token) : null;
 			if (port != null) return finish(resolvePort, port);
 			timer = setTimeout(poll, pollMs);
 		};
+		const probe = async () => {
+			if (settled) return;
+			try {
+				const res = await fetch(`http://${host}:${requestedPort}/api`, {
+					headers: { Authorization: `token ${token}` },
+					signal: AbortSignal.timeout(probeTimeoutMs)
+				});
+				await res.body?.cancel().catch(() => {});
+				if (res.ok) return finish(resolvePort, requestedPort);
+				lastProbe = `HTTP ${res.status}`;
+			} catch (err) {
+				lastProbe = err?.name === 'TimeoutError' ? `no response within ${probeTimeoutMs}ms` : (err?.cause?.code ?? err?.message ?? String(err));
+			}
+			if (!settled) probeTimer = setTimeout(probe, pollMs);
+		};
 		if (child.exitCode != null || child.signalCode != null) return onExit(child.exitCode, child.signalCode);
 		child.on('exit', onExit);
-		deadline = setTimeout(
-			() =>
-				finish(
-					reject,
-					new Error(
-						`the Jupyter sidecar did not report which port it bound within ${Math.round(timeoutMs / 1000)}s (it was asked for port ${requestedPort}; no server-info file carrying this launch's token appeared in ${runtimeDir}).`
-					)
-				),
-			timeoutMs
-		);
+		deadline = setTimeout(() => {
+			const file = runtimeDir
+				? `no server-info file carrying this launch's token appeared in ${runtimeDir}`
+				: `its runtime dir could not be determined, so no server-info file was read`;
+			finish(
+				reject,
+				new Error(
+					`the Jupyter sidecar did not report which port it bound within ${Math.round(timeoutMs / 1000)}s (it was asked for port ${requestedPort}; ${file}, and port ${requestedPort} did not accept this launch's token - last attempt: ${lastProbe}).`
+				)
+			);
+		}, timeoutMs);
 		poll();
+		void probe();
 	});
 }
 

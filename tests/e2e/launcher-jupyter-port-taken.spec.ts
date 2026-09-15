@@ -173,11 +173,11 @@ test.describe('launcher and a Jupyter port taken before the sidecar binds it', (
 		const t0 = Date.now();
 		const code = await Promise.race([
 			l.exited,
-			new Promise<'hung'>((r) => setTimeout(() => r('hung'), 25_000))
+			new Promise<'hung'>((r) => setTimeout(() => r('hung'), BOOT_TIMEOUT_MS))
 		]);
-		expect(code, `launcher did not exit within 25s\n${l.output().slice(-3000)}`).not.toBe('hung');
+		expect(code, `launcher did not exit within ${BOOT_TIMEOUT_MS}ms\n${l.output().slice(-3000)}`).not.toBe('hung');
 		expect(code).not.toBe(0);
-		expect(Date.now() - t0).toBeLessThan(25_000);
+		expect(Date.now() - t0).toBeLessThan(BOOT_TIMEOUT_MS);
 		const out = l.output();
 		expect(out).toContain('launch failed: the Jupyter sidecar exited');
 		expect(out).toContain(`asked for port ${pinned}`);

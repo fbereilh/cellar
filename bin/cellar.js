@@ -1609,7 +1609,7 @@ async function main() {
 	const sidecarEnv = { ...process.env, JUPYTER_PATH: jupyterDir };
 	// Asked in parallel with the sidecar's own (much slower) boot.
 	const runtimeDirP = jupyterRuntimeDir(hostPython, sidecarEnv);
-	runtimeDirP.catch(() => {}); // surfaced by the await below, never as an unhandled rejection
+	runtimeDirP.catch(() => {}); // surfaced below, never as an unhandled rejection
 	const jupyter = spawn(
 		hostPython,
 		[
@@ -1651,7 +1651,10 @@ async function main() {
 
 	console.log(`[cellar] starting Jupyter sidecar (asking for port ${requestedJupyterPort}) …`);
 	jupyterPort = await waitForSidecarPort({
-		runtimeDir: await runtimeDirP,
+		runtimeDir: await runtimeDirP.catch((err) => {
+			console.warn(`[cellar] ${err.message} Falling back to checking port ${requestedJupyterPort} directly.`);
+			return null;
+		}),
 		token,
 		child: jupyter,
 		requestedPort: requestedJupyterPort,
