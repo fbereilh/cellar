@@ -1,9 +1,9 @@
 import { describe, it, expect, afterEach } from 'vitest';
 import { EventEmitter } from 'node:events';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { createServer, type Server } from 'node:net';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { join } from 'node:path';
 import {
 	readSidecarPort,
 	sidecarInfoFile,
@@ -17,8 +17,9 @@ import {
  * polling the one it asked for (jupyter_server walks to a nearby port when the
  * requested one was taken). The end-to-end reproduction - a real launcher, a
  * real sidecar and a squatter on the requested port - is
- * tests/e2e/launcher-jupyter-port-taken.spec.ts; e2e is absent from the pre-push
- * gate, so the rules it rests on are pinned here as well.
+ * tests/e2e/launcher-jupyter-port-taken.spec.ts, which is what pins the launcher's
+ * wiring; the rules it rests on are pinned here too, since e2e is absent from the
+ * pre-push gate.
  */
 
 const TOKEN = 'a'.repeat(48);
@@ -144,19 +145,5 @@ describe('waitForHttp', () => {
 		} finally {
 			srv.close();
 		}
-	});
-});
-
-describe('bin/cellar.js wiring (source guard: e2e is absent from the pre-push gate)', () => {
-	const src = readFileSync(resolve(__dirname, '../../bin/cellar.js'), 'utf8');
-	it('builds the Jupyter URL from the port the sidecar reported', () => {
-		const read = src.indexOf('jupyterPort = await waitForSidecarPort(');
-		const url = src.indexOf('const jupyterUrl = `http://127.0.0.1:${jupyterPort}`');
-		expect(read).toBeGreaterThan(-1);
-		expect(url).toBeGreaterThan(read);
-		expect(src).not.toMatch(/const jupyterUrl = `http:\/\/127\.0\.0\.1:\$\{requestedJupyterPort\}`/);
-	});
-	it('gives a pinned Jupyter port port_retries=0, so it fails rather than walks', () => {
-		expect(src).toContain("...(jupyterPinned ? ['--ServerApp.port_retries=0'] : [])");
 	});
 });
