@@ -245,6 +245,20 @@ describe('waitForHttp', () => {
 		expect(Date.now() - t0).toBeLessThan(3000);
 	});
 
+	it('lets a slow response finish within the overall budget when the request bound allows it', async () => {
+		const { createServer: httpServer } = await import('node:http');
+		const srv = httpServer((_q, res) => setTimeout(() => res.end('{}'), 400));
+		servers.push(srv as unknown as Server);
+		await new Promise<void>((r) => srv.listen(0, '127.0.0.1', () => r()));
+		const port = (srv.address() as { port: number }).port;
+		await expect(
+			waitForHttp(`http://127.0.0.1:${port}/`, { timeoutMs: 2000, requestTimeoutMs: 2000, intervalMs: 20 })
+		).resolves.toBeUndefined();
+		await expect(
+			waitForHttp(`http://127.0.0.1:${port}/`, { timeoutMs: 600, requestTimeoutMs: 100, intervalMs: 20 })
+		).rejects.toThrow(/no response within/);
+	});
+
 	it('resolves once the URL answers', async () => {
 		const { createServer: httpServer } = await import('node:http');
 		const srv = httpServer((_q, res) => res.end('{}'));

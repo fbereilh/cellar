@@ -1731,6 +1731,7 @@ async function main() {
 	const appUrl = `http://localhost:${appPort}`;
 	console.log(`[cellar] starting SvelteKit app on ${appUrl} …`);
 	await waitForHttp(appUrl, {
+		requestTimeoutMs: 30_000,
 		describe: (last) => `the app server did not answer at ${appUrl} within 30s (last attempt: ${last}).`
 	});
 	const openUrl = `${appUrl}/?ws=${encodeURIComponent(WORKSPACE)}`;
