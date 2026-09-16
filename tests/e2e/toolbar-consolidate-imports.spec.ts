@@ -191,10 +191,15 @@ test('the toolbar button sweeps this notebook`s imports into the pinned cell', a
 		.toMatch(/import json[\s\S]*import os|import os[\s\S]*import json/);
 
 	// The imports really MOVED: neither body cell still declares one at module level.
-	const bodies = cellsOnDisk(NB.sweep)
-		.filter((c) => c.metadata?.cellar?.role !== 'imports')
-		.map((c) => c.source.join(''));
-	for (const body of bodies) expect(body).not.toMatch(/^import (os|json)$/m);
+	// POLLED, not read once: the sweep persists each cell edit as its own write, so
+	// the file can be caught with the imports cell already filled while a body cell
+	// has not been stripped yet.
+	const bodiesWithImports = () =>
+		cellsOnDisk(NB.sweep)
+			.filter((c) => c.metadata?.cellar?.role !== 'imports')
+			.map((c) => c.source.join(''))
+			.filter((body) => /^import (os|json)$/m.test(body));
+	await expect.poll(bodiesWithImports, { timeout: 30_000 }).toEqual([]);
 });
 
 test('a sweep in flight disables the button, so it cannot be fired twice', async ({ page }) => {

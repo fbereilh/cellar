@@ -4,6 +4,7 @@ import { existsSync, mkdtempSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { runtimeAvailable, bootCellar, killCellar, removeWorkspace } from './harness';
+import { tabPanelDomId } from '../../src/lib/tabIds';
 
 /**
  * A notebook whose export target is `.mojo` exports its Mojo cells to one module,
@@ -118,7 +119,15 @@ async function openNotebook(page: Page, rel: string): Promise<void> {
 	if (await openBtn.isVisible()) await openBtn.click();
 	await expect(cell).toBeVisible();
 	if (rel !== 'notebook.ipynb') {
-		await page.getByText(rel).first().dblclick();
+		// A single click, then wait for THIS notebook's pane - never a `dblclick`.
+		// Every test here shares one workspace and the server-owned tab session
+		// restores every notebook an earlier test opened, so the click that opens
+		// this one's tab can WRAP the tab strip onto another row and push the file
+		// tree down between the two clicks of a double-click: the second click then
+		// lands on a neighbouring row and opens THAT notebook instead (observed in
+		// CI: `orphan.ipynb` clicked, `no-target.ipynb` left active).
+		await page.getByTestId('tree-file').filter({ hasText: rel }).first().click();
+		await expect(page.locator(`[id="${tabPanelDomId('file:' + rel)}"]`)).toBeVisible();
 	}
 	// Per-CELL locators are addressed by cell id instead, which is unique across the
 	// mounted set.

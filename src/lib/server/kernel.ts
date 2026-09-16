@@ -363,6 +363,21 @@ function reconnectTimeoutMs(): number {
 }
 
 /**
+ * How long a FRESH kernel connection may take, once its websocket is open, to answer
+ * the `kernel_info_request` @jupyterlab sends on connect - see `awaitShellHandshake`.
+ * MEASURED: 55 of 56 fresh connections answered within 535ms even with every core
+ * saturated (most within 10ms), and the one that did not never answered at all, so
+ * the bound only has to separate "slow" from "never". Override with
+ * `CELLAR_KERNEL_HANDSHAKE_TIMEOUT_MS`.
+ */
+const DEFAULT_HANDSHAKE_TIMEOUT_MS = 5 * 1000;
+function handshakeTimeoutMs(): number {
+	return envMs('CELLAR_KERNEL_HANDSHAKE_TIMEOUT_MS', DEFAULT_HANDSHAKE_TIMEOUT_MS);
+}
+/** Fresh connections tried before a kernel start is refused as unreachable. */
+const HANDSHAKE_ATTEMPTS = 3;
+
+/**
  * The reason a run force-aborted because the kernel ignored an interrupt carries.
  * Distinct from the restart/teardown reasons because it means something different -
  * the namespace is INTACT and the code may still be running (see `abortMessage`).
@@ -1603,6 +1618,88 @@ async function verifyKernelCwd(nbKernel: NotebookKernel, kernel: KernelConnectio
 	);
 }
 
+/**
+ * Return a connection to a just-started kernel whose SHELL channel is PROVEN to answer,
+ * replacing the connection when it does not.
+ *
+ * The failure this exists for, reproduced under CPU contention and in CI: the
+ * websocket opens, iopub traffic flows, and yet the `kernel_info_request` @jupyterlab
+ * sends on connect gets no reply - and neither does anything sent after it on that
+ * connection. @jupyterlab's own answer is a single 3s failsafe that flushes the queued
+ * messages anyway (its source carries a FIXME saying a retry would be better), so the
+ * startup injection was sent into a dead shell pipe and its `future.done` never
+ * settled. Nothing bounds that await - no run is registered yet, so the idle watchdog
+ * cannot see it - and the user's run sat in `getKernel` until the client gave up.
+ *
+ * So nothing is sent until the connection has answered `kernel.info` (resolved by that
+ * very reply). One that does not answer within `handshakeTimeoutMs()` of opening is
+ * disposed - which closes only the socket, never the kernel - and replaced by
+ * `mgr.connectTo`, which mints a NEW client id and therefore brand-new server-side
+ * ZMQ sockets, rather than `reconnect()`, which would reuse the same identities. It is
+ * safe precisely because it runs before anything else is attached to the connection.
+ * After `HANDSHAKE_ATTEMPTS` it shuts the kernel down and throws, so the start fails
+ * with a reason instead of hanging. A connection that exposes no `info` promise has nothing to verify and is
+ * returned as is.
+ */
+async function awaitShellHandshake(
+	mgr: KernelManager,
+	first: KernelConnection,
+	nbPath: string
+): Promise<KernelConnection> {
+	let kernel = first;
+	for (let attempt = 1; ; attempt++) {
+		if (!(kernel.info && typeof (kernel.info as Promise<unknown>).then === 'function')) return kernel;
+		const answered = await shellAnswers(kernel, handshakeTimeoutMs());
+		if (answered) return kernel;
+		if (attempt >= HANDSHAKE_ATTEMPTS) {
+			// Refuse the start rather than park the run forever, and never leave the
+			// Python process behind: the map entry is dropped by the caller's
+			// `startPromise.catch`, so nothing else would ever reap it.
+			try {
+				await kernel.shutdown();
+			} catch {
+				/* the process may already be gone; the refusal below is what matters */
+			}
+			kernel.dispose();
+			throw new Error(
+				`the kernel for ${nbPath} started, but it did not answer on its shell channel over ${HANDSHAKE_ATTEMPTS} fresh connections ` +
+					`(no kernel_info_reply within ${handshakeTimeoutMs()}ms of each connection opening). Run the cell again to start a new kernel.`
+			);
+		}
+		logWarn(
+			'kernel',
+			`kernel for ${nbPath}: connection opened but its shell never answered kernel_info; replacing the connection (attempt ${attempt + 1} of ${HANDSHAKE_ATTEMPTS})`
+		);
+		const model = { id: kernel.id, name: kernel.name };
+		kernel.dispose();
+		kernel = mgr.connectTo({ model });
+	}
+}
+
+/**
+ * Whether `kernel`'s shell answers: waits for the websocket to open, then races the
+ * connect-time `kernel_info_reply` against `timeoutMs`. A connection that gives up
+ * (`disconnected`) or is disposed answers false. The bound starts only once the socket
+ * is open, so a slow kernel BOOT (the server holds the websocket until the kernel is
+ * alive) is never mistaken for a dead shell.
+ */
+async function shellAnswers(kernel: KernelConnection, timeoutMs: number): Promise<boolean> {
+	const opened = await new Promise<boolean>((resolve) => {
+		const status = kernel.connectionStatus;
+		if (status === 'connected' || status === undefined) return resolve(true);
+		if (status === 'disconnected' || kernel.isDisposed) return resolve(false);
+		const onChange = (_sender: unknown, next: string) => {
+			if (next === 'connecting') return;
+			kernel.connectionStatusChanged.disconnect(onChange);
+			resolve(next === 'connected');
+		};
+		kernel.connectionStatusChanged.connect(onChange);
+	});
+	if (!opened) return false;
+	// A reply that reports an error is still a reply: the shell is alive.
+	return Promise.race([kernel.info.then(() => true, () => true), delay(timeoutMs).then(() => false)]);
+}
+
 /** `realpathSync` where possible, else the path itself. */
 function realpathOrSelf(p: string): string {
 	try {
@@ -1697,7 +1794,8 @@ function getKernel(nbPath: string): Promise<KernelConnection> {
 		const startOptions = (root
 			? { name: 'python3', path: root.apiPath }
 			: { name: 'python3' }) as KernelAPI.IKernelOptions;
-		const kernel = await mgr.startNew(startOptions);
+		// Nothing may be sent until the shell has answered - see `awaitShellHandshake`.
+		const kernel = await awaitShellHandshake(mgr, await mgr.startNew(startOptions), nbPath);
 		nbKernel.connection = kernel;
 		// Run every comm on the kernel's MAIN shell, not a per-comm-target subshell
 		// (@jupyterlab/services' default under ipykernel 7). Cellar serializes runs
