@@ -9,7 +9,10 @@
  * the rules, and a DIFFERENTIAL block below proves they agree with the SERVER,
  * which stays the authority on every one of them.
  */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, beforeAll, beforeEach } from 'vitest';
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import {
 	dropVerdict,
 	parentDirOf,
@@ -78,9 +81,12 @@ describe('a drop that is refused', () => {
 		expect(refusal('docs', file('a/other.md'))).toBe('not-a-folder');
 	});
 
-	it('refuses a folder onto ITSELF', () => {
+	it('refuses an entry onto its OWN row, file or folder', () => {
 		expect(refusal('docs', dir('docs'))).toBe('into-itself');
 		expect(refusal('a/b', dir('a/b'))).toBe('into-itself');
+		// A file over its own row is the same abort, not a "drop on a file" mistake.
+		expect(refusal('notes.md', file('notes.md'))).toBe('into-itself');
+		expect(refusal('a/notes.md', file('a/notes.md'))).toBe('into-itself');
 	});
 
 	it('refuses a folder into its OWN descendant, at any depth', () => {
@@ -97,19 +103,19 @@ describe('a drop that is refused', () => {
 });
 
 describe('what a refusal is allowed to SAY', () => {
-	it('reports the three that are genuine mistakes', () => {
-		for (const r of ['not-a-folder', 'into-itself', 'into-descendant'] as const) {
+	it('reports the genuine mistakes', () => {
+		for (const r of ['not-a-folder', 'into-descendant'] as const) {
 			expect(refusalIsWorthReporting(r)).toBe(true);
 			expect(refusalMessage(r, 'notes.md')).toContain('notes.md');
 			expect(refusalMessage(r, 'notes.md').length).toBeGreaterThan(0);
 		}
 	});
 
-	it('stays SILENT about the two that are not', () => {
-		// `same-parent` asked for nothing and `no-drag` never started, so an error
-		// for either is noise - which is the whole reason they are separate reasons
-		// rather than one bare `false`.
-		for (const r of ['same-parent', 'no-drag'] as const) {
+	it('stays SILENT about the ones that are not', () => {
+		// `same-parent` asked for nothing, `no-drag` never started, and
+		// `into-itself` is a release back on the dragged row - the user taking the
+		// drag back. An error for any of them is noise.
+		for (const r of ['same-parent', 'no-drag', 'into-itself'] as const) {
 			expect(refusalIsWorthReporting(r)).toBe(false);
 			expect(refusalMessage(r, 'notes.md')).toBe('');
 		}
@@ -119,23 +125,73 @@ describe('what a refusal is allowed to SAY', () => {
 /**
  * The rule may only ever be over-STRICT relative to the server, never
  * over-permissive: an offer withheld costs a gesture, an offer the server then
- * refuses would travel to the filesystem. `moveEntry` is the authority - these
- * cases are the three it guards, asserted here so a future edit that loosens the
- * client cannot silently start offering them.
+ * refuses would travel to the filesystem. `moveEntry` is the authority, so this
+ * DRIVES it over a real workspace: every drop the rule offers must really move
+ * the entry, and every drop it refuses must be one the server throws on or
+ * no-ops. A change to either side that breaks that agreement fails here.
  */
 describe('agreement with the server guards (fstree.moveEntry)', () => {
-	it('never offers what moveEntry throws on', () => {
-		// "cannot move a folder into itself" - both of its shapes.
-		expect(dropVerdict('docs', dir('docs')).ok).toBe(false);
-		expect(dropVerdict('docs', dir('docs/sub')).ok).toBe(false);
-		// "destination is not a folder".
-		expect(dropVerdict('notes.md', file('other.md')).ok).toBe(false);
+	let WS: string;
+	let moveEntry: typeof import('../../src/lib/server/fstree').moveEntry;
+
+	beforeAll(async () => {
+		WS = mkdtempSync(join(tmpdir(), 'cellar-file-drag-'));
+		process.env.CELLAR_WORKSPACE = WS;
+		({ moveEntry } = await import('../../src/lib/server/fstree'));
 	});
 
-	it('never offers what moveEntry treats as a no-op', () => {
-		// moveEntry returns `from === path` for a same-parent move: nothing happens
-		// on disk, so a confirmation would be a dialog about nothing.
-		expect(dropVerdict('docs/notes.md', dir('docs')).ok).toBe(false);
-		expect(dropVerdict('notes.md', root).ok).toBe(false);
+	beforeEach(() => {
+		for (const name of ['docs', 'archive', 'notes', 'notes-old', 'notes.md', 'other.md']) {
+			rmSync(join(WS, name), { recursive: true, force: true });
+		}
+		mkdirSync(join(WS, 'docs/sub'), { recursive: true });
+		mkdirSync(join(WS, 'archive'));
+		mkdirSync(join(WS, 'notes'));
+		mkdirSync(join(WS, 'notes-old'));
+		writeFileSync(join(WS, 'notes.md'), 'n\n');
+		writeFileSync(join(WS, 'other.md'), 'o\n');
+		writeFileSync(join(WS, 'docs/inside.md'), 'i\n');
 	});
+
+	type Outcome = 'moved' | 'noop' | 'threw';
+	function serverOutcome(from: string, dest: string): Outcome {
+		let res;
+		try {
+			res = moveEntry(from, dest);
+		} catch {
+			return 'threw';
+		}
+		return res.path === res.from && existsSync(join(WS, from)) ? 'noop' : 'moved';
+	}
+	function destOf(target: DropTargetRow): string {
+		return target.type === 'root' ? '' : target.path;
+	}
+
+	const cases: Array<[string, DropTargetRow]> = [
+		['notes.md', dir('docs')],
+		['docs/inside.md', root],
+		['docs', dir('archive')],
+		['notes', dir('notes-old')],
+		['docs', dir('docs')],
+		['docs', dir('docs/sub')],
+		['notes.md', file('other.md')],
+		['notes.md', file('notes.md')],
+		['docs/inside.md', dir('docs')],
+		['notes.md', root],
+		['docs', root]
+	];
+
+	for (const [from, target] of cases) {
+		it(`${from} -> ${target.type}:${target.path || '(root)'}`, () => {
+			const verdict = dropVerdict(from, target);
+			const outcome = serverOutcome(from, destOf(target));
+			if (verdict.ok) {
+				expect(outcome).toBe('moved');
+			} else {
+				expect(outcome).not.toBe('moved');
+				if (verdict.reason === 'same-parent') expect(outcome).toBe('noop');
+				else expect(outcome).toBe('threw');
+			}
+		});
+	}
 });

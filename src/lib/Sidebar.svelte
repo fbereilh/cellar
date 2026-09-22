@@ -541,6 +541,38 @@
 	 * `dragleave` a drag-end fires over the row itself. See `fileDragLeave`.
 	 */
 	let lastRefusal = $state<{ path: string; message: string } | null>(null);
+	// Escape abandons the drag. MEASURED in Chromium: the page gets no `keydown`
+	// for it - the drag machinery consumes the key - and the drag ends with no
+	// terminal `dragleave` over the row, while `keyup` lands AFTER `dragend`. So a
+	// refusal is reported only for a real RELEASE over the refused row (see
+	// `releasedOn`), and only after `ESCAPE_GRACE_MS`, during which an Escape in
+	// either direction retracts it. A gesture the user called off is not a
+	// mistake to report.
+	const ESCAPE_GRACE_MS = 250;
+	let dragCancelled = false;
+	let releasedOn: string | null = null;
+	let pendingReport: ReturnType<typeof setTimeout> | null = null;
+	function cancelPendingReport() {
+		if (pendingReport) clearTimeout(pendingReport);
+		pendingReport = null;
+	}
+	$effect(() => {
+		const onKey = (e: KeyboardEvent) => {
+			if (e.key !== 'Escape') return;
+			if (dragging) {
+				dragCancelled = true;
+				lastRefusal = null;
+			}
+			cancelPendingReport();
+		};
+		window.addEventListener('keydown', onKey, true);
+		window.addEventListener('keyup', onKey, true);
+		return () => {
+			window.removeEventListener('keydown', onKey, true);
+			window.removeEventListener('keyup', onKey, true);
+			cancelPendingReport();
+		};
+	});
 	let moveTarget = $state<{
 		from: string;
 		fromName: string;
@@ -685,6 +717,9 @@
 		dragOverPath = null;
 		dragOverRoot = false;
 		lastRefusal = null;
+		dragCancelled = false;
+		releasedOn = null;
+		cancelPendingReport();
 	}
 
 	/**
@@ -694,6 +729,7 @@
 	 */
 	function fileDragOver(node: FileDescriptor | null): boolean {
 		const from = dragging?.path ?? null;
+		releasedOn = null;
 		const verdict = dropVerdict(from, dropRowFor(node));
 		if (!verdict.ok) {
 			// Whatever this row was, it is not the accepting one any more.
@@ -701,7 +737,7 @@
 				if (dragOverPath === node.path) dragOverPath = null;
 			} else if (dragOverRoot) dragOverRoot = false;
 			lastRefusal =
-				from && refusalIsWorthReporting(verdict.reason)
+				from && !dragCancelled && refusalIsWorthReporting(verdict.reason)
 					? { path: node ? node.path : '', message: refusalMessage(verdict.reason, baseName(from)) }
 					: null;
 			return false;
@@ -723,6 +759,7 @@
 		// contract's own note: the browser also fires `dragleave` on the way to
 		// `dragend`, and honouring that one discards the reason unreported.
 		if (genuine && lastRefusal?.path === path) lastRefusal = null;
+		if (!genuine && releasedOn === null) releasedOn = path;
 	}
 
 	/**
@@ -752,8 +789,17 @@
 	 * drop is reported, so a reason can never be said twice or in two voices.
 	 */
 	function endFileDrag() {
-		if (lastRefusal) opError = lastRefusal.message;
+		const report =
+			lastRefusal && !dragCancelled && releasedOn === lastRefusal.path ? lastRefusal.message : null;
 		lastRefusal = null;
+		releasedOn = null;
+		cancelPendingReport();
+		if (report) {
+			pendingReport = setTimeout(() => {
+				pendingReport = null;
+				opError = report;
+			}, ESCAPE_GRACE_MS);
+		}
 		dragging = null;
 		dragOverPath = null;
 		dragOverRoot = false;
@@ -1040,6 +1086,14 @@
 				{/each}
 			{:else}
 				<p class="px-2 text-xs text-base-content/40">loading…</p>
+			{/if}
+			{#if dragging && parentDirOf(dragging.path) !== ''}
+				<div
+					class="mt-1 rounded border border-dashed px-2 py-2 text-center text-[11px] {dragOverRoot ? 'border-primary/60 text-base-content/70' : 'border-base-300 text-base-content/45'}"
+					data-testid="files-root-drop"
+				>
+					Drop here to move to {treeRoot?.name ?? 'the workspace root'}
+				</div>
 			{/if}
 			{#if opError}
 				<p class="mt-1 px-2 text-xs text-error" data-testid="files-op-error">{opError}</p>

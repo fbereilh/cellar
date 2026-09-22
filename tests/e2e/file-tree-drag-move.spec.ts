@@ -44,7 +44,7 @@ test.describe(runtimeAvailable() ? 'file tree: move by drag' : `file tree drag (
 	 * rather than from whatever its predecessor left.
 	 */
 	function seed(): void {
-		for (const name of ['docs', 'archive', 'notes.md', 'report.md', 'nested']) {
+		for (const name of ['docs', 'archive', 'notes.md', 'report.md', 'nested', 'deep.md']) {
 			rmSync(join(ws, name), { recursive: true, force: true });
 		}
 		mkdirSync(join(ws, 'docs'));
@@ -177,6 +177,79 @@ test.describe(runtimeAvailable() ? 'file tree: move by drag' : `file tree drag (
 		await expect(page.getByTestId('files-op-error')).toContainText('inside itself');
 		expect(existsSync(join(ws, 'nested/inner'))).toBe(true);
 		expect(existsSync(join(ws, 'nested/inner/nested'))).toBe(false);
+	});
+
+	test('releasing back on the dragged row itself says nothing', async ({ page }) => {
+		await openTree(page);
+		// Pick up, change your mind, let go where you are: an abort, not a mistake.
+		await dragHold(page, fileRow(page, 'notes.md'), fileRow(page, 'report.md'));
+		const own = (await fileRow(page, 'notes.md').boundingBox())!;
+		await page.mouse.move(own.x + own.width / 2, own.y + own.height / 2, { steps: 8 });
+		await page.mouse.up();
+		await expect(page.locator('[data-dragging]')).toHaveCount(0);
+		await expect(page.getByTestId('files-op-error')).toHaveCount(0);
+		await expect(page.getByTestId('move-modal')).toHaveCount(0);
+
+		// A folder released on itself: the same silence.
+		await dragHold(page, dirRow(page, 'nested'), fileRow(page, 'report.md'));
+		const nb = (await dirRow(page, 'nested').boundingBox())!;
+		await page.mouse.move(nb.x + nb.width / 2, nb.y + nb.height / 2, { steps: 8 });
+		await page.mouse.up();
+		await expect(page.locator('[data-dragging]')).toHaveCount(0);
+		await expect(page.getByTestId('files-op-error')).toHaveCount(0);
+		expect(existsSync(join(ws, 'notes.md'))).toBe(true);
+		expect(existsSync(join(ws, 'nested/inner'))).toBe(true);
+
+		// CONTROL: the same gesture released over a DIFFERENT file still reports,
+		// so the silence above is about the self-release and nothing wider.
+		await dragHold(page, fileRow(page, 'notes.md'), fileRow(page, 'report.md'));
+		await page.mouse.up();
+		await expect(page.getByTestId('files-op-error')).toContainText('folder');
+		expect(existsSync(join(ws, 'notes.md'))).toBe(true);
+	});
+
+	test('Escape abandons a drag without reporting a refusal', async ({ page }) => {
+		await openTree(page);
+		await dragHold(page, fileRow(page, 'notes.md'), fileRow(page, 'report.md'));
+		await page.keyboard.press('Escape');
+		await page.mouse.up();
+		await expect(page.locator('[data-dragging]')).toHaveCount(0);
+		await expect(page.getByTestId('files-op-error')).toHaveCount(0);
+		await expect(page.getByTestId('move-modal')).toHaveCount(0);
+		expect(existsSync(join(ws, 'notes.md'))).toBe(true);
+		expect(existsSync(join(ws, 'report.md'))).toBe(true);
+
+		// CONTROL: without the Escape, the identical hold reports why.
+		await dragHold(page, fileRow(page, 'notes.md'), fileRow(page, 'report.md'));
+		await page.mouse.up();
+		await expect(page.getByTestId('files-op-error')).toContainText('folder');
+	});
+
+	test('a nested entry dragged to the root drop area moves to the workspace root', async ({ page }) => {
+		writeFileSync(join(ws, 'nested/deep.md'), '# deep\n');
+		await openTree(page);
+		// The strip appears only while dragging, so the tree's resting layout is unchanged.
+		await expect(page.getByTestId('files-root-drop')).toHaveCount(0);
+		await dirRow(page, 'nested').click();
+		await expect(fileRow(page, 'nested/deep.md')).toBeVisible();
+
+		await dragHold(page, fileRow(page, 'nested/deep.md'), fileRow(page, 'report.md'));
+		const strip = page.getByTestId('files-root-drop');
+		await expect(strip).toBeVisible();
+		const sb = (await strip.boundingBox())!;
+		await page.mouse.move(sb.x + sb.width / 2, sb.y + sb.height / 2, { steps: 8 });
+		await expect(page.getByTestId('files-body')).toHaveAttribute('data-drop-target', 'true');
+		await page.mouse.up();
+
+		await expect(page.getByTestId('move-modal')).toBeVisible();
+		await expect(page.getByTestId('move-from')).toHaveText('deep.md');
+		await page.getByTestId('move-confirm').click();
+
+		// On DISK: at the workspace root, gone from the folder.
+		await expect.poll(() => existsSync(join(ws, 'deep.md'))).toBe(true);
+		expect(existsSync(join(ws, 'nested/deep.md'))).toBe(false);
+		await expect(fileRow(page, 'deep.md')).toBeVisible();
+		await expect(strip).toHaveCount(0);
 	});
 
 	test('dropping into the folder it is already in asks nothing and says nothing', async ({ page }) => {
