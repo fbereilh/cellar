@@ -83,6 +83,69 @@
 
 	const descriptor: FileDescriptor = $derived({ type: node.type, path: node.path, name: node.name });
 
+	// ---- Move by drag --------------------------------------------------------
+	// Native HTML5 drag-and-drop, the idiom the sidebar's section reorder and the
+	// notebook's cell reorder already use. The rules and the state live in the
+	// sidebar (reached through the `cellarFileOps` context); a row only reports
+	// the gesture and draws the two roles it can play.
+	//
+	// A row being RENAMED is a `TreeEntryInput`, a different branch entirely, so
+	// it is neither draggable nor a drop target by construction - a control inside
+	// a tree row stays a control.
+	const isDragging = $derived(ops?.drag?.path === node.path);
+	// Only ever set on a row that ACCEPTS the drop, so a refused target can never
+	// read as droppable.
+	const isDropTarget = $derived(ops?.drag?.overPath === node.path);
+
+	function onDragStart(e: DragEvent) {
+		if (!ops) return;
+		ops.startDrag(descriptor);
+		if (e.dataTransfer) {
+			e.dataTransfer.effectAllowed = 'move';
+			try {
+				e.dataTransfer.setData('text/plain', node.path);
+			} catch {}
+		}
+	}
+	function onDragOver(e: DragEvent) {
+		if (!ops?.drag?.path) return;
+		// A row sits inside the tree's root drop area, so it must own the event it
+		// answers - otherwise the root highlights while the pointer is over a folder.
+		e.stopPropagation();
+		const accepted = ops.dragOver(descriptor);
+		if (!accepted) {
+			if (e.dataTransfer) e.dataTransfer.dropEffect = 'none';
+			return;
+		}
+		// preventDefault is what MAKES an element a drop target, so it is called
+		// only for a drop that is really on offer.
+		e.preventDefault();
+		if (e.dataTransfer) e.dataTransfer.dropEffect = 'move';
+	}
+	function onDragLeave(e: DragEvent) {
+		// `relatedTarget` is the element being ENTERED, so a null one is the
+		// browser tearing the drag down over this row rather than the pointer
+		// moving on. See `CellarFileOps.dragLeave`.
+		ops?.dragLeave(descriptor, e.relatedTarget != null);
+	}
+	function onDrop(e: DragEvent) {
+		if (!ops?.drag?.path) return;
+		e.preventDefault();
+		e.stopPropagation();
+		ops.drop(descriptor);
+	}
+
+	/**
+	 * A row's background is ONE choice, never two utilities layered and left to
+	 * stylesheet order to settle: `bg-primary/20` and `bg-base-300/70` are both
+	 * single-class backgrounds, so a row that is both a drop target and the
+	 * selection would render whichever Tailwind happened to emit last. Being the
+	 * drop target wins - it is the thing the pointer is asking about right now.
+	 */
+	const rowBg = $derived(
+		isDropTarget ? 'bg-primary/20 ring-1 ring-primary/60' : isSelected || isActive ? 'bg-base-300/70' : ''
+	);
+
 	function onContext(e: MouseEvent) {
 		if (!ops) return;
 		e.preventDefault();
@@ -102,14 +165,22 @@
 		/>
 	{:else}
 		<button
-			class="flex w-full items-center gap-1 rounded px-1 py-0.5 text-left text-xs hover:bg-base-300/60 {isSelected ? 'bg-base-300/70' : ''} {isCut ? 'opacity-40' : ''} {dimmed ? 'opacity-50' : ''}"
+			class="flex w-full items-center gap-1 rounded px-1 py-0.5 text-left text-xs hover:bg-base-300/60 {rowBg} {isCut || isDragging ? 'opacity-40' : ''} {dimmed ? 'opacity-50' : ''}"
 			style="padding-left: {depth * 12 + 4}px{color ? `; color: ${color}` : ''}"
 			onclick={() => { ops?.select(descriptor); open = !open; }}
 			oncontextmenu={onContext}
+			draggable="true"
+			ondragstart={onDragStart}
+			ondragover={onDragOver}
+			ondragleave={onDragLeave}
+			ondrop={onDrop}
+			ondragend={() => ops?.endDrag()}
 			data-testid="tree-dir"
 			data-path={node.path}
 			data-git={status || undefined}
 			data-git-ignored={dimmed || undefined}
+			data-drop-target={isDropTarget || undefined}
+			data-dragging={isDragging || undefined}
 		>
 			<svg class="h-3 w-3 shrink-0 text-base-content/50 transition-transform {open ? 'rotate-90' : ''}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m9 18 6-6-6-6" /></svg>
 			<span class="shrink-0">{@html iconSvg(node.name, { dir: true, open })}</span>
@@ -142,16 +213,24 @@
 	/>
 {:else}
 	<button
-		class="flex w-full items-center gap-1 rounded px-1 py-0.5 text-left text-xs hover:bg-base-300/60 {isActive || isSelected ? 'bg-base-300/70' : ''} {isCut ? 'opacity-40' : ''} {dimmed ? 'opacity-50' : ''}"
+		class="flex w-full items-center gap-1 rounded px-1 py-0.5 text-left text-xs hover:bg-base-300/60 {rowBg} {isCut || isDragging ? 'opacity-40' : ''} {dimmed ? 'opacity-50' : ''}"
 		style="padding-left: {depth * 12 + 4}px{color ? `; color: ${color}` : ''}"
 		class:text-base-content={!color}
 		onclick={() => { ops?.select(descriptor); onOpen(node.path); }}
 		ondblclick={() => onOpenPermanent?.(node.path)}
 		oncontextmenu={onContext}
+		draggable="true"
+		ondragstart={onDragStart}
+		ondragover={onDragOver}
+		ondragleave={onDragLeave}
+		ondrop={onDrop}
+		ondragend={() => ops?.endDrag()}
 		data-testid="tree-file"
 		data-path={node.path}
 		data-git={status || undefined}
 		data-git-ignored={dimmed || undefined}
+		data-drop-target={isDropTarget || undefined}
+		data-dragging={isDragging || undefined}
 		title={node.path}
 	>
 		<span class="h-3 w-3 shrink-0"></span>

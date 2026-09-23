@@ -28,6 +28,7 @@
 	import type { KernelInfo, KernelCard } from '$lib/kernelBadge';
 	import type { NbdevState } from '$lib/nbdev';
 	import type { CellarFileOps, FileClipboard, NewEntry, FileDescriptor } from '$lib/fileOps';
+	import { dropVerdict, parentDirOf, refusalIsWorthReporting, refusalMessage, type DropTargetRow } from '$lib/fileDrag';
 	import type { NotebookRef } from '$lib/types';
 
 	/** A file/dir/root descriptor the context menu + selection act on. */
@@ -507,15 +508,84 @@
 	let deleteTarget = $state<{ type: string; path: string; name: string } | null>(null);
 	let opError = $state('');
 
-	function parentDir(p: string): string {
-		const i = p.lastIndexOf('/');
-		return i >= 0 ? p.slice(0, i) : '';
+	// ---- Move by drag (drop a file/folder onto a folder) --------------------
+	// The gesture is native HTML5 drag-and-drop, the idiom the sidebar's own
+	// section reorder and the notebook's cell reorder already use - a drop ONTO a
+	// target, which is what this is, rather than the tab strip's pointer-driven
+	// insertion between wrapped rows. State lives here beside the clipboard
+	// because the sidebar owns every file mutation; the rows read it through the
+	// existing `cellarFileOps` context, which exists precisely so the recursive
+	// tree need not drill props.
+	//
+	// The drop does NOT move anything by itself: it opens a confirmation, and the
+	// move is committed only when that is accepted. A drag is far easier to
+	// trigger by accident than cut-then-paste, especially while scrolling a long
+	// tree.
+	let dragging = $state<FileDescriptor | null>(null); // entry being dragged
+	let dragOverPath = $state<string | null>(null); // folder row that ACCEPTS the drop
+	let dragOverRoot = $state(false); // the tree's root area accepts the drop
+	/**
+	 * The last row the pointer was over that REFUSED the drop for a reason worth
+	 * saying out loud, reported when the drag ends without a drop.
+	 *
+	 * It has to be reported from `dragend` rather than from the drop, because the
+	 * drop never arrives: `preventDefault` on `dragover` is what MAKES an element
+	 * a drop target, and calling it on a refused row would hand that row the
+	 * "you may drop here" cursor - a lie about the very thing being refused. So
+	 * the cursor stays honest (the native no-drop one, which is the platform's own
+	 * clear refusal) and the REASON follows a beat later, rather than the gesture
+	 * silently doing nothing.
+	 *
+	 * Retired as soon as the pointer really moves on, so a drag that ends anywhere
+	 * else cannot be reported against a row it merely passed over - but NOT by the
+	 * `dragleave` a drag-end fires over the row itself. See `fileDragLeave`.
+	 */
+	let lastRefusal = $state<{ path: string; message: string } | null>(null);
+	// Escape abandons the drag. MEASURED in Chromium: the page gets no `keydown`
+	// for it - the drag machinery consumes the key - and the drag ends with no
+	// terminal `dragleave` over the row, while `keyup` lands AFTER `dragend`. So a
+	// refusal is reported only for a real RELEASE over the refused row (see
+	// `releasedOn`), and only after `ESCAPE_GRACE_MS`, during which an Escape in
+	// either direction retracts it. A gesture the user called off is not a
+	// mistake to report.
+	const ESCAPE_GRACE_MS = 250;
+	let dragCancelled = false;
+	let releasedOn: string | null = null;
+	let pendingReport: ReturnType<typeof setTimeout> | null = null;
+	function cancelPendingReport() {
+		if (pendingReport) clearTimeout(pendingReport);
+		pendingReport = null;
 	}
+	$effect(() => {
+		const onKey = (e: KeyboardEvent) => {
+			if (e.key !== 'Escape') return;
+			if (dragging) {
+				dragCancelled = true;
+				lastRefusal = null;
+			}
+			cancelPendingReport();
+		};
+		window.addEventListener('keydown', onKey, true);
+		window.addEventListener('keyup', onKey, true);
+		return () => {
+			window.removeEventListener('keydown', onKey, true);
+			window.removeEventListener('keyup', onKey, true);
+			cancelPendingReport();
+		};
+	});
+	let moveTarget = $state<{
+		from: string;
+		fromName: string;
+		fromType: 'file' | 'dir';
+		dest: string;
+		destName: string;
+	} | null>(null);
+
 	// The folder a "new" / "paste" targets: a dir uses itself, a file its parent,
 	// the tree root the workspace root ('').
 	function targetDirFor(node: MenuNode | null): string {
 		if (!node || node.type === 'root') return '';
-		return node.type === 'dir' ? node.path : parentDir(node.path);
+		return node.type === 'dir' ? node.path : parentDirOf(node.path);
 	}
 
 	async function runOp(payload: Record<string, unknown>) {
@@ -552,6 +622,22 @@
 		window.addEventListener('keydown', onKey);
 		return () => window.removeEventListener('keydown', onKey);
 	});
+	// Escape dismisses either confirmation. A confirmation you cannot abandon from
+	// the keyboard is the wrong shape for a dialog, and cancelling can only ever
+	// be the SAFE direction for both of these - one deletes, the other moves.
+	// (The context menu above uses the same idiom for the same reason.)
+	$effect(() => {
+		if (!moveTarget && !deleteTarget) return;
+		const onKey = (e: KeyboardEvent) => {
+			if (e.key !== 'Escape') return;
+			e.stopPropagation();
+			moveTarget = null;
+			deleteTarget = null;
+		};
+		window.addEventListener('keydown', onKey, true);
+		return () => window.removeEventListener('keydown', onKey, true);
+	});
+
 	function onRootContext(e: MouseEvent) {
 		e.preventDefault();
 		openMenu(e, { type: 'root', path: '', name: treeRoot?.name ?? '' });
@@ -598,13 +684,137 @@
 		closeMenu();
 		if (!clipboard) return;
 		const dest = targetDirFor(node);
-		const op = clipboard.op === 'cut' ? 'move' : 'copy';
 		const from = clipboard.path;
-		const res = await runOp({ op, path: from, dest });
-		if (res && op === 'move' && res.path) {
-			onFsChange?.({ type: 'move', from, path: res.path });
-			clipboard = null; // a cut is consumed; a copy stays for repeat pastes
+		if (clipboard.op === 'copy') {
+			await runOp({ op: 'copy', path: from, dest });
+			return; // a copy stays on the clipboard for repeat pastes
 		}
+		if (await commitMove(from, dest)) clipboard = null; // a cut is consumed
+	}
+
+	/**
+	 * THE one move commit, shared by cut/paste and by drag-and-drop, so the two
+	 * gestures cannot drift about what a move does: the same path-guarded route,
+	 * the same `onFsChange` so an open tab follows the file, the same refresh.
+	 * The server is what decides the final name (it de-duplicates rather than
+	 * clobbering), so the moved path is read back from its answer.
+	 */
+	async function commitMove(from: string, dest: string): Promise<boolean> {
+		const res = await runOp({ op: 'move', path: from, dest });
+		if (!res?.path) return false;
+		onFsChange?.({ type: 'move', from, path: res.path });
+		return true;
+	}
+
+	/** The row (or root area) a drag is over, in the shape the pure rule reads. */
+	function dropRowFor(node: FileDescriptor | null): DropTargetRow {
+		return node ? { type: node.type, path: node.path } : { type: 'root', path: '' };
+	}
+
+	function startFileDrag(node: FileDescriptor) {
+		opError = '';
+		dragging = node;
+		dragOverPath = null;
+		dragOverRoot = false;
+		lastRefusal = null;
+		dragCancelled = false;
+		releasedOn = null;
+		cancelPendingReport();
+	}
+
+	/**
+	 * Returns whether the drop is on offer, so the row can set the native
+	 * `dropEffect` - a refused target shows the no-drop cursor instead of reading
+	 * as droppable. Only an ACCEPTING target is ever highlighted.
+	 */
+	function fileDragOver(node: FileDescriptor | null): boolean {
+		const from = dragging?.path ?? null;
+		releasedOn = null;
+		const verdict = dropVerdict(from, dropRowFor(node));
+		if (!verdict.ok) {
+			// Whatever this row was, it is not the accepting one any more.
+			if (node) {
+				if (dragOverPath === node.path) dragOverPath = null;
+			} else if (dragOverRoot) dragOverRoot = false;
+			lastRefusal =
+				from && !dragCancelled && refusalIsWorthReporting(verdict.reason)
+					? { path: node ? node.path : '', message: refusalMessage(verdict.reason, baseName(from)) }
+					: null;
+			return false;
+		}
+		dragOverPath = node ? node.path : null;
+		dragOverRoot = !node;
+		lastRefusal = null;
+		return true;
+	}
+
+	function fileDragLeave(node: FileDescriptor | null, genuine: boolean) {
+		const path = node ? node.path : '';
+		if (node) {
+			if (dragOverPath === node.path) dragOverPath = null;
+		} else {
+			dragOverRoot = false;
+		}
+		// Only a REAL move to another element retires the refusal - see the
+		// contract's own note: the browser also fires `dragleave` on the way to
+		// `dragend`, and honouring that one discards the reason unreported.
+		if (genuine && lastRefusal?.path === path) lastRefusal = null;
+		if (!genuine && releasedOn === null) releasedOn = path;
+	}
+
+	/**
+	 * A drop landed on a target the rule accepts: it ASKS rather than acts. A
+	 * refused target is never armed to receive a drop at all (see `lastRefusal`),
+	 * so a refusal that somehow reaches here must leave that record standing for
+	 * `endFileDrag` to report rather than answering it a second way.
+	 */
+	function fileDrop(node: FileDescriptor | null) {
+		const from = dragging;
+		if (!from) return;
+		const verdict = dropVerdict(from.path, dropRowFor(node));
+		if (!verdict.ok) return;
+		lastRefusal = null;
+		endFileDrag();
+		moveTarget = {
+			from: from.path,
+			fromName: baseName(from.path),
+			fromType: from.type,
+			dest: verdict.dest,
+			destName: verdict.dest === '' ? (treeRoot?.name ?? 'the workspace root') : baseName(verdict.dest)
+		};
+	}
+
+	/**
+	 * The drag is over - dropped, cancelled, or abandoned. THE one place a refused
+	 * drop is reported, so a reason can never be said twice or in two voices.
+	 */
+	function endFileDrag() {
+		const report =
+			lastRefusal && !dragCancelled && releasedOn === lastRefusal.path ? lastRefusal.message : null;
+		lastRefusal = null;
+		releasedOn = null;
+		cancelPendingReport();
+		if (report) {
+			pendingReport = setTimeout(() => {
+				pendingReport = null;
+				opError = report;
+			}, ESCAPE_GRACE_MS);
+		}
+		dragging = null;
+		dragOverPath = null;
+		dragOverRoot = false;
+	}
+
+	function baseName(p: string): string {
+		const i = p.lastIndexOf('/');
+		return i >= 0 ? p.slice(i + 1) : p;
+	}
+
+	async function doMove() {
+		const t = moveTarget;
+		moveTarget = null;
+		if (!t) return;
+		await commitMove(t.from, t.dest);
 	}
 
 	function askDelete(node: MenuNode) {
@@ -656,12 +866,20 @@
 		get selectedPath() {
 			return selectedNode?.path ?? null;
 		},
+		get drag() {
+			return { path: dragging?.path ?? null, overPath: dragOverPath, overRoot: dragOverRoot };
+		},
 		openMenu,
 		select: (node: FileDescriptor) => (selectedNode = node),
 		submitRename,
 		cancelRename,
 		submitNew,
-		cancelNew
+		cancelNew,
+		startDrag: startFileDrag,
+		dragOver: fileDragOver,
+		dragLeave: fileDragLeave,
+		drop: fileDrop,
+		endDrag: endFileDrag
 	});
 
 	// ---- Outline (the notebook's headings, nested by level) ------------------
@@ -814,8 +1032,32 @@
 		{@render refreshBtn(refreshFiles, 'Refresh file tree')}
 	</div>
 	{#if open.files}
+		<!-- The tree's ROOT drop area: dropping in the gaps between rows moves an
+		     entry out to the workspace root. A row stops its own dragover from
+		     bubbling here, so this only ever answers for the space around them. -->
 		<!-- svelte-ignore a11y_no_static_element_interactions -->
-		<div class="px-2 pb-2" oncontextmenu={onRootContext} onkeydown={onFilesKeydown} data-testid="files-body">
+		<div
+			class="px-2 pb-2 {dragOverRoot ? 'rounded bg-primary/10 ring-1 ring-primary/50' : ''}"
+			oncontextmenu={onRootContext}
+			onkeydown={onFilesKeydown}
+			ondragover={(e) => {
+				if (!dragging) return;
+				if (!fileDragOver(null)) {
+					if (e.dataTransfer) e.dataTransfer.dropEffect = 'none';
+					return;
+				}
+				e.preventDefault();
+				if (e.dataTransfer) e.dataTransfer.dropEffect = 'move';
+			}}
+			ondragleave={(e) => fileDragLeave(null, e.relatedTarget != null)}
+			ondrop={(e) => {
+				if (!dragging) return;
+				e.preventDefault();
+				fileDrop(null);
+			}}
+			data-testid="files-body"
+			data-drop-target={dragOverRoot || undefined}
+		>
 			{#if treeError}
 				<p class="px-2 text-xs text-error">{treeError}</p>
 			{:else if treeRoot}
@@ -844,6 +1086,14 @@
 				{/each}
 			{:else}
 				<p class="px-2 text-xs text-base-content/40">loading…</p>
+			{/if}
+			{#if dragging && parentDirOf(dragging.path) !== ''}
+				<div
+					class="mt-1 rounded border border-dashed px-2 py-2 text-center text-[11px] {dragOverRoot ? 'border-primary/60 text-base-content/70' : 'border-base-300 text-base-content/45'}"
+					data-testid="files-root-drop"
+				>
+					Drop here to move to {treeRoot?.name ?? 'the workspace root'}
+				</div>
 			{/if}
 			{#if opError}
 				<p class="mt-1 px-2 text-xs text-error" data-testid="files-op-error">{opError}</p>
@@ -1693,6 +1943,33 @@
 			{#if node.type === 'root'}{@render menuSep()}{/if}
 			{@render menuItem('Paste', 'ctx-paste', () => pasteEntry(node))}
 		{/if}
+	</div>
+{/if}
+
+<!-- ==== Move confirmation (drag-and-drop) ================================ -->
+<!-- A drag is far easier to trigger by accident than cut-then-paste, especially
+     while scrolling a long tree, so the drop ASKS before anything moves. Cancel
+     leaves the entry exactly where it was: nothing has been written at this
+     point - the drop only opened this. Same daisyUI modal shape as the delete
+     confirmation below, deliberately: one dialog idiom in this file. -->
+{#if moveTarget}
+	<div class="modal modal-open" data-testid="move-modal">
+		<div class="modal-box max-w-sm">
+			<h3 class="text-sm font-semibold">Move {moveTarget.fromType === 'dir' ? 'folder' : 'file'}</h3>
+			<p class="mt-2 text-sm text-base-content/70">
+				Move <code class="font-mono text-primary" data-testid="move-from">{moveTarget.fromName}</code>{moveTarget.fromType === 'dir' ? ' and all its contents' : ''}
+				into <code class="font-mono text-primary" data-testid="move-dest">{moveTarget.destName}</code>?
+			</p>
+			<div class="modal-action mt-4">
+				<button class="btn btn-sm btn-ghost" onclick={() => (moveTarget = null)} data-testid="move-cancel">Cancel</button>
+				<button class="btn btn-sm btn-primary" onclick={doMove} data-testid="move-confirm">Move</button>
+			</div>
+		</div>
+		<!-- The backdrop is a decorative dismiss surface, not a control: Escape is
+		     the keyboard route out, and Cancel is the focusable one. -->
+		<!-- svelte-ignore a11y_no_static_element_interactions -->
+		<!-- svelte-ignore a11y_click_events_have_key_events -->
+		<div class="modal-backdrop" onclick={() => (moveTarget = null)}></div>
 	</div>
 {/if}
 
