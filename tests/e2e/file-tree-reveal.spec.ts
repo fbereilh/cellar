@@ -65,7 +65,7 @@ test.describe(runtimeAvailable() ? 'file tree: reveal the active tab' : `file tr
 	/** The sidebar's scroll container - the element a reveal has to move. */
 	async function scrollTreeToTop(page: Page): Promise<void> {
 		await page.getByTestId('files-body').evaluate((el) => {
-			let n: HTMLElement | null = el;
+			let n: Element | null = el;
 			while (n && !(n.scrollHeight > n.clientHeight && getComputedStyle(n).overflowY !== 'visible')) n = n.parentElement;
 			if (n) n.scrollTop = 0;
 		});
