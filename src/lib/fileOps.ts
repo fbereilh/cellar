@@ -52,6 +52,15 @@ export interface CellarFileOps {
 	readonly drag: DragState;
 	openMenu: (e: MouseEvent, node: FileDescriptor) => void;
 	select: (node: FileDescriptor) => void;
+	/**
+	 * Whether the folder at `path` is expanded. Expansion is owned by the sidebar
+	 * (one set of paths, `$lib/treeExpansion`) rather than by each row, so a
+	 * reveal can open a whole ancestor chain the sidebar does not render itself.
+	 * Reactive: a row reading it re-derives when the set changes.
+	 */
+	isExpanded: (path: string) => boolean;
+	/** Open or close the folder at `path`. */
+	setExpanded: (path: string, open: boolean) => void;
 	submitRename: (path: string, name: string) => void;
 	cancelRename: () => void;
 	submitNew: (name: string) => void;
