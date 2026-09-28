@@ -1134,10 +1134,15 @@ export function setLastRun(id: string, lastRun: LastRun, nb?: string | null): bo
  *
  * The caller resolves which cells defined the wiped names (see dataflow.ts
  * `cellsDefiningNames`); passing an empty list is a no-op. Emits one
- * `kernel:variables-wiped` event so every open tab refetches its staleness.
+ * `kernel:variables-wiped` event (carrying the caller's `originId`) so every open
+ * tab refetches its staleness and a tab that did NOT wipe re-reads its Variables panel.
  * Returns how many cells were actually cleared.
  */
-export function clearLastRunStamps(cellIds: readonly string[], nb?: string | null): number {
+export function clearLastRunStamps(
+	cellIds: readonly string[],
+	nb?: string | null,
+	originId?: string | null
+): number {
 	const doc = docFor(nb);
 	let cleared = 0;
 	for (const id of cellIds) {
@@ -1148,7 +1153,9 @@ export function clearLastRunStamps(cellIds: readonly string[], nb?: string | nul
 			cleared++;
 		}
 	}
-	emit(doc, 'kernel:variables-wiped', { cleared });
+	// `originId` names the tab that asked, so that tab (which re-reads its own
+	// Variables panel) can tell its wipe apart from a FOREIGN one it must re-read for.
+	emit(doc, 'kernel:variables-wiped', { cleared }, originId);
 	return cleared;
 }
 
