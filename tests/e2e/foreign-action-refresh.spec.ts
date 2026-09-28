@@ -337,6 +337,9 @@ test("an AGENT's kernel restart clears the Variables panel of a page viewing it"
 	// ...and it stays gone: no late probe of the dead session repaints it.
 	await page.waitForTimeout(1_500);
 	await expect(page.getByTestId('var-row').filter({ hasText: 'doomed_by_restart' })).toHaveCount(0);
+	// The badge re-read that answers the restart must not freeze it on a status the
+	// kernel only held mid-restart: it settles back to idle with no reload.
+	await expect(page.getByTestId('kernel-status')).toHaveText(/idle/, { timeout: 15_000 });
 });
 
 test("another tab's kernel SHUTDOWN clears the Variables panel and the badge", async ({ page }) => {
@@ -394,6 +397,7 @@ test("the page's OWN restart, wipe and shutdown still clear its Variables panel"
 	await card.hover();
 	await card.getByTestId('kernel-restart').click();
 	await expect(row('own_restart_var')).toHaveCount(0, { timeout: 15_000 });
+	await expect(page.getByTestId('kernel-status')).toHaveText(/idle/, { timeout: 15_000 });
 
 	await call('add_and_run', { source: 'own_wipe_var = [1]', route_imports: false });
 	await expect(row('own_wipe_var')).toBeVisible({ timeout: 45_000 });

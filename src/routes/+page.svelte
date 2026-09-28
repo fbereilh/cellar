@@ -1731,6 +1731,16 @@
 				const prev = lastSeenKernels;
 				lastSeenKernels = next;
 				kernels = next;
+				// The badge follows its kernel through the stream too. A lifecycle re-read
+				// (below) can land while that kernel is still mid-restart ("unknown"), and a
+				// restart's settling flip to idle arrives only as a snapshot - so without this
+				// the badge froze on the transient status until a reload. Matched by kernel
+				// id (a restart keeps it); a vanished kernel is left to that re-read.
+				const same = kernelInfo.id ? next.find((k) => k.id === kernelInfo.id) : undefined;
+				if (same) {
+					kernelReqSeq++;
+					kernelInfo = { ...kernelInfo, started: true, status: same.status, session_id: same.session_id };
+				}
 				// A restart / autorestart shows as a NEW session on the notebook's entry,
 				// a shutdown / cull / rebind (or a replaced server) as a MISSING entry.
 				const rowsDead = varsNamespace !== null && !namespaceSurvives(varsNamespace, next);
