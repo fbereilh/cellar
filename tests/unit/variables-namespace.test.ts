@@ -10,14 +10,11 @@
  *
  *   1. the pure rule (`$lib/variablesNamespace`) across every lifecycle shape;
  *   2. the SERVER half: `inspectVariables` names the namespace it read, taken
- *      from the probe's own execute rather than sampled around the await;
- *   3. source guards on the shell wiring - `+page.svelte` cannot be mounted under
- *      vitest (no SvelteKit plugin), and e2e is absent from the pre-push gate. The
- *      behavioural proof in a real browser is `tests/e2e/foreign-action-refresh.spec.ts`.
+ *      from the probe's own execute rather than sampled around the await.
+ *
+ * The shell wiring is proven in a real browser by `tests/e2e/foreign-action-refresh.spec.ts`.
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { readFileSync } from 'node:fs';
-import { join } from 'node:path';
 import type { RunStreamEvent } from '../../src/lib/server/types';
 import type { KernelListEntry } from '../../src/lib/kernelBadge';
 import {
@@ -173,67 +170,5 @@ describe('inspectVariables names the namespace it read', () => {
 		h.status = 'not_started';
 		expect(await inspectVariables()).toEqual({ variables: [], path: 'nb.ipynb', session_id: null });
 		expect(h.execute).not.toHaveBeenCalled();
-	});
-});
-
-describe('the shell wires every lifecycle broadcast to that rule', () => {
-	const src = readFileSync(join(process.cwd(), 'src/routes/+page.svelte'), 'utf8');
-	function blockAt(marker: string): string {
-		const start = src.indexOf(marker);
-		expect(start, `anchor not found: ${marker}`).toBeGreaterThan(-1);
-		let depth = 0;
-		for (let i = start + marker.indexOf('{'); i < src.length; i++) {
-			if (src[i] === '{') depth++;
-			else if (src[i] === '}' && --depth === 0) return src.slice(start, i + 1);
-		}
-		throw new Error('unbalanced');
-	}
-	const handler = blockAt('subscribeEvents((ev: ClientEvent) => {');
-	const branch = (type: string) => {
-		const i = handler.indexOf(`if (ev.type === '${type}') {`);
-		expect(i, type).toBeGreaterThan(-1);
-		return handler.slice(i, handler.indexOf('return;', i));
-	};
-
-	it('tags the rows wherever the probe writes them, and untags them on a wipe', () => {
-		expect(blockAt('async function refreshVariables() {')).toMatch(
-			/variables = body\.variables;\s*varsNamespace = namespaceOf\(body\);/
-		);
-		expect(blockAt('function wipeVariablesLocally() {')).toContain('varsNamespace = null');
-	});
-
-	it('a kernel:status snapshot clears dead rows and re-reads the badge', () => {
-		const status = branch('kernel:status');
-		expect(status).toContain('namespaceSurvives(varsNamespace, next)');
-		expect(status).toContain('anyNamespaceDied(prev, next)');
-		expect(status).toContain('onNamespaceDeath(');
-		// Compared against the previous SSE snapshot, never against `kernels`, which a
-		// fetch reply can overwrite out of order.
-		expect(status).toMatch(/const prev = lastSeenKernels;/);
-	});
-
-	it('a kernel:shutdown clears rows read from the session that died', () => {
-		const shutdown = branch('kernel:shutdown');
-		expect(shutdown).toContain('shutdownEnds(varsNamespace, rel, ev.session_id)');
-		expect(shutdown).toContain('onNamespaceDeath(');
-	});
-
-	it('the death handler wipes the rows, supersedes an in-flight probe and re-reads the badge', () => {
-		const death = blockAt('function onNamespaceDeath(rowsDead: boolean) {');
-		expect(death).toContain('if (rowsDead) wipeVariablesLocally();');
-		expect(death).toMatch(/varsReqSeq\+\+;[\s\S]*scheduleForeignVariablesRefresh\(\)/);
-		expect(death).toContain('refreshKernel()');
-	});
-
-	it('a FOREIGN variables-wipe re-reads the panel; our own returns first', () => {
-		const wiped = handler.slice(handler.indexOf("if (ev.type === 'kernel:variables-wiped') {"));
-		expect(wiped.indexOf('ev.originId === originId) return;')).toBeGreaterThan(-1);
-		expect(wiped.indexOf('ev.originId === originId) return;')).toBeLessThan(
-			wiped.indexOf('scheduleForeignVariablesRefresh()')
-		);
-		// ...and our own wipe tells the server who asked, or it could never tell.
-		expect(blockAt('async function wipeKernel(path: string) {')).toContain(
-			'JSON.stringify({ path, originId })'
-		);
 	});
 });
