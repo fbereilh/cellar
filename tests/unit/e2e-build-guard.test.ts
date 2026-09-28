@@ -464,3 +464,19 @@ describe('the launcher refuses an unusable build', () => {
 		}
 	});
 });
+
+describe('`make run` does what its echo says', () => {
+	it('runs the freshness guard before the launcher, and the guard skips a fresh build', () => {
+		// The recipe echoes "rebuilds only when stale". That holds only while it
+		// calls ensure-build.js (which skips a fresh build) ahead of the launcher,
+		// and never an unconditional `npm run build`. `make -n` prints the recipe
+		// without running it, so this reads what make would really execute.
+		const dry = spawnSync('make', ['-n', 'run'], { cwd: REPO, encoding: 'utf8' });
+		expect(dry.status).toBe(0);
+		const cmds = dry.stdout.split('\n').filter((l) => /^(node|npm)\b/.test(l.trim()));
+		expect(cmds).toEqual(['node scripts/ensure-build.js', 'node bin/cellar.js']);
+
+		const outcome = ensureFreshBuild({ repo: fixtureFresh(), log: () => {} });
+		expect(outcome).toMatchObject({ ok: true, rebuilt: false });
+	});
+});
