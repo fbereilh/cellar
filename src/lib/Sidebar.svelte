@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { onMount, setContext } from 'svelte';
+	import { onMount, setContext, tick, untrack } from 'svelte';
 	import Databricks from '$lib/Databricks.svelte';
 	import ChatPanel from '$lib/ChatPanel.svelte';
 	import Environment from '$lib/Environment.svelte';
@@ -21,6 +21,15 @@
 	} from '$lib/search';
 	import type { SearchCache } from '$lib/search';
 	import { getUi, setUi } from '$lib/uiState';
+	import { getUserSettingDefaultOn } from '$lib/userSettings';
+	import {
+		TREE_AUTO_REVEAL_KEY,
+		expandAncestors,
+		findTreeNode,
+		pruneExpanded,
+		remapExpanded,
+		setExpanded as withExpanded
+	} from '$lib/treeExpansion';
 	import { makeIgnoredMatcher } from '$lib/gitIgnored';
 	import type { Cell } from '$lib/server/types';
 	import type { TreeNode } from '$lib/server/fstree';
@@ -143,6 +152,16 @@
 		 */
 		onOpenNotebook?: (path: string) => void;
 		activeFilePath?: string | null;
+		/**
+		 * Reveal a file in the tree: open every folder above it, select it and
+		 * scroll it into view (VS Code's `explorer.autoReveal`). The shell raises a
+		 * new request - a fresh object, `n` bumped - whenever the active tab changes
+		 * or a tab is clicked, and the sidebar honours it only while the person's
+		 * "reveal the active file" setting is on. A prop rather than a method, so a
+		 * sidebar that mounts later (it is unmounted while collapsed) still reveals
+		 * the file that is active when it opens.
+		 */
+		revealRequest?: { path: string; n: number } | null;
 		fsRefreshSignal?: number;
 		onScrollToCell: (cellId: string, key?: string) => void;
 		/** Open the floating find-in-page bar (Search P3) over the active notebook. */
@@ -200,6 +219,7 @@
 		onFocusNotebook,
 		onOpenNotebook,
 		activeFilePath = null,
+		revealRequest = null,
 		fsRefreshSignal = 0,
 		onScrollToCell,
 		onOpenFindBar,
@@ -425,8 +445,15 @@
 		try {
 			const res = await fetch('/api/fs/tree');
 			if (!res.ok) throw new Error('failed to list workspace');
-			treeRoot = await res.json();
+			const next: TreeRoot = await res.json();
+			treeRoot = next;
 			treeError = '';
+			// A deleted folder's entry must not linger and pop a later folder of the
+			// same name open; a reveal that arrived before this tree did gets its turn.
+			expandedDirs = pruneExpanded(expandedDirs, next.tree);
+			const pending = pendingReveal;
+			pendingReveal = null;
+			if (pending) revealInTree(pending);
 		} catch (err) {
 			treeError = String((err as Error)?.message ?? err);
 		}
@@ -504,6 +531,49 @@
 	let renaming = $state<string | null>(null); // relPath being renamed inline
 	let newEntry = $state<NewEntry | null>(null);
 	let selectedNode = $state<MenuNode | null>(null);
+
+	// ---- Folder expansion + reveal -------------------------------------------
+	// Which folders are open, by workspace-relative path. Owned here rather than
+	// by each `FileTreeNode` so a reveal can open a whole ancestor chain; the rows
+	// read their own membership through the `cellarFileOps` context. The rules
+	// live in `$lib/treeExpansion`. Starts empty: folders start collapsed.
+	let expandedDirs = $state<ReadonlySet<string>>(new Set());
+	// A reveal that could not land yet because the tree does not hold the path
+	// (still loading, or about to reload after the move/rename that produced it).
+	// Tried ONCE against the next tree load, then dropped. Plain, not `$state`:
+	// nothing renders from it.
+	let pendingReveal: string | null = null;
+	let filesBodyEl = $state<HTMLElement | null>(null);
+
+	/**
+	 * Reveal `path`: open its ancestors, select it, scroll its row into view.
+	 * Focus is left where it is - the person clicked a TAB, and moving focus into
+	 * the tree would take the keyboard away from the file they just switched to.
+	 * Returns false when the tree does not hold the path.
+	 */
+	function revealInTree(path: string): boolean {
+		const node = findTreeNode(treeRoot?.tree, path);
+		if (!node) return false;
+		expandedDirs = expandAncestors(expandedDirs, path);
+		selectedNode = { type: node.type, path: node.path, name: node.name };
+		void tick().then(() => {
+			const row = filesBodyEl?.querySelector(`[data-path="${CSS.escape(path)}"]`);
+			row?.scrollIntoView({ block: 'nearest' });
+		});
+		return true;
+	}
+
+	$effect(() => {
+		const req = revealRequest;
+		if (!req) return;
+		// Untracked: the reveal reads and writes tree state, and the setting read
+		// must not turn every later setting change into another reveal.
+		untrack(() => {
+			pendingReveal = null;
+			if (!getUserSettingDefaultOn(TREE_AUTO_REVEAL_KEY)) return;
+			if (!revealInTree(req.path)) pendingReveal = req.path;
+		});
+	});
 	let ctxMenu = $state<{ x: number; y: number; node: MenuNode } | null>(null);
 	let deleteTarget = $state<{ type: string; path: string; name: string } | null>(null);
 	let opError = $state('');
@@ -669,7 +739,11 @@
 	async function submitRename(path: string, name: string) {
 		renaming = null;
 		const res = await runOp({ op: 'rename', path, name });
-		if (res?.path && res.path !== path) onFsChange?.({ type: 'rename', from: path, path: res.path });
+		if (res?.path && res.path !== path) {
+			// An open folder stays open (with its open subfolders) under its new name.
+			expandedDirs = remapExpanded(expandedDirs, path, res.path);
+			onFsChange?.({ type: 'rename', from: path, path: res.path });
+		}
 	}
 
 	function cutEntry(node: MenuNode) {
@@ -702,6 +776,7 @@
 	async function commitMove(from: string, dest: string): Promise<boolean> {
 		const res = await runOp({ op: 'move', path: from, dest });
 		if (!res?.path) return false;
+		expandedDirs = remapExpanded(expandedDirs, from, res.path);
 		onFsChange?.({ type: 'move', from, path: res.path });
 		return true;
 	}
@@ -871,6 +946,8 @@
 		},
 		openMenu,
 		select: (node: FileDescriptor) => (selectedNode = node),
+		isExpanded: (path: string) => expandedDirs.has(path),
+		setExpanded: (path: string, isOpen: boolean) => (expandedDirs = withExpanded(expandedDirs, path, isOpen)),
 		submitRename,
 		cancelRename,
 		submitNew,
@@ -1056,6 +1133,7 @@
 				fileDrop(null);
 			}}
 			data-testid="files-body"
+			bind:this={filesBodyEl}
 			data-drop-target={dragOverRoot || undefined}
 		>
 			{#if treeError}

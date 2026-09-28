@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { onMount, tick, flushSync } from 'svelte';
+	import { onMount, tick, flushSync, untrack } from 'svelte';
 	import { fade } from 'svelte/transition';
 	import Navbar from '$lib/Navbar.svelte';
 	import Sidebar from '$lib/Sidebar.svelte';
@@ -699,8 +699,36 @@
 	}
 
 	function selectTab(id: string) {
+		// Clicking the tab that is ALREADY active changes no path, so the effect
+		// below does not fire - but the click is still a request to see the file,
+		// and the person may have collapsed its folder since.
+		if (id === activeTabId) {
+			const path = activeTab?.path;
+			if (path) requestReveal(path);
+		}
 		activeTabId = id;
 	}
+
+	// Reveal the active tab's file in the file tree (VS Code's
+	// `explorer.autoReveal`). Raised whenever the active tab's PATH changes -
+	// a tab click, a keyboard switch, a tree click that opened a file, a closed
+	// tab handing focus on, a rename that moved the file - and on a click of the
+	// already-active tab. The sidebar owns the tree and the person's on/off
+	// setting (`TREE_AUTO_REVEAL_KEY`), so this only ever ASKS. A fresh object
+	// every time, so a repeat for the same path still lands.
+	let revealRequest = $state<{ path: string; n: number } | null>(null);
+	let revealSeq = 0;
+	function requestReveal(path: string) {
+		revealRequest = { path, n: ++revealSeq };
+	}
+	// A string, so the effect below re-runs only when the PATH changes - not on
+	// every `tabs` rewrite (a dirty flag, a reorder), which re-derives `activeTab`
+	// as a new object and would re-open folders the person just collapsed.
+	const activeTabPath = $derived(activeTab?.path ?? null);
+	$effect(() => {
+		const path = activeTabPath;
+		if (path) untrack(() => requestReveal(path));
+	});
 
 	// Click on a tab's run/queue indicator: activate that notebook (if it isn't the
 	// viewed one) and scroll its running (or queued) cell into view. Reuses the
@@ -1900,6 +1928,7 @@
 					{varsLoading}
 					{varsError}
 					{activeFilePath}
+					{revealRequest}
 					{activeNotebookPath}
 					{fsRefreshSignal}
 					nbdev={data.nbdev}
