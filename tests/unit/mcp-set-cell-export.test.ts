@@ -333,7 +333,7 @@ describe('a .py text notebook is refused up front', () => {
 		expect(nbmod.getCell(cells[0].id, target)?.metadata?.cellar?.export).toBeUndefined();
 	});
 
-	it('does not spend a jupytext write on the doc-layer path either', () => {
+	it('refuses a MARK at the doc layer the UI reaches, applying and broadcasting nothing', async () => {
 		const target = abs('text-export-doc.py');
 		writeFileSync(target, '# %%\na = 0\n\n# %%\na = 1\n');
 		const cells = nbmod.listCells(target);
@@ -345,14 +345,40 @@ describe('a .py text notebook is refused up front', () => {
 			if (ev.type === 'cell:export' && ev.nb === target) seen.push(ev.cellId!);
 		});
 		try {
-			// The UI PATCH route reaches this directly, so the guard belongs here too -
-			// but the EVENTS must still fire, or an open tab keeps the stale badge.
-			nbmod.setCellExports([cells[0].id], true, target);
+			// The UI PATCH route reaches `setCellExport` directly. It used to APPLY the
+			// mark in memory and broadcast it, so the toggle showed ON over a document
+			// that could never store it - gone after the next relaunch. Now the mark is
+			// refused by name, through the same rule MCP's guard asks.
+			expect(nbmod.setCellExport(cells[0].id, true, target)).toEqual({ ok: false, reason: 'py-notebook' });
+			expect(nbmod.setCellExports([cells[0].id], true, target)).toEqual([]);
 		} finally {
 			off();
 		}
+		expect(nbmod.getCell(cells[0].id, target)?.metadata?.cellar?.export).toBeUndefined();
 		expect(py.writes).toEqual([]);
-		expect(seen).toEqual([cells[0].id]);
+		expect(seen).toEqual([]);
+
+		// The route answers it in its own refusal shape, so the browser can revert and
+		// say why rather than keep a mark nothing stored.
+		const { PATCH } = await import('../../src/routes/api/cells/[id]/+server.js');
+		const res = (await (PATCH as unknown as (e: unknown) => Promise<Response>)({
+			params: { id: cells[0].id },
+			request: new Request('http://x/api/cells/' + cells[0].id, {
+				method: 'PATCH',
+				headers: { 'content-type': 'application/json' },
+				body: JSON.stringify({ export: true, nb: target })
+			})
+		})) as Response;
+		expect(res.status).toBe(409);
+		expect(await res.json()).toMatchObject({ ok: false, reason: 'py-notebook' });
+		expect(nbmod.getCell(cells[0].id, target)?.metadata?.cellar?.export).toBeUndefined();
+	});
+
+	it('still allows an UNMARK there - it can only remove state, never strand it', () => {
+		const target = abs('text-export-unmark.py');
+		writeFileSync(target, '# %%\na = 0\n');
+		const [cell] = nbmod.listCells(target);
+		expect(nbmod.setCellExport(cell.id, false, target)).toEqual({ ok: true });
 	});
 });
 

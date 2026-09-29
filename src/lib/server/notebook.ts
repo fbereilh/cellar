@@ -55,6 +55,7 @@ import {
 	exportMarkedTwice,
 	exportTargetLanguage,
 	moduleExtension,
+	notebookHoldsExport,
 	type ExportLanguage
 } from '../exportRole';
 import { isHiddenFromAgent } from '../agentVisibility';
@@ -1192,9 +1193,11 @@ export function setCellRole(id: string, role: string | null, nb?: string | null,
 
 /**
  * Why a `setCellExport` call did not take. `not-code` is the pre-existing
- * eligibility refusal, `export-directive-owns-cell` the one this rule adds.
+ * eligibility refusal, `export-directive-owns-cell` the one the nbdev directive
+ * rule adds, and `py-notebook` a MARK on a `.py` text notebook, which can hold no
+ * export state at all (`notebookHoldsExport`).
  */
-export type SetCellExportRefusal = 'no-such-cell' | 'not-code' | 'export-directive-owns-cell';
+export type SetCellExportRefusal = 'no-such-cell' | 'not-code' | 'export-directive-owns-cell' | 'py-notebook';
 
 /**
  * A refused `setCellExport`, and - for the directive case - whether Cellar's own
@@ -1238,6 +1241,11 @@ export function setCellExport(
 	const doc = docFor(nb);
 	const cell = find(doc, id);
 	if (!cell) return { ok: false, reason: 'no-such-cell' };
+	// A `.py` text notebook stores no cell metadata, so a mark set here lived only
+	// in memory: the toggle showed ON and the mark was gone after a relaunch. It is
+	// REFUSED rather than applied, through the same rule every export surface asks.
+	// Only a MARK - an unmark can only remove state, never strand it.
+	if (exported && !notebookHoldsExport(!!doc.jpFormat)) return { ok: false, reason: 'py-notebook' };
 	// The module's LANGUAGE is the NOTEBOOK's (`docExportLanguage`, which the target's
 	// extension merely follows), and eligibility is a match against it (`exportRole`'s
 	// `canExportCell`): Mojo source has no place in a `.py` module and Python source
@@ -1293,6 +1301,9 @@ export function setCellExports(
 	originId?: string | null
 ): string[] {
 	const doc = docFor(nb);
+	// A `.py` text notebook cannot hold a mark (`notebookHoldsExport`); every caller
+	// refuses first, and this keeps the batch from ever applying one in memory.
+	if (exported && !notebookHoldsExport(!!doc.jpFormat)) return [];
 	const lang = docExportLanguage(doc); // which module language these marks describe
 	const changed: Cell[] = [];
 	const seen = new Set<string>();
@@ -1904,7 +1915,7 @@ export function setNotebookLanguage(
  */
 export function exportPy(nb?: string | null): ExportResult {
 	const doc = docFor(nb);
-	if (doc.jpFormat) throw new Error('cannot export a .py text notebook to a module');
+	if (!notebookHoldsExport(!!doc.jpFormat)) throw new Error('cannot export a .py text notebook to a module');
 	try {
 		const res = exportNotebookToPy(doc);
 		doc.lastExportError = null;

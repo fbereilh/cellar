@@ -41,6 +41,7 @@
 		exportMarkedTwice,
 		EXPORT_STRANDED_BADGE,
 		EXPORT_STRANDED_CELL_TITLE,
+		notebookHoldsExport,
 		type ExportLanguage
 	} from '$lib/exportRole';
 	import { MAIN_DROPPED_BADGE, MAIN_DROPPED_REASON } from '$lib/mojoExport';
@@ -430,6 +431,13 @@
 	// (`exportStrandedExplanation`) and a per-cell copy would repeat one sentence on
 	// every previously marked cell, wrapping each toolbar row to say the same thing.
 	const exportStranded = $derived(exportMarkStranded(cell, exportCellLanguage));
+	// Whether this notebook's FORMAT can hold an export mark at all - the ONE rule
+	// the server's refusals ask too (`notebookHoldsExport`). A `.py` text notebook
+	// cannot: it stores no cell metadata, so the toggle used to show a mark that
+	// lived only in memory and was gone after a relaunch. The control is HIDDEN
+	// there, like the export bar above the cells and every other affordance a
+	// notebook cannot use, rather than rendered and refused on click.
+	const exportOffered = $derived(notebookHoldsExport(isPy));
 	// The accessible NAME. It tracks what the control DOES - clear a stale mark, or
 	// write this cell to the notebook's module - and never the pressed state, which
 	// is `aria-pressed`'s job.
@@ -2271,7 +2279,7 @@
 				     the other end of the row. The export marker used to be a separate `badge`
 				     here saying what this toggle now says; two controls for one fact meant the
 				     row RE-LAID OUT on every mark, so they are one control. -->
-				{#if canExport || exportStranded}
+				{#if exportOffered && (canExport || exportStranded)}
 					<!-- nbdev-style export. Gated on a code cell whose LANGUAGE matches the
 					     target's (`canExportCell` is the rule, asked directly; a
 					     markdown/SQL/raw cell - or one carrying a foreign nbformat

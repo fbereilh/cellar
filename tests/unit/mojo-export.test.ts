@@ -1311,8 +1311,8 @@ describe('the wiring the browser ships', () => {
 		const live = read('LiveNotebook.svelte');
 		const fn = live.slice(live.indexOf('async function setExport('));
 		const body = fn.slice(0, fn.indexOf('\n\t}\n'));
-		expect(body).toContain(
-			"if (verdict?.reason !== 'export-directive-owns-cell' && verdict?.reason !== 'not-code') return;"
+		expect(body).toMatch(
+			/verdict\?\.reason !== 'export-directive-owns-cell' &&\s*verdict\?\.reason !== 'not-code' &&\s*verdict\?\.reason !== 'py-notebook'\s*\)\s*return;/
 		);
 		expect(body).toContain("verdict.reason === 'not-code'");
 		expect(body).toContain('exportIneligibleNotice(id)');
