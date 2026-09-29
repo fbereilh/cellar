@@ -78,6 +78,16 @@ const PREFIX_KEY = 'cellar-databricks-upload-prefix';
 const POSTFIX_KEY = 'cellar-databricks-upload-postfix';
 /** Short enough that a wedged page cannot eat the hook's budget before the reset. */
 const UI_CLEAR_TIMEOUT_MS = 2_000;
+/**
+ * Comfortably past the server stores' 250ms write debounce (`json-store.ts`).
+ *
+ * Every reset PUT leaves each touched instance holding a PENDING write of its own
+ * cache. Two instances share one settings file, and whichever flushes last wins the
+ * whole file - so a reset write still pending when the next test seeds a default
+ * through the OTHER instance lands on top of it and erases it. No endpoint can flush
+ * a server store, so the reset waits the debounce out before handing over.
+ */
+const STORE_SETTLE_MS = 1_000;
 
 /**
  * The instances a test has actually opened, so the reset touches those and no others.
@@ -262,6 +272,9 @@ async function resetStores(page: Page): Promise<void> {
 			return left.every((v) => v === undefined);
 		})
 		.toBe(true);
+	// The last pass above re-dirtied every touched store; let those writes land now,
+	// while they can only write the empty state this reset just produced.
+	await page.waitForTimeout(STORE_SETTLE_MS);
 }
 
 function localToday() {
