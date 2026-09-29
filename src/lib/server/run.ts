@@ -30,7 +30,7 @@ import { publish } from './events';
 import { isChatCell, isMojoCell, isSqlCell } from '../cellLanguage';
 import { sqlToPython } from './sql';
 import { mojoMissingOutput, mojoToCellSource, type MojoSetup } from './mojo';
-import { executeChatRun, chatReplyOutput } from './chat/run-chat';
+import { executeChatRun, finalizeChatOutputs } from './chat/run-chat';
 import { OutputAccumulator, OUTPUT_FLUSH_MS, type StreamDelta } from './output-accumulator';
 import { registerRunOutputs, unregisterRunOutputs } from './run-output-registry';
 import { noteRunStarted } from './run-queue';
@@ -228,25 +228,29 @@ export async function executeCellRun({ nb, cellId, actor, source, originId, onEv
 		// Flush the tail + finalize the truncation marker; this is the array we persist.
 		outputs = acc.finish();
 
-		// A SUCCESSFUL chat run finalizes its streamed text into ONE markdown
-		// display_data (built from the accumulator's SURVIVING text, so a mid-run
-		// clear truncates the reply exactly as it truncates a kernel cell's output)
-		// and re-emits it as a full frame at the same stable index - the client's
-		// applyOutput replaces in place, snapping the live stream to rendered
-		// markdown. Failures pass through untouched: their message is already a
-		// display_data of its own.
+		// A chat run finalizes its streamed reply into ONE markdown display_data - on
+		// EVERY outcome, a failure and a cancel as much as a success, since a partial
+		// reply left as raw stream text shows its own markdown and Cellar's tool-line
+		// syntax literally, for good. Built from the accumulator's SURVIVING text, so
+		// a mid-run clear truncates the reply exactly as it truncates a kernel cell's
+		// output. Re-emitted as a full frame at the same stable index; the client's
+		// applyOutput replaces in place, snapping the live stream to rendered markdown.
+		// A failure message is already a display_data of its own and keeps its index.
 		//
-		// NOT when the accumulator tripped a cap: it appended a truncation marker as
-		// a SECOND stream element, and the finalize only republishes index 0 - there
-		// is no retract frame, so folding two elements into one would persist ONE
-		// output while every client still held the marker at index 1, orphaned until
-		// a reload. A capped reply therefore stays as streamed text beside its honest
-		// marker; the client's array and the document agree, which outranks rendering
-		// the markdown for a reply that is already incomplete.
-		if (isChat && status === 'ok' && !acc.wasCapped) {
-			const reply = chatReplyOutput(outputs);
-			if (reply) {
-				outputs = [reply];
+		// There is NO retract frame, so a finalize may only REPLACE an index every
+		// client already holds: `finalizeChatOutputs` returns an array of the same
+		// length differing only at index 0, which is the one index republished here.
+		// That is also why a CAPPED run skips it: the accumulator appended a truncation
+		// marker as a SECOND stream element, and folding two elements into one would
+		// persist ONE output while every client still held the marker at index 1,
+		// orphaned until a reload. A capped reply therefore stays as streamed text
+		// beside its honest marker - the client's array and the document agree, which
+		// outranks rendering the markdown for a reply that is already incomplete.
+		if (isChat && !acc.wasCapped) {
+			const finalized = finalizeChatOutputs(outputs);
+			if (finalized) {
+				outputs = finalized;
+				const reply = finalized[0];
 				publish({ type: 'run:output', nb, cellId, output: reply, index: 0, originId });
 				onEvent?.({ type: 'output', output: reply, index: 0 });
 			}

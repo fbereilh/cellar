@@ -6,9 +6,10 @@
  * OutputAccumulator (+ its ~40ms flush, delta rail, mid-run-clear truncation),
  * setOutputs persist, lastRun stamp, run:end - and swaps only the middle:
  * instead of `execute()`, the reply streams from the ChatEngine as coalesced
- * stream text, and a successful run's surviving text is then FINALIZED into one
+ * stream text, and the run's surviving text is then FINALIZED into one
  * `display_data` carrying `text/markdown` (a native nbformat mime, so plain
- * Jupyter renders the reply too). Streaming as stream text first is what buys
+ * Jupyter renders the reply too) - on every outcome, a failed or cancelled run's
+ * partial reply included, beside its failure message (`finalizeChatOutputs`). Streaming as stream text first is what buys
  * live feedback through machinery every tab already understands; the finalize
  * frame at the same stable index is what snaps it to rendered markdown at the
  * end.
@@ -340,25 +341,52 @@ function chatReadableWorkspace(): string | null {
 }
 
 /**
- * The finalized reply for a SUCCESSFUL chat run: the finished outputs' stream
- * text as one markdown `display_data`, or null when there is nothing to convert
- * (an empty reply, or outputs that are not purely streamed text - a failure
- * message is already `display_data` and must pass through untouched).
+ * The finalized outputs of a chat run - on EVERY outcome, a failure and a
+ * cancel as much as a success - or null when there is nothing to finalize.
+ *
+ * The reply streams as `stdout` text (the live view) and is snapped to ONE
+ * markdown `display_data` at the end, so what persists RENDERS: the model's own
+ * `**bold**`, and Cellar's own tool-activity syntax (the `>` quote, the `\`
+ * hard break, `*(failed)*`), which read as broken when left raw. A failed or
+ * cancelled run is where that matters most - its partial reply is the whole of
+ * what the user got - so the rule does not look at the run's status at all.
+ *
+ * ## THE NO-RETRACT INVARIANT, and why this rule is shaped around it
+ *
+ * Every client already holds the frames the run emitted, index by index, and
+ * the wire has NO frame that removes an element: the finalize can only
+ * REPLACE an index a client holds. So the result has EXACTLY the input's length
+ * and differs from it ONLY at index 0, which the caller republishes as a full
+ * frame - after which every client holds exactly what is persisted. Folding two
+ * elements into one would persist one output while every client kept the
+ * second, orphaned until a reload.
+ *
+ * That is why the rule demands a SINGLE stream element and it must be the
+ * first: `[reply]` (success), `[reply, failure]` (a failure or a cancel after
+ * text streamed - the failure message is already a `display_data` and passes
+ * through untouched, keeping its index). Anything else is refused rather than
+ * reshaped - above all a CAPPED reply, whose truncation marker is a SECOND
+ * stream element at index 1 (`stderr`): converting only index 0 would leave the
+ * marker as the one raw element, and folding the two would orphan it. The
+ * caller's `wasCapped` gate says the same thing out loud; this rule enforces it
+ * structurally, so neither can drift into violating the invariant alone. The
+ * head must be `stdout` too, the only stream a chat run writes its reply to, so
+ * a lone marker (a cap tripped before any text landed) is never mistaken for a
+ * reply.
  *
  * `text/plain` carries the same text so any consumer without a markdown
  * renderer still shows the reply.
  */
-export function chatReplyOutput(outputs: readonly CellOutput[]): CellOutput | null {
-	if (outputs.length === 0) return null;
-	if (!outputs.every((o) => o.output_type === 'stream')) return null;
-	const text = outputs
-		.map((o) => (o.output_type === 'stream' ? asText(o.text) : ''))
-		.join('')
-		.replace(/\s+$/, '');
+export function finalizeChatOutputs(outputs: readonly CellOutput[]): CellOutput[] | null {
+	const [head, ...rest] = outputs;
+	if (!head || head.output_type !== 'stream' || head.name !== 'stdout') return null;
+	if (rest.some((o) => o.output_type === 'stream')) return null;
+	const text = asText(head.text).replace(/\s+$/, '');
 	if (!text) return null;
-	return {
+	const reply: CellOutput = {
 		output_type: 'display_data',
 		data: { 'text/markdown': text, 'text/plain': text },
 		metadata: {}
 	};
+	return [reply, ...rest];
 }

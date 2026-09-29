@@ -17,9 +17,12 @@
  *   door) and it settles `cancelled`;
  * - an over-budget transcript is REFUSED before the engine is spawned, with a
  *   message naming the size, rather than sent and failed opaquely;
- * - what the run PUBLISHES leaves every client holding exactly the outputs the
- *   document persisted - including the capped case, whose truncation marker the
- *   finalize must not orphan.
+ * - what the run PUBLISHES leaves every client (the SSE tabs AND the initiating
+ *   tab's NDJSON stream) holding exactly the outputs the document persisted,
+ *   applying every frame by the client's own rules without a single refusal -
+ *   on success, on a FAILED and a CANCELLED run (whose partial reply is
+ *   finalized into markdown too), and in the capped case, whose truncation
+ *   marker the finalize must not orphan.
  */
 import { describe, it, expect, beforeAll, afterEach } from 'vitest';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
@@ -254,17 +257,24 @@ describe('failures are distinct, friendly and readable in the cell', () => {
 		}
 	});
 
-	it('a partial reply cut by a failure keeps the streamed text AND the message', async () => {
+	it('a partial reply cut by a failure keeps the streamed text, RENDERED, AND the message', async () => {
 		const { nb } = makeNotebook('partial.ipynb');
 		scriptedEngine(async ({ onDelta }) => {
-			onDelta('Half an ans');
+			onDelta('Half an **ans**');
 			return { ok: false, failure: { kind: 'api_error', message: 'upstream 529' }, engine: null, replyText: null };
 		});
 		const res = await runmod.executeCellRun({ nb, cellId: 'chatcell', actor: 'user', source: 'q' });
 		expect(res.status).toBe('error');
 		expect(res.outputs).toHaveLength(2);
-		expect(res.outputs[0].output_type).toBe('stream'); // the partial, honest as-is
-		expect(res.outputs[1].output_type).toBe('display_data'); // the failure message
+		// The partial is kept and finalized into markdown like a successful reply,
+		// so its own syntax renders instead of showing literally.
+		expect(res.outputs[0]).toEqual({
+			output_type: 'display_data',
+			data: { 'text/markdown': 'Half an **ans**', 'text/plain': 'Half an **ans**' },
+			metadata: {}
+		});
+		expect(res.outputs[1].output_type).toBe('display_data'); // the failure message, untouched
+		expect((res.outputs[1] as { data: Record<string, string> }).data['text/markdown']).toContain('upstream 529');
 	});
 });
 
@@ -364,41 +374,151 @@ describe('the stop doors reach a chat run', () => {
 	});
 });
 
-describe('chatReplyOutput (the finalize rule)', () => {
-	it('converts pure streamed text, passes anything else through, invents nothing', () => {
-		expect(runchat.chatReplyOutput([])).toBeNull();
-		expect(
-			runchat.chatReplyOutput([
-				{ output_type: 'stream', name: 'stdout', text: 'a ' },
-				{ output_type: 'stream', name: 'stdout', text: 'reply\n' }
-			])
-		).toEqual({ output_type: 'display_data', data: { 'text/markdown': 'a reply', 'text/plain': 'a reply' }, metadata: {} });
-		// A failure display_data (or any non-stream output) passes through untouched.
-		expect(runchat.chatReplyOutput([{ output_type: 'display_data', data: { 'text/markdown': 'x' }, metadata: {} }])).toBeNull();
-		expect(runchat.chatReplyOutput([{ output_type: 'stream', name: 'stdout', text: '   \n' }])).toBeNull();
+describe('finalizeChatOutputs (the finalize rule)', () => {
+	const stdout = (text: string) => ({ output_type: 'stream' as const, name: 'stdout', text });
+	const md = (text: string) => ({ output_type: 'display_data' as const, data: { 'text/markdown': text, 'text/plain': text }, metadata: {} });
+	const failure = md('**Chat failed.** upstream 529');
+
+	it('finalizes the reply on every outcome and passes the failure message through', () => {
+		// A success: one streamed element.
+		expect(runchat.finalizeChatOutputs([stdout('a reply\n')])).toEqual([md('a reply')]);
+		// A failure or a cancel after text streamed: the reply is rendered too, the
+		// failure keeps its index.
+		expect(runchat.finalizeChatOutputs([stdout('Half an **ans**'), failure])).toEqual([md('Half an **ans**'), failure]);
+	});
+
+	it('refuses, rather than reshapes, anything it could only finalize by dropping an index', () => {
+		// Nothing streamed, or nothing but whitespace.
+		expect(runchat.finalizeChatOutputs([])).toBeNull();
+		expect(runchat.finalizeChatOutputs([failure])).toBeNull();
+		expect(runchat.finalizeChatOutputs([stdout('   \n'), failure])).toBeNull();
+		// A capped reply: the truncation marker is a SECOND stream element.
+		const marker = { output_type: 'stream' as const, name: 'stderr', text: '\n... output truncated ...\n' };
+		expect(runchat.finalizeChatOutputs([stdout('y'), marker])).toBeNull();
+		// A lone marker (a cap tripped before any text landed) is not a reply.
+		expect(runchat.finalizeChatOutputs([marker])).toBeNull();
+		// Two stream elements of any kind: folding them would orphan index 1.
+		expect(runchat.finalizeChatOutputs([stdout('a'), stdout('b')])).toBeNull();
+	});
+
+	it('never changes the LENGTH, and never touches any index but 0 (the no-retract invariant)', () => {
+		const marker = { output_type: 'stream' as const, name: 'stderr', text: 'm' };
+		const pieces = [stdout('x'), stdout(' '), marker, failure, md('other')];
+		// Every array of up to three of these pieces, in every order.
+		const shapes: (typeof pieces)[] = [[]];
+		for (let n = 1; n <= 3; n++) {
+			const grow = (prefix: typeof pieces): void => {
+				if (prefix.length === n) {
+					shapes.push(prefix);
+					return;
+				}
+				for (const p of pieces) grow([...prefix, p]);
+			};
+			grow([]);
+		}
+		let finalized = 0;
+		for (const shape of shapes) {
+			const out = runchat.finalizeChatOutputs(shape);
+			if (!out) continue;
+			finalized++;
+			expect(out).toHaveLength(shape.length);
+			for (let i = 1; i < shape.length; i++) expect(out[i]).toBe(shape[i]);
+		}
+		expect(finalized).toBeGreaterThan(0); // the sweep is not vacuous
 	});
 });
 
 /**
- * Replay this cell's published frames the way `LiveNotebook.applyOutput` does,
- * so a test can compare what every open tab ends up holding against what the
- * document persisted. A finalize that rewrites the outputs ARRAY but republishes
- * only one index would show up here as a length mismatch - the orphaned element
- * no reload-less client can ever be rid of.
+ * A client's copy of one cell's outputs, updated by the SAME rules
+ * `LiveNotebook` applies (`applyOutput` / `applyOutputAppend`) - including the
+ * two it REFUSES: an index past the end (a hole, which throws while rendering)
+ * and a delta whose `base` does not match the element it targets. Each refusal
+ * is recorded as a VIOLATION rather than silently tolerated, so a finalize that
+ * emitted a frame no client can apply is caught here, not merely one that left
+ * the array the wrong length.
  */
-function clientMirror(nb: string, cellId: string): { outputs: Record<string, unknown>[]; stop: () => void } {
-	const outputs: Record<string, unknown>[] = [];
+interface Mirror {
+	outputs: Record<string, unknown>[];
+	violations: string[];
+	/** Every index a frame WROTE, in order - what a client has been handed. */
+	written: number[];
+}
+
+function newMirror(): Mirror {
+	return { outputs: [], violations: [], written: [] };
+}
+
+function applyFrame(m: Mirror, frame: Record<string, unknown>): void {
+	const type = String(frame.type).replace(/^run:/, '');
+	if (type === 'cleared') {
+		m.outputs.length = 0;
+	} else if (type === 'output') {
+		const at = frame.index as number;
+		if (at > m.outputs.length) m.violations.push(`output at ${at} past the end (${m.outputs.length})`);
+		m.outputs[at] = frame.output as Record<string, unknown>;
+		m.written.push(at);
+	} else if (type === 'output-append') {
+		const at = frame.index as number;
+		const cur = m.outputs[at] as { output_type?: string; text?: string } | undefined;
+		if (!cur || cur.output_type !== 'stream') {
+			m.violations.push(`delta at ${at} targets no stream element`);
+			return;
+		}
+		const prev = cur.text ?? '';
+		if (prev.length !== frame.base) m.violations.push(`delta at ${at} base ${frame.base} != ${prev.length}`);
+		m.outputs[at] = { ...cur, text: prev.slice(0, frame.keep as number) + (frame.chunk as string) };
+		m.written.push(at);
+	}
+}
+
+/**
+ * Replay this cell's published frames the way every OTHER open tab does (SSE),
+ * so a test can compare what they end up holding against what the document
+ * persisted. A finalize that rewrites the outputs ARRAY but republishes only one
+ * index would show up here as a length mismatch - the orphaned element no
+ * reload-less client can ever be rid of.
+ */
+function clientMirror(nb: string, cellId: string): Mirror & { stop: () => void } {
+	const m = newMirror();
 	const unsub = events.subscribe((ev: Record<string, unknown>) => {
 		if (ev.nb !== nb || ev.cellId !== cellId) return;
-		if (ev.type === 'run:cleared') outputs.length = 0;
-		else if (ev.type === 'run:output') outputs[ev.index as number] = ev.output as Record<string, unknown>;
-		else if (ev.type === 'run:output-append') {
-			const at = outputs[ev.index as number] as { text?: string } | undefined;
-			const prev = at?.text ?? '';
-			if (at) at.text = prev.slice(0, ev.keep as number) + (ev.chunk as string);
-		}
+		applyFrame(m, ev);
 	});
-	return { outputs, stop: unsub };
+	return { ...m, stop: unsub };
+}
+
+/**
+ * The same, for the INITIATING tab: it drops its own SSE echo and renders from
+ * the run's `onEvent` (NDJSON) stream instead, so it is a second client whose
+ * copy must also match. Pass the returned `onEvent` to `executeCellRun`.
+ */
+function ndjsonMirror(): Mirror & { onEvent: (ev: object) => void } {
+	const m = newMirror();
+	return { ...m, onEvent: (ev) => applyFrame(m, ev as Record<string, unknown>) };
+}
+
+/**
+ * THE PROOF of the no-retract invariant for one run: both kinds of client
+ * applied every frame without a single refusal, and each holds EXACTLY the
+ * persisted outputs - no element left at an index the finalize stopped
+ * republishing, none the wire would have had to remove - and so does the disk.
+ */
+function expectClientsHoldPersisted(
+	res: { outputs: unknown[] },
+	clients: Mirror[],
+	nb: string,
+	cellId = 'chatcell'
+): void {
+	for (const c of clients) {
+		expect(c.violations).toEqual([]);
+		expect(c.outputs).toHaveLength(res.outputs.length);
+		expect(c.outputs).toEqual(res.outputs);
+		// Nothing was ever written past what persisted: an index a client was
+		// handed and the document then dropped is exactly an orphan.
+		expect(Math.max(-1, ...c.written)).toBeLessThan(res.outputs.length);
+	}
+	const disk = JSON.parse(readFileSync(nb, 'utf8'));
+	expect(disk.cells.find((c: { id: string }) => c.id === cellId).outputs).toHaveLength(res.outputs.length);
 }
 
 describe('an over-budget transcript is refused, not sent', () => {
@@ -442,13 +562,14 @@ describe('what the clients hold matches what was persisted', () => {
 			onDelta('reply');
 			return { ok: true, failure: null, engine: null, replyText: 'a reply' };
 		});
-		const mirror = clientMirror(nb, 'chatcell');
+		const sse = clientMirror(nb, 'chatcell');
+		const own = ndjsonMirror();
 		try {
-			const res = await runmod.executeCellRun({ nb, cellId: 'chatcell', actor: 'user', source: 'q' });
+			const res = await runmod.executeCellRun({ nb, cellId: 'chatcell', actor: 'user', source: 'q', onEvent: own.onEvent });
 			expect(res.outputs).toHaveLength(1);
-			expect(mirror.outputs).toEqual(res.outputs);
+			expectClientsHoldPersisted(res, [sse, own], nb);
 		} finally {
-			mirror.stop();
+			sse.stop();
 		}
 	});
 
@@ -461,23 +582,120 @@ describe('what the clients hold matches what was persisted', () => {
 			onDelta('dropped');
 			return { ok: true, failure: null, engine: null, replyText: null };
 		});
-		const mirror = clientMirror(nb, 'chatcell');
+		const sse = clientMirror(nb, 'chatcell');
+		const own = ndjsonMirror();
 		try {
-			const res = await runmod.executeCellRun({ nb, cellId: 'chatcell', actor: 'user', source: 'q' });
+			const res = await runmod.executeCellRun({ nb, cellId: 'chatcell', actor: 'user', source: 'q', onEvent: own.onEvent });
 			expect(res.status).toBe('ok');
 			// The marker survived into the persisted document, and every client holds
 			// exactly those outputs - no element left behind at an index the finalize
-			// stopped republishing.
+			// stopped republishing. The reply stays STREAM text: a capped run is not
+			// finalized (unchanged by the failure-path finalize).
 			expect(res.outputs).toHaveLength(2);
+			expect(res.outputs[0]).toMatchObject({ output_type: 'stream', name: 'stdout' });
 			expect(res.outputs[1]).toMatchObject({ output_type: 'stream', name: 'stderr' });
 			expect((res.outputs[1] as { text: string }).text).toMatch(/output truncated/);
-			expect(mirror.outputs).toHaveLength(res.outputs.length);
-			expect(mirror.outputs).toEqual(res.outputs);
-			// And what is on disk agrees with both.
-			const disk = JSON.parse(readFileSync(nb, 'utf8'));
-			expect(disk.cells.find((c: { id: string }) => c.id === 'chatcell').outputs).toHaveLength(2);
+			expectClientsHoldPersisted(res, [sse, own], nb);
 		} finally {
-			mirror.stop();
+			sse.stop();
+		}
+	});
+
+	it('a FAILED run renders its partial reply and tool lines, and every client holds exactly that', async () => {
+		const { nb } = makeNotebook('mirror-failed.ipynb');
+		scriptedEngine(async ({ onDelta, onToolCall }) => {
+			onDelta('Looking it up.\n');
+			onToolCall?.({ name: 'WebSearch', input: { query: 'node lts' }, outcome: 'ok' });
+			onToolCall?.({ name: 'WebSearch', input: { query: 'node 26' }, outcome: 'failed' });
+			// Let the flush timer establish the element and send deltas, so the
+			// finalize really replaces a frame clients already hold.
+			await new Promise((r) => setTimeout(r, 60));
+			onDelta('So far: **v24** is');
+			await new Promise((r) => setTimeout(r, 60));
+			return { ok: false, failure: { kind: 'api_error', message: 'upstream 529' }, engine: null, replyText: null };
+		});
+		const sse = clientMirror(nb, 'chatcell');
+		const own = ndjsonMirror();
+		try {
+			const res = await runmod.executeCellRun({ nb, cellId: 'chatcell', actor: 'user', source: 'q', onEvent: own.onEvent });
+			expect(res.status).toBe('error');
+			expect(res.outputs).toHaveLength(2);
+			// RENDERED: one markdown display_data carrying the reply AND Cellar's own
+			// tool-line syntax - no stream element left for it to show literally in.
+			expect(res.outputs.map((o) => o.output_type)).toEqual(['display_data', 'display_data']);
+			const reply = (res.outputs[0] as { data: Record<string, string> }).data['text/markdown'];
+			expect(reply).toContain('> `WebSearch(node lts)`');
+			expect(reply).toContain('`WebSearch(node 26)` *(failed)*');
+			expect(reply).toContain('So far: **v24** is');
+			expect((res.outputs[1] as { data: Record<string, string> }).data['text/markdown']).toContain('upstream 529');
+			// Clients were first handed the STREAM at index 0 (and deltas against it),
+			// then the failure at index 1, then the finalize at index 0 - and they
+			// end up holding exactly the persisted pair.
+			expect(own.written).toContain(1);
+			expect(own.written.at(-1)).toBe(0);
+			expectClientsHoldPersisted(res, [sse, own], nb);
+		} finally {
+			sse.stop();
+		}
+	});
+
+	it('a CANCELLED run renders its partial reply and its no-result line, and every client holds exactly that', async () => {
+		const { nb } = makeNotebook('mirror-cancelled.ipynb');
+		scriptedEngine(
+			({ onDelta, onToolCall, signal }) =>
+				new Promise((resolve) => {
+					onDelta('thinking about **it**\n');
+					signal.addEventListener('abort', () => {
+						// What the engine's tracker reports for a call a stop cut short.
+						onToolCall?.({ name: 'WebSearch', input: { query: 'slow search' }, outcome: 'no_result' });
+						resolve({ ok: false, failure: { kind: 'cancelled', message: 'interrupted' }, engine: null, replyText: null });
+					});
+				})
+		);
+		const sse = clientMirror(nb, 'chatcell');
+		const own = ndjsonMirror();
+		try {
+			const p = runmod.executeCellRun({ nb, cellId: 'chatcell', actor: 'user', source: 'q', onEvent: own.onEvent });
+			// Let the partial reply reach clients before the stop, as a user sees it.
+			await new Promise((r) => setTimeout(r, 100));
+			expect(own.outputs).toHaveLength(1);
+			expect(own.outputs[0]).toMatchObject({ output_type: 'stream' });
+			expect(activemod.abortChatRuns(nb)).toBe(1);
+			const res = await p;
+			expect(res.status).toBe('error');
+			expect(res.outputs.map((o) => o.output_type)).toEqual(['display_data', 'display_data']);
+			const reply = (res.outputs[0] as { data: Record<string, string> }).data['text/markdown'];
+			expect(reply).toContain('thinking about **it**');
+			expect(reply).toContain('`WebSearch(slow search)` *(no result)*');
+			expect((res.outputs[1] as { data: Record<string, string> }).data['text/markdown']).toContain('interrupted');
+			expectClientsHoldPersisted(res, [sse, own], nb);
+		} finally {
+			sse.stop();
+		}
+	});
+
+	it('a run cancelled before any text persists the failure alone - there is nothing to finalize', async () => {
+		const { nb } = makeNotebook('mirror-cancelled-empty.ipynb');
+		scriptedEngine(
+			({ signal }) =>
+				new Promise((resolve) => {
+					signal.addEventListener('abort', () =>
+						resolve({ ok: false, failure: { kind: 'cancelled', message: 'interrupted' }, engine: null, replyText: null })
+					);
+				})
+		);
+		const sse = clientMirror(nb, 'chatcell');
+		const own = ndjsonMirror();
+		try {
+			const p = runmod.executeCellRun({ nb, cellId: 'chatcell', actor: 'user', source: 'q', onEvent: own.onEvent });
+			await new Promise((r) => setTimeout(r, 50));
+			expect(activemod.abortChatRuns(nb)).toBe(1);
+			const res = await p;
+			expect(res.outputs).toHaveLength(1);
+			expect((res.outputs[0] as { data: Record<string, string> }).data['text/markdown']).toContain('interrupted');
+			expectClientsHoldPersisted(res, [sse, own], nb);
+		} finally {
+			sse.stop();
 		}
 	});
 });
