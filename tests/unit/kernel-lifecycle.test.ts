@@ -148,6 +148,7 @@ describe('idle-cull reconciliation', () => {
 		expect(new Set(loadedNotebookPaths())).toEqual(new Set([A, B]));
 		const aId = getKernelInfo(A).id!;
 		expect(aId).toBeTruthy();
+		const aSession = currentSessionId(A);
 
 		cull(aId);
 		// teardownKernel runs async (disposes the connection); let microtasks settle.
@@ -163,6 +164,9 @@ describe('idle-cull reconciliation', () => {
 		// A per-notebook kernel:shutdown event invalidates A's run-status in open tabs.
 		const shutdownEv = h.published.find((e) => e.type === 'kernel:shutdown' && e.nb === A);
 		expect(shutdownEv).toMatchObject({ type: 'kernel:shutdown', nb: A, reason: 'kernel_culled' });
+		// It names the session that DIED, so a tab clears Variables rows read from
+		// exactly that namespace and never rows a newer kernel of A produced.
+		expect(shutdownEv!.session_id).toBe(aSession);
 		// And a kernel:status snapshot refreshes the sidebar cards.
 		expect(h.published.some((e) => e.type === 'kernel:status' && e.global)).toBe(true);
 

@@ -2042,13 +2042,17 @@ async function teardownKernel(
 		}
 	}
 	// The old namespace is gone; bump so its epoch can never read as current, and
-	// drop this kernel's widgets from the store.
+	// drop this kernel's widgets from the store. The session that died is captured
+	// first so the event can NAME it.
+	const deadSession = nbKernel.sessionId;
 	beginSession(nbKernel);
 	nbKernel.connection = null;
 	nbKernel.statusHandler = null;
 	// Invalidate this notebook's run-status in every open tab: with no live kernel
-	// its cells must read "not run this session".
-	publish({ type: 'kernel:shutdown', nb: nbPath, reason });
+	// its cells must read "not run this session". `session_id` is the namespace that
+	// died, so a tab's Variables panel clears rows read from exactly that session and
+	// never rows a newer kernel of the same notebook produced.
+	publish({ type: 'kernel:shutdown', nb: nbPath, reason, session_id: deadSession });
 }
 
 /**

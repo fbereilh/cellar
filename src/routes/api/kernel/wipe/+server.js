@@ -20,10 +20,13 @@ import { connectionStatus } from '$lib/server/databricks';
  * from the cells that defined them (`cellsDefiningNames`), so the existing staleness
  * machinery reports those cells "not run this session" and their dependents "stale".
  * `lastRun` is never persisted, so the `.ipynb` is untouched.
+ *
+ * `originId` is the calling tab's, carried on the `kernel:variables-wiped` event so
+ * that tab (which re-reads its own panel) is not asked to re-read it twice.
  */
 export async function POST({ request }) {
 	try {
-		const { path } = await request.json().catch(() => ({}));
+		const { path, originId } = await request.json().catch(() => ({}));
 		const nb = path ? resolveNotebookPath(path) : null;
 		// Keep the Databricks session bindings iff a connection is live for this notebook.
 		const preserve = connectionStatus(nb).connected ? ['spark', 'w'] : [];
@@ -35,7 +38,7 @@ export async function POST({ request }) {
 		const ids = probe_failed
 			? listCells(nb).filter((c) => c.cell_type === 'code').map((c) => c.id)
 			: await cellsDefiningNames(cleared, nb);
-		const stamps_cleared = clearLastRunStamps(ids, nb);
+		const stamps_cleared = clearLastRunStamps(ids, nb, typeof originId === 'string' ? originId : null);
 		return json({ ok: true, status, cleared, count: cleared.length, stamps_cleared, session_id });
 	} catch (err) {
 		return json({ ok: false, message: String(err?.message ?? err) }, { status: 500 });

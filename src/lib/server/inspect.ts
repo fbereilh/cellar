@@ -10,7 +10,7 @@
  * in nor pollutes the inspected namespace.
  */
 import { execute, kernelStatus, kernelSession, currentSessionId } from './kernel';
-import { getActiveNotebookPath, resolveNotebookPath } from './notebook';
+import { getActiveNotebookPath, resolveNotebookPath, workspaceRelative } from './notebook';
 import { queueStateFor } from './run-queue';
 import type { RunStreamEvent, SessionId } from './types';
 
@@ -241,20 +241,33 @@ async function runProbe(nbPath?: string | null): Promise<{ session: SessionId | 
 export async function inspectVariables(): Promise<{
 	variables: Array<{ name: string; type: string; shape: string; preview: string }>;
 	busy?: boolean;
+	/** Workspace-relative notebook whose kernel was asked (the `kernel:status` path shape). */
+	path: string;
+	/** The session the list was read from; null when there is no namespace to read. */
+	session_id: SessionId | null;
 }> {
 	const nbPath = getActiveNotebookPath();
+	// The panel TAGS its rows with (path, session_id) and clears them the moment a
+	// `kernel:status` snapshot or `kernel:shutdown` event says that namespace is gone
+	// - which is how a FOREIGN restart / shutdown reaches a tab that did not do it
+	// (`$lib/variablesNamespace`). So the session reported is the one the probe
+	// EXECUTED in, never one sampled around the await, and the probe is pinned to the
+	// notebook named here rather than re-reading the active one at execute time.
+	const path = workspaceRelative(resolveNotebookPath(nbPath));
 	const status = kernelStatus(nbPath).status;
-	if (status === 'not_started') return { variables: [] };
+	if (status === 'not_started') return { variables: [], path, session_id: null };
 	if (status === 'busy' || queueStateFor(resolveNotebookPath(nbPath)).running != null)
-		return { variables: [], busy: true };
-	const state = await runProbe();
+		return { variables: [], busy: true, path, session_id: kernelSession(nbPath).session_id };
+	const state = await runProbe(nbPath);
 	return {
 		variables: (state.variables || []).map(({ name, type, shape, preview }) => ({
 			name,
 			type,
 			shape,
 			preview
-		}))
+		})),
+		path,
+		session_id: state.session
 	};
 }
 

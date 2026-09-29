@@ -277,3 +277,139 @@ test("the page's OWN run still refreshes the Variables panel", async ({ page }) 
 	await cell.getByTestId('run').click();
 	await expect(page.getByTestId('var-row').filter({ hasText: 'own_var' })).toBeVisible({ timeout: 60_000 });
 });
+
+// ---- Foreign kernel LIFECYCLE: restart, shutdown, variables-wipe ----------------
+//
+// The same invariant, one layer over: the page's OWN restart / shutdown / wipe
+// refresh the Variables panel (and the badge), and a FOREIGN one - an agent's
+// `restart_kernel`, another tab's Shut down or Wipe - used to refresh nothing, so
+// this tab went on listing a namespace that no longer existed. Each case seeds a
+// variable through the AGENT while this tab is VIEWING the notebook (so the rows
+// are known to describe that notebook's live namespace), then lets something
+// other than this page kill or empty it. The page never acts.
+
+/**
+ * Open `nb` in the page and have the agent define `name` in it, returning once
+ * the Variables panel lists it. The agent's run arrives as a foreign `run:end`
+ * for the notebook the page is VIEWING, which is what puts the row on screen.
+ */
+async function seedViewedNotebook(page: import('@playwright/test').Page, nb: string, name: string) {
+	await call('use_notebook', { name: nb });
+	await page.goto(`${baseURL}/?ws=${encodeURIComponent(workspace)}`);
+	// A single click opens it in the preview slot, which is enough to make it the
+	// ACTIVE notebook - and cannot be split across two rows the way a double click
+	// can if the tree settles between its two presses. The selected tab is the
+	// proof the rows will describe THIS notebook rather than a restored one.
+	await page.getByTestId('tree-file').filter({ hasText: nb }).click();
+	await expect(page.getByRole('tab', { name: new RegExp(`^${nb.replace('.', '\\.')},`) })).toHaveAttribute(
+		'aria-selected',
+		'true'
+	);
+	await expect(page.locator('[data-testid="cell"]:visible').first()).toBeVisible();
+	await expect(page.getByTestId('vars-body')).toBeVisible();
+	await call('add_and_run', { source: `${name} = [1, 2, 3]`, route_imports: false });
+	await expect(page.getByTestId('var-row').filter({ hasText: name })).toBeVisible({ timeout: 45_000 });
+}
+
+/** A kernel lifecycle call made by SOMEONE ELSE - no `originId`, like another tab. */
+async function foreignKernelPost(route: 'shutdown' | 'wipe', nb: string) {
+	const res = await fetch(`${baseURL}/api/kernel/${route}`, {
+		method: 'POST',
+		headers: { 'content-type': 'application/json' },
+		body: JSON.stringify({ path: nb })
+	});
+	expect(res.ok).toBe(true);
+}
+
+test("an AGENT's kernel restart clears the Variables panel of a page viewing it", async ({ page }) => {
+	const RESTART_NB = 'foreign-restart.ipynb';
+	await seedViewedNotebook(page, RESTART_NB, 'doomed_by_restart');
+	await expect(page.getByTestId('kernel-status')).toHaveText(/idle/, { timeout: 20_000 });
+
+	const r = await call('restart_kernel', { notebook: RESTART_NB });
+	expect(r.session_id).toBeTruthy();
+
+	// The namespace that row described is gone. Without the fix it stays listed
+	// for the rest of the session: nothing in this tab heard the restart.
+	await expect(page.getByTestId('var-row').filter({ hasText: 'doomed_by_restart' })).toHaveCount(0, {
+		timeout: 15_000
+	});
+	// ...and it stays gone: no late probe of the dead session repaints it.
+	await page.waitForTimeout(1_500);
+	await expect(page.getByTestId('var-row').filter({ hasText: 'doomed_by_restart' })).toHaveCount(0);
+	// The badge re-read that answers the restart must not freeze it on a status the
+	// kernel only held mid-restart: it settles back to idle with no reload.
+	await expect(page.getByTestId('kernel-status')).toHaveText(/idle/, { timeout: 15_000 });
+});
+
+test("another tab's kernel SHUTDOWN clears the Variables panel and the badge", async ({ page }) => {
+	const SHUTDOWN_NB = 'foreign-shutdown.ipynb';
+	await seedViewedNotebook(page, SHUTDOWN_NB, 'doomed_by_shutdown');
+	await expect(page.getByTestId('kernel-status')).toHaveText(/idle/, { timeout: 20_000 });
+
+	await foreignKernelPost('shutdown', SHUTDOWN_NB);
+
+	await expect(page.getByTestId('var-row').filter({ hasText: 'doomed_by_shutdown' })).toHaveCount(0, {
+		timeout: 15_000
+	});
+	// The navbar badge is the same invariant's other half: our own shutdown
+	// re-reads it, a foreign one left it reading "idle" over a kernel that is gone.
+	await expect(page.getByTestId('kernel-status')).toHaveText(/not started/, { timeout: 15_000 });
+});
+
+test("another tab's variables WIPE clears the wiped rows and keeps the kernel", async ({ page }) => {
+	const WIPE_NB = 'foreign-wipe.ipynb';
+	await seedViewedNotebook(page, WIPE_NB, 'doomed_by_wipe');
+
+	await foreignKernelPost('wipe', WIPE_NB);
+
+	await expect(page.getByTestId('var-row').filter({ hasText: 'doomed_by_wipe' })).toHaveCount(0, {
+		timeout: 15_000
+	});
+	// A wipe is not a teardown: the kernel is still up.
+	await expect(page.getByTestId('kernel-status')).toHaveText(/idle/);
+});
+
+test("a foreign lifecycle action on ANOTHER notebook leaves this page's rows alone", async ({ page }) => {
+	// The guard against over-reach: the rows describe THIS notebook's namespace,
+	// so killing some other notebook's kernel must not clear them.
+	const KEEP_NB = 'foreign-keep.ipynb';
+	const OTHER = 'foreign-other.ipynb';
+	await call('use_notebook', { name: OTHER });
+	await call('add_and_run', { source: 'other_side = 1', route_imports: false });
+	await seedViewedNotebook(page, KEEP_NB, 'survivor_var');
+
+	await call('restart_kernel', { notebook: OTHER });
+	await foreignKernelPost('shutdown', OTHER);
+	await page.waitForTimeout(2_000);
+	await expect(page.getByTestId('var-row').filter({ hasText: 'survivor_var' })).toBeVisible();
+});
+
+test("the page's OWN restart, wipe and shutdown still clear its Variables panel", async ({ page }) => {
+	// No-regression guard for the path that always worked: the page's own kernel
+	// card controls. The lifecycle broadcasts now reach this tab for its own
+	// actions too, so this pins that answering both changes nothing a user sees.
+	const OWN_NB = 'own-lifecycle.ipynb';
+	const card = page.locator(`[data-testid="kernel-card"][data-nb-path="${OWN_NB}"]`);
+	const row = (name: string) => page.getByTestId('var-row').filter({ hasText: name });
+
+	await seedViewedNotebook(page, OWN_NB, 'own_restart_var');
+	await card.hover();
+	await card.getByTestId('kernel-restart').click();
+	await expect(row('own_restart_var')).toHaveCount(0, { timeout: 15_000 });
+	await expect(page.getByTestId('kernel-status')).toHaveText(/idle/, { timeout: 15_000 });
+
+	await call('add_and_run', { source: 'own_wipe_var = [1]', route_imports: false });
+	await expect(row('own_wipe_var')).toBeVisible({ timeout: 45_000 });
+	await card.hover();
+	await card.getByTestId('kernel-wipe-vars').click();
+	await card.getByTestId('kernel-wipe-vars-confirm').click();
+	await expect(row('own_wipe_var')).toHaveCount(0, { timeout: 15_000 });
+
+	await call('add_and_run', { source: 'own_shutdown_var = [1]', route_imports: false });
+	await expect(row('own_shutdown_var')).toBeVisible({ timeout: 45_000 });
+	await card.hover();
+	await card.getByTestId('kernel-shutdown').click();
+	await expect(row('own_shutdown_var')).toHaveCount(0, { timeout: 15_000 });
+	await expect(page.getByTestId('kernel-status')).toHaveText(/not started/, { timeout: 15_000 });
+});

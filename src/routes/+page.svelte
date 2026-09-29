@@ -41,6 +41,13 @@
 	import { notebookHasPythonNamespace, type NotebookLanguage } from '$lib/cellLanguage';
 	import { notebookUsesImportsCell } from '$lib/importsRole';
 	import type { KernelInfo, KernelListEntry, KernelCard } from '$lib/kernelBadge';
+	import {
+		namespaceOf,
+		namespaceSurvives,
+		anyNamespaceDied,
+		shutdownEnds,
+		type VarsNamespace
+	} from '$lib/variablesNamespace';
 	import { isBlameUnavailable, activeBlameFor, type BlameReport } from '$lib/blame';
 	import { reorderTabs as reorderTabList } from '$lib/tabReorder';
 	import { tabDomId, tabPanelDomId } from '$lib/tabIds';
@@ -1444,6 +1451,14 @@
 	// namespace can land last and stick until something else happens to refresh.
 	let varsReqSeq = 0;
 
+	/**
+	 * The namespace the rows on screen were read from - (notebook, session), as the
+	 * probe reported it - or null when they describe none. A plain `let`: nothing
+	 * renders it, it only lets a lifecycle broadcast ask "are THESE rows dead?"
+	 * (`$lib/variablesNamespace`). Set only where rows are written.
+	 */
+	let varsNamespace: VarsNamespace | null = null;
+
 	async function refreshVariables() {
 		// A Mojo notebook has no Python namespace to report on, and its section is not
 		// rendered, so the probe would be a real kernel `execute` (serialized on that
@@ -1464,7 +1479,10 @@
 			// `busy` means the kernel was running a cell, so the server skipped the probe
 			// (an internal probe must never queue behind a run). Keep the variables we
 			// already show rather than clearing them; the next idle refresh updates them.
-			if (!body.busy) variables = body.variables;
+			if (!body.busy) {
+				variables = body.variables;
+				varsNamespace = namespaceOf(body);
+			}
 		} catch (err) {
 			if (seq !== varsReqSeq) return; // superseded → its error is stale too
 			varsError = String((err as Error)?.message ?? err);
@@ -1504,6 +1522,7 @@
 	 */
 	function wipeVariablesLocally() {
 		varsReqSeq++;
+		varsNamespace = null;
 		variables = [];
 		varsLoading = false;
 		varsError = '';
@@ -1558,6 +1577,44 @@
 		return norm(rel) === norm(activeNotebookPath);
 	}
 
+	/**
+	 * A kernel namespace died - a restart, autorestart, shutdown, cull or venv rebind,
+	 * by ANYONE. The page's own kernel controls clear the panel and re-read the badge
+	 * themselves; a foreign one (an agent's `restart_kernel`, another tab's Shut down)
+	 * reached neither, so the panel went on listing a namespace that no longer existed
+	 * and the badge went on reading "idle" over a kernel that was gone. So the SAME
+	 * pair is driven from the lifecycle broadcasts every tab receives, whoever acted:
+	 *
+	 *  - `rowsDead` (the namespace the rows were read from is the one that died) →
+	 *    drop them, exactly as the own restart/shutdown does. No re-probe, also
+	 *    exactly as the own path: a fresh namespace has nothing of the user's in it.
+	 *  - otherwise a probe still in flight may be reading the namespace that just
+	 *    went away (its reply names no session yet) → supersede it and re-read once
+	 *    things settle, so a dead namespace can never land after the fact.
+	 *  - the badge is re-read either way: `kernelInfo` is the ACTIVE notebook's, whose
+	 *    kernel may be the one that died. `/api/kernel` only READS state.
+	 *
+	 * For the page's OWN action this repeats what its handler already did - clearing
+	 * rows that are already empty, one extra status read - so it changes nothing there.
+	 */
+	function onNamespaceDeath(rowsDead: boolean) {
+		if (rowsDead) wipeVariablesLocally();
+		else if (varsLoading) {
+			varsReqSeq++;
+			varsLoading = false;
+			scheduleForeignVariablesRefresh();
+		}
+		refreshKernel();
+	}
+
+	/**
+	 * The last `kernel:status` snapshot this tab received over SSE. Kept apart from
+	 * `kernels` on purpose: that one is also written by `refreshKernel`'s fetch, whose
+	 * replies are unordered against the event stream, and comparing against a stale
+	 * fetch could report a death that never happened. The SSE stream is in server order.
+	 */
+	let lastSeenKernels: KernelListEntry[] = [];
+
 	// Per-notebook kernel controls. Each targets ONE notebook's kernel (by its
 	// workspace-relative `path`) and reuses the exact kernel.js paths the MCP agent
 	// interface proved: restart keeps the same session (document intact) while
@@ -1602,7 +1659,7 @@
 	// change (still the same running session), so no refreshKernel() is needed.
 	async function wipeKernel(path: string) {
 		try {
-			await fetch('/api/kernel/wipe', { ...kernelJson, body: JSON.stringify({ path }) });
+			await fetch('/api/kernel/wipe', { ...kernelJson, body: JSON.stringify({ path, originId }) });
 			if (path === activeNotebookPath) refreshVariables();
 		} catch {}
 	}
@@ -1670,7 +1727,47 @@
 			// kernel start / busy-idle flip / restart / shutdown. Drives the Kernels
 			// sidebar cards with no reload (two notebooks running show two busy cards).
 			if (ev.type === 'kernel:status') {
-				kernels = (ev.kernels as KernelListEntry[] | undefined) ?? [];
+				const next = (ev.kernels as KernelListEntry[] | undefined) ?? [];
+				const prev = lastSeenKernels;
+				lastSeenKernels = next;
+				kernels = next;
+				// The badge follows its kernel through the stream too. A lifecycle re-read
+				// (below) can land while that kernel is still mid-restart ("unknown"), and a
+				// restart's settling flip to idle arrives only as a snapshot - so without this
+				// the badge froze on the transient status until a reload. Matched by kernel
+				// id (a restart keeps it); a vanished kernel is left to that re-read.
+				const same = kernelInfo.id ? next.find((k) => k.id === kernelInfo.id) : undefined;
+				if (same) {
+					kernelReqSeq++;
+					kernelInfo = { ...kernelInfo, started: true, status: same.status, session_id: same.session_id };
+				}
+				// A restart / autorestart shows as a NEW session on the notebook's entry,
+				// a shutdown / cull / rebind (or a replaced server) as a MISSING entry.
+				const rowsDead = varsNamespace !== null && !namespaceSurvives(varsNamespace, next);
+				if (rowsDead || anyNamespaceDied(prev, next)) onNamespaceDeath(rowsDead);
+				return;
+			}
+			// A teardown names the notebook and the session that died. The snapshot above
+			// usually says the same a beat later; answering both is harmless.
+			if (ev.type === 'kernel:shutdown') {
+				const rel = typeof ev.nb === 'string' ? toWorkspaceRel(workspace, ev.nb) : null;
+				onNamespaceDeath(varsNamespace !== null && shutdownEnds(varsNamespace, rel, ev.session_id));
+				return;
+			}
+			// A FOREIGN variables-wipe emptied a namespace that is still alive, so the rows
+			// are re-read rather than cleared (a wipe keeps imports, functions and a
+			// Databricks session). Our own wipe carries our `originId` and re-reads itself.
+			// Which notebook the rows describe decides it when they describe one; otherwise
+			// the same fail-open rule a foreign run uses.
+			if (ev.type === 'kernel:variables-wiped') {
+				if (ev.originId === originId) return;
+				const nb = (ev as { nb?: unknown }).nb;
+				const rel = typeof nb === 'string' ? toWorkspaceRel(workspace, nb) : null;
+				const touches =
+					varsNamespace && rel
+						? rel.replace(/\\/g, '/') === varsNamespace.path.replace(/\\/g, '/')
+						: foreignRunTouchesActiveNotebook(nb);
+				if (touches) scheduleForeignVariablesRefresh();
 				return;
 			}
 			// A run this tab did NOT initiate (an agent, or another tab) may load a
