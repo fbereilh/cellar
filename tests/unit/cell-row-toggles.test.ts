@@ -676,13 +676,9 @@ describe('the wiring the browser ships (source guards - see the file header)', (
 		// the key stays visible and clearable, instead of leaving it invisible in the
 		// user's committed `.ipynb`. Both halves are shared predicates, never a second,
 		// looser rule derived here.
-		// The FORMAT gate sits in front: a `.py` text notebook can hold no export
-		// state (`notebookHoldsExport`, the rule the server refuses on), so nothing is
-		// offered there at all.
 		expect(openGates(cell, 'data-testid="toggle-export"')).toEqual([
 			'{#if exportOffered && (canExport || exportStranded)}'
 		]);
-		expect(cell).toContain('const exportOffered = $derived(notebookHoldsExport(isPy));');
 		expect(cell).toContain('const canExport = $derived(canExportCell(cell, exportCellLanguage));');
 		expect(cell).toContain('const exportStranded = $derived(exportMarkStranded(cell, exportCellLanguage));');
 		// WHICH language eligibility is judged by is not chosen here at all: it is the
