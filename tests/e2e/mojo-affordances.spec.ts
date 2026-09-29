@@ -109,6 +109,13 @@ async function openFile(page: Page, name: string, firstCell = PY_ID): Promise<vo
 async function openFresh(page: Page, name: string, cells?: SeedCell[]): Promise<void> {
 	seed(name, cells);
 	await page.goto(`${baseURL}/?ws=${encodeURIComponent(workspace)}`);
+	// Settle before the double-click: the tree is server-rendered, so a click
+	// landing before hydration is a no-op, and the shell's mount-time tab restore
+	// replaces the tab set wholesale. Either signal below appears only after that
+	// restore has run.
+	await expect(
+		page.getByTestId('empty-state').or(page.getByRole('tab').first())
+	).toBeVisible({ timeout: 30_000 });
 	await openFile(page, name, cells?.[0].id ?? PY_ID);
 }
 
