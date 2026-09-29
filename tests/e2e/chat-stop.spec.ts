@@ -96,15 +96,16 @@ test('Stop ends the run promptly and leaves nothing of it running', async ({ pag
 
 	// HONEST: the cell says it was interrupted - not a finished reply, and not
 	// the bare "Chat failed." an API error renders.
-	const reply = chat.getByTestId('output-markdown');
-	await expect(reply).toBeVisible({ timeout: 30_000 });
-	await expect(reply).toContainText('(interrupted)');
-	await expect(reply).not.toContainText('Chat failed');
+	// Two rendered blocks: the partial reply, finalized into markdown like any
+	// reply (`run.ts` finalizes every outcome), and the interruption beside it.
+	const blocks = chat.getByTestId('output-markdown');
+	await expect(blocks).toHaveCount(2, { timeout: 30_000 });
+	const stopped = blocks.last();
+	await expect(stopped).toContainText('(interrupted)');
+	await expect(stopped).not.toContainText('Chat failed');
 	// The partial reply that DID stream is kept, so the stop did not discard what
-	// the user had already been shown. It stays STREAM text rather than joining
-	// the finalized markdown - `run.ts` only finalizes a run that ended `ok` - so
-	// this is asked of the cell, not of the reply block.
-	await expect(chat).toContainText('thinking about it');
+	// the user had already been shown.
+	await expect(blocks.first()).toContainText('thinking about it');
 
 	// And the run is genuinely over: the cell is runnable again.
 	await expect(chat.getByTestId('run')).toBeEnabled();
