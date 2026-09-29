@@ -61,7 +61,7 @@ export async function PATCH({ params, request }) {
 		}
 	}
 	// REPORTED, unlike its `source`/`role`/`scrolled`/`hideInput` siblings, and for
-	// exactly TWO of its refusals - the scope is deliberate: `no-such-cell` stays
+	// exactly THREE of its refusals - the scope is deliberate: `no-such-cell` stays
 	// silent exactly as it always was (widening the sibling setters is a separate
 	// change - see `hiddenFromAgent` below). What cannot stay silent is a refusal the
 	// browser applied a mark for and cannot see:
@@ -78,7 +78,12 @@ export async function PATCH({ params, request }) {
 	//     the document refuses - so `{ok:true}` left a phantom flag the export bar
 	//     then counted as marked, for a mark that exists in no file.
 	//
-	// Either way the client reverts its optimistic write and says why.
+	//   - `py-notebook` - a MARK on a `.py` text notebook, which stores no cell
+	//     metadata (`notebookHoldsExport`). The browser withholds the toggle there,
+	//     so this is the authoritative backstop: applied, the mark lived only in
+	//     memory and was gone after a relaunch while the row showed it ON.
+	//
+	// Every time the client reverts its optimistic write and says why.
 	//
 	// `alsoFlagged` travels WITH the reason because the remedy differs and the client
 	// cannot work it out: it only sends this once it believed the cell was NOT
@@ -90,7 +95,7 @@ export async function PATCH({ params, request }) {
 	if (typeof body.source === 'string') setSource(params.id, body.source, body.nb, body.originId);
 	if ('export' in body) {
 		const r = setCellExport(params.id, !!body.export, body.nb, body.originId);
-		if (!r.ok && (r.reason === 'export-directive-owns-cell' || r.reason === 'not-code'))
+		if (!r.ok && (r.reason === 'export-directive-owns-cell' || r.reason === 'not-code' || r.reason === 'py-notebook'))
 			return json({ ok: false, reason: r.reason, alsoFlagged: !!r.alsoFlagged }, { status: 409 });
 	}
 	if ('scrolled' in body) setOutputScrolled(params.id, body.scrolled, body.nb);
