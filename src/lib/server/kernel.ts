@@ -1414,7 +1414,7 @@ async function runSilent(kernel: KernelConnection, code: string): Promise<void> 
 	const nbKernel = nbKernelForConnection(kernel);
 	const dT0 = Date.now();
 	let dStage = 'lock';
-	const dTimer = setInterval(() => logWarn('kernel', `DIAG runSilent ${nbKernel ? basename(nbKernel.nbPath) : '?'} stuck in ${dStage} ${Date.now() - dT0}ms conn=${kernel.connectionStatus} status=${kernel.status}`), 5000);
+	const dTimer = setInterval(() => console.warn(`DIAG runSilent ${nbKernel ? basename(nbKernel.nbPath) : '?'} stuck in ${dStage} ${Date.now() - dT0}ms conn=${kernel.connectionStatus} status=${kernel.status}`), 5000);
 	const release = nbKernel ? await acquireExecLock(nbKernel) : null;
 	try {
 		dStage = 'future.done';
@@ -1424,7 +1424,7 @@ async function runSilent(kernel: KernelConnection, code: string): Promise<void> 
 			store_history: false,
 			stop_on_error: false
 		});
-		future.onReply = () => void logWarn('kernel', `DIAG runSilent got shell reply after ${Date.now() - dT0}ms`);
+		future.onReply = () => void console.warn(`DIAG runSilent got shell reply after ${Date.now() - dT0}ms`);
 		await future.done;
 		clearInterval(dTimer);
 	} catch {
@@ -1970,8 +1970,18 @@ export async function restartKernel(nbPath?: string | null) {
 	const diagT0 = Date.now();
 	const diagTag = `DIAG restart ${basename(abs)}`;
 	let diagStage = 'rest-restart+reconnect';
+	const diagMsgs: string[] = [];
+	const diagAny = (_s: unknown, a: { direction: string; msg: { channel?: string; header: { msg_type: string } } }) => {
+		if (diagMsgs.length < 60) diagMsgs.push(`${Date.now() - diagT0}:${a.direction === 'send' ? '>' : '<'}${a.msg.channel ?? '?'}/${a.msg.header.msg_type}`);
+	};
+	kernel.anyMessage.connect(diagAny as never);
+	setTimeout(() => {
+		try { kernel.anyMessage.disconnect(diagAny as never); } catch {}
+	}, 20000);
+	const diagDump = () => console.warn(`${diagTag}: wire ${diagMsgs.join(' ')}`);
 	const diagTimer = setInterval(() => {
-		logWarn('kernel', `${diagTag}: still in ${diagStage} after ${Date.now() - diagT0}ms (conn=${kernel.connectionStatus} status=${kernel.status})`);
+		console.warn(`${diagTag}: still in ${diagStage} after ${Date.now() - diagT0}ms (conn=${kernel.connectionStatus} status=${kernel.status})`);
+		diagDump();
 	}, 5000);
 	try {
 		await kernel.restart();
@@ -1983,22 +1993,22 @@ export async function restartKernel(nbPath?: string | null) {
 		// as `ok_session` against a namespace that no longer exists.
 		beginSession(nbKernel);
 	}
-	logWarn('kernel', `${diagTag}: restart() resolved after ${Date.now() - diagT0}ms (conn=${kernel.connectionStatus} status=${kernel.status})`);
+	console.warn(`${diagTag}: restart() resolved after ${Date.now() - diagT0}ms (conn=${kernel.connectionStatus} status=${kernel.status})`);
 	diagStage = 'initKernel';
 	{
 		const t = Date.now();
 		kernel
 			.requestKernelInfo()
 			.then(
-				() => logWarn('kernel', `${diagTag}: diag kernel_info answered after ${Date.now() - t}ms`),
-				(e: unknown) => logWarn('kernel', `${diagTag}: diag kernel_info rejected ${String(e)}`)
+				() => console.warn(`${diagTag}: diag kernel_info answered after ${Date.now() - t}ms`),
+				(e: unknown) => console.warn(`${diagTag}: diag kernel_info rejected ${String(e)}`)
 			);
 	}
 	// restart() clears the namespace and the inline-backend config, so re-inject.
 	try {
 		await initKernel(nbKernel, kernel);
 		clearInterval(diagTimer);
-		logWarn('kernel', `${diagTag}: initKernel done after ${Date.now() - diagT0}ms`);
+		console.warn(`${diagTag}: initKernel done after ${Date.now() - diagT0}ms`);
 	} catch (err) {
 		clearInterval(diagTimer);
 		// The one thing in `initKernel` that may legitimately refuse is the code-root
