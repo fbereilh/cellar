@@ -1402,7 +1402,18 @@ function nbKernelForConnection(kernel: KernelConnection): NotebookKernel | undef
 	return undefined;
 }
 
-async function runSilent(kernel: KernelConnection, code: string): Promise<void> {
+/**
+ * Thrown by `runSilent` when its request was never ACKNOWLEDGED - see `ackTimeoutMs`.
+ * The one `runSilent` failure that is not swallowed, because it is not a failed
+ * injection but a kernel that cannot be reached, which bring-up must not paper over.
+ */
+class StartupCodeUnanswered extends Error {}
+
+async function runSilent(
+	kernel: KernelConnection,
+	code: string,
+	{ locked = false, ackTimeoutMs = 0 }: { locked?: boolean; ackTimeoutMs?: number } = {}
+): Promise<void> {
 	// A silent injection is still a `requestExecute` on the wire, so it MUST take the
 	// kernel's exec lock like every other execute — two in flight at once wedge a run's
 	// `future.done` (see NotebookKernel.execChain). This covers the paths that bypass
@@ -1411,8 +1422,23 @@ async function runSilent(kernel: KernelConnection, code: string): Promise<void> 
 	// lock is uncontended (no user run can execute until `getKernel` resolves); after
 	// an autorestart it waits behind the just-aborted run's release. Best-effort: if
 	// the connection isn't tracked yet, fall through unlocked rather than block bring-up.
-	const nbKernel = nbKernelForConnection(kernel);
+	// `locked` means the CALLER already holds this kernel's exec lock (`restartKernel`
+	// holds it across the whole restart); taking it again would queue behind itself.
+	//
+	// `ackTimeoutMs` bounds how long the kernel may take to ACKNOWLEDGE the request -
+	// any message whose parent it is, in practice the iopub `busy` its shell publishes
+	// the moment it picks the request up. Only the acknowledgement is bounded, never the
+	// run: an acknowledged injection is demonstrably executing and may take as long as
+	// its imports take. What this catches is the request that never reached the shell -
+	// MEASURED after a restart under load: the reconnect handshake answered, and the
+	// injection sent a millisecond later got no reply of any kind, so its `future.done`
+	// (which nothing else bounds) held the exec lock and the restart forever. On a miss
+	// the future is disposed and `StartupCodeUnanswered` is thrown for the caller to
+	// refuse the kernel. The healthy path waits on nothing extra: the acknowledgement is
+	// observed as it arrives.
+	const nbKernel = locked ? undefined : nbKernelForConnection(kernel);
 	const release = nbKernel ? await acquireExecLock(nbKernel) : null;
+	const watch = ackTimeoutMs > 0 ? watchReplies(kernel) : null;
 	try {
 		const future = kernel.requestExecute({
 			code,
@@ -1420,15 +1446,44 @@ async function runSilent(kernel: KernelConnection, code: string): Promise<void> 
 			store_history: false,
 			stop_on_error: false
 		});
+		const msgId = (future as { msg?: { header?: { msg_id?: string } } }).msg?.header?.msg_id;
+		if (watch?.answered && msgId) {
+			watch.track(msgId);
+			const acknowledged = await Promise.race([
+				watch.answered,
+				future.done.then(
+					() => true,
+					() => true
+				),
+				delay(ackTimeoutMs).then(() => false)
+			]);
+			if (!acknowledged) {
+				try {
+					future.dispose();
+				} catch {
+					/* already disposed */
+				}
+				throw new StartupCodeUnanswered(
+					`it did not acknowledge Cellar's startup code (no reply of any kind within ${ackTimeoutMs}ms of sending it)`
+				);
+			}
+		}
 		await future.done;
-	} catch {
-		// A failed startup injection must never break kernel bring-up.
+	} catch (err) {
+		// A failed startup injection must never break kernel bring-up - but a kernel
+		// that never received it is not a failed injection.
+		if (err instanceof StartupCodeUnanswered) throw err;
 	} finally {
+		watch?.dispose();
 		release?.();
 	}
 }
 
-async function initKernel(nbKernel: NotebookKernel, kernel: KernelConnection): Promise<void> {
+async function initKernel(
+	nbKernel: NotebookKernel,
+	kernel: KernelConnection,
+	{ locked = false, ackTimeoutMs = 0 }: { locked?: boolean; ackTimeoutMs?: number } = {}
+): Promise<void> {
 	const { nbPath } = nbKernel;
 	// Coalesce every startup injection into ONE round-trip in front of the first
 	// user result. Each block is independently guarded (a matplotlib/pandas/IPython
@@ -1482,8 +1537,8 @@ async function initKernel(nbKernel: NotebookKernel, kernel: KernelConnection): P
 	// (unchanged, the default). Read off the session rather than the document so it
 	// can never disagree with the process's real cwd — see `codeRoot`.
 	if (addProjectRootToPath()) parts.push(projectRootAddCode(nbKernel.codeRoot));
-	await runSilent(kernel, parts.join('\n\n'));
-	await verifyKernelCwd(nbKernel, kernel);
+	await runSilent(kernel, parts.join('\n\n'), { locked, ackTimeoutMs });
+	await verifyKernelCwd(nbKernel, kernel, { locked });
 }
 
 /**
@@ -1519,12 +1574,13 @@ async function initKernel(nbKernel: NotebookKernel, kernel: KernelConnection): P
 async function runCapture(
 	kernel: KernelConnection,
 	code: string,
-	{ timeoutMs = 0 }: { timeoutMs?: number } = {}
+	{ timeoutMs = 0, locked = false }: { timeoutMs?: number; locked?: boolean } = {}
 ): Promise<string | null> {
 	// The single budget: started HERE, before anything can wait, and awaited by both
 	// races below so the two together can never exceed `timeoutMs`.
 	const budget = timeoutMs > 0 ? delay(timeoutMs).then(() => false as const) : null;
-	const nbKernel = nbKernelForConnection(kernel);
+	// `locked`: the caller already holds the exec lock (see `runSilent`).
+	const nbKernel = locked ? undefined : nbKernelForConnection(kernel);
 	const lock = nbKernel ? beginExecLock(nbKernel) : null;
 	if (lock) {
 		if (budget) {
@@ -1600,12 +1656,17 @@ function delay(ms: number): Promise<void> {
  * mismatch — refusing on an unverifiable reading would fail starts for a reason
  * nothing observed.
  */
-async function verifyKernelCwd(nbKernel: NotebookKernel, kernel: KernelConnection): Promise<void> {
+async function verifyKernelCwd(
+	nbKernel: NotebookKernel,
+	kernel: KernelConnection,
+	{ locked = false }: { locked?: boolean } = {}
+): Promise<void> {
 	if (nbKernel.codeRootKind !== 'worktree') return;
 	const expected = realpathOrSelf(nbKernel.codeRoot);
 	let actual = '';
 	try {
-		actual = (await runCapture(kernel, 'import os as _c_os\nprint(_c_os.path.realpath(_c_os.getcwd()))\ndel _c_os')) ?? '';
+		actual =
+			(await runCapture(kernel, 'import os as _c_os\nprint(_c_os.path.realpath(_c_os.getcwd()))\ndel _c_os', { locked })) ?? '';
 	} catch {
 		// The probe itself failed to run; see the header — silence is not disagreement.
 		return;
@@ -1682,8 +1743,27 @@ async function awaitShellHandshake(
  * (`disconnected`) or is disposed answers false. The bound starts only once the socket
  * is open, so a slow kernel BOOT (the server holds the websocket until the kernel is
  * alive) is never mistaken for a dead shell.
+ *
+ * `reply` is the promise that connect-time reply settles. For a FRESH connection that
+ * is `kernel.info`; after a RESTART it cannot be, because `kernel.info` is a one-shot
+ * that the connection's FIRST reply already resolved, so it reads "answered" forever -
+ * `restartKernel` passes `watchConnectHandshake`'s promise instead.
+ *
+ * `resend`, when given, re-asks every `KERNEL_INFO_RESEND_MS` until an answer lands.
+ * The restart path needs it because ONE unanswered request is not proof of a silent
+ * shell there: MEASURED, about 1 restart in 15 under a busy poller loses the reconnect's
+ * request outright - the kernel never logs it, while every later message is answered
+ * (it goes out before jupyter_server's link to the new process is up; @jupyterlab's own
+ * source carries a FIXME saying it should retry). Waiting on that one request refused
+ * restarts of healthy kernels. A healthy reply arrives well inside the first interval,
+ * so re-asking costs the healthy path nothing.
  */
-async function shellAnswers(kernel: KernelConnection, timeoutMs: number): Promise<boolean> {
+async function shellAnswers(
+	kernel: KernelConnection,
+	timeoutMs: number,
+	reply: Promise<unknown> = kernel.info,
+	resend?: () => void
+): Promise<boolean> {
 	const opened = await new Promise<boolean>((resolve) => {
 		const status = kernel.connectionStatus;
 		if (status === 'connected' || status === undefined) return resolve(true);
@@ -1697,7 +1777,70 @@ async function shellAnswers(kernel: KernelConnection, timeoutMs: number): Promis
 	});
 	if (!opened) return false;
 	// A reply that reports an error is still a reply: the shell is alive.
-	return Promise.race([kernel.info.then(() => true, () => true), delay(timeoutMs).then(() => false)]);
+	const timer = resend ? setInterval(resend, KERNEL_INFO_RESEND_MS) : undefined;
+	timer?.unref?.();
+	try {
+		return await Promise.race([reply.then(() => true, () => true), delay(timeoutMs).then(() => false)]);
+	} finally {
+		if (timer) clearInterval(timer);
+	}
+}
+
+/** How often `shellAnswers` re-asks a post-restart shell that has not answered yet. */
+const KERNEL_INFO_RESEND_MS = 250;
+
+/**
+ * Watch `kernel` for a REPLY to a request sent from now on. A request counts when it
+ * is sent with type `requestType`, or when its id is handed to `track`; a reply counts
+ * when it is received with type `replyType` (any type when omitted) and its PARENT is
+ * one of those requests. `answered` resolves on the first such reply; `dispose`
+ * detaches. Keying on the parent id is what keeps a late message from the kernel being
+ * replaced from ever vouching for its successor. A connection that exposes no
+ * `anyMessage` signal has nothing to watch and yields `answered: null` - the same
+ * stance `awaitShellHandshake` takes on a missing `info`.
+ */
+function watchReplies(
+	kernel: KernelConnection,
+	{ requestType, replyType }: { requestType?: string; replyType?: string } = {}
+): { answered: Promise<true> | null; track: (msgId: string) => void; dispose: () => void } {
+	if (!kernel.anyMessage || typeof kernel.anyMessage.connect !== 'function')
+		return { answered: null, track: () => {}, dispose: () => {} };
+	const sent = new Set<string>();
+	let resolve!: (v: true) => void;
+	const answered = new Promise<true>((r) => (resolve = r));
+	const onMessage = (_sender: unknown, { msg, direction }: Kernel.IAnyMessageArgs) => {
+		if (direction === 'send') {
+			if (requestType && msg.header.msg_type === requestType) sent.add(msg.header.msg_id);
+		} else if (
+			(!replyType || msg.header.msg_type === replyType) &&
+			sent.has((msg.parent_header as { msg_id?: string } | undefined)?.msg_id ?? '')
+		)
+			resolve(true);
+	};
+	kernel.anyMessage.connect(onMessage);
+	return {
+		answered,
+		track: (msgId) => void sent.add(msgId),
+		dispose: () => {
+			try {
+				kernel.anyMessage.disconnect(onMessage);
+			} catch {
+				/* the connection is already gone */
+			}
+		}
+	};
+}
+
+/**
+ * Watch `kernel` for the `kernel_info_reply` to a `kernel_info_request` sent from now
+ * on - i.e. the one @jupyterlab sends each time its socket (re)connects, which a
+ * `restart()` does. Reading the reply @jupyterlab already asks for costs the healthy
+ * path nothing: no extra message goes on the wire, and nothing we send could reach the
+ * kernel sooner anyway, because @jupyterlab itself holds every other message until that
+ * same reply arrives.
+ */
+function watchConnectHandshake(kernel: KernelConnection) {
+	return watchReplies(kernel, { requestType: 'kernel_info_request', replyType: 'kernel_info_reply' });
 }
 
 /** `realpathSync` where possible, else the path itself. */
@@ -1960,35 +2103,98 @@ export async function restartKernel(nbPath?: string | null) {
 	// actually rescue a wedged run.
 	abortActiveRuns(nbKernel, 'kernel_restart');
 	const kernel = await nbKernel.startPromise;
+	// CLAIM this kernel's exec lock for the WHOLE restart window, from before the
+	// restart is issued until the startup injection has run on the new process. The
+	// claim is synchronous, so every execute that arrives from here on - a Variables
+	// probe, an agent's run, a completion's `onRunEnd` refresh - queues BEHIND it and
+	// reaches the NEW kernel, after its injection.
+	//
+	// Without it, a restart could hang for as long as ~90s (the idle watchdog's
+	// three-strike conviction of the stuck probe), and it did under load: an internal
+	// execute that took the lock mid-restart was put on the wire to the DYING kernel -
+	// @jupyterlab holds messages while its session reads "restarting", but the old
+	// kernel's own `shutdown_reply` overwrites that sentinel, so anything sent after it
+	// goes straight out - no reply ever came, and the post-restart injection waited
+	// behind it on the lock. The shell of the NEW kernel was answering all along.
+	//
+	// Everything already holding the lock lets go promptly: `abortActiveRuns` just
+	// aborted every run, and `restart()` disposes every other in-flight future
+	// (`_clearKernelState`), which settles the silent injections and probes holding it.
+	const lock = beginExecLock(nbKernel);
+	const handshake = watchConnectHandshake(kernel);
+	let restarted = false;
 	try {
-		await kernel.restart();
-	} finally {
-		// Once the REST restart is issued the kernel process is restarted and the
-		// namespace is cleared, even if the websocket reconnect afterwards rejects.
-		// The epoch must be bumped on BOTH paths: it is monotonic and opaque, so an
-		// extra bump is harmless, while a missing one leaves cells falsely reading
-		// as `ok_session` against a namespace that no longer exists.
-		beginSession(nbKernel);
-	}
-	// restart() clears the namespace and the inline-backend config, so re-inject.
-	try {
-		await initKernel(nbKernel, kernel);
+		try {
+			await kernel.restart();
+			restarted = true;
+		} finally {
+			// Once the REST restart is issued the kernel process is restarted and the
+			// namespace is cleared, even if the websocket reconnect afterwards rejects.
+			// The epoch must be bumped on BOTH paths: it is monotonic and opaque, so an
+			// extra bump is harmless, while a missing one leaves cells falsely reading
+			// as `ok_session` against a namespace that no longer exists.
+			beginSession(nbKernel);
+		}
+		// Before anything is sent to the new process, prove it can be reached: our turn
+		// on the lock, and a shell that answers - the fresh-start guard's question
+		// (`shellAnswers`), asked of the reconnect's own kernel_info reply. ONE budget
+		// covers both. A shell that never answers used to leave the injection's
+		// `future.done` - which nothing bounds - pending forever.
+		const deadline = Date.now() + handshakeTimeoutMs();
+		const ourTurn = await Promise.race([lock.ready.then(() => true), delay(handshakeTimeoutMs()).then(() => false)]);
+		if (!ourTurn) {
+			throw new Error(
+				`the kernel for ${abs} restarted, but a request sent to it before the restart still held it ${handshakeTimeoutMs()}ms later, so it was shut down. Run a cell to start a new kernel.`
+			);
+		}
+		const resend = () => void kernel.requestKernelInfo().catch(() => {});
+		if (
+			handshake.answered &&
+			!(await shellAnswers(kernel, Math.max(0, deadline - Date.now()), handshake.answered, resend))
+		) {
+			throw new Error(
+				`the kernel for ${abs} restarted, but it did not answer on its shell channel ` +
+					`(no kernel_info_reply within ${handshakeTimeoutMs()}ms of reconnecting, asked every ${KERNEL_INFO_RESEND_MS}ms), so it was shut down. Run a cell to start a new kernel.`
+			);
+		}
+		// restart() clears the namespace and the inline-backend config, so re-inject -
+		// under the lock this restart already holds. The handshake answering is not the
+		// end of it: MEASURED under load, the injection sent right after an answered
+		// handshake can still go unacknowledged, and nothing else bounds its
+		// `future.done` - so the injection's acknowledgement gets the same window.
+		try {
+			await initKernel(nbKernel, kernel, { locked: true, ackTimeoutMs: handshakeTimeoutMs() });
+		} catch (err) {
+			if (!(err instanceof StartupCodeUnanswered)) throw err;
+			throw new Error(
+				`the kernel for ${abs} restarted and answered on its shell channel, but ${err.message}, so it was shut down. Run a cell to start a new kernel.`
+			);
+		}
 	} catch (err) {
-		// The one thing in `initKernel` that may legitimately refuse is the code-root
-		// cwd verification, and `getKernel` handles that by not leaving a half-verified
-		// kernel behind. The same must hold here, and for a stronger reason: this entry
-		// is ALREADY in the map with a resolved `startPromise`, and `getKernel`
-		// short-circuits on an existing entry without re-verifying — so a refusal that
-		// merely propagated left every later run executing against the kernel whose cwd
-		// was just refused, the exact silent degrade the verification exists to prevent.
-		await teardownKernel(nbKernel, 'kernel_restart_failed');
-		// `teardownKernel` publishes only the per-notebook `kernel:shutdown`; the
-		// sidebar's Kernels cards come from the separate `kernel:status` snapshot, so
-		// every other teardown caller publishes it too. Without it a refused restart
-		// left a card on screen — with Interrupt/Restart/Shut down enabled — for a
-		// kernel that no longer exists.
-		publishKernelStatus();
+		// A restart that did not come back usable - its shell never answered, or the
+		// code-root cwd verification refused the new process - must not leave a kernel
+		// behind. `getKernel` handles a refused start the same way, and here the reason
+		// is stronger: this entry is ALREADY in the map with a resolved `startPromise`,
+		// and `getKernel` short-circuits on an existing entry without re-verifying, so a
+		// failure that merely propagated left every later run executing against a kernel
+		// that was just refused - or, for a silent shell, parking behind it for good.
+		// A `restart()` that itself rejected is left to propagate exactly as before.
+		if (restarted) {
+			await teardownKernel(nbKernel, 'kernel_restart_failed');
+			// `teardownKernel` publishes only the per-notebook `kernel:shutdown`; the
+			// sidebar's Kernels cards come from the separate `kernel:status` snapshot, so
+			// every other teardown caller publishes it too. Without it a refused restart
+			// left a card on screen - with Interrupt/Restart/Shut down enabled - for a
+			// kernel that no longer exists.
+			publishKernelStatus();
+		}
 		throw err;
+	} finally {
+		handshake.dispose();
+		// Hand the chain on only once our own turn has come (the `execute()` rule), so a
+		// restart that gave up waiting can never put a successor on the wire beside the
+		// request it was waiting behind.
+		void lock.ready.then(lock.release, lock.release);
 	}
 	publishKernelStatus();
 	// If this notebook had a live Databricks session, rebuild it against the same
