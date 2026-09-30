@@ -243,7 +243,7 @@ jobs:
       - name: Run E2E (shard ${{ matrix.shard }})
         run: |
           npx playwright test --list --shard=5/10 | grep -c foreign-action-refresh || true
-          for pass in 1 2; do echo "=== PASS $pass"; npx playwright test --shard=5/10 || true; done
+          for pass in 1 2 3; do echo "=== PASS $pass"; npx playwright test --shard=5/10 || true; done
 
       # Traces are `retain-on-failure`, so this uploads only when there is
       # something to look at — a red shard is diagnosable without re-running it

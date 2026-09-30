@@ -1995,15 +1995,6 @@ export async function restartKernel(nbPath?: string | null) {
 	}
 	console.warn(`${diagTag}: restart() resolved after ${Date.now() - diagT0}ms (conn=${kernel.connectionStatus} status=${kernel.status})`);
 	diagStage = 'initKernel';
-	{
-		const t = Date.now();
-		kernel
-			.requestKernelInfo()
-			.then(
-				() => console.warn(`${diagTag}: diag kernel_info answered after ${Date.now() - t}ms`),
-				(e: unknown) => console.warn(`${diagTag}: diag kernel_info rejected ${String(e)}`)
-			);
-	}
 	// restart() clears the namespace and the inline-backend config, so re-inject.
 	try {
 		await initKernel(nbKernel, kernel);
