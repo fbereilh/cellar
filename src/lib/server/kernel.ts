@@ -1538,7 +1538,7 @@ async function initKernel(
 	// can never disagree with the process's real cwd — see `codeRoot`.
 	if (addProjectRootToPath()) parts.push(projectRootAddCode(nbKernel.codeRoot));
 	await runSilent(kernel, parts.join('\n\n'), { locked, ackTimeoutMs });
-	await verifyKernelCwd(nbKernel, kernel, { locked });
+	await verifyKernelCwd(nbKernel, kernel, { locked, timeoutMs: ackTimeoutMs });
 }
 
 /**
@@ -1659,14 +1659,14 @@ function delay(ms: number): Promise<void> {
 async function verifyKernelCwd(
 	nbKernel: NotebookKernel,
 	kernel: KernelConnection,
-	{ locked = false }: { locked?: boolean } = {}
+	{ locked = false, timeoutMs = 0 }: { locked?: boolean; timeoutMs?: number } = {}
 ): Promise<void> {
 	if (nbKernel.codeRootKind !== 'worktree') return;
 	const expected = realpathOrSelf(nbKernel.codeRoot);
 	let actual = '';
 	try {
 		actual =
-			(await runCapture(kernel, 'import os as _c_os\nprint(_c_os.path.realpath(_c_os.getcwd()))\ndel _c_os', { locked })) ?? '';
+			(await runCapture(kernel, 'import os as _c_os\nprint(_c_os.path.realpath(_c_os.getcwd()))\ndel _c_os', { locked, timeoutMs })) ?? '';
 	} catch {
 		// The probe itself failed to run; see the header — silence is not disagreement.
 		return;
@@ -2082,14 +2082,32 @@ export async function shutdownKernelsUnder(deletedPath: string): Promise<number>
 	return victims.length;
 }
 
+const restartTails = new Map<string, Promise<void>>();
+
 /**
  * Restart notebook `nbPath`'s kernel process (clears ITS namespace) while KEEPING
  * the same connection. Other notebooks' kernels are untouched. Cellar's backend,
  * MCP server, and document are untouched — this is what makes the agent interface
  * kernel-restart-proof. Restarting a notebook that never started is a no-op.
  */
-export async function restartKernel(nbPath?: string | null) {
+export async function restartKernel(nbPath?: string | null): Promise<RestartResult> {
 	const abs = resolveNb(nbPath);
+	const prior = restartTails.get(abs);
+	const run = prior ? prior.then(() => restartKernelNow(abs)) : restartKernelNow(abs);
+	const tail = run.then(
+		() => {},
+		() => {}
+	);
+	restartTails.set(abs, tail);
+	void tail.then(() => {
+		if (restartTails.get(abs) === tail) restartTails.delete(abs);
+	});
+	return run;
+}
+
+type RestartResult = { status: string; id: string | null; session_id: number | null };
+
+async function restartKernelNow(abs: string): Promise<RestartResult> {
 	// Drop this notebook's pending runs BEFORE the restart is issued, so nothing can
 	// dequeue into the kernel that is about to lose its namespace. A live chat run
 	// (which holds no kernel) is aborted too, before the no-kernel early return.

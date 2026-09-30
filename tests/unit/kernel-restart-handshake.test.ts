@@ -41,8 +41,12 @@ interface Kernel {
 	phase: 'live' | 'dying';
 	/** The replacement never answers a `kernel_info_request`. */
 	silentShell: boolean;
+	/** Answer this many executes normally before any are dropped. */
+	answerFirst: number;
 	/** Drop this many executes on the floor (no busy, no reply) once live. */
 	dropExecutes: number;
+	/** How long an acknowledged execute runs before it replies. */
+	execMs: number;
 	/** Drop this many `kernel_info_request`s on the floor (the measured lost reconnect request). */
 	dropKernelInfos: number;
 }
@@ -76,7 +80,9 @@ const h = vi.hoisted(() => {
 	let msgSeq = 0;
 	const nextId = () => `m${++msgSeq}`;
 	/** How the NEXT restart's replacement process behaves. */
-	const next = { silentShell: false, dropExecutes: 0, dropKernelInfos: 0, restartMs: 60 };
+	const next = { silentShell: false, answerFirst: 0, dropExecutes: 0, execMs: 1, dropKernelInfos: 0, restartMs: 60 };
+	/** What `notebookRoot` resolves the notebook to. */
+	const root: { value: null | { kind: 'workspace' | 'worktree'; dir: string; apiPath: string } } = { value: null };
 
 	function makeConnection(id: string): FakeConnection {
 		const listeners = new Set<AnyListener>();
@@ -125,7 +131,8 @@ const h = vi.hoisted(() => {
 				const record = { code: args.code, phase: proc.phase, answered: false };
 				conn.sent.push(record);
 				let answer = proc.phase === 'live' && !proc.silentShell;
-				if (answer && proc.dropExecutes > 0) {
+				if (answer && proc.answerFirst > 0) proc.answerFirst--;
+				else if (answer && proc.dropExecutes > 0) {
 					proc.dropExecutes--;
 					answer = false;
 				}
@@ -137,7 +144,7 @@ const h = vi.hoisted(() => {
 								later(() => {
 									emit(msg('iopub', 'status', req.header.msg_id, { execution_state: 'busy' }), 'recv');
 									record.answered = true;
-									later(() => resolve({ content: { status: 'ok', execution_count: 1 } }));
+									setTimeout(() => resolve({ content: { status: 'ok', execution_count: 1 } }), proc.execMs);
 								})
 							)
 						: new Promise(() => {}),
@@ -153,7 +160,9 @@ const h = vi.hoisted(() => {
 				conn.proc = {
 					phase: 'live',
 					silentShell: next.silentShell,
+					answerFirst: next.answerFirst,
 					dropExecutes: next.dropExecutes,
+					execMs: next.execMs,
 					dropKernelInfos: next.dropKernelInfos
 				};
 				// The socket reconnects and @jupyterlab asks for kernel_info, as it does.
@@ -164,7 +173,7 @@ const h = vi.hoisted(() => {
 			dispose: vi.fn(),
 			sent: [],
 			disposedFutures: 0,
-			proc: { phase: 'live', silentShell: false, dropExecutes: 0, dropKernelInfos: 0 }
+			proc: { phase: 'live', silentShell: false, answerFirst: 0, dropExecutes: 0, execMs: 1, dropKernelInfos: 0 }
 		};
 		connections.push(conn);
 		return conn;
@@ -173,6 +182,7 @@ const h = vi.hoisted(() => {
 	return {
 		connections,
 		next,
+		root,
 		startNew: vi.fn(async () => makeConnection(`kernel-${++seq}`)),
 		connectTo: vi.fn(({ model }: { model: { id: string } }) => makeConnection(model.id))
 	};
@@ -193,7 +203,7 @@ vi.mock('../../src/lib/server/notebook', () => ({
 	resolveNotebookPath: (p: string) => (p.startsWith('/') ? p : `/ws/${p}`),
 	getNotebookRoot: () => null
 }));
-vi.mock('../../src/lib/server/notebookRoot', () => ({ notebookRoot: () => null }));
+vi.mock('../../src/lib/server/notebookRoot', () => ({ notebookRoot: () => h.root.value }));
 vi.mock('../../src/lib/server/run-queue', () => ({ clearRunQueue: vi.fn() }));
 vi.mock('../../src/lib/server/logs', () => ({ logInfo: vi.fn(), logWarn: vi.fn(), logError: vi.fn() }));
 vi.mock('../../src/lib/server/databricks', () => ({
@@ -226,7 +236,8 @@ beforeEach(async () => {
 	// The idle watchdog must not be what ends a hang here: it is a separate, slower
 	// mechanism, and leaving it on would let a regression pass as a slow success.
 	process.env.CELLAR_KERNEL_IDLE_TIMEOUT_MS = '0';
-	Object.assign(h.next, { silentShell: false, dropExecutes: 0, dropKernelInfos: 0, restartMs: 60 });
+	Object.assign(h.next, { silentShell: false, answerFirst: 0, dropExecutes: 0, execMs: 1, dropKernelInfos: 0, restartMs: 60 });
+	h.root.value = null;
 	await shutdownKernel(NB).catch(() => {});
 	h.connections.length = 0;
 });
@@ -280,6 +291,29 @@ describe('a request arriving while the restart is in flight (the hang that was s
 	});
 });
 
+describe('two restarts of one notebook that overlap', () => {
+	it('run one after the other, so a slow first restart does not get the second one to shut a healthy kernel down', async () => {
+		// The first restart's startup code runs longer than the handshake window while it
+		// holds the exec lock - realistic for matplotlib/pandas imports under load.
+		const conn = await started();
+		h.next.execMs = HANDSHAKE_MS * 1.5;
+		const settle = (p: Promise<unknown>) =>
+			p.then(
+				() => 'resolved',
+				(e: Error) => e.message
+			);
+		const first = settle(restartKernel(NB));
+		await new Promise((r) => setTimeout(r, 20));
+		const second = settle(restartKernel(NB));
+
+		expect(await within(first, 6000)).toBe('resolved');
+		expect(await within(second, 6000)).toBe('resolved');
+		expect(conn.restart).toHaveBeenCalledTimes(2);
+		expect(conn.shutdown).not.toHaveBeenCalled();
+		expect((await kernelStatus(NB)).status).not.toBe('not_started');
+	}, 15000);
+});
+
 describe('a restarted kernel that does not answer', () => {
 	it('is refused in bounded time when its shell never answers, and is not left behind', async () => {
 		h.next.silentShell = true;
@@ -318,6 +352,27 @@ describe('a restarted kernel that does not answer', () => {
 		expect(conn.disposedFutures).toBe(1);
 		expect(conn.shutdown).toHaveBeenCalled();
 		expect((await kernelStatus(NB)).status).toBe('not_started');
+	});
+
+	it('ends in bounded time when a worktree root\'s cwd probe is never acknowledged, keeping the kernel', async () => {
+		h.root.value = { kind: 'worktree', dir: '/wt', apiPath: '../wt' };
+		const conn = await started();
+		// The startup injection is answered; the cwd verification sent right after it is not.
+		h.next.answerFirst = 1;
+		h.next.dropExecutes = 1;
+		const res = await within(
+			restartKernel(NB).then(
+				() => 'resolved',
+				(e: Error) => e.message
+			),
+			2000
+		);
+		expect(res).toBe('resolved');
+		// The unanswered probe was released rather than left holding the exec lock, and an
+		// unverifiable reading does not refuse the restart.
+		expect(conn.disposedFutures).toBe(1);
+		expect(conn.shutdown).not.toHaveBeenCalled();
+		expect(await within(execute(NB, 'print(1)', noop, { internal: true }), 2000)).not.toBe('hung');
 	});
 
 	it('leaves the notebook usable: the next run starts a fresh kernel', async () => {
