@@ -241,7 +241,9 @@ jobs:
         run: npm run build
 
       - name: Run E2E (shard ${{ matrix.shard }})
-        run: npx playwright test --shard=${{ matrix.shard }}/${{ strategy.job-total }}
+        env:
+          REPRO_N: '30'
+        run: npx playwright test tests/e2e/zz-restart-repro-a.spec.ts tests/e2e/zz-restart-repro-b.spec.ts tests/e2e/zz-restart-repro-c.spec.ts tests/e2e/foreign-action-refresh.spec.ts --repeat-each=2
 
       # Traces are `retain-on-failure`, so this uploads only when there is
       # something to look at — a red shard is diagnosable without re-running it

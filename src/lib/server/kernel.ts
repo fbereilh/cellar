@@ -1412,18 +1412,25 @@ async function runSilent(kernel: KernelConnection, code: string): Promise<void> 
 	// an autorestart it waits behind the just-aborted run's release. Best-effort: if
 	// the connection isn't tracked yet, fall through unlocked rather than block bring-up.
 	const nbKernel = nbKernelForConnection(kernel);
+	const dT0 = Date.now();
+	let dStage = 'lock';
+	const dTimer = setInterval(() => logWarn('kernel', `DIAG runSilent ${nbKernel ? basename(nbKernel.nbPath) : '?'} stuck in ${dStage} ${Date.now() - dT0}ms conn=${kernel.connectionStatus} status=${kernel.status}`), 5000);
 	const release = nbKernel ? await acquireExecLock(nbKernel) : null;
 	try {
+		dStage = 'future.done';
 		const future = kernel.requestExecute({
 			code,
 			silent: true,
 			store_history: false,
 			stop_on_error: false
 		});
+		future.onReply = () => void logWarn('kernel', `DIAG runSilent got shell reply after ${Date.now() - dT0}ms`);
 		await future.done;
+		clearInterval(dTimer);
 	} catch {
 		// A failed startup injection must never break kernel bring-up.
 	} finally {
+		clearInterval(dTimer);
 		release?.();
 	}
 }
@@ -1960,6 +1967,12 @@ export async function restartKernel(nbPath?: string | null) {
 	// actually rescue a wedged run.
 	abortActiveRuns(nbKernel, 'kernel_restart');
 	const kernel = await nbKernel.startPromise;
+	const diagT0 = Date.now();
+	const diagTag = `DIAG restart ${basename(abs)}`;
+	let diagStage = 'rest-restart+reconnect';
+	const diagTimer = setInterval(() => {
+		logWarn('kernel', `${diagTag}: still in ${diagStage} after ${Date.now() - diagT0}ms (conn=${kernel.connectionStatus} status=${kernel.status})`);
+	}, 5000);
 	try {
 		await kernel.restart();
 	} finally {
@@ -1970,10 +1983,24 @@ export async function restartKernel(nbPath?: string | null) {
 		// as `ok_session` against a namespace that no longer exists.
 		beginSession(nbKernel);
 	}
+	logWarn('kernel', `${diagTag}: restart() resolved after ${Date.now() - diagT0}ms (conn=${kernel.connectionStatus} status=${kernel.status})`);
+	diagStage = 'initKernel';
+	{
+		const t = Date.now();
+		kernel
+			.requestKernelInfo()
+			.then(
+				() => logWarn('kernel', `${diagTag}: diag kernel_info answered after ${Date.now() - t}ms`),
+				(e: unknown) => logWarn('kernel', `${diagTag}: diag kernel_info rejected ${String(e)}`)
+			);
+	}
 	// restart() clears the namespace and the inline-backend config, so re-inject.
 	try {
 		await initKernel(nbKernel, kernel);
+		clearInterval(diagTimer);
+		logWarn('kernel', `${diagTag}: initKernel done after ${Date.now() - diagT0}ms`);
 	} catch (err) {
+		clearInterval(diagTimer);
 		// The one thing in `initKernel` that may legitimately refuse is the code-root
 		// cwd verification, and `getKernel` handles that by not leaving a half-verified
 		// kernel behind. The same must hold here, and for a stronger reason: this entry
