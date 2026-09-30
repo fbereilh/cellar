@@ -104,7 +104,7 @@ test('an AGENT run populates the Variables panel of a page that never ran a cell
 	// notebook, so the tree row can only appear because this create bumped it.
 	await page.getByTestId('empty-open-notebook').click();
 	await expect(page.locator('[data-testid="cell"]:visible').first()).toBeVisible();
-	await expect(page.getByTestId('tree-file').filter({ hasText: NB })).toBeVisible({ timeout: 15_000 });
+	await expect(page.getByTestId('tree-file').filter({ hasText: NB })).toBeVisible();
 
 	// The premise: a COLD page. No kernel exists yet, so the mount-time inspect
 	// had nothing to read and the panel is empty.
@@ -119,7 +119,7 @@ test('an AGENT run populates the Variables panel of a page that never ran a cell
 	// Bug 1: without the fix this stays "no variables" forever - the foreign
 	// `run:end` refreshed the kernel badge only, and the cold mount already
 	// passed. The badge half (which always worked) must keep working too.
-	await expect(page.getByTestId('var-row').filter({ hasText: 'foreign_answer' })).toBeVisible({ timeout: 45_000 });
+	await expect(page.getByTestId('var-row').filter({ hasText: 'foreign_answer' })).toBeVisible();
 	await expect(page.getByTestId('kernel-not-started')).toHaveCount(0);
 });
 
@@ -133,7 +133,7 @@ test('a page loading into an AGENT-booted kernel inspects variables on mount', a
 	await call('add_and_run', { source: 'mounted_answer = 42', route_imports: false });
 
 	await page.goto(`${baseURL}/?ws=${encodeURIComponent(workspace)}`);
-	await expect(page.getByTestId('var-row').filter({ hasText: 'mounted_answer' })).toBeVisible({ timeout: 45_000 });
+	await expect(page.getByTestId('var-row').filter({ hasText: 'mounted_answer' })).toBeVisible();
 });
 
 test('a notebook the AGENT creates appears in the file tree with its git decoration', async ({ page }) => {
@@ -148,19 +148,33 @@ test('a notebook the AGENT creates appears in the file tree with its git decorat
 	// Bug 2: the tab surfaces, but without the `fsRefreshSignal` bump the tree
 	// never re-reads, so neither the row nor its untracked badge ever appears.
 	const row = page.getByTestId('tree-file').filter({ hasText: AGENT_NB });
-	await expect(row).toBeVisible({ timeout: 20_000 });
+	await expect(row).toBeVisible();
 	await expect(row.getByTestId('tree-git-letter')).toHaveText('U');
 });
 
 /**
- * Count the page's OWN requests to a path, by EXACT pathname: `/api/kernel` is a
- * prefix of `/api/kernel/variables`, and the whole point of these two tests is
- * telling the cheap status READ apart from the real kernel PROBE.
+ * Track the page's OWN requests to the two kernel endpoints, by EXACT pathname:
+ * `/api/kernel` is a prefix of `/api/kernel/variables`, and several tests here turn
+ * on telling the cheap status READ apart from the real kernel PROBE.
+ *
+ * It also knows how many probes are still IN FLIGHT, which is what lets a test wait
+ * on a SIGNAL - "the probe it expects has answered and nothing is left pending" -
+ * instead of sleeping for a guessed number of seconds. Attach it BEFORE `goto`, so
+ * the mount-time probe is seen too.
  */
-function countRequests(page: import('@playwright/test').Page) {
-	const counts = {
+function trackKernelRequests(page: import('@playwright/test').Page) {
+	const pathOf = (url: string) => {
+		try {
+			return new URL(url).pathname;
+		} catch {
+			return '';
+		}
+	};
+	const t = {
 		status: 0,
 		probe: 0,
+		/** Probes issued but not yet answered. Never reset: it describes the wire, not a window. */
+		probesInFlight: 0,
 		/** Zero the counters once the page has settled, so setup traffic is excluded. */
 		reset() {
 			this.status = 0;
@@ -168,16 +182,47 @@ function countRequests(page: import('@playwright/test').Page) {
 		}
 	};
 	page.on('request', (req) => {
-		let path = '';
-		try {
-			path = new URL(req.url()).pathname;
-		} catch {
-			return;
+		const path = pathOf(req.url());
+		if (path === '/api/kernel') t.status++;
+		else if (path === '/api/kernel/variables') {
+			t.probe++;
+			t.probesInFlight++;
 		}
-		if (path === '/api/kernel') counts.status++;
-		else if (path === '/api/kernel/variables') counts.probe++;
 	});
-	return counts;
+	const settle = (req: import('@playwright/test').Request) => {
+		if (pathOf(req.url()) === '/api/kernel/variables') t.probesInFlight--;
+	};
+	page.on('requestfinished', settle);
+	page.on('requestfailed', settle);
+	return t;
+}
+
+/**
+ * Wait until every probe the page has issued has been ANSWERED and the page has had
+ * a turn to apply the answer - the signal a "nothing repaints it later" assertion
+ * needs. `minProbes` makes it wait for a probe that is expected but may not have
+ * been issued yet (the mount-time inspect).
+ */
+async function probesSettled(
+	page: import('@playwright/test').Page,
+	t: ReturnType<typeof trackKernelRequests>,
+	minProbes = 0
+) {
+	await expect.poll(() => t.probe >= minProbes && t.probesInFlight === 0).toBe(true);
+	// The response has arrived; one round trip through the page's event loop lets it
+	// finish `res.json()` and write (or drop) the rows before the caller asserts.
+	await page.evaluate(() => new Promise((resolve) => setTimeout(resolve, 0)));
+}
+
+/**
+ * Fire the foreign-refresh debounce NOW instead of sleeping past it. The page's
+ * clock is Playwright's fake one (installed before `goto`, flowing naturally until
+ * this call), so jumping it forward runs any timer that is due - in particular the
+ * 300ms trailing `scheduleForeignVariablesRefresh` - deterministically. A probe that
+ * timer issues is then visible to the tracker, and `probesSettled` waits for it.
+ */
+async function flushDebounce(page: import('@playwright/test').Page) {
+	await page.clock.fastForward(5_000);
 }
 
 test('an AGENT batch costs ONE inspector probe, not one per cell', async ({ page }) => {
@@ -190,21 +235,20 @@ test('an AGENT batch costs ONE inspector probe, not one per cell', async ({ page
 	for (let i = 0; i < CELLS; i++)
 		await call('add_cell', { source: `batch_var_${i} = ${i}`, route_imports: false });
 
+	const counts = trackKernelRequests(page);
 	await page.goto(`${baseURL}/?ws=${encodeURIComponent(workspace)}`);
 	await page.getByTestId('tree-file').filter({ hasText: BATCH_NB }).dblclick();
 	await expect(page.locator('[data-testid="cell"]:visible').first()).toBeVisible();
 	await expect(page.getByTestId('vars-body')).toBeVisible();
 
-	const counts = countRequests(page);
-	// The mount-time inspect is setup, not the batch: settle, then start counting.
-	await page.waitForTimeout(1_000);
+	// The mount-time inspect is setup, not the batch: wait for it to answer, then
+	// start counting.
+	await probesSettled(page, counts, 1);
 	counts.reset();
 	await call('run_all');
 
 	// The batch really did reach the inspector...
-	await expect(page.getByTestId('var-row').filter({ hasText: `batch_var_${CELLS - 1}` })).toBeVisible({
-		timeout: 45_000
-	});
+	await expect(page.getByTestId('var-row').filter({ hasText: `batch_var_${CELLS - 1}` })).toBeVisible();
 	// ...but coalesced. The assertion claims only "substantially fewer probes than
 	// cells", NOT a pinned debounce count. The bound is EMPIRICAL, chosen with
 	// headroom: measured, this batch costs 1 probe with the fix and 9 against an
@@ -227,28 +271,28 @@ test('an AGENT run in a notebook the user is NOT viewing never probes the kernel
 	// Open-or-create the notebook this test VIEWS, so it never leans on an earlier
 	// test having made it; the `use_notebook(OTHER_NB)` below re-pins the session.
 	await call('use_notebook', { name: NB });
+	await page.clock.install();
+	const counts = trackKernelRequests(page);
 	await page.goto(`${baseURL}/?ws=${encodeURIComponent(workspace)}`);
 	await page.getByTestId('tree-file').filter({ hasText: NB }).dblclick();
 	await expect(page.locator('[data-testid="cell"]:visible').first()).toBeVisible();
 	await expect(page.getByTestId('vars-body')).toBeVisible();
 
-	const counts = countRequests(page);
-	// The mount-time inspect is setup, not the agent's run: settle, then count.
-	await page.waitForTimeout(1_000);
+	// The mount-time inspect is setup, not the agent's run: wait for it, then count.
+	await probesSettled(page, counts, 1);
 	counts.reset();
 	await call('use_notebook', { name: OTHER_NB });
 	await call('add_and_run', { source: 'unrelated_var = 1', route_imports: false });
 
 	// The foreign `run:end` DID reach this tab - the ungated badge refresh proves
-	// the branch ran, so a zero probe count is the gate, not a missing event.
-	await expect
-		.poll(() => counts.status, { timeout: 45_000 })
-		.toBeGreaterThan(0);
-	await expect(page.getByTestId('kernel-notebook').filter({ hasText: OTHER_NB })).toBeVisible({
-		timeout: 20_000
-	});
-	// Well past the debounce window, so a probe that was merely late would show up.
-	await page.waitForTimeout(2_000);
+	// the branch ran, so a zero probe count is the gate, not a missing event. The
+	// gate is decided in the same synchronous handler that issues that read.
+	await expect.poll(() => counts.status).toBeGreaterThan(0);
+	await expect(page.getByTestId('kernel-notebook').filter({ hasText: OTHER_NB })).toBeVisible();
+	// Run the debounce out rather than sleeping past it: a probe the gate wrongly
+	// scheduled fires here, and `probesSettled` waits for it to land.
+	await flushDebounce(page);
+	await probesSettled(page, counts);
 	expect(counts.probe).toBe(0);
 	await expect(page.getByTestId('var-row').filter({ hasText: 'unrelated_var' })).toHaveCount(0);
 });
@@ -275,7 +319,7 @@ test("the page's OWN run still refreshes the Variables panel", async ({ page }) 
 	await page.keyboard.press('ControlOrMeta+a');
 	await page.keyboard.type('own_var = 7');
 	await cell.getByTestId('run').click();
-	await expect(page.getByTestId('var-row').filter({ hasText: 'own_var' })).toBeVisible({ timeout: 60_000 });
+	await expect(page.getByTestId('var-row').filter({ hasText: 'own_var' })).toBeVisible();
 });
 
 // ---- Foreign kernel LIFECYCLE: restart, shutdown, variables-wipe ----------------
@@ -308,7 +352,7 @@ async function seedViewedNotebook(page: import('@playwright/test').Page, nb: str
 	await expect(page.locator('[data-testid="cell"]:visible').first()).toBeVisible();
 	await expect(page.getByTestId('vars-body')).toBeVisible();
 	await call('add_and_run', { source: `${name} = [1, 2, 3]`, route_imports: false });
-	await expect(page.getByTestId('var-row').filter({ hasText: name })).toBeVisible({ timeout: 45_000 });
+	await expect(page.getByTestId('var-row').filter({ hasText: name })).toBeVisible();
 }
 
 /** A kernel lifecycle call made by SOMEONE ELSE - no `originId`, like another tab. */
@@ -323,38 +367,36 @@ async function foreignKernelPost(route: 'shutdown' | 'wipe', nb: string) {
 
 test("an AGENT's kernel restart clears the Variables panel of a page viewing it", async ({ page }) => {
 	const RESTART_NB = 'foreign-restart.ipynb';
+	const counts = trackKernelRequests(page);
 	await seedViewedNotebook(page, RESTART_NB, 'doomed_by_restart');
-	await expect(page.getByTestId('kernel-status')).toHaveText(/idle/, { timeout: 20_000 });
+	await expect(page.getByTestId('kernel-status')).toHaveText(/idle/);
 
 	const r = await call('restart_kernel', { notebook: RESTART_NB });
 	expect(r.session_id).toBeTruthy();
 
 	// The namespace that row described is gone. Without the fix it stays listed
 	// for the rest of the session: nothing in this tab heard the restart.
-	await expect(page.getByTestId('var-row').filter({ hasText: 'doomed_by_restart' })).toHaveCount(0, {
-		timeout: 15_000
-	});
-	// ...and it stays gone: no late probe of the dead session repaints it.
-	await page.waitForTimeout(1_500);
+	await expect(page.getByTestId('var-row').filter({ hasText: 'doomed_by_restart' })).toHaveCount(0);
+	// ...and it stays gone: once every probe the page issued has answered, none of
+	// them (a probe of the dead session in particular) has repainted it.
+	await probesSettled(page, counts);
 	await expect(page.getByTestId('var-row').filter({ hasText: 'doomed_by_restart' })).toHaveCount(0);
 	// The badge re-read that answers the restart must not freeze it on a status the
 	// kernel only held mid-restart: it settles back to idle with no reload.
-	await expect(page.getByTestId('kernel-status')).toHaveText(/idle/, { timeout: 15_000 });
+	await expect(page.getByTestId('kernel-status')).toHaveText(/idle/);
 });
 
 test("another tab's kernel SHUTDOWN clears the Variables panel and the badge", async ({ page }) => {
 	const SHUTDOWN_NB = 'foreign-shutdown.ipynb';
 	await seedViewedNotebook(page, SHUTDOWN_NB, 'doomed_by_shutdown');
-	await expect(page.getByTestId('kernel-status')).toHaveText(/idle/, { timeout: 20_000 });
+	await expect(page.getByTestId('kernel-status')).toHaveText(/idle/);
 
 	await foreignKernelPost('shutdown', SHUTDOWN_NB);
 
-	await expect(page.getByTestId('var-row').filter({ hasText: 'doomed_by_shutdown' })).toHaveCount(0, {
-		timeout: 15_000
-	});
+	await expect(page.getByTestId('var-row').filter({ hasText: 'doomed_by_shutdown' })).toHaveCount(0);
 	// The navbar badge is the same invariant's other half: our own shutdown
 	// re-reads it, a foreign one left it reading "idle" over a kernel that is gone.
-	await expect(page.getByTestId('kernel-status')).toHaveText(/not started/, { timeout: 15_000 });
+	await expect(page.getByTestId('kernel-status')).toHaveText(/not started/);
 });
 
 test("another tab's variables WIPE clears the wiped rows and keeps the kernel", async ({ page }) => {
@@ -363,9 +405,7 @@ test("another tab's variables WIPE clears the wiped rows and keeps the kernel", 
 
 	await foreignKernelPost('wipe', WIPE_NB);
 
-	await expect(page.getByTestId('var-row').filter({ hasText: 'doomed_by_wipe' })).toHaveCount(0, {
-		timeout: 15_000
-	});
+	await expect(page.getByTestId('var-row').filter({ hasText: 'doomed_by_wipe' })).toHaveCount(0);
 	// A wipe is not a teardown: the kernel is still up.
 	await expect(page.getByTestId('kernel-status')).toHaveText(/idle/);
 });
@@ -377,11 +417,20 @@ test("a foreign lifecycle action on ANOTHER notebook leaves this page's rows alo
 	const OTHER = 'foreign-other.ipynb';
 	await call('use_notebook', { name: OTHER });
 	await call('add_and_run', { source: 'other_side = 1', route_imports: false });
+	await page.clock.install();
+	const counts = trackKernelRequests(page);
 	await seedViewedNotebook(page, KEEP_NB, 'survivor_var');
+	const otherCard = page.locator(`[data-testid="kernel-card"][data-nb-path="${OTHER}"]`);
+	await expect(otherCard).toHaveCount(1);
 
 	await call('restart_kernel', { notebook: OTHER });
 	await foreignKernelPost('shutdown', OTHER);
-	await page.waitForTimeout(2_000);
+	// The page has handled the shutdown: the card drops on the same broadcast that
+	// would have cleared the rows if the page wrongly thought they were dead. Run
+	// any re-read it scheduled out, let every probe land, THEN look.
+	await expect(otherCard).toHaveCount(0);
+	await flushDebounce(page);
+	await probesSettled(page, counts);
 	await expect(page.getByTestId('var-row').filter({ hasText: 'survivor_var' })).toBeVisible();
 });
 
@@ -396,20 +445,20 @@ test("the page's OWN restart, wipe and shutdown still clear its Variables panel"
 	await seedViewedNotebook(page, OWN_NB, 'own_restart_var');
 	await card.hover();
 	await card.getByTestId('kernel-restart').click();
-	await expect(row('own_restart_var')).toHaveCount(0, { timeout: 15_000 });
-	await expect(page.getByTestId('kernel-status')).toHaveText(/idle/, { timeout: 15_000 });
+	await expect(row('own_restart_var')).toHaveCount(0);
+	await expect(page.getByTestId('kernel-status')).toHaveText(/idle/);
 
 	await call('add_and_run', { source: 'own_wipe_var = [1]', route_imports: false });
-	await expect(row('own_wipe_var')).toBeVisible({ timeout: 45_000 });
+	await expect(row('own_wipe_var')).toBeVisible();
 	await card.hover();
 	await card.getByTestId('kernel-wipe-vars').click();
 	await card.getByTestId('kernel-wipe-vars-confirm').click();
-	await expect(row('own_wipe_var')).toHaveCount(0, { timeout: 15_000 });
+	await expect(row('own_wipe_var')).toHaveCount(0);
 
 	await call('add_and_run', { source: 'own_shutdown_var = [1]', route_imports: false });
-	await expect(row('own_shutdown_var')).toBeVisible({ timeout: 45_000 });
+	await expect(row('own_shutdown_var')).toBeVisible();
 	await card.hover();
 	await card.getByTestId('kernel-shutdown').click();
-	await expect(row('own_shutdown_var')).toHaveCount(0, { timeout: 15_000 });
-	await expect(page.getByTestId('kernel-status')).toHaveText(/not started/, { timeout: 15_000 });
+	await expect(row('own_shutdown_var')).toHaveCount(0);
+	await expect(page.getByTestId('kernel-status')).toHaveText(/not started/);
 });
