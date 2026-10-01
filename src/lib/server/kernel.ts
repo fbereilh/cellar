@@ -2082,6 +2082,9 @@ export async function shutdownKernelsUnder(deletedPath: string): Promise<number>
 	return victims.length;
 }
 
+// Per-notebook restart chain. An overlapping restart waits for the previous one to
+// settle (lock released) before issuing its own `restart()`; otherwise it would time
+// out waiting on a lock a healthy predecessor still holds and tear that kernel down.
 const restartTails = new Map<string, Promise<void>>();
 
 /**
