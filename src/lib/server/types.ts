@@ -428,6 +428,14 @@ export type RunStreamEvent =
 export interface ExecuteOptions {
 	/** A Cellar-issued probe (inspect/databricks): excluded from execs_this_session. */
 	internal?: boolean;
+	/**
+	 * Work that must happen against the started kernel BEFORE this run claims the
+	 * exec lock - the Mojo `%%mojo` pre-flight (`ensureMojoMagic`). It runs inside the
+	 * run's abort window, so a run waiting on it stays reachable by interrupt, restart
+	 * and teardown exactly as one parked on the kernel start or the lock is. A throw
+	 * ends the run with that error, and nothing is sent to the kernel.
+	 */
+	prepare?: () => Promise<void>;
 }
 
 /** Result of `executeCellRun` (run.js). */

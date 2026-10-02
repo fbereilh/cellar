@@ -36,6 +36,20 @@ import { registerRunOutputs, unregisterRunOutputs } from './run-output-registry'
 import { noteRunStarted } from './run-queue';
 import type { Actor, CellOutput, LastRun, SessionId, RunStreamEvent, CellRunResult } from './types';
 
+/**
+ * The Mojo pre-flight ANSWERED that the toolchain is absent. Thrown from the
+ * `prepare` hook so `execute()` sends nothing, and caught by `executeCellRun`,
+ * which reports it as the cell's own error output carrying the install command.
+ */
+class MojoNotReady extends Error {
+	setup: MojoSetup;
+	constructor(setup: MojoSetup) {
+		super('the Mojo toolchain is not available');
+		this.name = 'MojoNotReady';
+		this.setup = setup;
+	}
+}
+
 /** Arguments to `executeCellRun`. */
 export interface CellRunArgs {
 	/** Absolute notebook path. */
@@ -113,20 +127,31 @@ export async function executeCellRun({ nb, cellId, actor, source, originId, onEv
 	// makes "the selector's code cells run as Mojo" true for every run path (the UI
 	// route, MCP `run_cell` and the imports cell all funnel through this function).
 	const isMojo = isMojoCell(cell, getNotebookLanguage(nb));
+	// The pre-flight runs INSIDE `execute()`'s abort window (its `prepare` hook), not
+	// in front of it: it is the first thing that needs the kernel, so on a notebook's
+	// first run it is what waits out the kernel START - and before it moved there, a
+	// run waiting on that start held the queue's `running` slot and read RUNNING while
+	// being reachable by no abort path at all. `prepare` is the same window a run
+	// parked on the start or the exec lock is settled in.
+	//
 	// NULL means NO VERDICT - the kernel could not be reached, or the bounded setup
-	// did not settle in time. Either way we fall through to `execute()`, which owns
+	// did not settle in time. Either way the run goes on to execute, which owns
 	// the run watchdog and reports honestly (`kernel_unavailable` where that is what
 	// happened): claiming a missing TOOLCHAIN on a reading that observed nothing
 	// would name a cause nobody saw, and would send the user installing 534 MB they
 	// may already have.
-	let mojoSetup: MojoSetup | null = null;
-	if (isMojo) {
-		try {
-			mojoSetup = await ensureMojoMagic(nb);
-		} catch {
-			/* no verdict; see above */
-		}
-	}
+	const prepare = isMojo
+		? async () => {
+				let setup: MojoSetup | null = null;
+				try {
+					setup = await ensureMojoMagic(nb);
+				} catch {
+					/* no verdict; see above */
+				}
+				// The probe ANSWERED that the toolchain is absent: nothing is sent.
+				if (setup && !setup.ready) throw new MojoNotReady(setup);
+			}
+		: undefined;
 	const execSource = isSqlCell(cell) ? sqlToPython(source) : isMojo ? mojoToCellSource(source) : source;
 
 	// Bound + coalesce the run's output across all three consumers (persist, SSE
@@ -173,55 +198,63 @@ export async function executeCellRun({ nb, cellId, actor, source, originId, onEv
 	let outputs: CellOutput[];
 	try {
 		try {
-			if (mojoSetup && !mojoSetup.ready) {
-				// The probe ANSWERED, and it answered that the toolchain is absent - a
-				// probe that could not answer is NO VERDICT (null) and never lands here,
-				// so this branch never asserts an absence nobody observed. The kernel is
-				// alive - `ensureMojoMagic` started it and ran a probe in it - so this run
-				// really did happen in `mojoSetup.session`'s namespace and is stamped with
-				// it: reporting no session would drop the cell into `error_persisted`, the
-				// label agents are told to distrust as a leftover from a previous session,
-				// for a failure raised seconds ago.
-				session = mojoSetup.session ?? null;
-				acc.push(mojoMissingOutput(mojoSetup));
-				status = 'error';
-			} else if (isChat) {
+			if (isChat) {
 				// No kernel, no session epoch: the reply streams from the ChatEngine into
 				// the same accumulator. `session` stays null - a chat run touches no
 				// namespace, so ran_this_session honestly reads false.
 				status = (await executeChatRun({ nb, cellId, question: source, acc })).status;
 			} else {
-				const reply = await execute(nb, execSource, (ev) => {
-					if (ev.type === 'output') {
-						acc.push(ev.output);
-					} else if (ev.type === 'kernel') {
-						session = ev.session;
-						onEvent?.(ev);
-					} else {
-						onEvent?.(ev);
-					}
-				});
+				const reply = await execute(
+					nb,
+					execSource,
+					(ev) => {
+						if (ev.type === 'output') {
+							acc.push(ev.output);
+						} else if (ev.type === 'kernel') {
+							session = ev.session;
+							onEvent?.(ev);
+						} else {
+							onEvent?.(ev);
+						}
+					},
+					{ prepare }
+				);
 				status = reply?.status ?? 'ok';
 			}
 		} catch (err) {
-			const message = err instanceof Error ? err.message : String(err);
-			acc.push({
-				output_type: 'error',
-				ename: 'CellarError',
-				evalue: message,
-				traceback: [message]
-			});
-			status = 'error';
-			// `kernelDown` means one thing only: execute() threw before it ever had a kernel
-			// in hand (the sidecar was unreachable), which is why the absent session epoch
-			// stands in for it. A chat run never has a kernel, so its failures are never
-			// "kernel down" - and neither is an ABORT: a run force-settled while parked on
-			// the exec lock (F2) also throws with no session, but the kernel it was queued
-			// behind was demonstrably alive and busy. Reporting that as kernel_unavailable
-			// asserts an unreachable kernel that was never observed, and drops the cell into
-			// `error_persisted` - the label agents are told to distrust as a leftover from a
-			// previous session, for a run that was aborted seconds ago.
-			if (session === null && !isChat && !(err instanceof KernelExecuteAborted)) kernelDown = true;
+			if (err instanceof MojoNotReady) {
+				// The probe ANSWERED, and it answered that the toolchain is absent - a
+				// probe that could not answer is NO VERDICT (null) and never lands here,
+				// so this branch never asserts an absence nobody observed. The kernel is
+				// alive - `ensureMojoMagic` started it and ran a probe in it - so this run
+				// really did happen in `err.setup.session`'s namespace and is stamped with
+				// it: reporting no session would drop the cell into `error_persisted`, the
+				// label agents are told to distrust as a leftover from a previous session,
+				// for a failure raised seconds ago.
+				session = err.setup.session ?? null;
+				acc.push(mojoMissingOutput(err.setup));
+				status = 'error';
+			} else {
+				const message = err instanceof Error ? err.message : String(err);
+				acc.push({
+					output_type: 'error',
+					ename: 'CellarError',
+					evalue: message,
+					traceback: [message]
+				});
+				status = 'error';
+				// `kernelDown` means one thing only: execute() threw before it ever had a
+				// kernel in hand (the sidecar was unreachable), which is why the absent
+				// session epoch stands in for it. A chat run never has a kernel, so its
+				// failures are never "kernel down" - and neither is an ABORT: a run
+				// force-settled while parked on the exec lock or the kernel start also
+				// throws with no session, but nothing observed an unreachable kernel.
+				// Reporting that as kernel_unavailable asserts what was never seen, and
+				// drops the cell into `error_persisted` - the label agents are told to
+				// distrust as a leftover from a previous session, for a run that was
+				// aborted seconds ago.
+				if (session === null && !isChat && !(err instanceof KernelExecuteAborted)) kernelDown = true;
+			}
 		} finally {
 			clearInterval(flushTimer);
 		}
