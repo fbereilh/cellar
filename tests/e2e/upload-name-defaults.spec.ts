@@ -1,6 +1,7 @@
 import { test, expect, type Page } from '@playwright/test';
 import { type ChildProcess } from 'node:child_process';
-import { mkdtempSync, existsSync, rmSync, readFileSync } from 'node:fs';
+import { mkdtempSync, existsSync, rmSync, readFileSync, writeFileSync, renameSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { runtimeAvailable, bootCellar, killCellar, openSidebarSection } from './harness';
@@ -58,6 +59,14 @@ import { UPLOAD_DATE_TOKENS } from '../../src/lib/databricksUploadName';
  * tests, so a test that leaned on the value its predecessor left would turn a single
  * genuine regression into a cascade of unrelated red - and the restore, written as a
  * trailing statement, would be skipped by exactly the failure that poisons the store.
+ *
+ * **The handover waits on signals, never on timers.** Both the browser and the
+ * servers DEBOUNCE their store writes, so a write can land after the test that caused
+ * it has finished - and every red this file produced in a full parallel sweep was one
+ * such write landing in the NEXT test. The reset therefore first stops the page from
+ * writing at all and waits for what it already sent (`routeStoreWrites`), then proves
+ * no server has a write pending (`settleGlobalStore`). Under load a timer only moves
+ * the threshold of that race; a signal removes it.
  */
 
 let launcherA: ChildProcess | null = null;
@@ -76,18 +85,13 @@ const PREFIX_DEFAULT_KEY = 'cellar-databricks-upload-prefix-default';
 const POSTFIX_DEFAULT_KEY = 'cellar-databricks-upload-postfix-default';
 const PREFIX_KEY = 'cellar-databricks-upload-prefix';
 const POSTFIX_KEY = 'cellar-databricks-upload-postfix';
-/** Short enough that a wedged page cannot eat the hook's budget before the reset. */
-const UI_CLEAR_TIMEOUT_MS = 2_000;
+/** The two store endpoints the PAGE writes through (`$lib/clientStore`). */
+const STORE_WRITE_ROUTE = /\/api\/(ui-state|user-settings)$/;
 /**
- * Comfortably past the server stores' 250ms write debounce (`json-store.ts`).
- *
- * Every reset PUT leaves each touched instance holding a PENDING write of its own
- * cache. Two instances share one settings file, and whichever flushes last wins the
- * whole file - so a reset write still pending when the next test seeds a default
- * through the OTHER instance lands on top of it and erases it. No endpoint can flush
- * a server store, so the reset waits the debounce out before handing over.
+ * A key no Cellar code reads. `settleGlobalStore` writes it into the global store and
+ * removes it again once every instance has read it back.
  */
-const STORE_SETTLE_MS = 1_000;
+const HANDSHAKE_KEY = 'cellar-e2e-reset-handshake';
 
 /**
  * The instances a test has actually opened, so the reset touches those and no others.
@@ -97,6 +101,56 @@ const STORE_SETTLE_MS = 1_000;
  * an instance a test never went near would quietly make that ordering untrue.
  */
 const touched = new Set<string>();
+
+/**
+ * Route every store write the PAGE sends through the test, so the test knows when the
+ * server has it - and can stop the page writing once the test is over.
+ *
+ * The browser debounces store writes (300ms, `$lib/clientStore`) and flushes what is
+ * still queued on `pagehide`, so a write can reach the server AFTER the test that
+ * queued it has finished. That is how this file failed in a full sweep: the old reset
+ * emptied the upload fields to clean up, which itself queued a `''` for B's prefix -
+ * an explicit "no prefix on this project" - and when that write landed after the
+ * reset had checked the store, the next test opened B and found its default
+ * overridden. Playwright cannot say when such a write lands, either: a `keepalive`
+ * request sent during a navigation is reported `ERR_ABORTED` at once while the server
+ * still receives it. Fetching it here (`route.fetch`) turns "sent" into "answered".
+ *
+ * `close()` ends the page's ability to write: it navigates the page away, so the app
+ * can queue nothing more, aborts whatever the page still sends instead of forwarding
+ * it, and waits for every write already forwarded. The test is over by then; the
+ * reset that follows owns the stores.
+ */
+function routeStoreWrites(page: Page) {
+	let open = true;
+	const inFlight = new Set<Promise<void>>();
+	const ready = page.route(STORE_WRITE_ROUTE, async (route) => {
+		if (route.request().method() !== 'PUT') return route.continue();
+		if (!open) return route.abort();
+		const forwarded = route
+			.fetch()
+			.then(
+				// The page may have navigated away meanwhile; the server has answered, and
+				// that is all the reset needs to know.
+				(response) => route.fulfill({ response }),
+				() => route.abort()
+			)
+			.catch(() => {});
+		inFlight.add(forwarded);
+		await forwarded;
+		inFlight.delete(forwarded);
+	});
+	return {
+		ready,
+		async close(): Promise<void> {
+			open = false;
+			await page.goto('about:blank').catch(() => {});
+			while (inFlight.size) await Promise.all([...inFlight]);
+		}
+	};
+}
+
+let storeWrites: ReturnType<typeof routeStoreWrites> | null = null;
 
 function connectedStatus() {
 	return {
@@ -206,6 +260,20 @@ function storedDefaults(): Record<string, unknown> {
 	}
 }
 
+/** Replace the global store's file, atomically, the way the server writes it. */
+function writeStoredDefaults(data: Record<string, unknown>): void {
+	const temp = `${settingsFile}.e2e-${process.pid}`;
+	writeFileSync(temp, JSON.stringify(data, null, 2) + '\n');
+	renameSync(temp, settingsFile);
+}
+
+/** `data` without the given keys. */
+function without(data: Record<string, unknown>, ...keys: string[]): Record<string, unknown> {
+	const rest = { ...data };
+	for (const key of keys) delete rest[key];
+	return rest;
+}
+
 /**
  * Set the cross-project default THROUGH one instance's own store, and wait for it to
  * reach the file - which is what another instance reads back.
@@ -213,15 +281,15 @@ function storedDefaults(): Record<string, unknown> {
  * Writing it through a server rather than into the file behind everyone's back is
  * what keeps the seeding honest: this is the same store the Settings pane writes, so
  * a test that needs a default in place starts from the state the UI would have left.
+ *
+ * Sent ONCE. The reset leaves no instance with a write pending, so the value reaches
+ * the file on this instance's own flush and nothing can overwrite it. Sending it again
+ * on every poll pass would leave a fresh flush pending behind the one just observed.
  */
 async function seedGlobalDefault(page: Page, url: string, prefix: string): Promise<void> {
 	touched.add(url);
-	await expect
-		.poll(async () => {
-			await page.request.put(`${url}/api/user-settings`, { data: { [PREFIX_DEFAULT_KEY]: prefix } });
-			return storedDefaults()[PREFIX_DEFAULT_KEY];
-		})
-		.toBe(prefix);
+	await page.request.put(`${url}/api/user-settings`, { data: { [PREFIX_DEFAULT_KEY]: prefix } });
+	await expect.poll(() => storedDefaults()[PREFIX_DEFAULT_KEY]).toBe(prefix);
 }
 
 /**
@@ -232,49 +300,55 @@ async function seedGlobalDefault(page: Page, url: string, prefix: string): Promi
  * was skipped by precisely the failure that left them dirty, so one genuine regression
  * surfaced as several unrelated red tests.
  *
- * The UI clear is best-effort and carries its OWN short timeout: after a failure the
- * page can be in any state at all, and an auto-waiting `fill()` would burn the hook's
- * budget without ever reaching the authoritative reset below. The SERVER store is that
- * authority, and the PUT sits INSIDE the poll so a debounced write still in flight from
- * the page is simply overwritten by the next pass rather than racing the last one.
+ * It runs only after `storeWrites.close()`, so the page can no longer write and every
+ * write it sent has been answered. Do NOT clear the upload fields in the UI here: that
+ * is a write of its own, and for a project field it is the wrong one - an emptied
+ * field persists `''`, an explicit "no prefix", which outranks the global default.
  */
 async function resetStores(page: Page): Promise<void> {
-	for (const id of ['settings-upload-prefix', 'settings-upload-postfix', 'databricks-upload-prefix', 'databricks-upload-postfix']) {
-		const field = page.getByTestId(id);
-		try {
-			if (await field.isVisible().catch(() => false)) {
-				await field.fill('', { timeout: UI_CLEAR_TIMEOUT_MS });
-			}
-		} catch {
-			// Not in a state to type into - the stores below are the authority.
-		}
-	}
 	const urls = [...touched];
+	for (const url of urls) {
+		// A per-project store is served from that instance's own cache, and nothing else
+		// writes its file, so the PUT has taken effect the moment it returns.
+		await page.request.put(`${url}/api/ui-state`, { data: { [PREFIX_KEY]: null, [POSTFIX_KEY]: null } });
+		const state = (await (await page.request.get(`${url}/api/ui-state`)).json()) as Record<string, unknown>;
+		expect([state[PREFIX_KEY], state[POSTFIX_KEY]]).toEqual([undefined, undefined]);
+	}
+	await settleGlobalStore(page, urls);
+}
+
+/**
+ * Clear the global defaults, and prove no instance can still write over them.
+ *
+ * Both instances serve ONE settings file from their own cache, and each writes its
+ * whole cache back 250ms after its last change (`json-store.ts`). An instance with a
+ * write still pending at the handover rewrites the file with what it held, so a default
+ * the next test seeds through the OTHER instance is erased. No endpoint flushes a
+ * server store, and a fixed wait only bets that the timer fires before it ends.
+ *
+ * So the file is written here directly, carrying a fresh token, and each instance is
+ * asked for it. A store with a write pending serves its own cache and never reloads
+ * the file, so an instance that echoes the token has nothing left to write - and with
+ * the page closed, nothing can hand it anything new. An instance that does not echo it
+ * is still waiting to flush; that flush rewrites the file, and the next pass writes a
+ * new token over it. The token is removed once every instance has echoed it.
+ */
+async function settleGlobalStore(page: Page, urls: string[]): Promise<void> {
 	await expect
 		.poll(async () => {
-			const left: unknown[] = [];
+			const token = randomUUID();
+			writeStoredDefaults({
+				...without(storedDefaults(), PREFIX_DEFAULT_KEY, POSTFIX_DEFAULT_KEY),
+				[HANDSHAKE_KEY]: token
+			});
 			for (const url of urls) {
-				try {
-					await page.request.put(`${url}/api/user-settings`, {
-						data: { [PREFIX_DEFAULT_KEY]: null, [POSTFIX_DEFAULT_KEY]: null }
-					});
-					await page.request.put(`${url}/api/ui-state`, {
-						data: { [PREFIX_KEY]: null, [POSTFIX_KEY]: null }
-					});
-					left.push(await storedProjectPrefix(page, url));
-				} catch {
-					// A request that did not land says nothing about the store - keep polling.
-					left.push('unread');
-				}
+				const res = await page.request.get(`${url}/api/user-settings`);
+				if (((await res.json()) as Record<string, unknown>)[HANDSHAKE_KEY] !== token) return false;
 			}
-			const defaults = storedDefaults();
-			left.push(defaults[PREFIX_DEFAULT_KEY], defaults[POSTFIX_DEFAULT_KEY]);
-			return left.every((v) => v === undefined);
+			return true;
 		})
 		.toBe(true);
-	// The last pass above re-dirtied every touched store; let those writes land now,
-	// while they can only write the empty state this reset just produced.
-	await page.waitForTimeout(STORE_SETTLE_MS);
+	writeStoredDefaults(without(storedDefaults(), HANDSHAKE_KEY));
 }
 
 function localToday() {
@@ -318,8 +392,16 @@ test.afterAll(async () => {
 	}
 });
 
+/* Registered before the test loads any page, so no store write can bypass it. */
+test.beforeEach(async ({ page }) => {
+	storeWrites = routeStoreWrites(page);
+	await storeWrites.ready;
+});
+
 /* Unconditional, and `resetStores` explains why that matters. */
 test.afterEach(async ({ page }) => {
+	await storeWrites?.close();
+	storeWrites = null;
 	await resetStores(page);
 });
 
