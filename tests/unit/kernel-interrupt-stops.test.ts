@@ -610,8 +610,8 @@ describe('reaching the kernel is bounded too', () => {
 		const res = await kernelmod.interruptKernel(nb);
 		expect(Date.now() - started).toBeLessThan(START_TIMEOUT_MS + SIGNAL_TIMEOUT_MS + GRACE_MS);
 
+		// It never reached a kernel, so it reports only what it can see: a booting one,
 		// with no id - and nothing of ours was executing, so the stop is `idle`.
-		// with no id - and nothing was signalled, so the stop is `forced_no_signal`.
 		expect(res.status).toBe('starting');
 		expect(res.id).toBe(null);
 		expect(res.stopped).toBe('idle');
