@@ -2480,9 +2480,9 @@ export async function rebindKernel(nbPath?: string | null) {
  * `stopped` field reports WHICH of them happened — `kernel` (it surrendered),
  * `forced` (it was asked and did not, so Cellar stopped waiting), `forced_no_signal`
  * (the same, except the interrupt was never delivered - the POST failed or was
- * abandoned, or the kernel was still starting so there was nothing to POST to),
- * `chat` (a chat run, which holds no kernel, was aborted), `idle` (nothing was
- * running) or `no_kernel` — so a caller, the MCP tool included, can say so instead of
+ * abandoned), `chat` (a chat run, which holds no kernel, was aborted), `idle`
+ * (nothing of ours had reached the kernel - including a run stopped before it sent)
+ * or `no_kernel` — so a caller, the MCP tool included, can say so instead of
  * claiming a stop, or a request, it did not observe.
  * What it does NOT do is restart the kernel: that would destroy a namespace the user
  * never asked to lose, and the message names it as the guaranteed escape.
@@ -2681,8 +2681,8 @@ async function signalInterrupt(kernel: KernelConnection): Promise<boolean> {
  * than force-aborted.
  *
  * `idle` = nothing was running (an interrupt with no live run is not a failure), or
- * nothing it watched ever reached the kernel and all of it ended on its own (a run
- * whose kernel start FAILED while it waited).
+ * nothing it watched had reached the kernel when the signal went out (a run whose
+ * kernel start FAILED while it waited, or one stopped before it sent).
  * `kernel` = the kernel ended the run itself, the graceful path.
  * `forced` = it was asked and did not, so Cellar stopped waiting; the caller must not
  * report that as the kernel having stopped.
@@ -2702,14 +2702,16 @@ async function settleAfterInterrupt(
 	while (pending() && Date.now() < deadline) {
 		await new Promise((r) => setTimeout(r, INTERRUPT_POLL_MS));
 	}
-	if (!pending()) {
-		if (watched.some((run) => run.aborted)) return 'forced';
-		// Every watched run ended on its own. That is the kernel surrendering only if
-		// one of them had reached it when the signal went out: a run registered while
-		// its kernel was still starting can also end because the start FAILED, which
-		// no kernel surrendered and which ran nothing of ours there.
+	// Only a run whose code was on the wire when the signal went out can still be
+	// executing, so only such a run may yield `forced`/`forced_no_signal`. A run that
+	// had not sent - refused at its send gate, or still parked when it was aborted -
+	// ran nothing, so the verdict is whatever the sent runs establish.
+	const verdict = (): 'idle' | 'kernel' | 'forced' => {
+		if (sentAtSignal.some((run) => run.aborted)) return 'forced';
 		return sentAtSignal.length > 0 ? 'kernel' : 'idle';
-	}
+	};
+	if (!pending()) return verdict();
+	const sentStillRunning = sentAtSignal.some((run) => nbKernel.activeRuns.has(run));
 	logWarn(
 		'kernel',
 		signalled
@@ -2717,6 +2719,7 @@ async function settleAfterInterrupt(
 			: `interrupt on ${nbKernel.nbPath}: the signal could not be delivered; force-settling the run without it`
 	);
 	abortActiveRuns(nbKernel, signalled ? INTERRUPT_ABORT_REASON : INTERRUPT_UNDELIVERED_REASON, watched);
+	if (!sentStillRunning) return verdict();
 	return signalled ? 'forced' : 'forced_no_signal';
 }
 
@@ -3472,8 +3475,6 @@ export async function execute(
 	// An interrupt watched this run before it sent: the user asked to stop it, so
 	// its code must not reach the kernel now that its turn has come.
 	if (run.interruptRequested) {
-		aborted = true;
-		run.aborted = true;
 		releaseExec();
 		dropBeforeSend();
 		throw new KernelExecuteAborted(abortMessage(INTERRUPT_ABORT_REASON, { sent: false }), INTERRUPT_ABORT_REASON);

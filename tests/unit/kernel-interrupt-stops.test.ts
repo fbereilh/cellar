@@ -458,7 +458,7 @@ describe('a run that had not reached the kernel when stop was pressed is never s
 		const run = await userP;
 		await holderP;
 
-		expect(res.stopped).not.toBe('kernel');
+		expect(res.stopped).toBe('kernel');
 		expect(h.sentCodes).not.toContain(code);
 		expect(run.status).toBe('error');
 		const evalue = String(soleError(run.outputs).evalue);
@@ -610,11 +610,11 @@ describe('reaching the kernel is bounded too', () => {
 		const res = await kernelmod.interruptKernel(nb);
 		expect(Date.now() - started).toBeLessThan(START_TIMEOUT_MS + SIGNAL_TIMEOUT_MS + GRACE_MS);
 
-		// It never reached a kernel, so it reports only what it can see: a booting one,
+		// with no id - and nothing of ours was executing, so the stop is `idle`.
 		// with no id - and nothing was signalled, so the stop is `forced_no_signal`.
 		expect(res.status).toBe('starting');
 		expect(res.id).toBe(null);
-		expect(res.stopped).toBe('forced_no_signal');
+		expect(res.stopped).toBe('idle');
 
 		// THE REGRESSION (cellar-interrupt-parked-in-kernel-start): the run parked on
 		// the start is SETTLED, now, with the start still held open. Before the fix it
@@ -664,8 +664,7 @@ describe('reaching the kernel is bounded too', () => {
 		h.releaseStart!('resolve');
 		const res = await interruptP;
 		expect(h.interruptKernel.mock.calls.length).toBe(signalsBefore + 1);
-		expect(res.stopped).not.toBe('forced_no_signal');
-		expect(res.stopped).not.toBe('kernel');
+		expect(res.stopped).toBe('idle');
 
 		const run = await runP;
 		expect(queue.queueStateFor(nb)).toEqual({ running: null, queue: [] });
@@ -712,7 +711,7 @@ describe('reaching the kernel is bounded too', () => {
 
 		const res = await kernelmod.interruptKernel(nb);
 		await probeP;
-		expect(res.stopped).toBe('forced_no_signal');
+		expect(res.stopped).toBe('idle');
 		expect(settledWith).toBeInstanceOf(kernelmod.KernelExecuteAborted);
 
 		h.releaseStart!('resolve');

@@ -414,7 +414,7 @@ describe('a Mojo run waiting on the pre-flight is reachable by Stop', () => {
 
 		const res = await kernelmod.interruptKernel(abs());
 		const run = await runP;
-		expect(res.stopped).toBe('forced_no_signal');
+		expect(res.stopped).toBe('idle');
 		expect(run.status).toBe('error');
 		expect(JSON.stringify(run.outputs)).toMatch(/before it reached the kernel/);
 		expect(queue.queueStateFor(abs())).toEqual({ running: null, queue: [] });
