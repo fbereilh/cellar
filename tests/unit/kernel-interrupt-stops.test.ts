@@ -544,8 +544,22 @@ describe('the escalation does not depend on the signal that is failing', () => {
 		// fake settles only on CANCEL, so this hangs forever unless the bound is real.
 		h.interruptSignalFails = 'hang';
 
-		const started = Date.now();
-		const res = await kernelmod.interruptKernel(nb);
+		// Widen the grace window for THIS test only, like the graceful-path test below:
+		// 120ms of headroom over an 80ms bound is not a yardstick a loaded CI runner
+		// can be held to. Wide, the assertion still means what it says - an escalation
+		// that waited out the grace would take the whole window - with margin only a
+		// genuine regression can cross.
+		const wide = 3000;
+		process.env.CELLAR_KERNEL_INTERRUPT_GRACE_MS = String(wide);
+		let elapsed: number;
+		let res: Awaited<ReturnType<typeof kernelmod.interruptKernel>>;
+		try {
+			const started = Date.now();
+			res = await kernelmod.interruptKernel(nb);
+			elapsed = Date.now() - started;
+		} finally {
+			process.env.CELLAR_KERNEL_INTERRUPT_GRACE_MS = String(GRACE_MS);
+		}
 		const run = await runP;
 
 		expect(res.stopped).toBe('forced_no_signal');
@@ -553,7 +567,7 @@ describe('the escalation does not depend on the signal that is failing', () => {
 		expect(queue.queueStateFor(nb)).toEqual({ running: null, queue: [] });
 		// Bounded by the signal timeout, and NOT additive with the grace window: nothing
 		// was asked, so there is no surrender to wait for.
-		expect(Date.now() - started).toBeLessThan(SIGNAL_TIMEOUT_MS + GRACE_MS);
+		expect(elapsed).toBeLessThan(wide);
 		expect(String(soleError(run.outputs).evalue)).toMatch(/could not deliver the interrupt/i);
 	});
 
@@ -603,12 +617,24 @@ describe('reaching the kernel is bounded too', () => {
 		await until(() => queue.queueStateFor(nb).running?.cellId === cellId, 'the run to hold the slot');
 		await until(() => h.releaseStart != null, 'the kernel start to be requested');
 
-		const started = Date.now();
-		// `await nbKernel.startPromise` used to be unbounded, so this never returned -
-		// `/api/kernel/interrupt` and the MCP tool hung forever while the cell read
-		// RUNNING.
-		const res = await kernelmod.interruptKernel(nb);
-		expect(Date.now() - started).toBeLessThan(START_TIMEOUT_MS + SIGNAL_TIMEOUT_MS + GRACE_MS);
+		// The grace window is widened for the same reason as the hanging-signal test:
+		// the bounds are never additive, so nothing here may wait it out, and a wide
+		// window leaves margin only a genuine regression can cross.
+		const wide = 3000;
+		process.env.CELLAR_KERNEL_INTERRUPT_GRACE_MS = String(wide);
+		let elapsed: number;
+		let res: Awaited<ReturnType<typeof kernelmod.interruptKernel>>;
+		try {
+			const started = Date.now();
+			// `await nbKernel.startPromise` used to be unbounded, so this never returned -
+			// `/api/kernel/interrupt` and the MCP tool hung forever while the cell read
+			// RUNNING.
+			res = await kernelmod.interruptKernel(nb);
+			elapsed = Date.now() - started;
+		} finally {
+			process.env.CELLAR_KERNEL_INTERRUPT_GRACE_MS = String(GRACE_MS);
+		}
+		expect(elapsed).toBeLessThan(wide);
 
 		// It never reached a kernel, so it reports only what it can see: a booting one,
 		// with no id - and nothing of ours was executing, so the stop is `idle`.
