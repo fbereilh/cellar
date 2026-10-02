@@ -22,7 +22,12 @@
  *        either). Only Databricks work runs kernel ops that long, which is why the bug
  *        reads as "especially on spark cells".
  *
- * In both, the old implementation signalled, returned `ok`, and never checked - so the
+ *   F3 - the same as F2 one await earlier: the run is parked on the kernel START (a
+ *        notebook's first run), which `execute()` awaited before registering its
+ *        abort handle. It now registers at entry, so the interrupt settles it the
+ *        way it settles F2 (see "reaching the kernel is bounded too").
+ *
+ * In F1 and F2, the old implementation signalled, returned `ok`, and never checked - so the
  * cell read "running" forever while the tool reported success. Proven here against the
  * REAL run-queue + REAL executeCellRun + REAL kernel.ts (only the Jupyter layer is
  * faked, so the whole owner -> execute -> finally -> release path runs).
@@ -89,6 +94,7 @@ const h = vi.hoisted(() => {
 			iopubMessage: { connect: vi.fn() },
 			requestExecute: (args: { code?: string }) => {
 				const code = typeof args?.code === 'string' ? args.code : '';
+				h.sentCodes.push(code);
 				// A silent blocking cell that never replies on its own - the shape of a
 				// Spark query. A test ends it via h.lastHanging, or the fake's interrupt
 				// does when `h.kernelObeysInterrupt` is set.
@@ -167,6 +173,8 @@ const h = vi.hoisted(() => {
 		lastHanging: null as ReturnType<typeof makeFuture> | null,
 		hanging: [] as ReturnType<typeof makeFuture>[],
 		kernelObeysInterrupt: false,
+		/** Every code string put on the wire, so a test can prove a run never sent. */
+		sentCodes: [] as string[],
 		live: 0,
 		maxLive: 0,
 		probeCalls: 0,
@@ -393,6 +401,11 @@ describe('F2: the cell never reached the kernel (parked on the exec lock)', () =
 		expect(res.stopped).toBe('forced');
 		expect(run.status).toBe('error');
 		expect(queue.queueStateFor(nb)).toEqual({ running: null, queue: [] });
+		// HONESTY: this run's code never reached the kernel - it was parked behind the
+		// holder - so it may not say the kernel "may still be executing" it.
+		const evalue = String(soleError(run.outputs).evalue);
+		expect(evalue).toMatch(/before it reached the kernel/i);
+		expect(evalue).not.toMatch(/may still be executing/i);
 
 		// The internal holder is settled by the same escalation, so the kernel is not
 		// left permanently claimed either.
@@ -422,6 +435,74 @@ describe('F2: the cell never reached the kernel (parked on the exec lock)', () =
 		await Promise.all([parkedP, holderP, thirdP]);
 
 		expect(h.maxLive).toBe(1);
+		expect(queue.queueStateFor(nb)).toEqual({ running: null, queue: [] });
+	});
+});
+
+describe('a run that had not reached the kernel when stop was pressed is never sent', () => {
+	it('a run parked on the exec lock is refused when its predecessor surrenders in the grace window', async () => {
+		const nb = abs();
+		const warm = newCell('warm_refuse = 1');
+		await startRun(warm, 'warm_refuse = 1');
+		h.kernelObeysInterrupt = true;
+
+		const holderP = kernelmod.execute(nb, 'HOLDER_REFUSE  # HANG', () => {}, { internal: true }).catch(() => {});
+		await until(() => h.lastHanging != null, 'the holder to take the kernel');
+
+		const code = 'parked_refuse = 1';
+		const c = newCell(code);
+		const userP = startRun(c, code);
+		await until(() => queue.queueStateFor(nb).running?.cellId === c, 'the user run to hold the slot');
+
+		const res = await kernelmod.interruptKernel(nb);
+		const run = await userP;
+		await holderP;
+
+		expect(res.stopped).toBe('kernel');
+		expect(h.sentCodes).not.toContain(code);
+		expect(run.status).toBe('error');
+		const evalue = String(soleError(run.outputs).evalue);
+		expect(evalue).toMatch(/before it reached the kernel/i);
+		expect(queue.queueStateFor(nb)).toEqual({ running: null, queue: [] });
+	});
+
+	it('a refusal does not leak into later runs, probes, or a run that starts after the signal', async () => {
+		const nb = abs();
+		const warm = newCell('warm_leak = 1');
+		await startRun(warm, 'warm_leak = 1');
+
+		const holderP = kernelmod.execute(nb, 'HOLDER_LEAK  # HANG', () => {}, { internal: true }).catch(() => {});
+		await until(() => h.lastHanging != null, 'the holder to take the kernel');
+		const parked = 'parked_leak = 1';
+		const pc = newCell(parked);
+		const parkedP = startRun(pc, parked);
+		await until(() => queue.queueStateFor(nb).running?.cellId === pc, 'the parked run to hold the slot');
+
+		const signalsBefore = h.interruptKernel.mock.calls.length;
+		const interruptP = kernelmod.interruptKernel(nb);
+		await until(() => h.interruptKernel.mock.calls.length > signalsBefore, 'the kernel to be signalled');
+		// Registered after the signal went out: not this interrupt's to stop.
+		const lateP = kernelmod.execute(nb, 'late_leak = 1', () => {});
+
+		await interruptP;
+		const parkedRun = await parkedP;
+		await holderP;
+		expect(parkedRun.status).toBe('error');
+		expect(h.sentCodes).not.toContain(parked);
+
+		const late = await lateP;
+		expect(late.status).toBe('ok');
+		expect(h.sentCodes).toContain('late_leak = 1');
+
+		const next = 'next_leak = 1';
+		const nc = newCell(next);
+		const nextRun = await startRun(nc, next);
+		expect(nextRun.status).toBe('ok');
+		expect(h.sentCodes).toContain(next);
+
+		const probe = await kernelmod.execute(nb, 'PROBE_LEAK', () => {}, { internal: true });
+		expect(probe.status).toBe('ok');
+		expect(h.sentCodes).toContain('PROBE_LEAK');
 		expect(queue.queueStateFor(nb)).toEqual({ running: null, queue: [] });
 	});
 });
@@ -523,30 +604,117 @@ describe('reaching the kernel is bounded too', () => {
 		await until(() => h.releaseStart != null, 'the kernel start to be requested');
 
 		const started = Date.now();
-		// THE REGRESSION: `await nbKernel.startPromise` was unbounded, so this never
-		// returned - `/api/kernel/interrupt` and the MCP tool hung forever while the
-		// cell read RUNNING.
+		// `await nbKernel.startPromise` used to be unbounded, so this never returned -
+		// `/api/kernel/interrupt` and the MCP tool hung forever while the cell read
+		// RUNNING.
 		const res = await kernelmod.interruptKernel(nb);
 		expect(Date.now() - started).toBeLessThan(START_TIMEOUT_MS + SIGNAL_TIMEOUT_MS + GRACE_MS);
 
-		// HONESTY: it never reached a kernel, so it reports only what it can see - a
-		// booting one, with no id and nothing of ours running IN it. It may not claim
-		// `forced`/`forced_no_signal`, which assert a run this call force-settled: a run
-		// registers its abort handle only once `getKernel` has resolved, so there was
-		// nothing here to settle. (Stated residual: that parked run keeps the queue slot
-		// until the start settles on its own - it is reachable by no abort path, which
-		// is a fact about `execute()`'s entry, not something this bound can repair.)
+		// It never reached a kernel, so it reports only what it can see: a booting one,
+		// with no id - and nothing of ours was executing, so the stop is `idle`.
 		expect(res.status).toBe('starting');
 		expect(res.id).toBe(null);
 		expect(res.stopped).toBe('idle');
 
-		// Abandoning the wait broke nothing: the start still completes (it is work we
-		// want finished, which is why it is abandoned rather than cancelled) and the run
-		// parked on it runs and frees the slot.
-		h.releaseStart!('resolve');
+		// THE REGRESSION (cellar-interrupt-parked-in-kernel-start): the run parked on
+		// the start is SETTLED, now, with the start still held open. Before the fix it
+		// registered its abort handle only once `getKernel` resolved, so it was in
+		// neither the queue's `pending` nor `activeRuns`, the interrupt reported `idle`,
+		// and the cell went on reading RUNNING until the start settled on its own.
 		const run = await runP;
-		expect(run.status).toBe('ok');
+		expect(run.status).toBe('error');
 		expect(queue.queueStateFor(nb)).toEqual({ running: null, queue: [] });
+		// HONESTY: its code never reached any kernel, so the message says exactly that,
+		// and may not claim the kernel "may still be executing" it.
+		const evalue = String(soleError(run.outputs).evalue);
+		expect(evalue).toMatch(/before it reached the kernel/i);
+		expect(evalue).toMatch(/not executed/i);
+		expect(evalue).not.toMatch(/may still be executing/i);
+		// An abort is not an unreachable kernel.
+		expect(run.kernelDown).toBe(false);
+
+		// Abandoning the wait broke nothing: the start still completes (it is work we
+		// want finished, which is why it is abandoned rather than cancelled), and the
+		// notebook's next run uses that kernel.
+		h.releaseStart!('resolve');
+		const next = nbmod.addCell(null, 'code', nb, null, 'y = 2').id;
+		const ticket = queue.enqueueRun({ nb, cellId: next, actor: 'user', source: 'y = 2' });
+		if (ticket.duplicate) throw new Error('unreachable: fresh ticket expected');
+		await ticket.wait();
+		try {
+			const ok = await runmod.executeCellRun({ nb, cellId: next, actor: 'user', source: 'y = 2' });
+			expect(ok.status).toBe('ok');
+		} finally {
+			ticket.done();
+		}
+		expect(queue.queueStateFor(nb)).toEqual({ running: null, queue: [] });
+	});
+
+	it('a start that resolves INSIDE the bound is signalled, and the run is refused before it sends', async () => {
+		const { nb, cellId, runP } = parkRunOnStartingKernel('interrupt-start-in-time.ipynb');
+		await until(() => queue.queueStateFor(nb).running?.cellId === cellId, 'the run to hold the slot');
+		await until(() => h.releaseStart != null, 'the kernel start to be requested');
+
+		// The start comes back well inside the interrupt's start bound: the kernel is
+		// reachable, so it is SIGNALLED rather than force-settled without a signal. The
+		// run the user asked to stop must still never reach that kernel.
+		const signalsBefore = h.interruptKernel.mock.calls.length;
+		const interruptP = kernelmod.interruptKernel(nb);
+		await sleep(10);
+		h.releaseStart!('resolve');
+		const res = await interruptP;
+		expect(h.interruptKernel.mock.calls.length).toBe(signalsBefore + 1);
+		expect(res.stopped).toBe('idle');
+
+		const run = await runP;
+		expect(queue.queueStateFor(nb)).toEqual({ running: null, queue: [] });
+		expect(h.sentCodes).not.toContain('x = 1');
+		expect(run.status).toBe('error');
+		const evalue = String(soleError(run.outputs).evalue);
+		expect(evalue).toMatch(/before it reached the kernel/i);
+		expect(evalue).not.toMatch(/may still be executing/i);
+	});
+
+	it('a RESTART while the kernel is starting settles the parked run', async () => {
+		const { nb, cellId, runP } = parkRunOnStartingKernel('interrupt-start-restart.ipynb');
+		await until(() => queue.queueStateFor(nb).running?.cellId === cellId, 'the run to hold the slot');
+		await until(() => h.releaseStart != null, 'the kernel start to be requested');
+
+		// `restartKernel` force-aborts every registered run before it waits for the
+		// start; a run parked ON the start is now one of them, so the slot frees before
+		// the start does - and it says the kernel was restarted, which it was.
+		const restartP = kernelmod.restartKernel(nb);
+		const run = await runP;
+		expect(run.status).toBe('error');
+		expect(String(soleError(run.outputs).evalue)).toMatch(/the kernel was restarted/i);
+		expect(queue.queueStateFor(nb)).toEqual({ running: null, queue: [] });
+
+		h.releaseStart!('resolve');
+		await restartP;
+	});
+
+	it('an INTERNAL probe parked on the start is reachable too', async () => {
+		const nbName = 'interrupt-start-internal.ipynb';
+		const nb = nbmod.resolveNotebookPath(nbName);
+		nbmod.createNotebook(nbName, null, { focus: false });
+		h.startHangs = true;
+		// Every Cellar probe and Databricks op goes through `execute()` too, so the same
+		// entry path decides whether THEY are settleable while the kernel boots - the
+		// shape of the internal lock holder F2 depends on being able to abort.
+		let settledWith: unknown = null;
+		const probeP = kernelmod
+			.execute(nb, 'PROBE', () => {}, { internal: true })
+			.catch((err: unknown) => {
+				settledWith = err;
+			});
+		await until(() => h.releaseStart != null, 'the kernel start to be requested');
+
+		const res = await kernelmod.interruptKernel(nb);
+		await probeP;
+		expect(res.stopped).toBe('idle');
+		expect(settledWith).toBeInstanceOf(kernelmod.KernelExecuteAborted);
+
+		h.releaseStart!('resolve');
 	});
 
 	it('a start that REJECTS is escalated on, never thrown out of the interrupt', async () => {
