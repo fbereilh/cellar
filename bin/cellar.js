@@ -31,7 +31,8 @@
  *   cellar ls                       list known cellar instances (registry +
  *                                   untracked orphans) with liveness.
  *   cellar cleanup [options]        reap dead/orphaned instances (launcher gone,
- *                                   app still listening) — anywhere, at every
+ *                                   app still listening) and chat runs whose app
+ *                                   is gone — anywhere, at every
  *                                   scope. `--all` additionally stops LIVE
  *                                   instances serving THIS workspace;
  *                                   `--all-workspaces` stops live instances in
@@ -152,6 +153,7 @@ import {
 	isIsolatedEnv
 } from '../src/lib/server/instances.js';
 import { CONFIRM_PHRASE, planCleanup, resolveCallerWorkspace, workspaceKey } from '../src/lib/server/cleanup-plan.js';
+import { findOrphanChatRuns, pruneDeadChatRuns, reapOrphanChatRuns } from '../src/lib/server/chat-run-registry.js';
 import { resolveWorkspacePorts } from '../src/lib/server/ports.js';
 import { jupyterRuntimeDir, sidecarPortConflict, waitForHttp, waitForSidecarPort } from '../src/lib/server/jupyter-sidecar.js';
 import {
@@ -603,8 +605,9 @@ Subcommands:
                              every start. Merges; never clobbers existing config.
              remove <name…>  stop managing one (--strip also removes its entry)
   ls         list registered + untracked cellar instances and whether each is alive
-  cleanup    reap dead/orphaned instances anywhere; stopping a LIVE instance is
-             opt-in and scoped to a workspace (see Cleanup options below)
+  cleanup    reap dead/orphaned instances (and chat runs whose app is gone)
+             anywhere; stopping a LIVE instance is opt-in and scoped to a
+             workspace (see Cleanup options below)
 
 Options:
   --help, -h              print this usage message and exit
@@ -619,7 +622,8 @@ Options:
   --new / --force         start a second instance in a folder that already has one
 
 Cleanup options (cellar cleanup …):
-  (no flags)              reap dead + orphaned instances only; never stops a live one
+  (no flags)              reap dead + orphaned instances, and chat runs whose app
+                          is gone; never stops a live one
   --all                   also stop LIVE instances serving THIS workspace
   --all-workspaces        also stop LIVE instances in ANY workspace. Someone else
                           may be working in them, so this needs an explicit
@@ -914,6 +918,7 @@ async function cleanupCommand(flags) {
 	if (!dryRun) {
 		const pruned = await pruneDeadInstances({ log });
 		if (pruned.length) console.log(`[cellar] pruned ${pruned.length} dead registry entr(ies).`);
+		pruneDeadChatRuns({ log });
 	}
 
 	// 2) Gather facts, then decide (the decision is pure and unit-tested).
@@ -925,12 +930,16 @@ async function cleanupCommand(flags) {
 	// offered the cross-workspace flag to reach it.
 	const here = resolveCallerWorkspace(callerKey, entries.map((e) => workspaceKey(e.workspace)));
 	const plan = planCleanup({ entries, untracked: scanUntrackedCellarProcesses(), workspace: here, scope });
+	// Chat process groups whose owning app is gone. Nobody's live session at any
+	// scope - the owner being provably gone is what puts one here - so, like an
+	// orphaned instance, they are reaped by every form of the command.
+	const chatOrphans = findOrphanChatRuns();
 
 	console.log(
 		`[cellar] workspace: ${here || '(unknown)'}` + (here && here !== callerKey ? ` (you are in ${callerKey})` : '')
 	);
 
-	if (plan.reap.length === 0 && plan.killPids.length === 0) {
+	if (plan.reap.length === 0 && plan.killPids.length === 0 && chatOrphans.length === 0) {
 		console.log(
 			scope === 'orphans'
 				? '[cellar] nothing to reap (no dead or orphaned instances).'
@@ -945,6 +954,8 @@ async function cleanupCommand(flags) {
 	console.log(dryRun ? '[cellar] would stop:' : '[cellar] will stop:');
 	for (const e of plan.reap) console.log(planLine(e));
 	for (const u of plan.untrackedOrphans) console.log(`  orphan pid=${u.pid} (untracked)  ${u.command}`);
+	for (const { record: r } of chatOrphans)
+		console.log(`  chat   pgid=${r.pgid} (its app, pid ${r.ownerPid}, is gone)  ${r.notebook ?? r.workspace ?? ''}`);
 	if (scope === 'everywhere')
 		for (const u of plan.untrackedLive) console.log(`  live   pid=${u.pid} (untracked, workspace unknown)  ${u.command}`);
 
@@ -985,6 +996,10 @@ async function cleanupCommand(flags) {
 		console.log(`[cellar] killing pid ${pid} …`);
 		await killPid(pid);
 	}
+	// After the instances, so a chat group whose app had to be SIGKILLed just now
+	// is reaped too rather than left for the next launch. Re-decides every record,
+	// so it still signals only an owner-gone, leader-verified group.
+	await reapOrphanChatRuns({ log });
 	console.log('[cellar] cleanup done.');
 	reportSkipped(plan);
 	return 0;
@@ -1488,6 +1503,21 @@ async function main() {
 		const stale = readRuntime(WORKSPACE);
 		if (stale && stale.pid !== process.pid) clearRuntime(WORKSPACE, stale.pid);
 	}
+
+	// Chat process groups an app left behind (crashed, OOM-killed, SIGKILLed)
+	// run in a session of their own that nothing else will ever signal, so every
+	// launch sweeps the out-of-process record of them (`chat-run-registry.js`).
+	// Not gated on --new: it can only signal a group whose owning app is provably
+	// gone and whose leader is provably the process recorded, so it never touches
+	// a live instance, which is what --new exists to protect. It IS gated on
+	// isolation, whose whole point is never touching the shared state in $HOME.
+	// AFTER the take-over above, deliberately: a take-over that had to SIGKILL a
+	// wedged app has just orphaned that app's chat runs, and this is what reaps them.
+	// Housekeeping may never cost the user their launch, hence the catch.
+	if (!isolated)
+		await reapOrphanChatRuns({ log: reapLog }).catch((err) =>
+			console.error(`[cellar] could not sweep orphaned chat runs: ${err?.message ?? err}`)
+		);
 
 	// uv is mandatory — fail fast with an actionable message, no silent fallback.
 	try {

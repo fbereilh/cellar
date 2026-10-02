@@ -160,6 +160,11 @@ export function removeWorkspace(ws: string | undefined | null): void {
  * place Cellar treats as gitignored runtime state, and specs that `git init` their
  * workspace assert on git decorations and `status` - so a redirected store at the
  * root would surface as an untracked file the moment any spec wrote a setting.
+ *
+ * The chat-run registry (`CELLAR_CHAT_RUNS_DIR`) is redirected the same way and for
+ * a sharper reason: every launch SWEEPS it and may signal what it finds, so a spec
+ * left on the real one would be reaping - however carefully - the process groups
+ * of whoever ran the suite.
  */
 export function bootCellar(
 	ws: string,
@@ -185,6 +190,7 @@ export function bootCellar(
 				PATH: `${shim}:${process.env.PATH}`,
 				CI: '1',
 				CELLAR_USER_SETTINGS: join(ws, '.cellar', 'user-settings.json'),
+				CELLAR_CHAT_RUNS_DIR: join(ws, '.cellar', 'chat-runs'),
 				...env
 			},
 			stdio: ['ignore', 'pipe', 'pipe'],
