@@ -17,6 +17,7 @@
  */
 import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -71,8 +72,15 @@ describe('the no-mistakes Test step runs the real suite', () => {
 	it('runs vitest once rather than watching, and an empty run does not pass', () => {
 		const pkg = JSON.parse(read('package.json'));
 		expect(pkg.scripts.test).toBe('vitest run');
-		expect(read('vitest.config.ts')).not.toMatch(/passWithNoTests/);
-	});
+		const run = spawnSync('npm', ['test', '--', '__cellar_no_such_test_file__'], {
+			cwd: REPO,
+			encoding: 'utf8',
+			env: { ...process.env, CI: '1' },
+			timeout: 60_000
+		});
+		expect(run.status).not.toBe(0);
+		expect(`${run.stdout}${run.stderr}`).toMatch(/No test files found/i);
+	}, 90_000);
 });
 
 describe('topLevelMapping', () => {
