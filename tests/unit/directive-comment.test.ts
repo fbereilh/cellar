@@ -16,16 +16,31 @@
 //     plugin - it rebuilds on scroll, not only on edit - hand over its document
 //     instead of a whole-document copy.
 //
+// EVERY READ OF THE LIVE EDITOR SETTLES ITS PARSE FIRST (`settleParse`). CodeMirror
+// parses a new state for at most 20ms of wall clock (`Work.Apply` in
+// @codemirror/language), takes whatever PARTIAL tree it reached, and finishes the
+// rest from a background worker (an idle callback, or a 500ms timeout where none
+// exists - jsdom). On a starved CPU those 20ms cover a few tokens, so an editor read
+// the instant it is built reports only the directives in the parsed PREFIX - that is
+// the `[]` this suite once failed with under load (instrumented: tree 17 of 33 chars,
+// the directive on line 3). The product is not wrong there: the decorations follow
+// the tree, exactly as CodeMirror's own token colours do, and the worker completes
+// them a beat later (pinned below, in "a starved parser"). What was wrong was a
+// test asking about the settled render and reading the provisional one. A starved
+// clock (`starved`) makes the incomplete first parse deterministic, so the
+// reproduction is a test rather than a load pattern.
+//
 // The one-expression-wide wiring gets narrow, formatting-tolerant source guards at
 // the end: vitest deliberately runs without the SvelteKit plugin, so no component
 // here can be mounted, and the CSS cascade is only observable in a real browser
 // (`tests/e2e/directive-comment-highlight.spec.ts` answers both for real).
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { EditorState, Text } from '@codemirror/state';
 import { EditorView } from '@codemirror/view';
 import { python, pythonLanguage } from '@codemirror/lang-python';
+import { forceParsing, syntaxTreeAvailable } from '@codemirror/language';
 import { DIRECTIVE_CLASS, directiveCommentRanges, directiveCommentHighlight } from '$lib/directiveComment';
 import { EDITOR_THEME } from '$lib/editorTheme';
 import { highlightLines } from '$lib/staticHighlight';
@@ -36,12 +51,45 @@ function directivesIn(source: string): string[] {
 	return directiveCommentRanges(source, tree).map((r) => source.slice(r.from, r.to));
 }
 
+/**
+ * Finish the editor's parse before reading what it rendered (see the header). The
+ * `Infinity` is a WORK budget, not a wait: it tells the parser to run to the end of
+ * the document instead of stopping at a 20ms deadline, so the result cannot depend
+ * on how busy the machine is. `forceParsing` dispatches the completed tree, which
+ * is what makes the decoration plugin rebuild from it.
+ */
+function settleParse(view: EditorView): void {
+	expect(forceParsing(view, view.state.doc.length, Infinity)).toBe(true);
+}
+
+/** The text of every directive mark currently rendered under `parent`. */
+function marked(parent: HTMLElement): string[] {
+	return [...parent.querySelectorAll(`.${DIRECTIVE_CLASS}`)].map((n) => n.textContent ?? '');
+}
+
+/**
+ * Run `fn` with a clock that leaps 50ms on every read - past CodeMirror's 20ms
+ * synchronous parse budget at its first check - which is what a starved CPU looks
+ * like to the parser, made deterministic.
+ */
+function starved<T>(fn: () => T): T {
+	const real = Date.now;
+	let t = real();
+	Date.now = () => (t += 50);
+	try {
+		return fn();
+	} finally {
+		Date.now = real;
+	}
+}
+
 /** Render `source` in a real (jsdom) editor and return the directive-marked text. */
 function editorDirectives(source: string, extensions = [python(), directiveCommentHighlight]): string[] {
 	const parent = document.createElement('div');
 	document.body.appendChild(parent);
 	const view = new EditorView({ parent, state: EditorState.create({ doc: source, extensions }) });
-	const out = [...parent.querySelectorAll(`.${DIRECTIVE_CLASS}`)].map((n) => n.textContent ?? '');
+	settleParse(view);
+	const out = marked(parent);
 	view.destroy();
 	parent.remove();
 	return out;
@@ -142,6 +190,7 @@ describe('the live editor', () => {
 				extensions: [python(), EDITOR_THEME, directiveCommentHighlight]
 			})
 		});
+		settleParse(view);
 		const mark = parent.querySelector(`.${DIRECTIVE_CLASS}`);
 		expect(mark).not.toBeNull();
 		// The comment token survives, as a descendant carrying its own class.
@@ -160,8 +209,10 @@ describe('the live editor', () => {
 			parent,
 			state: EditorState.create({ doc: '# export', extensions: [python(), directiveCommentHighlight] })
 		});
+		settleParse(view);
 		expect(parent.querySelectorAll(`.${DIRECTIVE_CLASS}`)).toHaveLength(0);
 		view.dispatch({ changes: { from: 1, to: 1, insert: '|' } }); // '# export' -> '#| export'
+		settleParse(view);
 		expect([...parent.querySelectorAll(`.${DIRECTIVE_CLASS}`)].map((n) => n.textContent)).toEqual([
 			'#| export'
 		]);
@@ -219,6 +270,66 @@ describe('the two render paths agree', () => {
 			expect(fromStatic).toEqual(fromEditor);
 		});
 	}
+});
+
+describe('a starved parser', () => {
+	// The load failure, reproduced deterministically. The source is the one the
+	// suite failed on: its only directive sits on the LAST line, past what a starved
+	// first parse reaches.
+	const SRC = 'x = 1  #| export\n# plain\n#|export';
+
+	it('really does leave the first parse incomplete (so the cases below are not vacuous)', () => {
+		const parent = document.createElement('div');
+		document.body.appendChild(parent);
+		const view = starved(
+			() =>
+				new EditorView({
+					parent,
+					state: EditorState.create({ doc: SRC, extensions: [python(), directiveCommentHighlight] })
+				})
+		);
+		expect(syntaxTreeAvailable(view.state, SRC.length)).toBe(false);
+		expect(marked(parent)).toEqual([]); // the provisional render: nothing reached yet
+		view.destroy();
+		parent.remove();
+	});
+
+	it('the editor read agrees with the static render once its parse is settled', () => {
+		// What the "two render paths agree" cases now do, under the condition that
+		// broke them. Fails if `settleParse` is dropped from `editorDirectives`.
+		expect(starved(() => editorDirectives(SRC))).toEqual(['#|export']);
+		expect(staticLines(SRC)[2]).toContain(DIRECTIVE_CLASS);
+	});
+
+	it('a directive the first parse missed is decorated when the background parse lands', () => {
+		// The PRODUCT half: a slow machine must still see the highlight, a beat late,
+		// with nothing typed. CodeMirror's parse worker finishes the tree and
+		// dispatches it with NO doc or viewport change, so the plugin's tree-identity
+		// check is the only thing that rebuilds the decorations - drop it and the
+		// directive is never marked. Fake timers drive the worker's idle timeout
+		// (jsdom has no `requestIdleCallback`); the clock it measures with is real.
+		vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+		const parent = document.createElement('div');
+		document.body.appendChild(parent);
+		try {
+			const view = starved(
+				() =>
+					new EditorView({
+						parent,
+						state: EditorState.create({ doc: SRC, extensions: [python(), directiveCommentHighlight] })
+					})
+			);
+			expect(syntaxTreeAvailable(view.state, SRC.length)).toBe(false);
+			expect(marked(parent)).toEqual([]);
+			vi.runAllTimers();
+			expect(syntaxTreeAvailable(view.state, SRC.length)).toBe(true);
+			expect(marked(parent)).toEqual(['#|export']);
+			view.destroy();
+		} finally {
+			vi.useRealTimers();
+			parent.remove();
+		}
+	});
 });
 
 describe('wiring and scope', () => {
@@ -312,6 +423,7 @@ describe('the rule reads only what it needs', () => {
 		};
 		try {
 			view.dispatch({ changes: { from: 15, insert: '\n#| hide' } });
+			settleParse(view);
 			expect([...parent.querySelectorAll(`.${DIRECTIVE_CLASS}`)].map((n) => n.textContent)).toEqual([
 				'#| export',
 				'#| hide'
