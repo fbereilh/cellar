@@ -399,7 +399,13 @@ test.beforeEach(async ({ page }) => {
 });
 
 /* Unconditional, and `resetStores` explains why that matters. */
-test.afterEach(async ({ page }) => {
+test.afterEach(async ({ page }, testInfo) => {
+	// Closing the store channel navigates the page away, and Playwright takes its own
+	// failure snapshot only after this hook - so keep the page as the test left it.
+	if (testInfo.status !== testInfo.expectedStatus) {
+		const snapshot = await page.locator('body').ariaSnapshot({ timeout: 5_000 }).catch(() => '');
+		if (snapshot) await testInfo.attach('page before teardown', { body: snapshot, contentType: 'text/yaml' });
+	}
 	await storeWrites?.close();
 	storeWrites = null;
 	await resetStores(page);
