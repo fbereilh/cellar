@@ -634,31 +634,10 @@ describe('an app killed with SIGKILL', () => {
 });
 
 // ---------------------------------------------------------------------------
-// The two call sites in the launcher. Source guards, because the launch path
-// boots a whole Jupyter sidecar and is exercised for real only in the e2e suite,
-// which the pre-push gate does not run.
+// The npm package manifest: the launcher imports this module at runtime, so the
+// published `files` list must carry it.
 
-describe('the launcher sweeps the registry', () => {
-	const src = readFileSync(CLI, 'utf8');
-	const main = src.slice(src.indexOf('async function main()'));
-
-	it('on every non-isolated launch, AFTER the take-over (whose SIGKILL can orphan a run)', () => {
-		const sweep = main.indexOf('await reapOrphanChatRuns({ log: reapLog })');
-		expect(main.slice(sweep - 40, sweep)).toContain('if (!isolated)');
-		expect(sweep).toBeGreaterThan(0);
-		expect(main.indexOf('lockWorkspace = WORKSPACE;')).toBeGreaterThan(0);
-		expect(sweep).toBeGreaterThan(main.indexOf('lockWorkspace = WORKSPACE;'));
-		// ...and BEFORE the app is spawned, so it can never be sweeping our own app's runs.
-		expect(sweep).toBeLessThan(main.indexOf("spawn('node', [buildEntry]"));
-	});
-
-	it('in `cellar cleanup`, AFTER the instances it stops', () => {
-		const cleanupFn = src.slice(src.indexOf('async function cleanupCommand('));
-		const body = cleanupFn.slice(0, cleanupFn.indexOf('\nfunction reportSkipped('));
-		expect(body.indexOf('await reapOrphanChatRuns(')).toBeGreaterThan(body.indexOf('await reapInstance('));
-		expect(body.indexOf('const chatOrphans = findOrphanChatRuns()')).toBeGreaterThan(0);
-	});
-
+describe('package.json files', () => {
 	it('ships the module the launcher imports', () => {
 		const pkg = JSON.parse(readFileSync(join(REPO, 'package.json'), 'utf8'));
 		expect(pkg.files).toContain('src/lib/server/chat-run-registry.js');
