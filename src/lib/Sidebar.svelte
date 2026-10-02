@@ -1218,122 +1218,155 @@
 {#snippet kernelRow(card: KernelCard)}
 	{@const acting = actingPaths.has(card.path)}
 	{@const busy = card.info.status === 'busy'}
+	{@const memory = cardMemory(card)}
+	<!-- TWO LINES, and every control is ALWAYS VISIBLE - both deliberate, and both
+	     answers to the same narrow-sidebar problem.
+
+	     One line could not hold dot + name + closed chip + RSS + four 24px controls:
+	     at the 180px minimum the row OVERFLOWED (a horizontal scrollbar under the
+	     list, the chip painted over the RSS figure), and even at the 256px default
+	     the name got 0-7px. So the name owns line 1 outright, and everything else -
+	     the state words, the memory figure, the controls - sits on line 2, indented
+	     under the name. Line 2 is `flex-wrap`, so where the meta and the controls do
+	     not fit side by side the controls drop to their own line instead of
+	     squeezing anything: the card grows a line, it never overflows.
+
+	     The controls are NOT revealed on hover/focus. They used to sit at
+	     `opacity-0` at rest - invisible but still hit-testable, so a click on the
+	     empty end of a row fired Restart or Shut down. A floating hover-reveal was
+	     tried to buy the name room and reverted after three rounds of the same
+	     class (clickable while invisible, inert while visible at the transition
+	     midpoint, overlap on hover-out, a spacer forcing a horizontal scrollbar).
+	     Visibility here is a plain fact of the markup: a control is rendered, and
+	     therefore both seen and clickable, or it is not rendered at all. Keep it
+	     that way - no opacity, visibility or pointer-events toggling on these. -->
 	<div
-		class="group flex items-center gap-2 rounded-md px-2 py-1 hover:bg-base-300/40 {busy ? 'bg-warning/5' : ''}"
+		class="rounded-md px-2 py-1 hover:bg-base-300/40 {busy ? 'bg-warning/5' : ''}"
 		data-testid="kernel-card"
 		data-nb-path={card.path}
 	>
-		<!-- Status dot — the at-a-glance signal. A busy kernel gets a ping halo so a
-		     working notebook stands out across a long list. -->
-		<span class="relative flex h-2 w-2 shrink-0" title="{kernelStatusLabel(card.info)}">
-			{#if busy}<span class="absolute inline-flex h-full w-full animate-ping rounded-full bg-warning opacity-60"></span>{/if}
-			<span class="relative inline-flex h-2 w-2 rounded-full {kernelDotClass(card.info)}"></span>
-		</span>
-		<!-- THE CLICK TARGET IS THE NAME, NOT THE ROW — deliberately. The row also
-		     carries four icon buttons, one of them destructive behind a two-step
-		     confirm, so a row-level handler would have to be a `role="button"` div
-		     with `stopPropagation` on every control (fragile: a control added later
-		     silently inherits the open action), or an outer <button> wrapping them
-		     (invalid markup, and a confusing tab order). The name button is `flex-1`,
-		     so it already spans the row minus the controls — the same shape (and the
-		     same testid) the OPEN card has always had, now extended to the closed one,
-		     which was an inert <span> and so reachable by neither mouse nor keyboard.
-		     One handler for both states: `onOpenNotebook` surfaces an already-open tab
-		     and opens a closed one, so the row never duplicates a notebook and never
-		     reloads the one you are already looking at. The accessible name is
-		     explicit because the visible text is only a filename; the tooltip carries
-		     the full PATH, which is what tells two same-named notebooks apart. -->
-		<button
-			class="flex min-w-0 flex-1 items-center gap-1.5 text-left text-sm hover:text-primary"
-			onclick={() => onOpenNotebook?.(card.path)}
-			title="{card.open ? 'Focus' : 'Open'} {card.path} — {card.open
-				? kernelStatusLabel(card.info)
-				: 'kernel running, tab closed'}"
-			aria-label="{card.open ? 'Focus' : 'Open'} notebook {card.name}"
-			data-testid="kernel-notebook"
-		>
-			<span class="min-w-0 truncate {busy ? 'font-medium' : ''} {nameToneFor(card)}">{card.name}</span>
-			{#if card.active}<span class="h-1.5 w-1.5 shrink-0 rounded-full bg-primary" title="active notebook"></span>{/if}
-			{#if !card.open}<span class="shrink-0 text-[10px] uppercase tracking-wide text-base-content/30">closed</span>{/if}
-		</button>
-		{#if cardMemory(card)}
-			<span
-				class="shrink-0 tabular-nums text-[11px] text-base-content/40"
-				title="Kernel resident memory (RSS)"
-				data-testid="kernel-memory"
-			>
-				{cardMemory(card)}
+		<div class="flex items-center gap-2">
+			<!-- Status dot — the at-a-glance signal. A busy kernel gets a ping halo so a
+			     working notebook stands out across a long list. -->
+			<span class="relative flex h-2 w-2 shrink-0" title="{kernelStatusLabel(card.info)}">
+				{#if busy}<span class="absolute inline-flex h-full w-full animate-ping rounded-full bg-warning opacity-60"></span>{/if}
+				<span class="relative inline-flex h-2 w-2 rounded-full {kernelDotClass(card.info)}"></span>
 			</span>
-		{/if}
-		{#if !card.hasKernel}
-			<!-- Open but never run: no process to control, just a muted state hint. -->
-			<span class="shrink-0 text-[10px] uppercase tracking-wide text-base-content/30" data-testid="kernel-not-started">not started</span>
-		{:else if acting}
-			<span class="loading loading-spinner loading-xs shrink-0 text-base-content/50" data-testid="kernel-acting"></span>
-		{:else if confirmWipePath === card.path}
-			<!-- Two-step confirm for "wipe variables": armed on this row only. -->
-			<div class="flex shrink-0 items-center gap-1" data-testid="kernel-wipe-confirm">
-				<span class="text-[11px] text-base-content/60">Wipe vars?</span>
-				<button
-					class="btn btn-warning btn-xs h-6 min-h-0 px-2"
-					onclick={() => runWipe(card.path)}
-					data-testid="kernel-wipe-vars-confirm"
-				>
-					Confirm
-				</button>
-				<button
-					class="btn btn-ghost btn-xs h-6 min-h-0 px-2"
-					onclick={() => (confirmWipePath = null)}
-					data-testid="kernel-wipe-vars-cancel"
-				>
-					Cancel
-				</button>
-			</div>
-		{:else}
-			<!-- Uncluttered at rest, full control on interaction: reveal on row hover or
-			     keyboard focus. The slot keeps layout width stable (no reflow). -->
-			<div
-				class="flex shrink-0 items-center gap-0.5 opacity-0 transition-opacity group-hover:opacity-100 group-focus-within:opacity-100"
-				data-testid="kernel-controls"
+			<!-- THE CLICK TARGET IS THE NAME, NOT THE ROW — deliberately. The row also
+			     carries four icon buttons, one of them destructive behind a two-step
+			     confirm, so a row-level handler would have to be a `role="button"` div
+			     with `stopPropagation` on every control (fragile: a control added later
+			     silently inherits the open action), or an outer <button> wrapping them
+			     (invalid markup, and a confusing tab order). The name button is `flex-1`,
+			     so it spans line 1 beside the status dot.
+			     One handler for both states: `onOpenNotebook` surfaces an already-open tab
+			     and opens a closed one, so the row never duplicates a notebook and never
+			     reloads the one you are already looking at. The accessible name is
+			     explicit because the visible text is only a filename; the tooltip carries
+			     the full PATH, which is what tells two same-named notebooks apart. -->
+			<button
+				class="flex min-w-0 flex-1 items-center gap-1.5 text-left text-sm hover:text-primary"
+				onclick={() => onOpenNotebook?.(card.path)}
+				title="{card.open ? 'Focus' : 'Open'} {card.path} — {card.open
+					? kernelStatusLabel(card.info)
+					: 'kernel running, tab closed'}"
+				aria-label="{card.open ? 'Focus' : 'Open'} notebook {card.name}"
+				data-testid="kernel-notebook"
 			>
-				<button
-					class="btn btn-ghost btn-xs btn-square h-6 min-h-0 w-6 text-base-content/60 hover:text-base-content"
-					onclick={() => runKernelAction(card.path, onInterruptKernel)}
-					title="Interrupt this kernel (stop the running cell)"
-					aria-label="Interrupt {card.name}'s kernel"
-					data-testid="kernel-interrupt"
-				>
-					<svg class="h-3 w-3" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><rect x="6" y="6" width="12" height="12" rx="1.5" /></svg>
-				</button>
-				<button
-					class="btn btn-ghost btn-xs btn-square h-6 min-h-0 w-6 text-base-content/60 hover:text-base-content"
-					onclick={() => (confirmWipePath = card.path)}
-					title="Clear this kernel's user variables from memory — keeps imports, functions/classes & any Databricks session; the kernel stays alive (no restart)"
-					aria-label="Wipe {card.name}'s kernel variables"
-					data-testid="kernel-wipe-vars"
-				>
-					<svg class="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 20H7L3 16a1.5 1.5 0 0 1 0-2.1l8.4-8.4a1.5 1.5 0 0 1 2.1 0l5.9 5.9a1.5 1.5 0 0 1 0 2.1L13 20" /><path d="m7 20 6.5-6.5" /></svg>
-				</button>
-				<button
-					class="btn btn-ghost btn-xs btn-square h-6 min-h-0 w-6 text-base-content/60 hover:text-base-content"
-					onclick={() => runKernelAction(card.path, onRestartKernel)}
-					title="Restart this kernel — wipe its namespace from memory (keeps the notebook)"
-					aria-label="Restart {card.name}'s kernel"
-					data-testid="kernel-restart"
-				>
-					<svg class="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 12a9 9 0 0 1 15-6.7L21 8" /><path d="M21 3v5h-5" /><path d="M21 12a9 9 0 0 1-15 6.7L3 16" /><path d="M3 21v-5h5" /></svg>
-				</button>
-				<button
-					class="btn btn-ghost btn-xs btn-square h-6 min-h-0 w-6 text-error/70 hover:bg-error/10 hover:text-error"
-					onclick={() => runKernelAction(card.path, onShutdownKernel)}
-					title="Shut down this kernel — free its memory and remove it (starts fresh on next run)"
-					aria-label="Shut down {card.name}'s kernel"
-					data-testid="kernel-shutdown"
-				>
-					<svg class="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 2v10" /><path d="M18.4 6.6a9 9 0 1 1-12.8 0" /></svg>
-				</button>
-			</div>
-		{/if}
+				<span class="min-w-0 truncate {busy ? 'font-medium' : ''} {nameToneFor(card)}">{card.name}</span>
+				{#if card.active}<span class="h-1.5 w-1.5 shrink-0 rounded-full bg-primary" title="active notebook"></span>{/if}
+			</button>
+		</div>
+		<!-- Line 2, indented to the name (dot w-2 + gap-2). `min-h-6` holds the line
+		     at the controls' height whichever state it is in, so a card does not
+		     change height when its kernel starts or a confirm is armed. -->
+		<div class="flex min-h-6 flex-wrap items-center gap-x-2 gap-y-0.5 pl-4" data-testid="kernel-card-meta">
+			{#if !card.open || memory || !card.hasKernel}
+				<div class="flex min-w-0 items-center gap-2 text-[10px] text-base-content/40">
+					{#if !card.open}<span class="shrink-0 uppercase tracking-wide text-base-content/35">closed</span>{/if}
+					{#if !card.hasKernel}
+						<!-- Open but never run: no process to control, just a muted state hint. -->
+						<span class="shrink-0 uppercase tracking-wide text-base-content/35" data-testid="kernel-not-started">not started</span>
+					{/if}
+					{#if memory}
+						<span
+							class="shrink-0 tabular-nums text-[11px]"
+							title="Kernel resident memory (RSS)"
+							data-testid="kernel-memory"
+						>
+							{memory}
+						</span>
+					{/if}
+				</div>
+			{/if}
+			{#if !card.hasKernel}
+				<!-- Nothing to control. -->
+			{:else if acting}
+				<span class="loading loading-spinner loading-xs ml-auto shrink-0 text-base-content/50" data-testid="kernel-acting"></span>
+			{:else if confirmWipePath === card.path}
+				<!-- Two-step confirm for "wipe variables": armed on this row only. It wraps
+				     onto as many lines as the sidebar width needs rather than overflow. -->
+				<div class="ml-auto flex flex-wrap items-center justify-end gap-x-1.5 gap-y-1" data-testid="kernel-wipe-confirm">
+					<span class="text-[11px] text-base-content/60">Wipe vars?</span>
+					<!-- The two buttons wrap TOGETHER, so a narrow row never strands one alone. -->
+					<div class="flex shrink-0 items-center gap-1">
+						<button
+							class="btn btn-warning btn-xs h-6 min-h-0 px-2"
+							onclick={() => runWipe(card.path)}
+							data-testid="kernel-wipe-vars-confirm"
+						>
+							Confirm
+						</button>
+						<button
+							class="btn btn-ghost btn-xs h-6 min-h-0 px-2"
+							onclick={() => (confirmWipePath = null)}
+							data-testid="kernel-wipe-vars-cancel"
+						>
+							Cancel
+						</button>
+					</div>
+				</div>
+			{:else}
+				<div class="ml-auto flex shrink-0 items-center gap-0.5" data-testid="kernel-controls">
+					<button
+						class="btn btn-ghost btn-xs btn-square h-6 min-h-0 w-6 text-base-content/55 hover:text-base-content"
+						onclick={() => runKernelAction(card.path, onInterruptKernel)}
+						title="Interrupt this kernel (stop the running cell)"
+						aria-label="Interrupt {card.name}'s kernel"
+						data-testid="kernel-interrupt"
+					>
+						<svg class="h-3 w-3" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><rect x="6" y="6" width="12" height="12" rx="1.5" /></svg>
+					</button>
+					<button
+						class="btn btn-ghost btn-xs btn-square h-6 min-h-0 w-6 text-base-content/55 hover:text-base-content"
+						onclick={() => (confirmWipePath = card.path)}
+						title="Clear this kernel's user variables from memory — keeps imports, functions/classes & any Databricks session; the kernel stays alive (no restart)"
+						aria-label="Wipe {card.name}'s kernel variables"
+						data-testid="kernel-wipe-vars"
+					>
+						<svg class="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 20H7L3 16a1.5 1.5 0 0 1 0-2.1l8.4-8.4a1.5 1.5 0 0 1 2.1 0l5.9 5.9a1.5 1.5 0 0 1 0 2.1L13 20" /><path d="m7 20 6.5-6.5" /></svg>
+					</button>
+					<button
+						class="btn btn-ghost btn-xs btn-square h-6 min-h-0 w-6 text-base-content/55 hover:text-base-content"
+						onclick={() => runKernelAction(card.path, onRestartKernel)}
+						title="Restart this kernel — wipe its namespace from memory (keeps the notebook)"
+						aria-label="Restart {card.name}'s kernel"
+						data-testid="kernel-restart"
+					>
+						<svg class="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 12a9 9 0 0 1 15-6.7L21 8" /><path d="M21 3v5h-5" /><path d="M21 12a9 9 0 0 1-15 6.7L3 16" /><path d="M3 21v-5h5" /></svg>
+					</button>
+					<button
+						class="btn btn-ghost btn-xs btn-square h-6 min-h-0 w-6 text-error/65 hover:bg-error/10 hover:text-error"
+						onclick={() => runKernelAction(card.path, onShutdownKernel)}
+						title="Shut down this kernel — free its memory and remove it (starts fresh on next run)"
+						aria-label="Shut down {card.name}'s kernel"
+						data-testid="kernel-shutdown"
+					>
+						<svg class="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 2v10" /><path d="M18.4 6.6a9 9 0 1 1-12.8 0" /></svg>
+					</button>
+				</div>
+			{/if}
+		</div>
 	</div>
 {/snippet}
 
