@@ -205,6 +205,13 @@ interface ActiveRun {
 	 * kernel having surrendered it.
 	 */
 	sent?: boolean;
+	/**
+	 * Set by an interrupt that watched this run before its code was sent. The run
+	 * then refuses to send: the user asked to stop it, so it must not reach the
+	 * kernel afterwards, even when the start or the exec lock it was parked on
+	 * resolves inside the grace window. Per run, so it can never reach a later one.
+	 */
+	interruptRequested?: boolean;
 }
 
 /** One shared KernelManager hosts every notebook's kernel (N kernels, one host). */
@@ -2510,14 +2517,25 @@ export async function interruptKernel(nbPath?: string | null) {
 	// RUNNING) a few microtasks before that entry runs. Such a run WAS live when the
 	// user asked, so reading only at entry would leave it un-aborted and report
 	// `idle` over a cell still showing RUNNING.
+	//
+	// Every watched run that has not sent its code yet is marked at each read, so it
+	// refuses to send when its start or exec lock resolves inside the grace window.
 	const watched = [...nbKernel.activeRuns];
+	for (const run of watched) if (!run.sent) run.interruptRequested = true;
 	const kernel = await awaitKernelStart(nbKernel);
-	for (const run of nbKernel.activeRuns) if (!watched.includes(run)) watched.push(run);
+	for (const run of nbKernel.activeRuns) {
+		if (watched.includes(run)) continue;
+		watched.push(run);
+		if (!run.sent) run.interruptRequested = true;
+	}
+	// Only a run whose code was already on the wire when the signal went out can be
+	// surrendered by the kernel.
+	const sentAtSignal = watched.filter((run) => run.sent);
 	// No kernel in hand means nothing was asked, so the escalation runs at once under
 	// the undelivered reason - the same honest verdict a signal that could not be
 	// delivered earns, and for the same reason: the request was never made.
 	const signalled = kernel ? await signalInterrupt(kernel) : false;
-	const settled = await settleAfterInterrupt(nbKernel, watched, signalled);
+	const settled = await settleAfterInterrupt(nbKernel, watched, sentAtSignal, signalled);
 	// A chat run really was stopped, so `idle` (nothing was running) would be false.
 	const stopped = settled === 'idle' && chatAborted ? ('chat' as const) : settled;
 	publishKernelStatus();
@@ -2674,6 +2692,7 @@ async function signalInterrupt(kernel: KernelConnection): Promise<boolean> {
 async function settleAfterInterrupt(
 	nbKernel: NotebookKernel,
 	watched: readonly ActiveRun[],
+	sentAtSignal: readonly ActiveRun[],
 	signalled: boolean
 ): Promise<'idle' | 'kernel' | 'forced' | 'forced_no_signal'> {
 	if (watched.length === 0) return 'idle';
@@ -2686,10 +2705,10 @@ async function settleAfterInterrupt(
 	if (!pending()) {
 		if (watched.some((run) => run.aborted)) return 'forced';
 		// Every watched run ended on its own. That is the kernel surrendering only if
-		// one of them had actually reached it: a run registered while its kernel was
-		// still starting can also end because the start FAILED, which no kernel
-		// surrendered and which ran nothing of ours there.
-		return watched.some((run) => run.sent) ? 'kernel' : 'idle';
+		// one of them had reached it when the signal went out: a run registered while
+		// its kernel was still starting can also end because the start FAILED, which
+		// no kernel surrendered and which ran nothing of ours there.
+		return sentAtSignal.length > 0 ? 'kernel' : 'idle';
 	}
 	logWarn(
 		'kernel',
@@ -3449,6 +3468,15 @@ export async function execute(
 		void execReady.then(releaseExec, releaseExec);
 		dropBeforeSend();
 		throw err;
+	}
+	// An interrupt watched this run before it sent: the user asked to stop it, so
+	// its code must not reach the kernel now that its turn has come.
+	if (run.interruptRequested) {
+		aborted = true;
+		run.aborted = true;
+		releaseExec();
+		dropBeforeSend();
+		throw new KernelExecuteAborted(abortMessage(INTERRUPT_ABORT_REASON, { sent: false }), INTERRUPT_ABORT_REASON);
 	}
 	// Read AFTER the wait so it reflects the state at the moment this run actually
 	// reaches the kernel (a restart during the wait bumps the epoch), not the moment
