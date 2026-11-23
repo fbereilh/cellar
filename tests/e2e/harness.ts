@@ -302,8 +302,13 @@ export async function openSidebarSection(page: Page, section: string, body: stri
 export async function openNotebookSettings(page: Page): Promise<void> {
 	const open = page.locator('[data-testid="notebook-settings-menu"]:popover-open');
 	if ((await open.count()) > 0) return;
-	await page.locator('[data-testid="notebook-settings"]:visible').click();
+	const button = page.locator('[data-testid="notebook-settings"]:visible');
+	await button.click();
 	await expect(open).toHaveCount(1);
+	// The menu takes focus from its `toggle` event, which the browser fires a task
+	// AFTER the popover opens. `aria-expanded` flips in that same handler, so wait
+	// for it: a key pressed before it lands would have its focus taken back.
+	await expect(button).toHaveAttribute('aria-expanded', 'true');
 }
 
 /**
