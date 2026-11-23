@@ -13,7 +13,7 @@
  * the user hits.
  */
 import { describe, it, expect, beforeAll, vi } from 'vitest';
-import { mkdtempSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -97,6 +97,13 @@ const logs = vi.hoisted(() => ({
 }));
 vi.mock('../../src/lib/server/logs', () => logs);
 
+const venv = vi.hoisted(() => ({ installPackages: vi.fn(async () => {}) }));
+vi.mock('../../src/lib/server/venv.js', async (orig) => ({
+	...(await orig<typeof import('../../src/lib/server/venv.js')>()),
+	hasUv: async () => true,
+	installPackages: venv.installPackages
+}));
+
 let dbx: typeof import('../../src/lib/server/databricks');
 let kernelmod: typeof import('../../src/lib/server/kernel');
 let nbmod: typeof import('../../src/lib/server/notebook');
@@ -167,5 +174,68 @@ describe('connecting Databricks from a Rust notebook', () => {
 		// The guard let it through to the kernel start, which is what failed here.
 		expect(h.startNew).toHaveBeenCalled();
 		expect(err!.code).toBe('kernel_unavailable');
+	});
+});
+
+describe('a Rust notebook with a LIVE kernel', () => {
+	/**
+	 * A stub project interpreter answering every probe with a cluster on DBR 13.3 and
+	 * an installed databricks-connect 17.3 - the "client newer than the cluster" case
+	 * that makes a connect re-pin the client and restart the kernel.
+	 */
+	function useNewerClientStub() {
+		const stub = join(dir, 'stub-python');
+		const answer = {
+			ok: true,
+			spark_version: '13.3.x-scala2.12',
+			state: 'RUNNING',
+			sdk: true,
+			connect: true,
+			sdk_version: '0.50.0',
+			connect_version: '17.3.1'
+		};
+		writeFileSync(stub, `#!/bin/sh\ncat <<'EOF'\n__CELLAR_DBX__${JSON.stringify(answer)}\nEOF\n`, { mode: 0o755 });
+		process.env.CELLAR_PROJECT_VENV = stub;
+	}
+
+	async function liveRustKernel(name: string) {
+		const evcxr = join(dir, 'evcxr_jupyter');
+		writeFileSync(evcxr, '#!/bin/sh\n', { mode: 0o755 });
+		process.env.CELLAR_EVCXR = evcxr;
+		const specDir = join(dir, 'jupyter', 'kernels', 'python3');
+		mkdirSync(specDir, { recursive: true });
+		process.env.CELLAR_KERNELSPEC_DIR = specDir;
+		nbmod.createNotebook(name, null, { focus: false });
+		const nb = join(dir, name);
+		nbmod.setNotebookLanguage('rust', nb);
+		h.startNew.mockClear();
+		await kernelmod.execute(nb, 'let x = 1;', () => {});
+		expect(kernelmod.liveKernelLanguage(nb)).toBe('rust');
+		const kernel = await h.startNew.mock.results[0].value;
+		return { nb, kernel: kernel as ReturnType<typeof h.makeKernel> };
+	}
+
+	it('refuses a connect without re-pinning the client or restarting the kernel', async () => {
+		const { nb, kernel } = await liveRustKernel('live-connect.ipynb');
+		useNewerClientStub();
+		venv.installPackages.mockClear();
+		try {
+			await expect(
+				dbx.connect({ profile: 'test', clusterId: '0101-abc-def', clusterName: 'c', nb })
+			).rejects.toMatchObject({ code: 'not_python_kernel' });
+		} finally {
+			delete process.env.CELLAR_PROJECT_VENV;
+		}
+		expect(venv.installPackages).not.toHaveBeenCalled();
+		expect(kernel.restart).not.toHaveBeenCalled();
+		expect(kernelmod.liveKernelLanguage(nb)).toBe('rust');
+	});
+
+	it('refuses the runtime toggle without restarting the kernel', async () => {
+		const { nb, kernel } = await liveRustKernel('live-runtime.ipynb');
+		await expect(dbx.setRuntimeAdvertisement({ enable: true, nb })).rejects.toMatchObject({
+			code: 'not_python_kernel'
+		});
+		expect(kernel.restart).not.toHaveBeenCalled();
 	});
 });

@@ -2701,28 +2701,32 @@ function kernelLanguageFor(nb: string): KernelLanguage | null {
 	}
 }
 
-async function runInKernel(nb: string, code: string): Promise<{ result: ProbeResult; session: SessionId | null }> {
-	let stdout = '';
-	let kernelError: string | null = null;
-	let session: SessionId | null = null;
-	// Every Databricks kernel op is Python source. A Rust (Evcxr) kernel would
-	// compile it as Rust and fail with a compiler error that names no cause, so it
-	// is refused here, before anything is sent.
-	//
-	// Decided from the NOTEBOOK's language, which is what `execute()` starts a kernel
-	// for, and not only from the live process: a Rust notebook that has not run a cell
-	// has no kernel yet, so a live-only check passed and `execute()` then STARTED an
-	// Evcxr kernel just to send it Python (or, with Evcxr absent, its
-	// `RustKernelMissing` was reported as an unreachable Python kernel). The live
-	// process is still asked too, so a kernel that has not yet been freed after a
-	// language switch is refused as well.
+// Every Databricks kernel op is Python source. A Rust (Evcxr) kernel would
+// compile it as Rust and fail with a compiler error that names no cause, so it
+// is refused here, before anything is sent.
+//
+// Decided from the NOTEBOOK's language, which is what `execute()` starts a kernel
+// for, and not only from the live process: a Rust notebook that has not run a cell
+// has no kernel yet, so a live-only check passed and `execute()` then STARTED an
+// Evcxr kernel just to send it Python (or, with Evcxr absent, its
+// `RustKernelMissing` was reported as an unreachable Python kernel). The live
+// process is still asked too, so a kernel that has not yet been freed after a
+// language switch is refused as well.
+function assertPythonKernel(nb: string): void {
 	const lang = kernelLanguageFor(nb);
 	if (lang && lang !== 'python') {
 		throw new DatabricksError(
 			'not_python_kernel',
-			`Databricks sessions need a Python kernel, and this notebook runs on a ${lang} kernel. Switch the notebook language to Python to connect.`
+			`Databricks sessions need a Python kernel, and this notebook runs on a ${lang} kernel. Switch the notebook language to Python first.`
 		);
 	}
+}
+
+async function runInKernel(nb: string, code: string): Promise<{ result: ProbeResult; session: SessionId | null }> {
+	let stdout = '';
+	let kernelError: string | null = null;
+	let session: SessionId | null = null;
+	assertPythonKernel(nb);
 	try {
 		// Databricks binds `spark`/`w` into THIS notebook's own kernel (each notebook
 		// has its own kernel + Databricks session); the epoch we stamp comes from it.
@@ -3338,6 +3342,7 @@ export async function connect({
 }): Promise<{ ok: true; connection: ConnectionStatus }> {
 	assertMatches(clusterId, CLUSTER_RE, 'cluster id');
 	const abs = resolveNotebookPath(nb);
+	assertPythonKernel(abs);
 	const s = stateFor(abs);
 	const sel: Selection = profile ? { profile } : { host };
 	const auth = resolveAuth(sel);
@@ -4047,6 +4052,7 @@ export async function setRuntimeAdvertisement({
 	nb?: string | null;
 }) {
 	const abs = resolveNotebookPath(nb);
+	assertPythonKernel(abs);
 	const forced = databricksRuntimeForced();
 	if (forced !== null) {
 		throw new DatabricksError(
