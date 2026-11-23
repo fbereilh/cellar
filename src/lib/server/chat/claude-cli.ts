@@ -214,6 +214,7 @@ import { existsSync, realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
 import { normalizeChatModel } from '$lib/chatCell';
+import { customInstructionsBlock } from '$lib/customInstructions';
 import { chatChildEnv, CLAUDE_BIN } from './env';
 import type { ChatEngine, ChatEngineFailure, ChatEngineResult, ChatEngineRunArgs } from './engine';
 import { ChatToolTracker } from './tool-lines';
@@ -915,14 +916,20 @@ export const CHAT_LEARNING_MODE_BLOCK = [
  * sentence, then whichever answering-style blocks are on.
  *
  * Every part is a module-scope LITERAL, so the result is a pure function of
- * (shape, learning mode) and nothing per-run can enter - which is what preserves
+ * (shape, learning mode, the person's custom instructions) and nothing per-run can enter - which is what preserves
  * the byte-stability rule the frozen constants had: the prompt is the cached
  * prompt prefix, so within one shape and one setting every run sends the same
  * bytes. Flipping learning mode changes which composition is sent (one cache
  * miss), exactly as flipping a capability does, and is inherent to changing it.
  */
-function buildChatSystemPrompt(capability: readonly string[], learningMode: boolean): string {
-	return [...PROMPT_FRAMING, ...capability, ...(learningMode ? [CHAT_LEARNING_MODE_BLOCK] : [])].join(' ');
+function buildChatSystemPrompt(capability: readonly string[], learningMode: boolean, customInstructions = ''): string {
+	// The person's own instructions go LAST and on their own paragraph: Cellar's
+	// rules above stay the frame, and the text is theirs verbatim. It comes from a
+	// setting, never from a run, so the prompt is still a pure function of
+	// (shape, settings) and byte-stable between runs. Empty adds nothing at all.
+	const custom = customInstructionsBlock(customInstructions);
+	const base = [...PROMPT_FRAMING, ...capability, ...(learningMode ? [CHAT_LEARNING_MODE_BLOCK] : [])].join(' ');
+	return custom ? `${base}\n\n${custom}` : base;
 }
 
 /**
@@ -961,8 +968,8 @@ function capabilityBlock(policy: ChatToolPolicy): readonly string[] {
  * Defaults OFF, so every caller that does not ask for it - and every existing
  * test - gets the frozen constant above, byte for byte.
  */
-export function chatSystemPrompt(policy: ChatToolPolicy, learningMode = false): string {
-	return buildChatSystemPrompt(capabilityBlock(policy), learningMode);
+export function chatSystemPrompt(policy: ChatToolPolicy, learningMode = false, customInstructions = ''): string {
+	return buildChatSystemPrompt(capabilityBlock(policy), learningMode, customInstructions);
 }
 
 /** The per-run inputs `chatCliArgs` accepts (all optional = today's bare run). */
@@ -981,6 +988,13 @@ export interface ChatCliOptions extends ChatCapabilities {
 	 * input that shapes argv without shaping the policy.
 	 */
 	learningMode?: boolean;
+	/**
+	 * The person's own standing instructions (Settings), appended to the system
+	 * prompt. Untrusted text: cleaned and bounded by `customInstructionsBlock`
+	 * before it touches argv. Like learning mode it grants nothing - only
+	 * `--system-prompt` moves.
+	 */
+	customInstructions?: string;
 	/**
 	 * The policy ALREADY derived for this run. The engine passes it so one run
 	 * derives exactly once: the policy reads the filesystem (`canonicalPath`), so
@@ -1043,7 +1057,7 @@ export function chatCliArgs(opts: ChatCliOptions = {}): string[] {
 		// The capability half comes from the policy the argv above was built from,
 		// so the prompt can never describe a shape this run does not have; learning
 		// mode composes onto whichever shape that is.
-		chatSystemPrompt(policy, opts.learningMode === true)
+		chatSystemPrompt(policy, opts.learningMode === true, opts.customInstructions)
 	];
 }
 
@@ -1276,6 +1290,7 @@ function runOnce({
 	notebookPath,
 	otherNotebooks,
 	learningMode,
+	customInstructions,
 	signal,
 	onDelta,
 	onToolCall
@@ -1303,7 +1318,7 @@ function runOnce({
 
 		let child: ChildProcess;
 		try {
-			child = spawn(CLAUDE_BIN, chatCliArgs({ model, policy, learningMode }), {
+			child = spawn(CLAUDE_BIN, chatCliArgs({ model, policy, learningMode, customInstructions }), {
 				env: chatChildEnv(configDir),
 				cwd,
 				stdio: ['pipe', 'pipe', 'pipe'],

@@ -29,6 +29,12 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import type { ChatEngine, ChatEngineRunArgs } from '../../src/lib/server/chat/engine';
+import {
+	CUSTOM_INSTRUCTIONS_CHAT_KEY,
+	CUSTOM_INSTRUCTIONS_MCP_KEY,
+	CUSTOM_INSTRUCTIONS_MERGED_KEY,
+	CUSTOM_INSTRUCTIONS_SHARED_KEY
+} from '../../src/lib/customInstructions';
 import { CHAT_LEARNING_MODE_KEY, CHAT_MODEL_DEFAULT, CHAT_MODEL_KEY, CHAT_OTHER_NOTEBOOKS_KEY, CHAT_WEB_SEARCH_KEY, CHAT_WORKSPACE_READS_KEY } from '../../src/lib/chatCell';
 
 let WS: string;
@@ -65,7 +71,12 @@ afterEach(() => {
 	enginemod.__setChatEngineForTests(null);
 	activemod.__resetChatRuns();
 	// Undo whatever a threading test wrote, so key absence stays each test's default.
-	settingsmod.setUserSettings({ [CHAT_MODEL_KEY]: null, [CHAT_WEB_SEARCH_KEY]: null, [CHAT_WORKSPACE_READS_KEY]: null, [CHAT_OTHER_NOTEBOOKS_KEY]: null, [CHAT_LEARNING_MODE_KEY]: null });
+	settingsmod.setUserSettings({ [CHAT_MODEL_KEY]: null, [CHAT_WEB_SEARCH_KEY]: null, [CHAT_WORKSPACE_READS_KEY]: null, [CHAT_OTHER_NOTEBOOKS_KEY]: null, [CHAT_LEARNING_MODE_KEY]: null,
+		[CUSTOM_INSTRUCTIONS_CHAT_KEY]: null,
+		[CUSTOM_INSTRUCTIONS_MCP_KEY]: null,
+		[CUSTOM_INSTRUCTIONS_SHARED_KEY]: null,
+		[CUSTOM_INSTRUCTIONS_MERGED_KEY]: null
+	});
 });
 
 /** A notebook: python cell / hidden cell / chat cell. */
@@ -821,6 +832,24 @@ describe('the engine capability settings are read from the user store and gated'
 		await runmod.executeCellRun({ nb, cellId: 'chatcell', actor: 'user', source: 'q' });
 		expect(args[0].learningMode === true).toBe(false);
 		expect(args[0].webSearch).toBe(true);
+	});
+
+	it('hands the engine the chat custom instructions, or the shared text when merged', async () => {
+		const { nb } = makeNotebook('settings-custom-instructions.ipynb');
+		const run = async () => {
+			const { args } = capturingEngine();
+			const res = await runmod.executeCellRun({ nb, cellId: 'chatcell', actor: 'user', source: 'q' });
+			expect(res.status).toBe('ok');
+			return args[0].customInstructions ?? '';
+		};
+		expect(await run()).toBe('');
+		// The MCP text is not a chat instruction.
+		settingsmod.setUserSettings({ [CUSTOM_INSTRUCTIONS_MCP_KEY]: 'agents only' });
+		expect(await run()).toBe('');
+		settingsmod.setUserSettings({ [CUSTOM_INSTRUCTIONS_CHAT_KEY]: 'Answer in Spanish.' });
+		expect(await run()).toBe('Answer in Spanish.');
+		settingsmod.setUserSettings({ [CUSTOM_INSTRUCTIONS_SHARED_KEY]: 'Shared.', [CUSTOM_INSTRUCTIONS_MERGED_KEY]: true });
+		expect(await run()).toBe('Shared.');
 	});
 
 	it('hand-edited junk is gated BEFORE the seam: unknown model falls back, truthy-not-true search stays off', async () => {

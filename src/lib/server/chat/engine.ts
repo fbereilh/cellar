@@ -74,6 +74,11 @@ export interface ChatEngineRunArgs {
 	 * glue because the system prompt is the engine's to build.
 	 */
 	learningMode?: boolean;
+	/**
+	 * The person's own standing instructions for chat cells, already resolved
+	 * (merged or separate). Empty/absent adds nothing. Not a capability.
+	 */
+	customInstructions?: string;
 	/** Aborted by interrupt / kernel restart / shutdown; the engine must kill its work. */
 	signal: AbortSignal;
 	/** Streamed reply text, in order, as it is produced. */

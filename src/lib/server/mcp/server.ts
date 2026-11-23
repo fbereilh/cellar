@@ -27,6 +27,8 @@ import { isNotebookUnavailable } from '../notebook';
 import { NOTEBOOK_LANGUAGE_LABELS, TextNotebookCellTypeError, type NotebookLanguage } from '../../cellLanguage';
 import { moduleExtension, noModuleLanguageMessage } from '../../exportRole';
 import { reasonWithoutServerPath } from '../../serverMessage';
+import { customInstructionsBlock, resolveCustomInstructions } from '../../customInstructions';
+import { getUserSettings } from '../user-settings';
 
 const text = (obj: unknown) => ({ content: [{ type: 'text' as const, text: JSON.stringify(obj) }] });
 const notFound = (msg: string) => ({ content: [{ type: 'text' as const, text: msg }], isError: true });
@@ -983,8 +985,26 @@ export function registerTools(server: McpServer) {
 
 	// --- prompt: the house style as a surfaceable slash-command ---
 	server.registerPrompt('cellar_notebook_style', { description: "Cellar's house style for building one coherent notebook." }, () => ({
-		messages: [{ role: 'user', content: { type: 'text', text: INSTRUCTIONS } }]
+		messages: [{ role: 'user', content: { type: 'text', text: mcpInstructions() } }]
 	}));
+}
+
+/**
+ * The instructions an agent is delivered: Cellar's house style, then the person's
+ * own standing instructions from Settings (their MCP text, or the shared one when
+ * merged). Read when a session is CREATED, since MCP delivers instructions once at
+ * connect - so an edit reaches new agent sessions, not ones already connected.
+ * With nothing set this is `INSTRUCTIONS` byte for byte. A store that cannot be
+ * read costs the custom text, never the session.
+ */
+export function mcpInstructions(): string {
+	let custom = '';
+	try {
+		custom = customInstructionsBlock(resolveCustomInstructions(getUserSettings(), 'mcp'));
+	} catch {
+		custom = '';
+	}
+	return custom ? `${INSTRUCTIONS}\n\n${custom}` : INSTRUCTIONS;
 }
 
 /**
@@ -995,7 +1015,7 @@ export function registerTools(server: McpServer) {
  * really delivered rather than a second, hand-assembled server that could drift.
  */
 export function createCellarMcpServer(): McpServer {
-	const server = new McpServer({ name: 'cellar', version: '0.1.0' }, { instructions: INSTRUCTIONS });
+	const server = new McpServer({ name: 'cellar', version: '0.1.0' }, { instructions: mcpInstructions() });
 	registerTools(server);
 	return server;
 }
