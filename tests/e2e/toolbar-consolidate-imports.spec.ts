@@ -386,6 +386,12 @@ test('the toolbar stays reachable as the window narrows', async ({ page }) => {
 	expect(wide.overflows).toBe(false);
 	expect(wide.pageScrolls).toBe(false);
 
+	// The fifth button moved the one-row limit: measured at ~940px with the sidebar
+	// at its default width (four buttons fit down to ~820px). Pinned with headroom
+	// for font metrics, so a wider toolbar fails here and not only at 1280px.
+	await page.setViewportSize({ width: 1000, height: 800 });
+	expect((await measure()).rows, 'the bar wraps at 1000px').toBe(1);
+
 	// Narrow: it may wrap onto a second row, but it must never clip a button out of
 	// reach nor push the page into a horizontal scrollbar.
 	for (const width of [900, 768, 640]) {
