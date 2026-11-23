@@ -31,6 +31,7 @@ const h = vi.hoisted(() => ({
 }));
 
 vi.mock('../../src/lib/server/kernel', () => ({
+	liveKernelLanguage: () => 'python',
 	kernelStatus: () => ({ status: h.status, id: 'k1' }),
 	kernelSession: () => ({ session_id: 9 }),
 	currentSessionId: () => 9,
@@ -38,6 +39,8 @@ vi.mock('../../src/lib/server/kernel', () => ({
 }));
 
 vi.mock('../../src/lib/server/notebook', () => ({
+	// kernel.ts picks the kernel (ipykernel or Evcxr) from the notebook's language.
+	getNotebookLanguage: () => 'python',
 	getNotebookRoot: () => null,
 	getActiveNotebookPath: () => h.active,
 	resolveNotebookPath: (nb?: string | null) => nb ?? h.active,

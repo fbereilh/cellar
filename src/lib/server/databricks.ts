@@ -105,6 +105,7 @@ import {
 	restartKernel,
 	refreshKernelConnection,
 	liveDatabricksRuntime,
+	liveKernelLanguage,
 	KernelExecuteAborted
 } from './kernel';
 import { queueStateFor } from './run-queue';
@@ -129,7 +130,7 @@ import {
 } from '../databricksDefaultProfile';
 import { PROFILE_REAUTH_CODE, isProfileReauthError, reauthCommand, reauthMessage } from '../databricksReauth';
 import { resolveUploadName, type UploadNameAffixes } from '../databricksUploadName';
-import { notebookIpynb, resolveNotebookPath } from './notebook';
+import { getNotebookLanguage, notebookIpynb, resolveNotebookPath } from './notebook';
 import {
 	databricksRuntimeForced,
 	databricksRuntimePreference,
@@ -140,6 +141,7 @@ import {
 } from './ui-state';
 import { DBX_RUNTIME_KEY, DBX_RUNTIME_VERSION_KEY } from './databricksRuntime';
 import { publishGlobal } from './events';
+import { notebookKernelLanguage, type KernelLanguage } from '../cellLanguage';
 import { logInfo, logWarn, logError } from './logs';
 import { hasUv, installPackages, isValidVenv, venvPython } from './venv.js';
 import type { RunStreamEvent, SessionId } from './types';
@@ -1194,6 +1196,7 @@ export function statusFor(code: string): number {
 		case 'reconnect_failed':
 		case 'workspace_conflict':
 		case 'runtime_env_forced':
+		case 'not_python_kernel':
 		// The kernel run this op was riding was stopped (an interrupt, a restart, a
 		// teardown). A state conflict, deliberately NOT `kernel_unavailable`'s 503:
 		// nothing observed an unreachable kernel, and the remedy is to try again
@@ -2682,10 +2685,48 @@ export function isSessionClosed(message: unknown): boolean {
  * session was actually built in, and `connectionStatus()` correctly reports it
  * as gone rather than pairing a fresh namespace with a `spark` it never got.
  */
+/**
+ * The kernel language a Databricks op on `nb` would reach: a live non-Python
+ * kernel first, else the one the notebook's declared language starts. Null only
+ * when neither can be read (an unloadable document), which leaves `execute()` to
+ * report the real failure.
+ */
+function kernelLanguageFor(nb: string): KernelLanguage | null {
+	const live = liveKernelLanguage(nb);
+	if (live && live !== 'python') return live;
+	try {
+		return notebookKernelLanguage(getNotebookLanguage(nb));
+	} catch {
+		return live;
+	}
+}
+
+// Every Databricks kernel op is Python source. A Rust (Evcxr) kernel would
+// compile it as Rust and fail with a compiler error that names no cause, so it
+// is refused here, before anything is sent.
+//
+// Decided from the NOTEBOOK's language, which is what `execute()` starts a kernel
+// for, and not only from the live process: a Rust notebook that has not run a cell
+// has no kernel yet, so a live-only check passed and `execute()` then STARTED an
+// Evcxr kernel just to send it Python (or, with Evcxr absent, its
+// `RustKernelMissing` was reported as an unreachable Python kernel). The live
+// process is still asked too, so a kernel that has not yet been freed after a
+// language switch is refused as well.
+function assertPythonKernel(nb: string): void {
+	const lang = kernelLanguageFor(nb);
+	if (lang && lang !== 'python') {
+		throw new DatabricksError(
+			'not_python_kernel',
+			`Databricks sessions need a Python kernel, and this notebook runs on a ${lang} kernel. Switch the notebook language to Python first.`
+		);
+	}
+}
+
 async function runInKernel(nb: string, code: string): Promise<{ result: ProbeResult; session: SessionId | null }> {
 	let stdout = '';
 	let kernelError: string | null = null;
 	let session: SessionId | null = null;
+	assertPythonKernel(nb);
 	try {
 		// Databricks binds `spark`/`w` into THIS notebook's own kernel (each notebook
 		// has its own kernel + Databricks session); the epoch we stamp comes from it.
@@ -3301,6 +3342,7 @@ export async function connect({
 }): Promise<{ ok: true; connection: ConnectionStatus }> {
 	assertMatches(clusterId, CLUSTER_RE, 'cluster id');
 	const abs = resolveNotebookPath(nb);
+	assertPythonKernel(abs);
 	const s = stateFor(abs);
 	const sel: Selection = profile ? { profile } : { host };
 	const auth = resolveAuth(sel);
@@ -4010,6 +4052,7 @@ export async function setRuntimeAdvertisement({
 	nb?: string | null;
 }) {
 	const abs = resolveNotebookPath(nb);
+	assertPythonKernel(abs);
 	const forced = databricksRuntimeForced();
 	if (forced !== null) {
 		throw new DatabricksError(

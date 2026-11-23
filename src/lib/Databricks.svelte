@@ -2127,6 +2127,7 @@
 	/** What the user should DO about a failure. The server's own message follows it. */
 	const REMEDY: Record<string, string> = {
 		not_connected: 'Connect to a cluster first.',
+		not_python_kernel: 'Databricks needs a Python kernel. Switch this notebook’s language to Python.',
 		sdk_missing: 'Install databricks-sdk into this workspace’s Python environment.',
 		connect_missing: 'Install databricks-connect into this workspace’s Python environment.',
 		profile_missing: 'That profile is not in your ~/.databrickscfg. Pick another, or add it.',

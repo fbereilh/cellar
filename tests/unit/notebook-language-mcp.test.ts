@@ -299,7 +299,7 @@ describe('the schemas and the doctrine an agent is billed for', () => {
 		expect(tool, 'set_notebook_language must be registered').toBeTruthy();
 		const enums = cellTypeEnums(tool!.inputSchema).filter((e) => e.includes('python'));
 		expect(enums.length).toBe(1);
-		expect([...enums[0]].sort()).toEqual(['mojo', 'python']);
+		expect([...enums[0]].sort()).toEqual(['mojo', 'python', 'rust']);
 	});
 
 	it('states what carries between Mojo cells BEFORE any tool schema is read', async () => {
@@ -317,7 +317,7 @@ describe('the schemas and the doctrine an agent is billed for', () => {
 		expect(instructions).toContain('already RAN OK in this kernel session');
 		expect(instructions).toContain('A restart clears what is carried');
 		// The notebook-level model itself, and the tool that reaches it.
-		expect(instructions).toContain('A notebook is Python or Mojo, never both');
+		expect(instructions).toContain('A notebook is Python, Mojo or Rust, never a mix');
 		expect(instructions).toContain('there is NO mojo cell_type');
 		expect(instructions).toContain('set_notebook_language');
 		// And the facts about what a Mojo notebook is NOT - narrowed to its CODE cells,
@@ -350,5 +350,40 @@ describe('the schemas and the doctrine an agent is billed for', () => {
 		for (const name of ['add_cell', 'set_cell_type']) {
 			expect(byName[name], `${name} description must name the notebook's language`).toMatch(/NOTEBOOK/);
 		}
+	});
+});
+
+describe('set_cell_export on a Rust notebook', () => {
+	async function refusal(name: string, cellar: Record<string, unknown>) {
+		const client = await connect(`s-${name}`);
+		const nb = nbmod.createNotebook(name).path;
+		const cell = nbmod.listCells(nb)[0];
+		nbmod.setSource(cell.id, 'fn f() {}', nb);
+		if (cellar.export_target) nbmod.setExportTarget(String(cellar.export_target), nb);
+		nbmod.setNotebookLanguage('rust', nb);
+		await client.callTool({ name: 'use_notebook', arguments: { name } });
+		const r = (await client.callTool({
+			name: 'set_cell_export',
+			arguments: { ids: [cell.id], export: true }
+		})) as CallResult;
+		return { r, nb, cell };
+	}
+
+	it('says a Rust notebook exports no module, and names neither Python code nor a target to set', async () => {
+		const { r, nb, cell } = await refusal('rust-export.ipynb', {});
+		expect(r.isError).toBe(true);
+		const text = bodyOf(r);
+		expect(text).toContain('Rust notebook does not export a module');
+		expect(text).not.toContain('Python code');
+		expect(text).not.toContain('name one with set_export_target');
+		expect(nbmod.getCell(cell.id, nb)?.metadata?.cellar?.export).toBeUndefined();
+	});
+
+	it('says the same over a target kept from before the switch, never a .rs module mismatch', async () => {
+		const { r } = await refusal('rust-export-kept.ipynb', { export_target: 'utils.py' });
+		expect(r.isError).toBe(true);
+		const text = bodyOf(r);
+		expect(text).toContain('Rust notebook does not export a module');
+		expect(text).not.toContain("module is a .rs one");
 	});
 });

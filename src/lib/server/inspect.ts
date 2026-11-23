@@ -9,7 +9,7 @@
  * only underscore-prefixed temporaries and deletes them, so it neither shows up
  * in nor pollutes the inspected namespace.
  */
-import { execute, kernelStatus, kernelSession, currentSessionId } from './kernel';
+import { execute, kernelStatus, kernelSession, currentSessionId, liveKernelLanguage } from './kernel';
 import { getActiveNotebookPath, resolveNotebookPath, workspaceRelative } from './notebook';
 import { queueStateFor } from './run-queue';
 import type { RunStreamEvent, SessionId } from './types';
@@ -256,6 +256,9 @@ export async function inspectVariables(): Promise<{
 	const path = workspaceRelative(resolveNotebookPath(nbPath));
 	const status = kernelStatus(nbPath).status;
 	if (status === 'not_started') return { variables: [], path, session_id: null };
+	// Every probe here is PYTHON source. A Rust (Evcxr) kernel would compile it as
+	// Rust and fail, so it is never sent: there is no Python namespace to list.
+	if (nonPythonKernel(nbPath)) return { variables: [], path, session_id: null };
 	if (status === 'busy' || queueStateFor(resolveNotebookPath(nbPath)).running != null)
 		return { variables: [], busy: true, path, session_id: kernelSession(nbPath).session_id };
 	const state = await runProbe(nbPath);
@@ -289,6 +292,8 @@ export async function inspectVariables(): Promise<{
 export async function kernelState(nbPath?: string | null) {
 	const status = kernelStatus(nbPath).status;
 	if (status === 'not_started') return { started: false, session_id: null };
+	const foreign = nonPythonKernelState(nbPath);
+	if (foreign) return foreign;
 	// Report busy from the run queue's OWN truth as well as jupyter's status. A run
 	// claims the kernel synchronously the instant it is dequeued (`queue.active`),
 	// but jupyter's idle→busy flip lands asynchronously a beat later; reading only
@@ -716,8 +721,40 @@ def _cellar_inspect(_target):
 function inspectionGuard(nbPath?: string | null): { started: boolean; busy?: boolean; session_id: SessionId | null } | null {
 	const status = kernelStatus(nbPath).status;
 	if (status === 'not_started') return { started: false, session_id: null };
+	const foreign = nonPythonKernelState(nbPath);
+	if (foreign) return foreign;
 	if (status === 'busy') return { started: true, busy: true, session_id: kernelSession(nbPath).session_id };
 	return null;
+}
+
+/** The live kernel's language when it is NOT Python, else null (Python, or no kernel). */
+function nonPythonKernel(nbPath?: string | null): string | null {
+	const lang = liveKernelLanguage(nbPath);
+	return lang && lang !== 'python' ? lang : null;
+}
+
+/**
+ * The answer every Python-namespace probe gives for a kernel that is not Python.
+ * The probes are Python source, so sending one to a Rust (Evcxr) kernel would be
+ * compiled as Rust and fail. Nothing is sent, and the reply says why, so an agent
+ * does not read an empty namespace as "nothing is defined".
+ */
+function nonPythonKernelState(nbPath?: string | null): {
+	started: true;
+	python_namespace: false;
+	kernel_language: string;
+	session_id: SessionId | null;
+	note: string;
+} | null {
+	const lang = nonPythonKernel(nbPath);
+	if (!lang) return null;
+	return {
+		started: true,
+		python_namespace: false,
+		kernel_language: lang,
+		session_id: kernelSession(nbPath).session_id,
+		note: `This notebook runs on a ${lang} kernel. Cellar's variable inspection reads a Python namespace, so it has nothing to report here. Run a cell to inspect a value.`
+	};
 }
 
 /**

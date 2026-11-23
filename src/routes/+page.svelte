@@ -1659,7 +1659,13 @@
 	// change (still the same running session), so no refreshKernel() is needed.
 	async function wipeKernel(path: string) {
 		try {
-			await fetch('/api/kernel/wipe', { ...kernelJson, body: JSON.stringify({ path, originId }) });
+			const res = await fetch('/api/kernel/wipe', { ...kernelJson, body: JSON.stringify({ path, originId }) });
+			// The one refusal this route makes on purpose: a kernel that is not Python.
+			if (res.status === 409) {
+				const body = await res.json().catch(() => null);
+				if (body?.reason === 'unsupported' && typeof body.message === 'string') showNotice(body.message);
+				return;
+			}
 			if (path === activeNotebookPath) refreshVariables();
 		} catch {}
 	}

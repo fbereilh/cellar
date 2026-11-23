@@ -107,6 +107,7 @@ vi.mock('node:child_process', async (importOriginal) => {
 });
 
 vi.mock('../../src/lib/server/kernel', () => ({
+	liveKernelLanguage: () => 'python',
 	execute: async (_nb: string, code: string, onEvent: (e: unknown) => void) => {
 		if (state.hold) await state.hold;
 		if (state.failDisconnect && code.includes('_cellar_dbx_disconnect')) {

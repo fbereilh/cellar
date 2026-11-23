@@ -1289,7 +1289,7 @@ describe('the wiring the browser ships', () => {
 		// this is one of the documented `.svelte` source guards.
 		const live = read('LiveNotebook.svelte');
 		expect(live).toContain(
-			"`a cell edit that belongs in the ${exportModuleLanguage === null ? 'module' : `${exportModuleLanguage === 'mojo' ? '.mojo' : '.py'} module`} could not be saved`"
+			"`a cell edit that belongs in the ${exportModuleLanguage === null ? 'module' : `${moduleExtension(exportModuleLanguage)} module`} could not be saved`"
 		);
 		// The two shapes that name `.py` for a notebook that targets nothing.
 		expect(live).not.toContain("const UNSAVED_EXPORT_EDIT = 'a cell edit that belongs in the .py module");

@@ -24,7 +24,8 @@
 		notebookHoldsExport,
 		orphanedModuleExplanation,
 		type ExportLanguage,
-		type ExportStrandedSummary
+		type ExportStrandedSummary,
+		moduleExtension
 	} from '$lib/exportRole';
 	import { reservedFailureHeight, failureDetail } from '$lib/cellRenderFailure';
 	import type { ExportPyResult } from '$lib/types';
@@ -751,7 +752,7 @@
 	// the same null branch `Cell.svelte`'s `exportModuleLabel`, the stranded
 	// explanation and the MCP refusal already carry.
 	const exportButtonLabel = $derived(
-		exportLanguage === null ? 'Export' : `Export to ${exportLanguage === 'mojo' ? '.mojo' : '.py'}`
+		exportLanguage === null ? 'Export' : `Export to ${moduleExtension(exportLanguage)}`
 	);
 	// The notebook-wide stranded-mark explanation, stated ONCE (`$lib/exportRole`
 	// owns the wording, so the bar and each cell's short marker cannot drift). It
@@ -1324,14 +1325,22 @@
 				</select>
 				<!-- What it reaches, and what it does NOT cost - the code-root bar states
 				     its kernel-restart price here, and the honest thing to say about this
-				     one is that it has none: nothing per-cell is written and no kernel is
-				     restarted, so markdown, raw, SQL and chat cells are untouched. The
+				     one is that nothing per-cell is written. Python and Mojo share one kernel,
+				     so a switch between them restarts nothing. Rust runs on its own kernel,
+				     so a switch to or from it frees the kernel - stated here before the click. The
 				     export clause is here because that target is the one OTHER setting
 				     this moves. -->
 				<span class="text-xs text-base-content/55">
-					every code cell runs as {NOTEBOOK_LANGUAGE_LABELS[notebookLanguage]}; markdown, raw,
-					SQL and chat cells are unaffected. The export target's extension follows it. No
-					kernel restart - the Python kernel keeps its variables.
+					{#if notebookLanguage === 'rust'}
+						every code cell runs as Rust on the Evcxr kernel, and state carries between
+						cells. A Rust notebook exports no module and runs no SQL cells. Switching away
+						restarts the kernel and clears its variables.
+					{:else}
+						every code cell runs as {NOTEBOOK_LANGUAGE_LABELS[notebookLanguage]}; markdown, raw,
+						SQL and chat cells are unaffected. The export target's extension follows it.
+						Python and Mojo share one kernel, so its variables are kept. Switching to Rust
+						restarts the kernel and clears them.
+					{/if}
 				</span>
 				{#if languageFeedback}
 					<span class="text-xs text-base-content/70" data-testid="language-feedback"

@@ -98,14 +98,29 @@ async function openNotebook(page: Page): Promise<void> {
 	// session was already populated; accepting the loading state makes it
 	// order-independent rather than lucky.
 	//
-	// `.first()` on the WHOLE chain, not on the `loading…` locator: unlike a cell,
-	// `loading…` really can be on screen AT THE SAME TIME as the empty-state button
-	// (the shell paints the empty state while a restored tab is still loading), so
-	// the two-element match is a strict-mode violation rather than a race.
-	await expect(
-		empty.or(page.getByTestId('cell')).or(page.getByText('loading…')).first()
-	).toBeVisible({ timeout: 30_000 });
-	if (await empty.isVisible().catch(() => false)) await empty.click();
+	// `.first()` on the WHOLE chain: a notebook has several cells, and a held tab
+	// can show `loading…` beside another tab's cells, so a bare match is a
+	// strict-mode violation.
+	//
+	// The click is RETRIED until a notebook answers it, rather than sent once. The
+	// empty-state button only exists once the app has hydrated and restored its
+	// tabs, so on a slow runner the first probe finds no button and clicks nothing.
+	// Probed once, that left the empty state up for the whole assertion budget
+	// (seen on a Linux CI run: the snapshot showed "No notebook open" and no tab).
+	// A second click is harmless, since creating a notebook that exists only opens it.
+	//
+	// `loading…` is read INSIDE the notebook column, never page-wide. The Files
+	// sidebar shows its own `loading…` until the tree arrives, and the server
+	// renders it, so a page-wide match is satisfied before the app has hydrated:
+	// the empty-state button does not exist yet, nothing is clicked, and the helper
+	// returns with no notebook open.
+	const notebookLoading = page.locator('.cellar-notebook-column').getByText('loading…');
+	await expect(async () => {
+		if (await empty.isVisible().catch(() => false)) await empty.click();
+		await expect(page.getByTestId('cell').or(notebookLoading).first()).toBeVisible({
+			timeout: 2_000
+		});
+	}).toPass({ timeout: 60_000 });
 }
 
 /** A notebook with wide content, so a screenshot shows cells really using the width. */
@@ -241,7 +256,9 @@ test('the pre-render loading state is laid out like the notebook it becomes', as
 	// `.first()`: the shell keeps every open notebook tab mounted, so a restored
 	// session renders one `loading…` per held tab and a bare locator is a strict-mode
 	// violation. The claim is "the loading view is on screen", which first() makes.
-	await expect(page.getByText('loading…').first()).toBeVisible();
+	await expect(
+		page.locator('.cellar-notebook-column').getByText('loading…').first()
+	).toBeVisible();
 	await settle(page);
 	const pre = await measure(page);
 

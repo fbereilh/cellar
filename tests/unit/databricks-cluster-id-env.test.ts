@@ -37,6 +37,7 @@ const state = vi.hoisted(() => ({
 }));
 
 vi.mock('../../src/lib/server/kernel', () => ({
+	liveKernelLanguage: () => 'python',
 	execute: async (nbPath: string, code: string, onEvent: (e: unknown) => void) => {
 		if (code.includes('_cellar_dbx_connect')) state.lastConnectCode = code;
 		if (code.includes('_cellar_dbx_disconnect')) state.lastDisconnectCode = code;

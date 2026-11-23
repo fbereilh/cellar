@@ -80,6 +80,8 @@ vi.mock('@jupyterlab/services', () => ({
 }));
 
 vi.mock('../../src/lib/server/notebook', () => ({
+	// kernel.ts picks the kernel (ipykernel or Evcxr) from the notebook's language.
+	getNotebookLanguage: () => 'python',
 	getActiveNotebookPath: () => '/ws/a.ipynb',
 	workspaceRelative: (abs: string) => abs.replace(/^\/ws\//, ''),
 	resolveNotebookPath: (p: string) => (p.startsWith('/') ? p : `/ws/${p}`),

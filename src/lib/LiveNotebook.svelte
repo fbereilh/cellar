@@ -13,6 +13,7 @@
 		languageTagFor,
 		logicalTypeFor,
 		nbCellType,
+		NOTEBOOK_LANGUAGE_LABELS,
 		offersCellType,
 		textNotebookTypeForReason,
 		textNotebookTypeMessage,
@@ -42,7 +43,8 @@
 		exportTargetLanguage,
 		isExportCell,
 		notebookHoldsExport,
-		TEXT_NOTEBOOK_EXPORT_MARK_MESSAGE
+		TEXT_NOTEBOOK_EXPORT_MARK_MESSAGE,
+		moduleExtension
 	} from '$lib/exportRole';
 	import { mojoMainDroppedIds } from '$lib/mojoExport';
 	import { isExportBase } from '$lib/exportTarget';
@@ -2499,7 +2501,7 @@
 	 * are the user's document intent and are still written.
 	 */
 	const unsavedExportEdit = $derived(
-		`a cell edit that belongs in the ${exportModuleLanguage === null ? 'module' : `${exportModuleLanguage === 'mojo' ? '.mojo' : '.py'} module`} could not be saved`
+		`a cell edit that belongs in the ${exportModuleLanguage === null ? 'module' : `${moduleExtension(exportModuleLanguage)} module`} could not be saved`
 	);
 	function unsavedExportEditNotice(outcome: 'skipped' | 'proceeding'): string {
 		const said = unsavedExportEdit;
@@ -3167,7 +3169,7 @@
 				notebookLanguage = next;
 				scheduleStaleness();
 				showLanguageFeedback(
-					`Not confirmed - the server did not answer. This notebook is showing ${next === 'mojo' ? 'Mojo' : 'Python'}; reload to see what it really holds.`
+					`Not confirmed - the server did not answer. This notebook is showing ${NOTEBOOK_LANGUAGE_LABELS[next]}; reload to see what it really holds.`
 				);
 				return 'unreachable';
 			}
@@ -3198,8 +3200,10 @@
 			}
 			showLanguageFeedback(
 				writeFailed !== null
-					? `Applied to this session - code cells now run as ${notebookLanguage === 'mojo' ? 'Mojo' : 'Python'}, but the notebook could not be saved: ${writeFailed}`
-					: `Applied - code cells now run as ${notebookLanguage === 'mojo' ? 'Mojo' : 'Python'}.`
+					? `Applied to this session - code cells now run as ${NOTEBOOK_LANGUAGE_LABELS[notebookLanguage]}, but the notebook could not be saved: ${writeFailed}`
+					: `Applied - code cells now run as ${NOTEBOOK_LANGUAGE_LABELS[notebookLanguage]}.${
+							body.namespace_cleared ? ' The kernel was freed, so its variables are cleared.' : ''
+						}`
 			);
 			return writeFailed !== null ? 'writeFailed' : 'committed';
 		} finally {

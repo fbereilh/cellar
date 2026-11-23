@@ -49,6 +49,7 @@ vi.mock('../../src/lib/server/kernel', () => {
 	const sess = (nb?: string | null): number | null =>
 		nb != null && state.sessions.has(nb) ? (state.sessions.get(nb) as number | null) : state.globalSession;
 	return {
+		liveKernelLanguage: () => 'python',
 		execute: async (nbPath: string, code: string, onEvent: (e: unknown) => void) => {
 			if (code.includes('_cellar_dbx_connect')) state.lastConnectCode = code;
 			onEvent({ type: 'kernel', session: sess(nbPath) });

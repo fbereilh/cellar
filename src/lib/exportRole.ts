@@ -24,7 +24,7 @@
  */
 
 import type { CellMetadata } from '$lib/server/types';
-import { isLogicalCellType, type NotebookLanguage } from '$lib/cellLanguage';
+import { isLogicalCellType, NOTEBOOK_LANGUAGE_LABELS, type NotebookLanguage } from '$lib/cellLanguage';
 import { hasMojoHeader } from '$lib/cellMagic';
 import { hasBareNbdevDirective } from '$lib/nbdevDirectives';
 
@@ -39,7 +39,25 @@ type ExportCell =
  * target, and its extension decides which language that module is - and therefore
  * which cells may go into it.
  */
-export type ExportLanguage = 'python' | 'mojo';
+export type ExportLanguage = NotebookLanguage;
+
+/** The one sentence every surface says when a module is asked of such a notebook. */
+export function noModuleLanguageMessage(lang: NotebookLanguage): string {
+	return `a ${NOTEBOOK_LANGUAGE_LABELS[lang]} notebook does not export a module: its cells are top-level statements, which a ${MODULE_EXTENSIONS[lang]} module cannot hold. Clear the export target, or change the notebook's language.`;
+}
+
+/**
+ * Does a notebook of this language generate a module at all? Python and Mojo do.
+ * Rust does NOT yet, and the reason is structural rather than an omission: an
+ * Evcxr cell is a sequence of top-level STATEMENTS (`let x = 1;`), which a Rust
+ * module cannot hold, so concatenating cells would write a `.rs` file that does
+ * not compile. `rust` is still an `ExportLanguage` so every signature that
+ * threads the notebook's language keeps one type, but no cell is ever eligible
+ * for it (`exportLanguageOf`) and no surface offers a target for it.
+ */
+export function languageGeneratesModule(lang: NotebookLanguage): boolean {
+	return lang !== 'rust';
+}
 
 /**
  * The module language an export target's path names, or null when the path names
@@ -73,8 +91,10 @@ export function exportTargetLanguage(target: string | null | undefined): ExportL
  * with its own null branch, and several are pinned by source guards, so folding
  * them in would be churn for no correctness gain.
  */
+const MODULE_EXTENSIONS: Record<ExportLanguage, string> = { python: '.py', mojo: '.mojo', rust: '.rs' };
+
 export function moduleExtension(lang: ExportLanguage): string {
-	return lang === 'mojo' ? '.mojo' : '.py';
+	return MODULE_EXTENSIONS[lang];
 }
 
 /**
@@ -109,6 +129,10 @@ export function exportLanguageOf(
 	nbLang: NotebookLanguage = 'python'
 ): ExportLanguage | null {
 	if (!isLogicalCellType(cell, 'code')) return null;
+	// A Rust notebook generates no module (`languageGeneratesModule`), so its cells
+	// contribute no module source - which makes every one of them ineligible, and
+	// any mark carried over from before a language switch STRANDED rather than exported.
+	if (!languageGeneratesModule(nbLang)) return null;
 	return hasMojoHeader(cell?.source) ? 'mojo' : nbLang;
 }
 
@@ -240,7 +264,7 @@ export function exportModuleLanguage(
 	notebookLanguage: ExportLanguage,
 	targetNamesModule: boolean
 ): ExportLanguage | null {
-	return targetNamesModule ? notebookLanguage : null;
+	return targetNamesModule && languageGeneratesModule(notebookLanguage) ? notebookLanguage : null;
 }
 
 /**
