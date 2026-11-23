@@ -25,9 +25,10 @@
  * never been asked. Keeping that direction fixed is what stops a global preference
  * silently rewriting settings the user made per project - the reader's job is to
  * seed, never to override. A setting with no per-project counterpart, because it
- * is about the PERSON rather than the project (the chat account slot, and the chat
- * model and web-search opt-in the engine reads at run time), IS the live value and
- * is read straight off this store.
+ * is about the PERSON rather than the project (the chat account slot, the chat
+ * model and web-search opt-in the engine reads at run time, and whether the file
+ * tree reveals the active tab's file), IS the live value and is read straight off
+ * this store.
  *
  * `~/.cellar/` is outside every checkout, so nothing here can show up as a git diff.
  */

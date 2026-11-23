@@ -217,6 +217,7 @@ import { normalizeChatModel } from '$lib/chatCell';
 import { chatChildEnv, CLAUDE_BIN } from './env';
 import type { ChatEngine, ChatEngineFailure, ChatEngineResult, ChatEngineRunArgs } from './engine';
 import { ChatToolTracker } from './tool-lines';
+import { forgetChatRun, recordChatRun } from '../chat-run-registry.js';
 
 /**
  * The one tool a search-on run requests, spelled exactly as the CLI reports it
@@ -1075,7 +1076,8 @@ export function chatCliCwd(policy: ChatToolPolicy): string {
  * it takes the tree out of the TERMINAL's group permanently, and every route
  * replacing that reach is HANDLER-based, so an app that dies without running one
  * (a crash, a SIGKILL) orphans the tree where a later terminal close cannot
- * reach it either. Read that residual - and the follow-up that closes it - before
+ * reach it either. `chat-run-registry.js` closes that: each group is recorded
+ * on disk and reaped by the next launch or `cellar cleanup`. Read both before
  * either "simplifying" this flag away or reaching for an `uncaughtException`
  * listener, which is a worse trade than the leak it looks like it fixes.
  */
@@ -1315,6 +1317,14 @@ function runOnce({
 			return;
 		}
 
+		// The group is also written to DISK, so an app that dies without running a
+		// handler (a crash, an OOM kill, a SIGKILL) does not orphan this tree for
+		// good: the next launch or `cellar cleanup` reads it back and reaps it, with
+		// both the owner and the leader identity-checked first. Synchronous and
+		// right here, before the first await, so the window in which an app death
+		// leaves an unrecorded tree is one `ps` wide. See `chat-run-registry.js`.
+		const groupRecord = OWNS_PROCESS_GROUP ? recordChatRun(child.pid, { notebook: notebookPath }) : null;
+
 		let engine: string | null = null;
 		let sawInit = false;
 		let unsafe: string | null = null;
@@ -1364,6 +1374,12 @@ function runOnce({
 		let reaped = false;
 		child.on('exit', () => {
 			reaped = true;
+			// The record is dropped when the LEADER is gone, never when the run
+			// settles: a stop settles on its verdict before the tree has died, and
+			// dropping it then would leave a slow-to-exit leader unrecorded exactly
+			// when the app may be going away. Past this point the pid is no longer
+			// ours, so the record could not authorise anything anyway.
+			forgetChatRun(groupRecord);
 		});
 
 		let killing = false;

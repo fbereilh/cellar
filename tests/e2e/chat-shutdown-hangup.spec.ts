@@ -1,10 +1,10 @@
 import { test, expect } from '@playwright/test';
-import { execFileSync, type ChildProcess } from 'node:child_process';
+import { type ChildProcess } from 'node:child_process';
 import { existsSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { runtimeAvailable, bootCellar, killCellar } from './harness';
-import { alive, grandchildPid, installStubClaude, openChatNotebook, reapPids } from './chat-run-fixture';
+import { alive, appPidOf, grandchildPid, installStubClaude, openChatNotebook, reapPids } from './chat-run-fixture';
 
 /**
  * CLOSING THE TERMINAL must not leave a `claude` process tree behind, and must
@@ -49,24 +49,6 @@ let launcher: ChildProcess | null = null;
 let workspace = '';
 let baseURL = '';
 const started: number[] = [];
-
-/**
- * The app server's pid: the launcher's own child running the production build.
- * Read from `ps` rather than from a Cellar record, because an isolated (`--new`)
- * launch deliberately registers no instance - and the point here is to ask the
- * OS whether that process is still there.
- */
-function appPidOf(launcherPid: number): number {
-	const out = execFileSync('ps', ['-eo', 'pid=,ppid=,command='], { encoding: 'utf8' });
-	for (const line of out.split('\n')) {
-		const m = line.trim().match(/^(\d+)\s+(\d+)\s+(.*)$/);
-		if (!m) continue;
-		const [, pid, ppid, command] = m;
-		if (Number(ppid) !== launcherPid) continue;
-		if (command.includes(`build${'/'}index.js`)) return Number(pid);
-	}
-	throw new Error('the app server is not a child of the launcher - the fixture is broken, not the code');
-}
 
 test.beforeAll(async () => {
 	test.skip(!runtimeAvailable(), 'kernel runtime (uv + python3 + host-venv) not available - E2E is local-only');

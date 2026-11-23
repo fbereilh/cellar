@@ -1,5 +1,7 @@
 import { defineConfig } from 'vitest/config';
 import { fileURLToPath } from 'node:url';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 // Vitest runs the server-side unit tests (pure Node, no browser, no kernel).
 // It deliberately does NOT load the SvelteKit vite plugin: these tests import
@@ -40,6 +42,12 @@ export default defineConfig({
 		// than per test. A genuinely hung test still fails; it just no longer fails
 		// merely for being scheduled next to `git worktree`.
 		testTimeout: 30_000,
-		hookTimeout: 30_000
+		hookTimeout: 30_000,
+		// Every real chat-engine run records its process group under this directory
+		// (`src/lib/server/chat-run-registry.js`), which defaults to the developer's
+		// own `~/.cellar/chat-runs` - the registry every real `cellar` launch sweeps.
+		// The suite keeps its records out of it. A test that is ABOUT the registry
+		// still sets its own directory explicitly.
+		env: { CELLAR_CHAT_RUNS_DIR: join(tmpdir(), 'cellar-vitest-chat-runs') }
 	}
 });

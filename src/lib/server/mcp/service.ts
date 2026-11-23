@@ -74,7 +74,8 @@ import {
 	exportEligibilityLanguage,
 	exportLanguageOf,
 	exportMarkedTwice,
-	exportTargetLanguage
+	exportTargetLanguage,
+	notebookHoldsExport
 } from '../../exportRole';
 import { hazardReport } from '../../exportHazard';
 import { isHiddenFromAgent } from '../../agentVisibility';
@@ -2204,7 +2205,7 @@ export function setNotebookLanguage(language: string, nb?: string | null) {
  */
 function exportWriteGuard(nb: string) {
 	try {
-		return isPyTextNotebook(nb) ? { ok: false as const, refused: 'py-notebook' as const } : null;
+		return notebookHoldsExport(isPyTextNotebook(nb)) ? null : { ok: false as const, refused: 'py-notebook' as const };
 	} catch (err) {
 		if (isNotebookUnavailable(err))
 			return { ok: false as const, unavailable: unavailableReason(err) };

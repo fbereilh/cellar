@@ -7,10 +7,11 @@
  * `import mojo.notebook` has run in the session, so `executeCellRun` runs a
  * once-per-session setup BEFORE it dispatches. That setup goes through `runCapture`,
  * which awaits `future.done` with NO watchdog of its own - so an unbounded await
- * there would hang the run BEFORE `execute()`, i.e. before the idle watchdog that
- * exists to free exactly that slot, and before the run registers its `ActiveRun`, so
- * no abort path could see it either. That is the wedge class this repo's kernel
- * doctrine is written against, and it is what the bound below exists to prevent.
+ * there would hang the run before the idle watchdog that exists to free exactly that
+ * slot is ever armed. That is the wedge class this repo's kernel doctrine is written
+ * against, and it is what the bound below exists to prevent. (The setup runs as
+ * `execute()`'s `prepare` hook, so the run IS registered for Stop by then - see the
+ * last describe block - but a bound is what frees it without one.)
  *
  * Three properties, and the middle one is the subtle one:
  *   1. a READY setup dispatches the compiled `%%mojo` source to the kernel;
@@ -112,7 +113,18 @@ const h = vi.hoisted(() => {
 	return {
 		makeFakeKernel,
 		HOLD_CODE,
-		startNew: vi.fn(async () => makeFakeKernel()),
+		startNew: vi.fn(async () => {
+			// A start the test holds open - the window a Mojo notebook's FIRST run waits
+			// out inside its pre-flight.
+			if (h.startHangs) {
+				return await new Promise<ReturnType<typeof makeFakeKernel>>((resolve) => {
+					h.releaseStart = () => resolve(makeFakeKernel());
+				});
+			}
+			return makeFakeKernel();
+		}),
+		startHangs: false,
+		releaseStart: null as null | (() => void),
 		lastKernel: null as ReturnType<typeof makeFakeKernel> | null,
 		hangingSetup: null as ReturnType<typeof makeFuture> | null,
 		holdFuture: null as ReturnType<typeof makeFuture> | null,
@@ -174,6 +186,7 @@ beforeAll(async () => {
 	process.env.CELLAR_MOJO_SETUP_TIMEOUT_MS = '120'; // tiny bound so a hang is observable
 	process.env.CELLAR_KERNEL_IDLE_TIMEOUT_MS = '0'; // the watchdog is a different test's subject
 	process.env.CELLAR_KERNEL_INTERRUPT_GRACE_MS = '60'; // a parked run never surrenders; do not wait 5s for it
+	process.env.CELLAR_KERNEL_INTERRUPT_START_TIMEOUT_MS = '80'; // a held-open start: do not wait 5s for it either
 	nbmod = await import('../../src/lib/server/notebook');
 	queue = await import('../../src/lib/server/run-queue');
 	runmod = await import('../../src/lib/server/run');
@@ -193,6 +206,8 @@ beforeEach(async () => {
 	h.executed.length = 0;
 	h.hangingSetup = null;
 	h.holdFuture = null;
+	h.startHangs = false;
+	h.releaseStart = null;
 	await kernelmod.shutdownKernel(abs()); // a fresh session per test, so the memo is clear
 });
 
@@ -257,8 +272,8 @@ describe('THE WEDGE GUARD: a setup that cannot answer must not hang the run', ()
 		// left this shape un-bounded: the probe parked here in front of a run that has
 		// already emitted `run:start` and holds the queue's `running` slot while being
 		// in neither `pending` nor `activeRuns` - reachable by no abort path at all.
-		// Post-fix the probe gives up on the same bound, the run falls through to
-		// `execute()`, which registers its `ActiveRun`, and the user's Stop reaches it.
+		// Post-fix the probe gives up on the same bound, and the run - registered from
+		// `execute()`'s entry, which the probe now runs inside - is reached by Stop.
 		const holder = kernelmod.execute(abs(), h.HOLD_CODE, () => {}, { internal: true }).catch(() => {});
 		await vi.waitFor(() => expect(h.executed).toContain(h.HOLD_CODE));
 
@@ -366,6 +381,65 @@ describe('THE WEDGE GUARD: a setup that cannot answer must not hang the run', ()
 		h.setupMode = 'ready';
 		await runViaOwner(id, MOJO_SOURCE);
 		expect(h.setupRuns).toBe(2);
+	});
+});
+
+/**
+ * The pre-flight is the first thing a Mojo run does with the kernel, so on a
+ * notebook's first run it is what waits out the kernel START. It used to run in
+ * FRONT of `execute()`, where a run waiting there held the queue's `running` slot and
+ * read RUNNING while being in no abort set at all (`cellar-interrupt-parked-in-kernel-start`).
+ * It now runs as `execute()`'s `prepare` hook, inside the run's abort window.
+ */
+describe('a Mojo run waiting on the pre-flight is reachable by Stop', () => {
+	/** Start a run without awaiting it, recording when it settles. */
+	function startRun(cellId: string) {
+		const nb = abs();
+		const ticket = queue.enqueueRun({ nb, cellId, actor: 'user', source: MOJO_SOURCE });
+		if (ticket.duplicate) throw new Error('unreachable: fresh ticket expected');
+		return ticket
+			.wait()
+			.then(() => runmod.executeCellRun({ nb, cellId, actor: 'user', source: MOJO_SOURCE }).finally(() => ticket.done()));
+	}
+
+	it('a run parked on the kernel START is settled by an interrupt, and nothing is sent', async () => {
+		h.startHangs = true;
+		const id = nbmod.addCell(null, 'code', abs(), null, MOJO_SOURCE).id;
+		const runP = startRun(id);
+		const deadline = Date.now() + 5000;
+		while ((queue.queueStateFor(abs()).running?.cellId !== id || !h.releaseStart) && Date.now() < deadline) {
+			await new Promise((r) => setTimeout(r, 5));
+		}
+		expect(h.releaseStart).not.toBeNull();
+
+		const res = await kernelmod.interruptKernel(abs());
+		const run = await runP;
+		expect(res.stopped).toBe('idle');
+		expect(run.status).toBe('error');
+		expect(JSON.stringify(run.outputs)).toMatch(/before it reached the kernel/);
+		expect(queue.queueStateFor(abs())).toEqual({ running: null, queue: [] });
+		// Neither the probe nor the cell ran: the kernel never even finished starting.
+		expect(h.setupRuns).toBe(0);
+		expect(h.executed.every((c) => !c.includes(MOJO_MAGIC_HEADER))).toBe(true);
+		h.releaseStart!();
+	});
+
+	it('a Stop landing DURING the probe sends nothing to the kernel', async () => {
+		h.setupMode = 'hang';
+		const id = nbmod.addCell(null, 'code', abs(), null, MOJO_SOURCE).id;
+		const runP = startRun(id);
+		const deadline = Date.now() + 5000;
+		while (!h.hangingSetup && Date.now() < deadline) await new Promise((r) => setTimeout(r, 5));
+		expect(h.hangingSetup).not.toBeNull();
+
+		await kernelmod.interruptKernel(abs());
+		const run = await runP;
+		expect(run.status).toBe('error');
+		expect(queue.queueStateFor(abs())).toEqual({ running: null, queue: [] });
+		// The run ended before its own request: the probe is abandoned to its bound and
+		// the compiled cell is never put on the wire.
+		expect(h.executed.every((c) => !c.includes(MOJO_MAGIC_HEADER))).toBe(true);
+		expect(JSON.stringify(run.outputs)).not.toContain('uv pip install max');
 	});
 });
 

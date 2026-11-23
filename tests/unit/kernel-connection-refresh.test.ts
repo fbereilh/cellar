@@ -260,3 +260,62 @@ describe('no kernel', () => {
 		expect(h.startNew).not.toHaveBeenCalled();
 	});
 });
+
+/**
+ * `execute()` registers its abort handle BEFORE it touches the kernel (so a run parked
+ * on the kernel start is reachable by interrupt/restart/teardown -
+ * `cellar-interrupt-parked-in-kernel-start`). That puts the handle in place for the
+ * defensive dispatch refresh too, whose rung 3 TEARS the entry down - and a teardown
+ * aborts every registered run. These pin that the early registration did not change
+ * what a run dispatched onto a dead socket does, in both directions.
+ */
+describe("execute()'s defensive refresh, with the run registered from entry", () => {
+	it('a run dispatched onto a PROVEN-DEAD kernel follows to a fresh one - its own refresh does not abort it', async () => {
+		const NB = '/ws/dispatch-gone.ipynb';
+		await startKernel(NB);
+		h.lastKernel!.connectionStatus = 'disconnected';
+		const goneKernel = h.lastKernel!;
+		h.model = () => undefined;
+
+		// The refresh proves the process gone and tears its entry down. Before the run
+		// was registered this early, nothing could abort it there and it simply ran on
+		// the fresh kernel `getKernel` then starts; it still must.
+		const reply = await execute(NB, 'y = 2', noop);
+		expect(reply.status).toBe('ok');
+		expect(goneKernel.shutdown).toHaveBeenCalledTimes(1);
+		expect(getKernelInfo(NB).started).toBe(true);
+		expect(getKernelInfo(NB).id).not.toBe(goneKernel.id);
+	});
+
+	it('a SHUTDOWN landing during that refresh still settles the run', async () => {
+		const NB = '/ws/dispatch-shutdown.ipynb';
+		await startKernel(NB);
+		h.lastKernel!.connectionStatus = 'disconnected';
+		// The server still has the kernel, so the refresh reaches a SLOW reconnect().
+		let release: () => void = () => {};
+		h.reconnectImpl = () =>
+			new Promise<void>((r) => {
+				release = r;
+			});
+		const kernelmod = await import('../../src/lib/server/kernel');
+
+		let outcome: unknown = null;
+		const runP = execute(NB, 'z = 3', noop).then(
+			() => {
+				outcome = 'ran';
+			},
+			(err: unknown) => {
+				outcome = err;
+			}
+		);
+		const deadline = Date.now() + 2000;
+		while (h.lastKernel!.reconnect.mock.calls.length === 0 && Date.now() < deadline) {
+			await new Promise((r) => setTimeout(r, 5));
+		}
+		// Only a refresh's OWN `kernel_gone` is followed; anyone else's teardown ends the run.
+		await kernelmod.shutdownKernel(NB);
+		await runP;
+		expect(outcome).toBeInstanceOf(kernelmod.KernelExecuteAborted);
+		release();
+	});
+});

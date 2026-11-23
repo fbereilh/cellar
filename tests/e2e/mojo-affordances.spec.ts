@@ -102,13 +102,27 @@ function seed(name: string, cells: SeedCell[] = [{ id: PY_ID, source: "print('hi
  * once - and on an already-open tab it simply focuses it.
  */
 async function openFile(page: Page, name: string, firstCell = PY_ID): Promise<void> {
-	await page.locator(`[data-testid="tree-file"][data-path="${name}"]`).dblclick();
+	const row = page.locator(`[data-testid="tree-file"][data-path="${name}"]`);
+	// Single-click first and let the layout settle. A bare dblclick fires both
+	// clicks at ONE coordinate, but the first click can add a tab that wraps the
+	// tab strip onto a new row, shifting the sidebar down - so the second click
+	// lands on the tree row ABOVE and opens the wrong file (seen on CI).
+	await row.click();
+	await expect(cellBy(page, firstCell)).toBeVisible({ timeout: 30_000 });
+	await row.dblclick();
 	await expect(cellBy(page, firstCell)).toBeVisible({ timeout: 30_000 });
 }
 
 async function openFresh(page: Page, name: string, cells?: SeedCell[]): Promise<void> {
 	seed(name, cells);
 	await page.goto(`${baseURL}/?ws=${encodeURIComponent(workspace)}`);
+	// Settle before the double-click: the tree is server-rendered, so a click
+	// landing before hydration is a no-op, and the shell's mount-time tab restore
+	// replaces the tab set wholesale. Either signal below appears only after that
+	// restore has run.
+	await expect(
+		page.getByTestId('empty-state').or(page.getByRole('tab').first())
+	).toBeVisible({ timeout: 30_000 });
 	await openFile(page, name, cells?.[0].id ?? PY_ID);
 }
 

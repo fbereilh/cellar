@@ -4,7 +4,8 @@
 	// (view + rebind).
 	import { shortcuts, chordFromEvent, chordTokens, formatChord, typesACharacter, typingHazards, shortcutCategories, MODE_LABEL } from '$lib/shortcuts.svelte';
 	import type { VenvInfo } from '$lib/server/venv-bind';
-	import { getUserSettingFlag, getUserSettingText, setUserSetting, setUserSettingNow } from '$lib/userSettings';
+	import { getUserSettingDefaultOn, getUserSettingFlag, getUserSettingText, setUserSetting, setUserSettingNow } from '$lib/userSettings';
+	import { TREE_AUTO_REVEAL_KEY } from '$lib/treeExpansion';
 	import { CHAT_LEARNING_MODE_KEY, CHAT_MODEL_KEY, CHAT_MODELS, CHAT_OTHER_NOTEBOOKS_KEY, CHAT_WEB_SEARCH_KEY, CHAT_WORKSPACE_READS_KEY, normalizeChatModel } from '$lib/chatCell';
 	import { UPLOAD_PREFIX_DEFAULT_KEY, UPLOAD_POSTFIX_DEFAULT_KEY } from '$lib/uploadDefaults';
 	import {
@@ -92,6 +93,24 @@
 		// into the user's checkout — precisely what the setting exists to prevent.
 		// The Databricks runtime toggle documents the same shape for the same reason.
 		void setUiNow(WORKTREE_AGENT_CONFIG_KEY, worktreeAgentConfig);
+	}
+
+	// ---- Reveal the active tab's file in the file tree (default ON) -----------
+	// VS Code's `explorer.autoReveal`. A person-level preference (how this person
+	// browses a tree), so it lives in the cross-project `~/.cellar/` store beside
+	// the other person-level settings. Re-read whenever the modal OPENS, not once:
+	// this component is mounted for the life of the shell, possibly before
+	// `hydrateUserSettings` ran. Only the sidebar reads it, from the client cache,
+	// so the debounced write is enough - `setUserSetting` updates that cache
+	// synchronously. ON deletes the key, so an untouched install stores nothing.
+	let treeAutoReveal = $state(true);
+	$effect(() => {
+		if (!open) return;
+		treeAutoReveal = getUserSettingDefaultOn(TREE_AUTO_REVEAL_KEY);
+	});
+	function toggleTreeAutoReveal() {
+		treeAutoReveal = !treeAutoReveal;
+		setUserSetting(TREE_AUTO_REVEAL_KEY, treeAutoReveal ? null : false);
 	}
 
 	// ---- Default Databricks upload name ---------------------------------------
@@ -590,6 +609,28 @@
 							(windowed rendering {virtualizeCells ? 'on' : 'off'}); reload without it to change this.
 						</p>
 					{/if}
+				</div>
+
+				<div class="divider my-1"></div>
+
+				<!-- Reveal the active file in the tree. A person-level setting, stored
+				     across projects; on by default, like VS Code's own. -->
+				<div data-testid="tree-auto-reveal-control">
+					<label class="flex cursor-pointer items-center justify-between gap-4">
+						<span class="text-sm font-medium">Reveal the active file in the file tree</span>
+						<input
+							type="checkbox"
+							class="toggle toggle-primary toggle-sm"
+							checked={treeAutoReveal}
+							onchange={toggleTreeAutoReveal}
+							data-testid="settings-tree-auto-reveal"
+						/>
+					</label>
+					<p class="mt-1 text-xs text-base-content/50">
+						Switching tabs opens the folders above that file in the Files sidebar, selects it and
+						scrolls it into view. Turn it off to leave the tree exactly as you left it while you
+						browse. This applies in every project.
+					</p>
 				</div>
 
 				<div class="divider my-1"></div>

@@ -158,6 +158,34 @@ export function canExportCell(cell: ExportCell, lang: ExportLanguage = 'python')
 }
 
 /**
+ * Can a notebook of this FORMAT hold nbdev export state at all - a per-cell mark
+ * or an export target? The ONE rule every export surface asks, on both sides of
+ * the wire: the server's refusals (`setCellExport`/`setCellExports`, `exportPy`,
+ * the export-target route and both MCP export tools) and the browser's gates (the
+ * row toggle in `Cell.svelte`, the export bar in `Notebook.svelte`, and
+ * `LiveNotebook`'s optimistic mirror).
+ *
+ * A `.py` TEXT notebook (jupytext percent/light, or Databricks source) cannot:
+ * `persist` rebuilds it from its CELLS through jupytext, which stores no cell or
+ * notebook metadata, and no module is ever generated from it. A mark set there
+ * lived only in the server's memory - the toggle showed ON, nothing reached disk,
+ * and the mark was gone after the next relaunch. So a surface OFFERS nothing
+ * here, the way the export bar was already withheld, rather than presenting a
+ * control the document cannot honour.
+ *
+ * The argument is the same fact on both sides - `isPyTextNotebook(nb)` on the
+ * server, the view's `isPy` in the browser, both `!!doc.jpFormat` - so the two
+ * cannot disagree about which notebooks are refused.
+ */
+export function notebookHoldsExport(isPyText: boolean): boolean {
+	return !isPyText;
+}
+
+/** The one sentence a surface says when a `.py` text notebook refuses an export mark. */
+export const TEXT_NOTEBOOK_EXPORT_MARK_MESSAGE =
+	'A .py notebook cannot mark a cell for export: a .py (jupytext / Databricks source) notebook stores no cell metadata and generates no module, so the mark would be lost on the next save. Convert it to .ipynb first.';
+
+/**
  * WHICH language eligibility is judged by, given the two the browser has in hand:
  * the NOTEBOOK's language, and the nullable MODULE language (`exportLanguage` /
  * `exportModuleLanguage` - null until a target names a module Cellar can build).

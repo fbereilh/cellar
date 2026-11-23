@@ -27,10 +27,9 @@ import { runtimeAvailable, bootCellar, killCellar, openSidebarSection, removeWor
  *      mints no tab, and names the notebook workspace-relative - never leaking
  *      the absolute server path the throw carries.
  *
- * The row's hover LAYOUT is deliberately not pinned here. Reserving room for the
- * out-of-flow control cluster was reverted: the controls sit in flow as they did
- * before this change, so the pre-existing narrow-sidebar name truncation is back
- * and is a separate task. The tests that measured that mechanism went with it.
+ * The row's LAYOUT is not pinned here: the two-line card, its no-overflow
+ * widths and the clickable-exactly-when-visible invariant are
+ * `kernel-card-narrow-width.spec.ts`.
  *
  * Boots the REAL launcher, so it SKIPS without the kernel runtime.
  */

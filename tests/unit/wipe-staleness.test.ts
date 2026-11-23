@@ -93,4 +93,12 @@ describe('wipe staleness reflection', () => {
 		expect(cleared).toBe(0);
 		expect(published.filter((e) => e.type === 'kernel:variables-wiped').length).toBe(1);
 	});
+
+	it("carries the asking tab's originId, so every OTHER tab re-reads its Variables panel", () => {
+		// The shell tells its own wipe (which re-reads the panel itself) from a
+		// FOREIGN one (which it must re-read for) by this id alone.
+		published.length = 0;
+		nbmod.clearLastRunStamps([], abs(), 'tab-1');
+		expect(published.find((e) => e.type === 'kernel:variables-wiped')).toMatchObject({ originId: 'tab-1' });
+	});
 });

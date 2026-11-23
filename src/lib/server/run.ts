@@ -34,11 +34,25 @@ import { mojoMissingOutput, mojoToCellSource, type MojoSetup } from './mojo';
 import { buildMojoProgram, type CarriedCell, type MojoProgram } from '../mojoCarry';
 import { hasMojoHeader } from '../cellMagic';
 import { mojoRunsIn, recordMojoRun } from './mojo-session';
-import { executeChatRun, chatReplyOutput } from './chat/run-chat';
+import { executeChatRun, finalizeChatOutputs } from './chat/run-chat';
 import { OutputAccumulator, OUTPUT_FLUSH_MS, type StreamDelta } from './output-accumulator';
 import { registerRunOutputs, unregisterRunOutputs } from './run-output-registry';
 import { noteRunStarted } from './run-queue';
 import type { Actor, CellOutput, LastRun, SessionId, RunStreamEvent, CellRunResult } from './types';
+
+/**
+ * The Mojo pre-flight ANSWERED that the toolchain is absent. Thrown from the
+ * `prepare` hook so `execute()` sends nothing, and caught by `executeCellRun`,
+ * which reports it as the cell's own error output carrying the install command.
+ */
+class MojoNotReady extends Error {
+	setup: MojoSetup;
+	constructor(setup: MojoSetup) {
+		super('the Mojo toolchain is not available');
+		this.name = 'MojoNotReady';
+		this.setup = setup;
+	}
+}
 
 /** Arguments to `executeCellRun`. */
 export interface CellRunArgs {
@@ -140,26 +154,39 @@ export async function executeCellRun({ nb, cellId, actor, source, originId, onEv
 	// makes "the selector's code cells run as Mojo" true for every run path (the UI
 	// route, MCP `run_cell` and the imports cell all funnel through this function).
 	const isMojo = isMojoCell(cell, getNotebookLanguage(nb));
+	// The pre-flight runs INSIDE `execute()`'s abort window (its `prepare` hook), not
+	// in front of it: it is the first thing that needs the kernel, so on a notebook's
+	// first run it is what waits out the kernel START - and before it moved there, a
+	// run waiting on that start held the queue's `running` slot and read RUNNING while
+	// being reachable by no abort path at all. `prepare` is the same window a run
+	// parked on the start or the exec lock is settled in.
+	//
 	// NULL means NO VERDICT - the kernel could not be reached, or the bounded setup
-	// did not settle in time. Either way we fall through to `execute()`, which owns
+	// did not settle in time. Either way the run goes on to execute, which owns
 	// the run watchdog and reports honestly (`kernel_unavailable` where that is what
 	// happened): claiming a missing TOOLCHAIN on a reading that observed nothing
 	// would name a cause nobody saw, and would send the user installing 534 MB they
 	// may already have.
-	let mojoSetup: MojoSetup | null = null;
-	if (isMojo) {
-		try {
-			mojoSetup = await ensureMojoMagic(nb);
-		} catch {
-			/* no verdict; see above */
-		}
-	}
+	const prepare = isMojo
+		? async () => {
+				let setup: MojoSetup | null = null;
+				try {
+					setup = await ensureMojoMagic(nb);
+				} catch {
+					/* no verdict; see above */
+				}
+				// The probe ANSWERED that the toolchain is absent: nothing is sent.
+				if (setup && !setup.ready) throw new MojoNotReady(setup);
+			}
+		: undefined;
 	// A Mojo cell is a fresh `mojo run` process, so nothing it declares survives it.
 	// The program sent to the compiler is therefore the cell's own source plus the
 	// declarations it reaches in cells that already ran this session (see
 	// `$lib/mojoCarry` for the rules, and `mojo-session.ts` for what "ran" means).
+	// The session is read here, before the kernel is claimed: with no kernel yet
+	// there is no session, so nothing has run and nothing is carried.
 	let mojoProgram: MojoProgram | null = null;
-	if (isMojo) mojoProgram = buildMojoProgram(source, carriedMojoCells(nb, cellId, mojoSetup?.session ?? currentSessionId(nb)));
+	if (isMojo) mojoProgram = buildMojoProgram(source, carriedMojoCells(nb, cellId, currentSessionId(nb)));
 	const execSource = isSqlCell(cell) ? sqlToPython(source) : mojoProgram ? mojoToCellSource(mojoProgram.program) : source;
 
 	// Bound + coalesce the run's output across all three consumers (persist, SSE
@@ -206,38 +233,31 @@ export async function executeCellRun({ nb, cellId, actor, source, originId, onEv
 	let outputs: CellOutput[];
 	try {
 		try {
-			if (mojoSetup && !mojoSetup.ready) {
-				// The probe ANSWERED, and it answered that the toolchain is absent - a
-				// probe that could not answer is NO VERDICT (null) and never lands here,
-				// so this branch never asserts an absence nobody observed. The kernel is
-				// alive - `ensureMojoMagic` started it and ran a probe in it - so this run
-				// really did happen in `mojoSetup.session`'s namespace and is stamped with
-				// it: reporting no session would drop the cell into `error_persisted`, the
-				// label agents are told to distrust as a leftover from a previous session,
-				// for a failure raised seconds ago.
-				session = mojoSetup.session ?? null;
-				acc.push(mojoMissingOutput(mojoSetup));
-				status = 'error';
-			} else if (isChat) {
+			if (isChat) {
 				// No kernel, no session epoch: the reply streams from the ChatEngine into
 				// the same accumulator. `session` stays null - a chat run touches no
 				// namespace, so ran_this_session honestly reads false.
 				status = (await executeChatRun({ nb, cellId, question: source, acc })).status;
 			} else {
-				const reply = await execute(nb, execSource, (ev) => {
-					if (ev.type === 'output') {
-						// A cell with no `main` of its own ran a no-op one, and the magic
-						// prints the captured stdout even when it is empty. That blank line
-						// is Cellar's doing, so it is not the cell's output.
-						if (mojoProgram?.synthesizedMain && isBlankStdout(ev.output)) return;
-						acc.push(ev.output);
-					} else if (ev.type === 'kernel') {
-						session = ev.session;
-						onEvent?.(ev);
-					} else {
-						onEvent?.(ev);
-					}
-				});
+				const reply = await execute(
+					nb,
+					execSource,
+					(ev) => {
+						if (ev.type === 'output') {
+							// A cell with no `main` of its own ran a no-op one, and the magic
+							// prints the captured stdout even when it is empty. That blank line
+							// is Cellar's doing, so it is not the cell's output.
+							if (mojoProgram?.synthesizedMain && isBlankStdout(ev.output)) return;
+							acc.push(ev.output);
+						} else if (ev.type === 'kernel') {
+							session = ev.session;
+							onEvent?.(ev);
+						} else {
+							onEvent?.(ev);
+						}
+					},
+					{ prepare }
+				);
 				status = reply?.status ?? 'ok';
 				// Only a run that compiled and exited cleanly has declared anything. A
 				// `%%mojo …` cell speaks to the magic directly and stays out of it.
@@ -245,49 +265,68 @@ export async function executeCellRun({ nb, cellId, actor, source, originId, onEv
 				if (isMojo && status === 'ok' && ranIn !== null && !hasMojoHeader(source)) recordMojoRun(nb, ranIn, cellId, source);
 			}
 		} catch (err) {
-			const message = err instanceof Error ? err.message : String(err);
-			acc.push({
-				output_type: 'error',
-				ename: 'CellarError',
-				evalue: message,
-				traceback: [message]
-			});
-			status = 'error';
-			// `kernelDown` means one thing only: execute() threw before it ever had a kernel
-			// in hand (the sidecar was unreachable), which is why the absent session epoch
-			// stands in for it. A chat run never has a kernel, so its failures are never
-			// "kernel down" - and neither is an ABORT: a run force-settled while parked on
-			// the exec lock (F2) also throws with no session, but the kernel it was queued
-			// behind was demonstrably alive and busy. Reporting that as kernel_unavailable
-			// asserts an unreachable kernel that was never observed, and drops the cell into
-			// `error_persisted` - the label agents are told to distrust as a leftover from a
-			// previous session, for a run that was aborted seconds ago.
-			if (session === null && !isChat && !(err instanceof KernelExecuteAborted)) kernelDown = true;
+			if (err instanceof MojoNotReady) {
+				// The probe ANSWERED, and it answered that the toolchain is absent - a
+				// probe that could not answer is NO VERDICT (null) and never lands here,
+				// so this branch never asserts an absence nobody observed. The kernel is
+				// alive - `ensureMojoMagic` started it and ran a probe in it - so this run
+				// really did happen in `err.setup.session`'s namespace and is stamped with
+				// it: reporting no session would drop the cell into `error_persisted`, the
+				// label agents are told to distrust as a leftover from a previous session,
+				// for a failure raised seconds ago.
+				session = err.setup.session ?? null;
+				acc.push(mojoMissingOutput(err.setup));
+				status = 'error';
+			} else {
+				const message = err instanceof Error ? err.message : String(err);
+				acc.push({
+					output_type: 'error',
+					ename: 'CellarError',
+					evalue: message,
+					traceback: [message]
+				});
+				status = 'error';
+				// `kernelDown` means one thing only: execute() threw before it ever had a
+				// kernel in hand (the sidecar was unreachable), which is why the absent
+				// session epoch stands in for it. A chat run never has a kernel, so its
+				// failures are never "kernel down" - and neither is an ABORT: a run
+				// force-settled while parked on the exec lock or the kernel start also
+				// throws with no session, but nothing observed an unreachable kernel.
+				// Reporting that as kernel_unavailable asserts what was never seen, and
+				// drops the cell into `error_persisted` - the label agents are told to
+				// distrust as a leftover from a previous session, for a run that was
+				// aborted seconds ago.
+				if (session === null && !isChat && !(err instanceof KernelExecuteAborted)) kernelDown = true;
+			}
 		} finally {
 			clearInterval(flushTimer);
 		}
 		// Flush the tail + finalize the truncation marker; this is the array we persist.
 		outputs = acc.finish();
 
-		// A SUCCESSFUL chat run finalizes its streamed text into ONE markdown
-		// display_data (built from the accumulator's SURVIVING text, so a mid-run
-		// clear truncates the reply exactly as it truncates a kernel cell's output)
-		// and re-emits it as a full frame at the same stable index - the client's
-		// applyOutput replaces in place, snapping the live stream to rendered
-		// markdown. Failures pass through untouched: their message is already a
-		// display_data of its own.
+		// A chat run finalizes its streamed reply into ONE markdown display_data - on
+		// EVERY outcome, a failure and a cancel as much as a success, since a partial
+		// reply left as raw stream text shows its own markdown and Cellar's tool-line
+		// syntax literally, for good. Built from the accumulator's SURVIVING text, so
+		// a mid-run clear truncates the reply exactly as it truncates a kernel cell's
+		// output. Re-emitted as a full frame at the same stable index; the client's
+		// applyOutput replaces in place, snapping the live stream to rendered markdown.
+		// A failure message is already a display_data of its own and keeps its index.
 		//
-		// NOT when the accumulator tripped a cap: it appended a truncation marker as
-		// a SECOND stream element, and the finalize only republishes index 0 - there
-		// is no retract frame, so folding two elements into one would persist ONE
-		// output while every client still held the marker at index 1, orphaned until
-		// a reload. A capped reply therefore stays as streamed text beside its honest
-		// marker; the client's array and the document agree, which outranks rendering
-		// the markdown for a reply that is already incomplete.
-		if (isChat && status === 'ok' && !acc.wasCapped) {
-			const reply = chatReplyOutput(outputs);
-			if (reply) {
-				outputs = [reply];
+		// There is NO retract frame, so a finalize may only REPLACE an index every
+		// client already holds: `finalizeChatOutputs` returns an array of the same
+		// length differing only at index 0, which is the one index republished here.
+		// That is also why a CAPPED run skips it: the accumulator appended a truncation
+		// marker as a SECOND stream element, and folding two elements into one would
+		// persist ONE output while every client still held the marker at index 1,
+		// orphaned until a reload. A capped reply therefore stays as streamed text
+		// beside its honest marker - the client's array and the document agree, which
+		// outranks rendering the markdown for a reply that is already incomplete.
+		if (isChat && !acc.wasCapped) {
+			const finalized = finalizeChatOutputs(outputs);
+			if (finalized) {
+				outputs = finalized;
+				const reply = finalized[0];
 				publish({ type: 'run:output', nb, cellId, output: reply, index: 0, originId });
 				onEvent?.({ type: 'output', output: reply, index: 0 });
 			}

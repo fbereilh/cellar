@@ -40,7 +40,9 @@
 		exportMarkedTwice,
 		exportStrandedSummary,
 		exportTargetLanguage,
-		isExportCell
+		isExportCell,
+		notebookHoldsExport,
+		TEXT_NOTEBOOK_EXPORT_MARK_MESSAGE
 	} from '$lib/exportRole';
 	import { mojoMainDroppedIds } from '$lib/mojoExport';
 	import { isExportBase } from '$lib/exportTarget';
@@ -2707,6 +2709,14 @@
 	 */
 	async function setExport(id: string, exported: boolean) {
 		const cell = findCell(id);
+		// A `.py` text notebook cannot hold a mark (`notebookHoldsExport`, the rule the
+		// server refuses on too). `Cell.svelte` withholds the toggle there, so this is
+		// the optimistic mirror for any other caller: nothing is applied and nothing is
+		// sent, and it is SAID rather than silently dropped.
+		if (exported && !notebookHoldsExport(isPy)) {
+			onNotice?.(TEXT_NOTEBOOK_EXPORT_MARK_MESSAGE);
+			return;
+		}
 		// A cell whose SOURCE carries nbdev's `#| export` is marked by that line, and
 		// Cellar never writes a directive - so clearing the metadata half would leave
 		// the cell exported with the toggle bouncing straight back to ON. Refused here
@@ -2754,7 +2764,8 @@
 			.json()
 			.then((b) => (b as { reason?: string; alsoFlagged?: boolean } | null) ?? null)
 			.catch(() => null);
-		// TWO refusals revert, and `not-code` is the one this tab could not predict at
+		// THREE refusals revert (`py-notebook` is the server backstop for the gate
+		// above), and `not-code` is the one this tab could not predict at
 		// all: eligibility is a NOTEBOOK-level fact mirrored over SSE, so a target
 		// change still in flight lets this tab offer a mark the document refuses.
 		// Left as `{ok:true}` the phantom flag survived until the next `load()`, and
@@ -2762,7 +2773,12 @@
 		// revert is purely local - the stale language heals on its own when the
 		// `notebook:export-target` event lands - so no cross-tab coordination is
 		// involved.
-		if (verdict?.reason !== 'export-directive-owns-cell' && verdict?.reason !== 'not-code') return;
+		if (
+			verdict?.reason !== 'export-directive-owns-cell' &&
+			verdict?.reason !== 'not-code' &&
+			verdict?.reason !== 'py-notebook'
+		)
+			return;
 		// Looked up AGAIN, because a `load()` refetch replaces `cells` and the object
 		// the click read may no longer be the one on screen.
 		const c = findCell(id);
@@ -2773,9 +2789,11 @@
 			c.metadata = { ...(c.metadata ?? {}), cellar };
 		}
 		onNotice?.(
-			verdict.reason === 'not-code'
-				? exportIneligibleNotice(id)
-				: exportDirectiveNotice(verdict.alsoFlagged === true)
+			verdict.reason === 'py-notebook'
+				? TEXT_NOTEBOOK_EXPORT_MARK_MESSAGE
+				: verdict.reason === 'not-code'
+					? exportIneligibleNotice(id)
+					: exportDirectiveNotice(verdict.alsoFlagged === true)
 		);
 	}
 

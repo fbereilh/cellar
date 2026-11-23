@@ -7,6 +7,7 @@ import {
 	exportPy,
 	isPyTextNotebook
 } from '$lib/server/notebook';
+import { notebookHoldsExport } from '$lib/exportRole';
 
 /**
  * nbdev-style selective export of a notebook to a `.py` module (distinct from the
@@ -138,7 +139,7 @@ function applyTargetWrite(body, write) {
 			return { target: null, base: 'workspace', resolved: null, resolveError: null };
 		}
 	};
-	if (isPyTextNotebook(body.path))
+	if (!notebookHoldsExport(isPyTextNotebook(body.path)))
 		return json(
 			{
 				ok: false,

@@ -26,7 +26,7 @@
 <script lang="ts">
 	import Self from '$lib/FileTreeNode.svelte';
 	import { iconSvg } from '$lib/fileIcons';
-	import { getContext } from 'svelte';
+	import { getContext, untrack } from 'svelte';
 	import TreeEntryInput from '$lib/TreeEntryInput.svelte';
 	import type { TreeNode } from '$lib/server/fstree';
 	import type { GitStatusLetter } from '$lib/server/git';
@@ -53,9 +53,16 @@
 	// via the shared `cellarFileOps` context so it need not drill through the
 	// recursive tree.
 	let { node, depth = 0, onOpen, onOpenPermanent, gitFiles = {}, ignoredMatcher, activePath = null }: Props = $props();
-	let open = $state(false); // folders start collapsed
 
 	const ops = getContext<CellarFileOps>('cellarFileOps');
+	// Folders start collapsed. Expansion is the SIDEBAR's, keyed by path
+	// (`$lib/treeExpansion`), not this row's: a reveal has to open every ancestor
+	// of a file three folders down, and a parent cannot reach into a child's local
+	// state to do that.
+	const open = $derived(node.type === 'dir' && !!ops?.isExpanded(node.path));
+	function setOpen(next: boolean) {
+		ops?.setExpanded(node.path, next);
+	}
 
 	const status = $derived(node.type === 'dir' ? rollupStatus(gitFiles, node.path) : gitFiles[node.path] || '');
 	const color = $derived(gitColor(status));
@@ -77,8 +84,10 @@
 
 	// Keep a folder expanded once it becomes (or was) the new-entry target so the
 	// freshly created child stays visible after the tree refreshes.
+	// Untracked: `setExpanded` reads the sidebar's expansion set, and tracking it
+	// here would re-open this folder on every later expansion change.
 	$effect(() => {
-		if (isNewTarget) open = true;
+		if (isNewTarget) untrack(() => setOpen(true));
 	});
 
 	const descriptor: FileDescriptor = $derived({ type: node.type, path: node.path, name: node.name });
@@ -167,7 +176,7 @@
 		<button
 			class="flex w-full items-center gap-1 rounded px-1 py-0.5 text-left text-xs hover:bg-base-300/60 {rowBg} {isCut || isDragging ? 'opacity-40' : ''} {dimmed ? 'opacity-50' : ''}"
 			style="padding-left: {depth * 12 + 4}px{color ? `; color: ${color}` : ''}"
-			onclick={() => { ops?.select(descriptor); open = !open; }}
+			onclick={() => { ops?.select(descriptor); setOpen(!open); }}
 			oncontextmenu={onContext}
 			draggable="true"
 			ondragstart={onDragStart}
@@ -177,6 +186,8 @@
 			ondragend={() => ops?.endDrag()}
 			data-testid="tree-dir"
 			data-path={node.path}
+			aria-expanded={open}
+			data-selected={isSelected || undefined}
 			data-git={status || undefined}
 			data-git-ignored={dimmed || undefined}
 			data-drop-target={isDropTarget || undefined}
@@ -227,6 +238,7 @@
 		ondragend={() => ops?.endDrag()}
 		data-testid="tree-file"
 		data-path={node.path}
+		data-selected={isSelected || undefined}
 		data-git={status || undefined}
 		data-git-ignored={dimmed || undefined}
 		data-drop-target={isDropTarget || undefined}

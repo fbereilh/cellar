@@ -21,6 +21,7 @@
 	import { hazardSummaryClause, humanExportHazards, type ExportHazard } from '$lib/exportHazard';
 	import {
 		exportStrandedExplanation,
+		notebookHoldsExport,
 		orphanedModuleExplanation,
 		type ExportLanguage,
 		type ExportStrandedSummary
@@ -683,10 +684,12 @@
 	// styled as neutral standing chrome rather than a call to action. Hidden only
 	// on a `.py` text notebook, which stores no notebook metadata: the server
 	// refuses a target there, so offering the control would show a setting that
-	// does nothing (the same rule as the root picker's absence).
+	// does nothing (the same rule as the root picker's absence). Asked through the
+	// shared `notebookHoldsExport`, the rule the per-cell toggle and the server's
+	// refusals ask too.
 	let exportFeedback = $state('');
 	let exporting = $state(false);
-	const showExportBar = $derived(!isPy);
+	const showExportBar = $derived(notebookHoldsExport(isPy));
 	// The LANGUAGE selector. Shown on every `.ipynb`, unlike the code-root bar's
 	// opt-in chrome: every notebook HAS a language and it decides how every code cell
 	// in it runs, so the one place that says which is not something to make the user

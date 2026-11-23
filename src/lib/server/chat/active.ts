@@ -89,8 +89,8 @@ export function abortChatRunsUnder(deletedAbs: string, sep: string): number {
  * tree is `tests/e2e/harness.ts`. So this listener is not restoring an accident,
  * it closes a pre-existing leak.
  *
- * STATED RESIDUAL - the coverage is HANDLER-based, so an app that LEAVES WITHOUT
- * RUNNING ONE orphans the tree. Every route in is a handler: the two signals
+ * The coverage HERE is HANDLER-based, so an app that LEAVES WITHOUT RUNNING ONE
+ * orphans the tree. Every route in is a handler: the two signals
  * below, `CHAT_HANGUP_SIGNAL`, and `parent-watch`'s explicit call. An uncaught
  * exception, an OOM kill or a SIGKILL runs none of them - and SIGKILL is
  * reachable, since `killPid` escalates to it after a 4s grace - so the tree is
@@ -105,9 +105,13 @@ export function abortChatRunsUnder(deletedAbs: string, sep: string): number {
  * finishes its turn and exits rather than running forever - the endless `sleep`
  * is a property of the test STUB, not of what a user's machine leaves behind.
  *
- * It is CLOSED by the filed follow-up `cellar-chat-pgid-registry-orphan-reap`:
- * an out-of-process pgid registry mirroring `instances.js`, reaped on the next
- * launch or `cellar cleanup`, with pid-reuse verification (`verifyPidIdentity`).
+ * That gap is closed OUT of process, by `../chat-run-registry.js`: every chat
+ * group is recorded on disk as it is spawned (the `instances.js` pattern), and
+ * the next launch or `cellar cleanup` reaps one whose owning app is gone - only
+ * after `verifyPidIdentity` proves the leader is still the process recorded, so
+ * a recycled pid is never signalled. Nothing in THIS file has to know: a handler
+ * that runs still does the prompt, in-process stop; the registry is the backstop
+ * for the death no handler sees.
  *
  * DO NOT reach for an `uncaughtException` listener instead. It SUPPRESSES node's
  * default crash-exit exactly as a SIGHUP listener suppresses the default

@@ -220,8 +220,15 @@ for (const theme of ['dim', 'cellar-light'] as const) {
 		// The pixel-for-pixel contract: identical colours either side of the lazy
 		// editor being built. This is what the CSS descendant selector buys - without
 		// it the editor's nested token span keeps painting comment grey.
-		expect(await colourOf(content, '#| default_exp')).toBe(directive);
-		expect(await colourOf(content, '# an ordinary comment')).toBe(comment);
-		expect(await colourOf(content, '#| not a directive, it trails')).toBe(comment);
+		//
+		// POLLED, not read once: a new editor parses for at most 20ms and finishes the
+		// rest from an idle callback, so on a loaded machine the first paint can carry
+		// a partial tree - later lines untokenized, no span to read yet. The colours
+		// SETTLE when that parse lands; asking before then is asking about a render
+		// CodeMirror itself treats as provisional (`tests/unit/directive-comment.test.ts`
+		// pins both the incomplete first parse and the decorations catching up).
+		await expect.poll(() => colourOf(content, '#| default_exp')).toBe(directive);
+		await expect.poll(() => colourOf(content, '# an ordinary comment')).toBe(comment);
+		await expect.poll(() => colourOf(content, '#| not a directive, it trails')).toBe(comment);
 	});
 }

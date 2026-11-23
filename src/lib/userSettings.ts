@@ -82,6 +82,19 @@ export function getUserSettingFlag(key: string): boolean {
 	return getUserSetting<unknown>(key, false) === true;
 }
 
+/**
+ * A setting read as a DEFAULT-ON flag: only a literal stored `false` is off.
+ *
+ * The mirror of `getUserSettingFlag` for a preference that ships enabled (the file
+ * tree revealing the active tab's file). Its strictness points the other way on
+ * purpose: these gate a CONVENIENCE rather than a capability, so the safe reading
+ * of junk in the untyped store is the shipped default, and only the value the
+ * toggle itself writes turns it off.
+ */
+export function getUserSettingDefaultOn(key: string): boolean {
+	return getUserSetting<unknown>(key, true) !== false;
+}
+
 /** Set `key` to `value` (pass `null` to delete) and schedule a server write. */
 export function setUserSetting(key: string, value: unknown): void {
 	store.set(key, value);

@@ -1,24 +1,26 @@
 import { expect, type Page } from '@playwright/test';
+import { execFileSync } from 'node:child_process';
 import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 /**
- * The shared fixture for the two specs that assert what a SIGNAL reaches through
- * a chat run - `chat-stop.spec.ts` (the Stop control) and
- * `chat-shutdown-hangup.spec.ts` (a terminal close).
+ * The shared fixture for the specs that assert what a SIGNAL reaches through a
+ * chat run - `chat-stop.spec.ts` (the Stop control),
+ * `chat-shutdown-hangup.spec.ts` (a terminal close) and `chat-orphan-reap.spec.ts`
+ * (an app killed outright, reaped by the next launch).
  *
  * It lives here for the reason `openSidebarSection` was lifted into `harness.ts`:
- * both specs need a run with a REAL descendant, and a hand-rolled copy of that
+ * every one needs a run with a REAL descendant, and a hand-rolled copy of that
  * per spec is a documented flake source in this repo - a drift in one copy would
  * silently weaken whichever spec kept the weaker version, and here the weaker
  * version is one whose CLI leaves no descendant, i.e. exactly the masking
- * condition both specs exist to rule out.
+ * condition these specs exist to rule out.
  *
  * What is NOT here is what genuinely differs: each spec owns its notebook name,
  * its own launcher, its own tracked-pid array, and its own assertions.
  */
 
-/** The one chat cell both specs seed and drive. */
+/** The one chat cell every one of these specs seeds and drives. */
 export const CHAT_CELL_ID = 'chatcell0';
 
 /** A cell by its stable id, so a windowed-out sibling can never be addressed. */
@@ -116,7 +118,7 @@ export function seedChatNotebook(name: string, ws: string): void {
  * share a worker, so one module-level list would let one spec's teardown reap
  * the other's pids. Passing it also makes the tracking structural - a caller
  * cannot read the pid without recording it, and a leaked descendant is the very
- * thing both specs are about.
+ * thing these specs are about.
  */
 export async function grandchildPid(pidfile: string, started: number[]): Promise<number> {
 	await expect
@@ -149,4 +151,21 @@ export function reapPids(pids: readonly number[]): void {
 			/* already gone */
 		}
 	}
+}
+
+/**
+ * The app server's pid: the launcher's own child running the production build.
+ * Read from `ps` rather than from a Cellar record: the specs that need it are
+ * about whether that PROCESS is still there, which only the OS can answer.
+ */
+export function appPidOf(launcherPid: number): number {
+	const out = execFileSync('ps', ['-eo', 'pid=,ppid=,command='], { encoding: 'utf8' });
+	for (const line of out.split('\n')) {
+		const m = line.trim().match(/^(\d+)\s+(\d+)\s+(.*)$/);
+		if (!m) continue;
+		const [, pid, ppid, command] = m;
+		if (Number(ppid) !== launcherPid) continue;
+		if (command.includes(`build${'/'}index.js`)) return Number(pid);
+	}
+	throw new Error('the app server is not a child of the launcher - the fixture is broken, not the code');
 }
