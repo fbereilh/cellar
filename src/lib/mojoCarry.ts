@@ -118,12 +118,48 @@ function importedNames(list: string, dotted: boolean): string[] {
 	for (const raw of stripLineComments(list).replace(/[()\\]/g, ' ').split(',')) {
 		const item = raw.trim().replace(/\s+/g, ' ');
 		if (item === '' || item === '*') continue;
-		const alias = / as (\S+)$/.exec(item);
 		// `import a.b.c` binds the first segment, which is how the code then spells it.
-		const name = alias ? alias[1] : dotted ? item.split('.')[0] : item;
+		const name = itemName(item, dotted);
 		if (NAME_RE.test(name)) names.push(name);
 	}
 	return names;
+}
+
+/** The binding name of one import-list item, as `importedNames` reads it. */
+function itemName(item: string, dotted: boolean): string {
+	const alias = / as (\S+)$/.exec(item);
+	return alias ? alias[1] : dotted ? item.split('.')[0] : item;
+}
+
+/**
+ * An import with every name the running cell declares itself removed, or null when
+ * none is left. A carried line binding one of the cell's own names would redefine it
+ * (`invalid redefinition`), on a line the user cannot see. A line that loses nothing
+ * is returned byte-identical; a narrowed one is rebuilt on one line.
+ */
+export function narrowImport(text: string, own: ReadonlySet<string>): string | null {
+	const lines = scanLines(text);
+	const head = lines.find((l) => !l.blank && !l.comment && !l.inString && !l.continued && !l.text.startsWith('@'));
+	const prefix = head ? text.slice(0, head.start) : '';
+	const body = head ? text.slice(head.start) : text;
+	const from = FROM_IMPORT_RE.exec(body);
+	const plain = from ? null : PLAIN_IMPORT_RE.exec(body);
+	if (!from && !plain) return text;
+	const list = (from ? from[1] : (plain as RegExpExecArray)[1]) as string;
+	const items = stripLineComments(list)
+		.replace(/[()\\]/g, ' ')
+		.split(',')
+		.map((raw) => raw.trim().replace(/\s+/g, ' '))
+		.filter((item) => item !== '');
+	const kept = items.filter((item) => {
+		if (item === '*') return true;
+		if (!from && item.includes('.') && !/ as \S+$/.test(item)) return true;
+		return !own.has(itemName(item, !from));
+	});
+	if (kept.length === items.length) return text;
+	if (kept.length === 0) return null;
+	const lead = from ? body.slice(0, body.length - list.length).trimEnd() : 'import';
+	return `${prefix}${lead} ${kept.join(', ')}`;
 }
 
 function classify(text: string): { kind: MojoDeclKind; names: string[] } {
@@ -244,7 +280,6 @@ export function buildMojoProgram(cellSource: string | null | undefined, carried:
 			// bind names no scan can see (`from x import *`).
 			if (p.block.kind !== 'import') {
 				for (const imp of cellImports.get(p.cell) ?? []) {
-					if (imp.block.names.length > 0 && imp.block.names.every((n) => own.has(n))) continue;
 					include(imp);
 				}
 			}
@@ -252,10 +287,23 @@ export function buildMojoProgram(cellSource: string | null | undefined, carried:
 	}
 
 	const synthesizedMain = !hasTopLevelMain(source);
-	const blocks = [...included].sort((a, b) => a.seq - b.seq || a.cell - b.cell || a.index - b.index);
-	// Two cells importing the same thing would repeat it. Harmless, but noise.
+	const sorted = [...included].sort((a, b) => a.seq - b.seq || a.cell - b.cell || a.index - b.index);
+	// A carried import is narrowed to the names the running cell does not declare
+	// itself, and dropped when none are left.
+	const blocks: Provided[] = [];
 	const texts: string[] = [];
-	for (const p of blocks) if (!(p.block.kind === 'import' && texts.includes(p.block.text))) texts.push(p.block.text);
+	for (const p of sorted) {
+		if (p.block.kind !== 'import') {
+			blocks.push(p);
+			texts.push(p.block.text);
+			continue;
+		}
+		const text = narrowImport(p.block.text, own);
+		if (text === null) continue;
+		blocks.push(p);
+		// Two cells importing the same thing would repeat it. Harmless, but noise.
+		if (!texts.includes(text)) texts.push(text);
+	}
 
 	let program = source;
 	if (synthesizedMain || texts.length > 0) {
@@ -264,6 +312,6 @@ export function buildMojoProgram(cellSource: string | null | undefined, carried:
 		if (texts.length > 0) program += `\n${MOJO_CARRY_MARKER}\n${texts.join('\n\n')}\n`;
 	}
 	const names: string[] = [];
-	for (const p of blocks) for (const n of p.block.names) if (!names.includes(n)) names.push(n);
+	for (const p of blocks) for (const n of p.block.names) if (!own.has(n) && !names.includes(n)) names.push(n);
 	return { program, synthesizedMain, carried: names };
 }
