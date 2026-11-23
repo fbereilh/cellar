@@ -98,10 +98,9 @@ async function openNotebook(page: Page): Promise<void> {
 	// session was already populated; accepting the loading state makes it
 	// order-independent rather than lucky.
 	//
-	// `.first()` on the WHOLE chain, not on the `loading…` locator: unlike a cell,
-	// `loading…` really can be on screen AT THE SAME TIME as the empty-state button
-	// (the shell paints the empty state while a restored tab is still loading), so
-	// the two-element match is a strict-mode violation rather than a race.
+	// `.first()` on the WHOLE chain: a notebook has several cells, and a held tab
+	// can show `loading…` beside another tab's cells, so a bare match is a
+	// strict-mode violation.
 	//
 	// The click is RETRIED until a notebook answers it, rather than sent once. The
 	// empty-state button only exists once the app has hydrated and restored its
