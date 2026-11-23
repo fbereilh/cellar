@@ -1915,7 +1915,7 @@ export async function applyProjectRootToLiveKernels(enabled: boolean): Promise<v
 	// setting off must remove the path it actually inserted. `codeRoot` is the
 	// workspace root for every notebook that declares none, so the single-root case
 	// is unchanged.
-	const live = [...kernels.values()].filter((k) => k.connection !== null);
+	const live = [...kernels.values()].filter((k) => k.connection !== null && k.kernelLanguage === 'python');
 	await Promise.all(
 		live.map((k) =>
 			runSilent(

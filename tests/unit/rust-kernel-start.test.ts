@@ -70,7 +70,7 @@ vi.mock('../../src/lib/server/run-queue', () => ({ clearRunQueue: vi.fn() }));
 vi.mock('../../src/lib/server/logs', () => ({ logInfo: vi.fn(), logWarn: vi.fn(), logError: vi.fn() }));
 
 import * as kernelModule from '../../src/lib/server/kernel';
-import { completeInKernel, execute, inspectInKernel, liveKernelLanguage, shutdownKernel } from '../../src/lib/server/kernel';
+import { applyProjectRootToLiveKernels, completeInKernel, execute, inspectInKernel, liveKernelLanguage, shutdownKernel } from '../../src/lib/server/kernel';
 import { syncKernelToNotebookLanguage } from '../../src/lib/server/notebook-language-actions';
 import { EVCXR_ENV, RustKernelMissing } from '../../src/lib/server/rust';
 
@@ -155,6 +155,27 @@ describe('editor introspection on a Rust kernel', () => {
 		expect(await inspectInKernel(RUST, 'x', 1, 0)).toEqual({ ok: false, reason: 'not_python' });
 		expect(h.execCodes.length).toBe(sent);
 		await shutdownKernel(RUST);
+	});
+});
+
+describe('the project-root toggle', () => {
+	it('sends its sys.path code to a live Python kernel and nothing to a live Rust kernel', async () => {
+		await execute(RUST, 'let x = 1;', noop);
+		await execute(PY, 'x = 1', noop);
+		const rustKernel = await h.startNew.mock.results[0].value;
+		const pyKernel = await h.startNew.mock.results[1].value;
+		const rustSent = rustKernel.requestExecute.mock.calls.length;
+		const pySent = pyKernel.requestExecute.mock.calls.length;
+
+		await applyProjectRootToLiveKernels(false);
+		await applyProjectRootToLiveKernels(true);
+
+		expect(rustKernel.requestExecute.mock.calls.length).toBe(rustSent);
+		const pyCodes = pyKernel.requestExecute.mock.calls.slice(pySent).map((c: [{ code: string }]) => c[0].code);
+		expect(pyCodes).toHaveLength(2);
+		expect(pyCodes.every((c: string) => c.includes('sys.path'))).toBe(true);
+		await shutdownKernel(RUST);
+		await shutdownKernel(PY);
 	});
 });
 
