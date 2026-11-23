@@ -56,11 +56,10 @@
  * `server/mojo.ts` compiles such a cell to that magic at RUN time exactly as
  * `server/sql.ts` compiles SQL to `spark.sql(...)`; the source on disk stays bare
  * Mojo. Two costs are ACCEPTED and must not be "fixed" later:
- *   - **NO state persists between Mojo cells.** Each `%%mojo` cell is a fresh temp
- *     file and a fresh `mojo run`, so Modular's own docs say every Mojo cell must
- *     be a complete program with a `main()`. That is Modular's semantics, not a
- *     Cellar defect; Cellar states it (the badge tooltip) rather than faking
- *     continuity.
+ *   - **NO VALUE persists between Mojo cells.** Each cell is a fresh temp file
+ *     and a fresh `mojo run`. That is Modular's semantics and Cellar does not fake
+ *     it. DECLARATIONS are a different matter: `$lib/mojoCarry` carries the
+ *     functions, structs and imports a cell uses from cells that already ran.
  *   - **In plain Jupyter a Mojo notebook's cells are code cells holding Mojo
  *     source**: they render fine, and running one there raises `SyntaxError` -
  *     the same interop trade already accepted for SQL and chat cells.
