@@ -375,10 +375,13 @@ test('the toolbar stays reachable as the window narrows', async ({ page }) => {
 			};
 		});
 
-	// One row at an ordinary window width, every button on it.
+	// Five buttons: Run all, Interrupt, Clear all outputs, Consolidate imports and
+	// the language-and-export menu at the right end. One row at an ordinary window
+	// width, every button on it.
+	const BUTTONS = 5;
 	await page.setViewportSize({ width: 1280, height: 800 });
 	const wide = await measure();
-	expect(wide.count).toBe(4);
+	expect(wide.count).toBe(BUTTONS);
 	expect(wide.rows, 'the bar wraps at an ordinary width').toBe(1);
 	expect(wide.overflows).toBe(false);
 	expect(wide.pageScrolls).toBe(false);
@@ -388,7 +391,7 @@ test('the toolbar stays reachable as the window narrows', async ({ page }) => {
 	for (const width of [900, 768, 640]) {
 		await page.setViewportSize({ width, height: 800 });
 		const m = await measure();
-		expect(m.count, `a button vanished at ${width}px`).toBe(4);
+		expect(m.count, `a button vanished at ${width}px`).toBe(BUTTONS);
 		expect(m.overflows, `the toolbar overflows at ${width}px`).toBe(false);
 		expect(m.pageScrolls, `the page scrolls horizontally at ${width}px`).toBe(false);
 	}
