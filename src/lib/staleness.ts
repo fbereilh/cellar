@@ -226,8 +226,9 @@ export function computeStaleness(
 	// nondeterministic, and a staleness verdict over it would claim a re-run
 	// restores something no re-run can. A MOJO NOTEBOOK's CODE cells are excluded for
 	// the sibling reason: each one is a whole program compiled to a `%%mojo` magic that
-	// runs in a SUBPROCESS, so it binds nothing any later cell can read and a
-	// fresh/stale verdict over it would be a claim about state that never existed.
+	// runs in a SUBPROCESS, so it binds no VALUE any later cell can read. Its
+	// declarations do carry (`$lib/mojoCarry`), but this graph is Python dataflow
+	// and has no edge for them, so a verdict here would be a claim it cannot back.
 	// That is decided by `nbLang`, the notebook's own language, not per cell - which
 	// is why a Mojo notebook needs no chip-level special case anywhere.
 	//

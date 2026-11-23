@@ -21,20 +21,21 @@
  * `mojo/notebook.py` is ~58 lines: write the cell body to a fresh temp file, run
  * `mojo run <file>` in a SUBPROCESS with `capture_output=True`, print the captured
  * stdout, delete the temp dir. Therefore:
- *   - **No state persists between Mojo cells.** The subprocess and its whole
- *     namespace die with the cell, which is why Modular's docs say every Mojo cell
- *     must be a complete program with a `main()`. Cellar STATES this (the badge
- *     tooltip and the type-menu hint) rather than faking continuity, and
- *     `hasPythonDataflow` keeps such a cell out of the dependency graph entirely so
- *     nothing downstream ever claims a Mojo cell defined something.
+ *   - **No VALUE persists between Mojo cells.** The subprocess and its whole
+ *     namespace die with the cell. Cellar does not fake that. What it does carry
+ *     is DECLARATIONS: `$lib/mojoCarry` appends the functions, structs and imports
+ *     a cell uses from cells that already ran, so the program handed to this
+ *     module may be longer than the cell. `hasPythonDataflow` still keeps such a
+ *     cell out of the PYTHON dependency graph entirely.
  *   - **Output is fully buffered.** `capture_output=True` means a long Mojo cell
  *     shows nothing until it finishes; the run watchdog is safe here (the kernel is
  *     genuinely busy inside `subprocess.run`, and the watchdog only probes).
  *   - **A compile error arrives as a Python exception** (`MojoCompilationError`)
  *     whose text names a temp path that no longer exists. Left as-is: rewriting a
  *     compiler diagnostic is a separate feature, and a wrong rewrite is worse than a
- *     verbose right one. The line/column ARE cell-relative (the body is written
- *     verbatim with no preamble), so a future rewrite is a path substitution.
+ *     verbose right one. The line/column ARE cell-relative (the cell is written
+ *     first and carried code only ever follows it), so a future rewrite is a path
+ *     substitution. A line past the cell's own length names carried code.
  *
  * WHY A PRE-FLIGHT RATHER THAN A STARTUP INJECTION. The magic exists only after
  * `import mojo.notebook`, and `max` is a 534 MB, 16-package dependency Cellar

@@ -302,9 +302,9 @@ describe('the schemas and the doctrine an agent is billed for', () => {
 		expect([...enums[0]].sort()).toEqual(['mojo', 'python']);
 	});
 
-	it('states the no-state-between-cells rule BEFORE any tool schema is read', async () => {
-		// An agent that does not know this writes a define/use pair across two Mojo
-		// cells and cannot understand why the second one fails to compile. Read off
+	it('states what carries between Mojo cells BEFORE any tool schema is read', async () => {
+		// An agent that does not know this expects a variable from an earlier cell,
+		// or repeats every helper in every cell. Read off
 		// the instructions the SERVER really delivered at connect, which the SDK hands
 		// the client before any tool is listed.
 		const client = await connect('s-doctrine');
@@ -312,8 +312,10 @@ describe('the schemas and the doctrine an agent is billed for', () => {
 		// the lines it happens to be laid out on.
 		const instructions = (client.getInstructions() ?? '').replace(/\s+/g, ' ');
 		expect(instructions).toContain('12. LANGUAGE IS THE NOTEBOOK\'S, AND EVERY MOJO CELL IS A SEPARATE PROGRAM.');
-		expect(instructions).toContain('NOTHING carries from one cell to the next');
-		expect(instructions).toContain('complete program with its own');
+		expect(instructions).toContain('no VALUE carries from one cell to the next');
+		expect(instructions).toContain('DECLARATIONS do carry');
+		expect(instructions).toContain('already RAN OK in this kernel session');
+		expect(instructions).toContain('A restart clears what is carried');
 		// The notebook-level model itself, and the tool that reaches it.
 		expect(instructions).toContain('A notebook is Python or Mojo, never both');
 		expect(instructions).toContain('there is NO mojo cell_type');

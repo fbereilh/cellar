@@ -151,7 +151,7 @@ const MAIN_DEF_RE = /^def\s+main\s*[([]/;
 /** A line that is nothing but a decorator (`@parameter`, `@always_inline(...)`). */
 const DECORATOR_RE = /^@/;
 
-interface ScannedLine {
+export interface ScannedLine {
 	/** Offset of the line's first character. */
 	start: number;
 	/** Offset just past the line's terminating newline (or of end-of-source). */
@@ -196,7 +196,7 @@ interface ScannedLine {
  * they open and close within one line - but their contents are skipped so a
  * `"""` appearing inside one does not open a block.
  */
-function scanLines(src: string): ScannedLine[] {
+export function scanLines(src: string): ScannedLine[] {
 	const out: ScannedLine[] = [];
 	let i = 0;
 	let triple: '"""' | "'''" | null = null;

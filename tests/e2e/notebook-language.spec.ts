@@ -157,10 +157,11 @@ test('flipping the selector to Mojo makes every code cell a Mojo cell', async ({
 	await chooseLanguage(page, 'mojo');
 	await expect(cell.getByTestId('mojo-badge')).toBeVisible();
 	await expect(cell.getByTestId('type-toggle')).toHaveText(/mojo/);
-	// The tooltip carries the one fact a Mojo user must know, because it is
-	// Modular's semantics rather than anything Cellar chose.
-	await expect(cell.getByTestId('mojo-badge')).toHaveAttribute('title', /complete program/i);
+	// The tooltip carries the one fact a Mojo user must know: declarations carry
+	// over from cells that already ran, values do not.
+	await expect(cell.getByTestId('mojo-badge')).toHaveAttribute('title', /its own program/i);
 	await expect(cell.getByTestId('mojo-badge')).toHaveAttribute('title', /carry over/i);
+	await expect(cell.getByTestId('mojo-badge')).toHaveAttribute('title', /runtime values do not/i);
 
 	// It IS runnable, unlike raw: the Run affordances stay.
 	await expect(cell.getByTestId('run')).toBeVisible();

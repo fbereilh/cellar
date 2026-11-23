@@ -17,19 +17,23 @@
  *   try { return await executeCellRun({ nb, cellId, actor, source: ticket.source() }); }
  *   finally { ticket.done(); }
  */
-import { execute, ensureMojoMagic, KernelExecuteAborted } from './kernel';
+import { currentSessionId, execute, ensureMojoMagic, KernelExecuteAborted } from './kernel';
 import {
 	setOutputs,
 	setOutputsLive,
 	setLastRun,
 	clearOutputsLive,
 	getCell,
-	getNotebookLanguage
+	getNotebookLanguage,
+	listCells
 } from './notebook';
 import { publish } from './events';
 import { isChatCell, isMojoCell, isSqlCell } from '../cellLanguage';
 import { sqlToPython } from './sql';
 import { mojoMissingOutput, mojoToCellSource, type MojoSetup } from './mojo';
+import { buildMojoProgram, type CarriedCell, type MojoProgram } from '../mojoCarry';
+import { hasMojoHeader } from '../cellMagic';
+import { mojoRunsIn, recordMojoRun } from './mojo-session';
 import { executeChatRun, chatReplyOutput } from './chat/run-chat';
 import { OutputAccumulator, OUTPUT_FLUSH_MS, type StreamDelta } from './output-accumulator';
 import { registerRunOutputs, unregisterRunOutputs } from './run-output-registry';
@@ -52,6 +56,29 @@ export interface CellRunArgs {
 			| { type: 'output-append'; index: number; base: number; keep: number; chunk: string }
 			| ({ type: 'run:end' } & LastRun)
 	) => void;
+}
+
+/** A stdout stream output holding nothing but whitespace. */
+function isBlankStdout(out: CellOutput): boolean {
+	if (out.output_type !== 'stream' || out.name !== 'stdout') return false;
+	const text = Array.isArray(out.text) ? out.text.join('') : String(out.text ?? '');
+	return text.trim() === '';
+}
+
+/**
+ * The cells whose declarations may carry into a run of `cellId`: every Mojo cell
+ * that ran successfully in `session` and is STILL in the document as a Mojo cell.
+ *
+ * The running cell is left out, because a re-run replaces its own old definitions
+ * rather than colliding with them. A deleted cell is left out too: its code would
+ * otherwise be compiled into later programs with nothing on screen to explain it.
+ */
+function carriedMojoCells(nb: string, cellId: string, session: SessionId | null): CarriedCell[] {
+	const runs = mojoRunsIn(nb, session);
+	if (runs.length === 0) return [];
+	const lang = getNotebookLanguage(nb);
+	const live = new Set(listCells(nb).filter((c) => isMojoCell(c, lang)).map((c) => c.id));
+	return runs.filter((r) => r.cellId !== cellId && live.has(r.cellId)).map((r) => ({ seq: r.seq, source: r.source }));
 }
 
 /**
@@ -127,7 +154,13 @@ export async function executeCellRun({ nb, cellId, actor, source, originId, onEv
 			/* no verdict; see above */
 		}
 	}
-	const execSource = isSqlCell(cell) ? sqlToPython(source) : isMojo ? mojoToCellSource(source) : source;
+	// A Mojo cell is a fresh `mojo run` process, so nothing it declares survives it.
+	// The program sent to the compiler is therefore the cell's own source plus the
+	// declarations it reaches in cells that already ran this session (see
+	// `$lib/mojoCarry` for the rules, and `mojo-session.ts` for what "ran" means).
+	let mojoProgram: MojoProgram | null = null;
+	if (isMojo) mojoProgram = buildMojoProgram(source, carriedMojoCells(nb, cellId, mojoSetup?.session ?? currentSessionId(nb)));
+	const execSource = isSqlCell(cell) ? sqlToPython(source) : mojoProgram ? mojoToCellSource(mojoProgram.program) : source;
 
 	// Bound + coalesce the run's output across all three consumers (persist, SSE
 	// broadcast, this caller's stream). The accumulator merges consecutive
@@ -193,6 +226,10 @@ export async function executeCellRun({ nb, cellId, actor, source, originId, onEv
 			} else {
 				const reply = await execute(nb, execSource, (ev) => {
 					if (ev.type === 'output') {
+						// A cell with no `main` of its own ran a no-op one, and the magic
+						// prints the captured stdout even when it is empty. That blank line
+						// is Cellar's doing, so it is not the cell's output.
+						if (mojoProgram?.synthesizedMain && isBlankStdout(ev.output)) return;
 						acc.push(ev.output);
 					} else if (ev.type === 'kernel') {
 						session = ev.session;
@@ -202,6 +239,10 @@ export async function executeCellRun({ nb, cellId, actor, source, originId, onEv
 					}
 				});
 				status = reply?.status ?? 'ok';
+				// Only a run that compiled and exited cleanly has declared anything. A
+				// `%%mojo …` cell speaks to the magic directly and stays out of it.
+				const ranIn = session as SessionId | null;
+				if (isMojo && status === 'ok' && ranIn !== null && !hasMojoHeader(source)) recordMojoRun(nb, ranIn, cellId, source);
 			}
 		} catch (err) {
 			const message = err instanceof Error ? err.message : String(err);

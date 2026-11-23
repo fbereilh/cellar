@@ -2385,13 +2385,12 @@
 				{/if}
 				{#if isMojo}
 					<!-- Mojo indicator. Tinted like SQL and chat - it IS an execution mode -
-					     and its tooltip carries the one thing a Mojo user must know, because
-					     it is Modular's semantics rather than anything Cellar chose: each
-					     `%%mojo` cell is a fresh `mojo run` subprocess, so nothing survives
-					     from one Mojo cell to the next. -->
+					     and its tooltip carries the one thing a Mojo user must know: each
+					     cell is a fresh `mojo run` subprocess, so DECLARATIONS carry over
+					     from cells that already ran (`$lib/mojoCarry`) and VALUES never do. -->
 					<span
 						class="badge badge-xs ml-1.5 badge-soft badge-accent font-medium"
-						title="Mojo cell - compiled to a %%mojo cell magic and run by `mojo run` in a subprocess. Each Mojo cell is a COMPLETE program (it needs its own `def main():`); no variables, imports or definitions carry over from one Mojo cell to the next."
+						title="Mojo cell - run by `mojo run` in a subprocess, as its own program. Functions, structs, traits, comptime values and imports carry over from Mojo cells that already ran in this kernel session. Variables and other runtime values do not. A cell with no `def main():` only defines things."
 						data-testid="mojo-badge">mojo</span
 					>
 				{/if}
