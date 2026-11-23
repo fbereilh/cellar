@@ -151,7 +151,11 @@ export function narrowImport(text: string, own: ReadonlySet<string>): string | n
 		.split(',')
 		.map((raw) => raw.trim().replace(/\s+/g, ' '))
 		.filter((item) => item !== '');
-	const kept = items.filter((item) => item === '*' || !own.has(itemName(item, !from)));
+	const kept = items.filter((item) => {
+		if (item === '*') return true;
+		if (!from && item.includes('.') && !/ as \S+$/.test(item)) return true;
+		return !own.has(itemName(item, !from));
+	});
 	if (kept.length === items.length) return text;
 	if (kept.length === 0) return null;
 	const lead = from ? body.slice(0, body.length - list.length).trimEnd() : 'import';

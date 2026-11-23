@@ -130,6 +130,16 @@ describe('buildMojoProgram', () => {
 		expect(narrowImport('from m import x', new Set(['x']))).toBeNull();
 	});
 
+	it('keeps a carried dotted import whose first segment the running cell also imports', () => {
+		const nap = 'def nap():\n    std.time.sleep(1)';
+		const own = 'import std.math\n\ndef main():\n    nap()';
+		expect(buildMojoProgram(own, cells(`import std.time, helpers\n\n${nap}`)).program).toContain('\nimport std.time, helpers\n');
+		expect(buildMojoProgram(own, cells(`import std.time\n\n${nap}`)).program).toContain('\nimport std.time\n');
+		const mixed = buildMojoProgram(`def helpers():\n    pass\n\n${own}`, cells(`import std.time, helpers\n\n${nap}`));
+		expect(mixed.program).toContain('\nimport std.time\n');
+		expect(mixed.program).not.toContain('std.time, helpers');
+	});
+
 	it('leaves an empty cell and a `%%mojo` cell exactly alone, in both directions', () => {
 		expect(buildMojoProgram('', cells(HELPER)).program).toBe('');
 		const magic = '%%mojo build -o x.so\ndef f():\n    twice(1)';
