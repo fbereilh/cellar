@@ -264,7 +264,7 @@ export function exportModuleLanguage(
 	notebookLanguage: ExportLanguage,
 	targetNamesModule: boolean
 ): ExportLanguage | null {
-	return targetNamesModule ? notebookLanguage : null;
+	return targetNamesModule && languageGeneratesModule(notebookLanguage) ? notebookLanguage : null;
 }
 
 /**

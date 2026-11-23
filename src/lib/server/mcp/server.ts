@@ -25,7 +25,7 @@ import { runAsAgent, digestFor, deletionNote, currentSeq, DIGEST_PREFIX } from '
 import { CellRefError } from './cellHandle';
 import { isNotebookUnavailable } from '../notebook';
 import { NOTEBOOK_LANGUAGE_LABELS, TextNotebookCellTypeError, type NotebookLanguage } from '../../cellLanguage';
-import { moduleExtension } from '../../exportRole';
+import { moduleExtension, noModuleLanguageMessage } from '../../exportRole';
 import { reasonWithoutServerPath } from '../../serverMessage';
 
 const text = (obj: unknown) => ({ content: [{ type: 'text' as const, text: JSON.stringify(obj) }] });
@@ -919,6 +919,7 @@ export function registerTools(server: McpServer) {
 		// setter rejects on every branch that carried it. `set_notebook_language` is
 		// what moves the module's language, and it re-expresses the stored target with
 		// it, so branches 3 and 4 name it beside the target action each still needs.
+		if ('noModule' in r && r.noModule) return notFound(`no cell was marked for export: ${noModuleLanguageMessage(r.noModule)}`);
 		if ('notCode' in r)
 			return notFound(
 				r.cellLanguage == null

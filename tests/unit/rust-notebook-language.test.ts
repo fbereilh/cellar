@@ -24,6 +24,7 @@ import {
 import {
 	canExportCell,
 	exportLanguageOf,
+	exportModuleLanguage,
 	languageGeneratesModule,
 	moduleExtension,
 	noModuleLanguageMessage
@@ -98,6 +99,14 @@ describe('module export', () => {
 		expect(canExportCell(code, 'rust')).toBe(false);
 		// The control: the same cell in a Python notebook is eligible.
 		expect(canExportCell(code, 'python')).toBe(true);
+	});
+
+	it('names no module language for a Rust notebook, even with a target kept from before the switch', () => {
+		expect(exportModuleLanguage('rust', true)).toBeNull();
+		expect(exportModuleLanguage('rust', false)).toBeNull();
+		// The control: a named module in the other two languages is in that language.
+		expect(exportModuleLanguage('python', true)).toBe('python');
+		expect(exportModuleLanguage('mojo', true)).toBe('mojo');
 	});
 
 	it('says why, naming the language', () => {

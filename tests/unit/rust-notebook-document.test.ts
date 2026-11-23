@@ -120,6 +120,16 @@ describe('a Rust notebook exports no module', () => {
 		expect(nbmod.exportTargetInfo(nb)?.ok).toBe(true);
 	});
 
+	it('reports no module language for a target kept across the switch', () => {
+		const nb = makeNotebook('kept-lang.ipynb', ['x = 1'], { export_target: 'utils.py' });
+		expect(nbmod.exportTargetInfoFor(nb).language).toBe('python');
+		nbmod.setNotebookLanguage('rust', nb);
+		const info = nbmod.exportTargetInfoFor(nb);
+		expect(info.configured).toBe(true);
+		expect(info.language).toBeNull();
+		expect(nbmod.getNotebook(nb).exportLanguage).toBeNull();
+	});
+
 	it('refuses to mark a cell for export', () => {
 		const nb = makeNotebook('mark.ipynb', ['fn f() {}'], { language: 'rust' });
 		const res = nbmod.setCellExport('cell0', true, nb);

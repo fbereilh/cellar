@@ -75,6 +75,7 @@ import {
 	exportLanguageOf,
 	exportMarkedTwice,
 	exportTargetLanguage,
+	languageGeneratesModule,
 	notebookHoldsExport
 } from '../../exportRole';
 import { hazardReport } from '../../exportHazard';
@@ -2344,6 +2345,7 @@ export function setCellExport(ids: string[], exported: boolean, nb?: string | nu
 	const targetInfo = exportTargetInfoFor(target);
 	const targetLang = targetInfo.language;
 	const lang = targetInfo.eligibility;
+	if (exported && !languageGeneratesModule(lang)) return { ok: false as const, noModule: lang };
 	const full: string[] = [];
 	const seen = new Set<string>();
 	for (const ref of ids) {

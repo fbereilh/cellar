@@ -455,7 +455,7 @@ export function docExportTargetInfo(
 	// caller is unchanged.
 	const eligibility = docExportLanguage(doc);
 	return resolved
-		? { configured: true, language: targetNamesModule(resolved) ? eligibility : null, eligibility }
+		? { configured: true, language: targetNamesModule(resolved) && languageGeneratesModule(eligibility) ? eligibility : null, eligibility }
 		: { configured: false, language: null, eligibility };
 }
 
