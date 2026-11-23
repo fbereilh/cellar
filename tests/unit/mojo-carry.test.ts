@@ -14,7 +14,7 @@ import { execFileSync } from 'node:child_process';
 import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { buildMojoProgram, topLevelBlocks, MOJO_CARRY_MARKER, MOJO_SYNTHESIZED_MAIN, type CarriedCell } from '../../src/lib/mojoCarry';
+import { buildMojoProgram, narrowImport, topLevelBlocks, MOJO_CARRY_MARKER, MOJO_SYNTHESIZED_MAIN, type CarriedCell } from '../../src/lib/mojoCarry';
 
 const STRUCT = '@fieldwise_init\nstruct Point(Copyable):\n    var x: Int\n    var y: Int';
 const HELPER = 'def twice(x: Int) -> Int:\n    return x * 2';
@@ -111,6 +111,25 @@ describe('buildMojoProgram', () => {
 		expect(out.program).not.toContain('std.math');
 	});
 
+	it('narrows a carried import line to the names the running cell does not declare', () => {
+		const carried = 'from std.math import sqrt, floor\n\ndef g(x: Float64) -> Float64:\n    return sqrt(x)';
+		const out = buildMojoProgram('def floor(x: Int) -> Int:\n    return x\n\ndef main():\n    print(g(4.0), floor(3))', cells(carried));
+		expect(out.program).toContain('from std.math import sqrt\n');
+		expect(out.program).not.toContain('sqrt, floor');
+		expect(out.carried).toEqual(['sqrt', 'g']);
+	});
+
+	it('narrows by the ALIASED name, and also an import pulled in by a used name', () => {
+		const carried = 'from std.math import sqrt, floor as fl\n\ndef g(x: Float64) -> Float64:\n    return sqrt(x)';
+		const own = 'def fl(x: Int) -> Int:\n    return x\n\ndef main():\n    print(g(4.0), fl(3), sqrt(9.0))';
+		expect(buildMojoProgram(own, cells(carried)).program).toContain('from std.math import sqrt\n');
+		const plain = buildMojoProgram('def b(x: Int) -> Int:\n    return x\n\ndef main():\n    print(a.f(), b(1))', cells('import a, b'));
+		expect(plain.program).toContain('\nimport a\n');
+		expect(narrowImport('from m import (x,\n    y)', new Set(['z']))).toBe('from m import (x,\n    y)');
+		expect(narrowImport('from m import (x,\n    y)', new Set(['y']))).toBe('from m import x');
+		expect(narrowImport('from m import x', new Set(['x']))).toBeNull();
+	});
+
 	it('leaves an empty cell and a `%%mojo` cell exactly alone, in both directions', () => {
 		expect(buildMojoProgram('', cells(HELPER)).program).toBe('');
 		const magic = '%%mojo build -o x.so\ndef f():\n    twice(1)';
@@ -173,6 +192,13 @@ describe.skipIf(!MOJO_BIN)(`carried programs against a REAL mojo${why}`, () => {
 	it('keeps a compile error in the cell on the cell\'s own line', () => {
 		const out = run(buildMojoProgram('def main():\n    print(twice(1))\n    oops()', cells(HELPER)).program).out;
 		expect(out).toMatch(/cell\d+\.mojo:3:\d+: error/);
+	});
+
+	it('a carried import sharing a name with the running cell is narrowed, not a redefinition', () => {
+		const carried = 'from std.math import sqrt, floor\n\ndef g(x: Float64) -> Float64:\n    return sqrt(x)';
+		const cell = 'def floor(x: Int) -> Int:\n    return x\n\ndef main():\n    print(g(4.0), floor(3))';
+		expect(run(`${cell}\n${carried}\n`).out).toContain('redefinition');
+		expect(run(buildMojoProgram(cell, cells(carried)).program)).toEqual({ ok: true, out: '2.0 3\n' });
 	});
 
 	it('a re-run with a changed definition replaces the old one', () => {
