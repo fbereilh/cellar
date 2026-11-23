@@ -102,10 +102,19 @@ async function openNotebook(page: Page): Promise<void> {
 	// `loading…` really can be on screen AT THE SAME TIME as the empty-state button
 	// (the shell paints the empty state while a restored tab is still loading), so
 	// the two-element match is a strict-mode violation rather than a race.
-	await expect(
-		empty.or(page.getByTestId('cell')).or(page.getByText('loading…')).first()
-	).toBeVisible({ timeout: 30_000 });
-	if (await empty.isVisible().catch(() => false)) await empty.click();
+	//
+	// The click is RETRIED until a notebook answers it, rather than sent once. The
+	// empty state is server-rendered, so it can be on screen before hydration has
+	// attached its handler, and a click landing in that window does nothing. Sent
+	// once, it left the empty state up for the whole assertion budget (seen on a
+	// Linux CI run: the snapshot showed "No notebook open" and no tab). A second
+	// click is harmless, since creating a notebook that exists only opens it.
+	await expect(async () => {
+		if (await empty.isVisible().catch(() => false)) await empty.click();
+		await expect(
+			page.getByTestId('cell').or(page.getByText('loading…')).first()
+		).toBeVisible({ timeout: 2_000 });
+	}).toPass({ timeout: 60_000 });
 }
 
 /** A notebook with wide content, so a screenshot shows cells really using the width. */
