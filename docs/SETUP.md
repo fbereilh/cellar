@@ -619,6 +619,7 @@ outlive the run that asked for it.
 | `CELLAR_KERNEL_INTERRUPT_SIGNAL_TIMEOUT_MS` | `5000` (ms, = 5s) | How long the interrupt request itself (a localhost POST to the Jupyter sidecar) may take before it is cancelled and Cellar stops waiting for it. Never additive with the grace window: an interrupt that could not be delivered means the kernel was never asked, so the run is force-settled straight away. |
 | `CELLAR_KERNEL_INTERRUPT_START_TIMEOUT_MS` | `5000` (ms, = 5s) | How long an interrupt waits for a kernel that is still **starting** before it frees the run without signalling it (the start is left to finish; a later run picks it up). Same rule as above - nothing was asked, so the grace window is skipped. |
 | `CELLAR_MOJO_SETUP_TIMEOUT_MS` | `30000` (ms, = 30s) | How long the once-per-session Mojo setup probe (a silent `import mojo.notebook` in the kernel, which registers the `%%mojo` magic a Mojo cell runs through) may take before the run stops waiting for a verdict. Timing out is **no verdict**, never "the toolchain is missing": the run falls through to the ordinary kernel path and the run watchdog above reports what really happened. Only a probe that answers can report the toolchain absent. |
+| `CELLAR_EVCXR` | unset | Absolute path to the `evcxr_jupyter` binary a Rust notebook's kernel runs. Unset, Cellar looks on `PATH`, then in `$CARGO_HOME/bin` (default `~/.cargo/bin`). A value that names no file is not papered over with another binary: the Rust cell fails with the install instruction. Cellar never installs Evcxr itself. |
 | `CELLAR_KERNEL_INTROSPECT_TIMEOUT_MS` | `3000` (ms, = 3s) | How long Tab completion and the Shift+Tab docs tooltip wait for the kernel's reply before giving up. Both are only ever sent to a kernel Cellar has just checked is idle and connected, so this bounds a reply that never comes rather than an ordinary wait; giving up shows the tooltip a `timeout` reason and leaves completion to the editor's own file-local sources. |
 | `CELLAR_KERNEL_INTROSPECT_IDLE_WAIT_MS` | `500` (ms) | How long those two requests wait out Cellar's **own** brief kernel work (above all the variable-inspector probe that runs after every cell) before refusing. A **user** cell run is never waited for: it refuses immediately, so neither key can ever block behind a running cell. |
 | `CELLAR_MAX_KERNELS` | `8` | Soft cap: shows a warn-only banner past N live kernels (never blocks a run). `0` disables the warning. |
@@ -897,19 +898,19 @@ runs two spec files at a time. Install its browser once with `npx playwright ins
   the output formats it belongs to. Change it back from the type label at the right of its
   toolbar, the command palette (*Change cell(s) to code*), or `y`/`m`/`r` in command mode
   (`r` is the chord that makes a cell raw in the first place).
-- **A cell will not become raw or chat, and the notebook will not become Mojo: "A .py
-  notebook cannot hold a raw cell" / "...a chat cell" / "A .py notebook cannot be a Mojo
-  notebook"** - a jupytext / Databricks-source notebook is rebuilt from its cells on every
+- **A cell will not become raw or chat, and the notebook will not become Mojo or Rust: "A
+  .py notebook cannot hold a raw cell" / "...a chat cell" / "A .py notebook cannot be a Mojo
+  notebook" / "...a Rust notebook"** - a jupytext / Databricks-source notebook is rebuilt from its cells on every
   save, and the format carries no raw marker, no cell metadata or outputs, and no notebook
   metadata. So the declaration would be gone after a reload: raw text would come back in a
   **runnable** Python cell, a chat cell would come back as runnable prose with its AI
-  reply gone for good (no re-run reproduces one), and every cell of a Mojo notebook would
-  come back as a runnable Python cell holding Mojo source. Cellar refuses all three
-  instead - in the type menu (where neither raw nor chat is offered), in the notebook's
+  reply gone for good (no re-run reproduces one), and every cell of a Mojo or Rust notebook
+  would come back as a runnable Python cell holding Mojo or Rust source. Cellar refuses all
+  of them instead - in the type menu (where neither raw nor chat is offered), in the notebook's
   add controls (which withhold the **Chat** button there), on the `r` and `t` chords, and
   in the notebook chrome, which offers no **Language** bar on a `.py`; an agent's
   `add_cell` / `set_cell_type` is refused for raw, its `set_notebook_language` is refused
-  for Mojo, and it cannot ask for a chat cell at all (no agent write tool takes `chat`).
+  for Mojo and Rust, and it cannot ask for a chat cell at all (no agent write tool takes `chat`).
   Convert the notebook to `.ipynb` (app menu → **Convert to .ipynb**) if you need one. The
   same limit applies to raw in the other direction: **Save as .py** writes a raw cell out
   as code, so a Quarto notebook exported that way loses its frontmatter cell's type.
