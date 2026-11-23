@@ -17,13 +17,15 @@ import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/
 import { isInitializeRequest } from '@modelcontextprotocol/sdk/types.js';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import * as svc from './service';
+import { syncKernelToNotebookLanguage } from '../notebook-language-actions';
 import { IMG_MAX_EDGE, MAX_IMAGE_BLOCKS, MAX_FULL_OUTPUT_IMAGE_BLOCKS } from './image';
 import { INSPECT_HEAD_ROWS, INSPECT_ARRAY_HEAD_ROWS, INSPECT_ARRAY_ITEMS, INSPECT_STR_CHARS, INSPECT_HEAD_BUDGET } from '../inspect';
 import { McpSessionRegistry, SESSION_IDLE_MS, REAPER_INTERVAL_MS } from './sessions';
 import { runAsAgent, digestFor, deletionNote, currentSeq, DIGEST_PREFIX } from './userActivity';
 import { CellRefError } from './cellHandle';
 import { isNotebookUnavailable } from '../notebook';
-import { TextNotebookCellTypeError } from '../../cellLanguage';
+import { NOTEBOOK_LANGUAGE_LABELS, TextNotebookCellTypeError, type NotebookLanguage } from '../../cellLanguage';
+import { moduleExtension } from '../../exportRole';
 import { reasonWithoutServerPath } from '../../serverMessage';
 
 const text = (obj: unknown) => ({ content: [{ type: 'text' as const, text: JSON.stringify(obj) }] });
@@ -39,8 +41,8 @@ const pyNotebookRefusal = (what: string) =>
 	`refused: this is a .py text notebook (jupytext/Databricks source). It carries no per-cell metadata and generates no module, so ${what} - convert it to .ipynb first.`;
 
 /** How an export language is NAMED to an agent: the source it holds, and the module it goes in. */
-const cellLang = (lang: 'python' | 'mojo') => (lang === 'mojo' ? 'Mojo' : 'Python');
-const moduleExt = (lang: 'python' | 'mojo') => (lang === 'mojo' ? '.mojo' : '.py');
+const cellLang = (lang: NotebookLanguage) => NOTEBOOK_LANGUAGE_LABELS[lang];
+const moduleExt = (lang: NotebookLanguage) => moduleExtension(lang);
 
 /**
  * Run an ADD handler, turning the doc layer's `.py`-notebook type refusal
@@ -584,7 +586,7 @@ Follow this house style:
    marker, so every tool that would create or convert one there refuses.
 
 12. LANGUAGE IS THE NOTEBOOK'S, AND EVERY MOJO CELL IS A SEPARATE PROGRAM. A
-   notebook is Python or Mojo, never both: get_notebook_map's display block reports
+   notebook is Python, Mojo or Rust, never a mix: get_notebook_map's display block reports
    \`language\`, set_notebook_language switches it, and there is NO mojo cell_type -
    every code cell is written in the notebook's language. In a MOJO notebook Cellar
    compiles each code cell to Modular's own "%%mojo" cell magic, which runs
@@ -601,6 +603,16 @@ Follow this house style:
    MojoCompilationError naming a temp path. If the Mojo toolchain is missing the
    cell fails with the exact install command — relay it; Cellar never installs it
    for the user.
+   RUST is the third language and works the OPPOSITE way: a Rust notebook runs on
+   a real kernel (Evcxr), so variables, functions and \`use\` lines DO carry from
+   cell to cell, and a cell is top-level statements, not a program with a main.
+   Switching to or from Rust changes which kernel runs the notebook, so a live
+   kernel is freed and its variables are gone (kernel_restarted in the reply);
+   Python and Mojo share one kernel and keep it. A Rust notebook has no Python
+   namespace: kernel_state and the variable tools report python_namespace:false,
+   no cell shows a staleness verdict, there is no imports cell, a sql cell and the
+   Databricks session tools are refused, and it exports no module. If Evcxr is
+   missing the cell fails with the exact \`cargo install\` command — relay it.
 
 The goal: a notebook a human would be happy to have written — imports up top,
 shared state, a clean section outline, and a continuous line of reasoning from
@@ -833,8 +845,9 @@ export function registerTools(server: McpServer) {
 	// touched), but it is NOT display: it decides how every code cell RUNS. The
 	// `.py`-notebook refusal is reported by reason like the cell-type ones, since
 	// its cause and its remedy are the same (that document stores no metadata).
-	server.registerTool('set_notebook_language', { description: 'Set the notebook\'s LANGUAGE: "python" or "mojo". A notebook is one or the other, never both - every plain code cell in it is written in this language (there is no mojo cell type). Switching touches NO cell: markdown, raw, sql and chat cells are unaffected, and code cells simply run as the new language (doctrine clause 12). The nbdev export target follows it - a stored `utils.py` becomes `utils.mojo` and back - so the two can never disagree; the reply reports the target so you can name it again correctly. Refused on a `.py` text notebook, which stores no notebook metadata. Returns {language, export_target, ...}.', inputSchema: { language: z.enum(['python', 'mojo']), ...notebookParam } }, async ({ language, notebook }, extra: ToolExtra) => {
-		const r = svc.setNotebookLanguage(language, targetOf(extra, notebook));
+	server.registerTool('set_notebook_language', { description: 'Set the notebook\'s LANGUAGE: "python", "mojo" or "rust". A notebook is exactly one, never a mix - every plain code cell in it is written in this language (there is no mojo cell type). Switching touches NO cell: markdown, raw, sql and chat cells are unaffected, and code cells simply run as the new language (doctrine clause 12). The nbdev export target follows it - a stored `utils.py` becomes `utils.mojo` and back - so the two can never disagree; the reply reports the target so you can name it again correctly. A switch to or from "rust" changes the KERNEL (Evcxr vs ipykernel): a live kernel is freed, kernel_restarted/namespace_cleared report it, and every variable is gone; a Rust notebook exports no module, so its target is reported unresolvable until it switches back. Refused on a `.py` text notebook, which stores no notebook metadata. Returns {language, export_target, ...}.', inputSchema: { language: z.enum(['python', 'mojo', 'rust']), ...notebookParam } }, async ({ language, notebook }, extra: ToolExtra) => {
+		const target = targetOf(extra, notebook);
+		const r = svc.setNotebookLanguage(language, target);
 		// Checked FIRST, and it is NOT the write failure below: the document could not
 		// be OPENED, so nothing was applied at all. Reported as a failed save it would
 		// claim the language took and send the agent to fix a save that never ran.
@@ -850,9 +863,13 @@ export function registerTools(server: McpServer) {
 		// the call failed would leave an agent writing the other language into a notebook
 		// that has switched - so this names what is true, and does not hand back the
 		// refusals' remedy above.
+		// Past every refusal the live document holds the new language, saved or not, so
+		// the kernel follows it. Composed here so the service stays synchronous.
+		const kernel = await syncKernelToNotebookLanguage(target);
+		const kernelNote = kernel.kernel_restarted ? ' The kernel was restarted to match the new language, so its variables are gone.' : '';
 		if ('writeFailed' in r)
-			return notFound(`the notebook language was applied in memory but the notebook could not be saved: ${r.writeFailed} - the open notebook already holds ${JSON.stringify(r.language)} and every plain code cell in it runs as that language now; it is written to disk with the notebook's next successful save${r.export_target ? `. Export target: ${r.export_target}` : ''}`);
-		return text(r);
+			return notFound(`the notebook language was applied in memory but the notebook could not be saved: ${r.writeFailed} - the open notebook already holds ${JSON.stringify(r.language)} and every plain code cell in it runs as that language now; it is written to disk with the notebook's next successful save${r.export_target ? `. Export target: ${r.export_target}` : ''}.${kernelNote}`);
+		return text({ ...r, ...kernel });
 	});
 
 	server.registerTool('set_report_view', { description: 'Turn the notebook-wide report view on/off: enabled:true renders every code cell OUTPUT-only, so a human reads results and markdown without the code; enabled:false shows code again. Display-only — no source is touched and cells still run. A per-cell set_hide_input override beats it in either direction. Returns the resulting report_view.', inputSchema: { enabled: z.boolean(), ...notebookParam } }, async ({ enabled, notebook }, extra: ToolExtra) => text(svc.setReportView(enabled, targetOf(extra, notebook))));

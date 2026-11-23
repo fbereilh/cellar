@@ -66,6 +66,7 @@ const SDK_ERROR = `ValueError: default auth: databricks-cli: cannot get access t
 const kernel = { session: 1, connectOk: false, sessionExpired: false, connectMessage: SDK_ERROR };
 
 vi.mock('../../src/lib/server/kernel', () => ({
+	liveKernelLanguage: () => 'python',
 	execute: async (_nb: string, code: string, onEvent: (e: unknown) => void) => {
 		onEvent({ type: 'kernel', session: kernel.session });
 		let out: unknown;

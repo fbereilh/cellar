@@ -105,6 +105,7 @@ import {
 	restartKernel,
 	refreshKernelConnection,
 	liveDatabricksRuntime,
+	liveKernelLanguage,
 	KernelExecuteAborted
 } from './kernel';
 import { queueStateFor } from './run-queue';
@@ -1194,6 +1195,7 @@ export function statusFor(code: string): number {
 		case 'reconnect_failed':
 		case 'workspace_conflict':
 		case 'runtime_env_forced':
+		case 'not_python_kernel':
 		// The kernel run this op was riding was stopped (an interrupt, a restart, a
 		// teardown). A state conflict, deliberately NOT `kernel_unavailable`'s 503:
 		// nothing observed an unreachable kernel, and the remedy is to try again
@@ -2686,6 +2688,16 @@ async function runInKernel(nb: string, code: string): Promise<{ result: ProbeRes
 	let stdout = '';
 	let kernelError: string | null = null;
 	let session: SessionId | null = null;
+	// Every Databricks kernel op is Python source. A Rust (Evcxr) kernel would
+	// compile it as Rust and fail with a compiler error that names no cause, so it
+	// is refused here, before anything is sent.
+	const lang = liveKernelLanguage(nb);
+	if (lang && lang !== 'python') {
+		throw new DatabricksError(
+			'not_python_kernel',
+			`Databricks sessions need a Python kernel, and this notebook runs on a ${lang} kernel. Switch the notebook language to Python to connect.`
+		);
+	}
 	try {
 		// Databricks binds `spark`/`w` into THIS notebook's own kernel (each notebook
 		// has its own kernel + Databricks session); the epoch we stamp comes from it.

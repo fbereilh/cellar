@@ -8,13 +8,14 @@ import {
 } from '$lib/server/notebook';
 import { InvalidNotebookLanguageError, TextNotebookLanguageError } from '$lib/cellLanguage';
 import { reasonWithoutServerPath } from '$lib/serverMessage';
+import { syncKernelToNotebookLanguage } from '$lib/server/notebook-language-actions';
 
 /**
  * Set the notebook's LANGUAGE - the ONE authority for python-vs-mojo. Every plain
  * `code` cell in the notebook is written in it; markdown, raw, SQL and chat cells
  * are untouched, because nothing per-cell is written at all.
  *
- * POST { language:'python'|'mojo', path?, originId? } -> the applied value, PLUS
+ * POST { language:'python'|'mojo'|'rust', path?, originId? } -> the applied value, PLUS
  * the resulting export-target state. The target's extension follows the language,
  * so a switch can MOVE it (`utils.py` -> `utils.mojo`); the initiating tab
  * suppresses its own `notebook:export-target` echo by `originId`, so the reply is
@@ -70,7 +71,10 @@ export async function POST({ request }) {
 	};
 	try {
 		const language = setNotebookLanguage(String(body.language ?? ''), body.path, body.originId);
-		return json({ ok: true, language, exportTarget: getExportTargetState(body.path) });
+		// A switch to or from Rust changes which KERNEL runs the notebook, so a live
+		// kernel of the other kind is freed. Python and Mojo share one and keep it.
+		const kernel = await syncKernelToNotebookLanguage(body.path);
+		return json({ ok: true, language, exportTarget: getExportTargetState(body.path), ...kernel });
 	} catch (err) {
 		if (isNotebookUnavailable(err)) {
 			const raw = String(err?.message ?? err);
@@ -92,6 +96,8 @@ export async function POST({ request }) {
 		// The language was ACCEPTED and the live document holds it, so `held()` reports
 		// the NEW one: the select keeps it, and the notebook's next successful save
 		// writes it.
-		return json({ ok: false, writeFailed: String(err?.message ?? err), ...held() }, { status: 500 });
+		// The live document holds the new language, so the kernel follows it here too.
+		const kernel = await syncKernelToNotebookLanguage(body.path);
+		return json({ ok: false, writeFailed: String(err?.message ?? err), ...held(), ...kernel }, { status: 500 });
 	}
 }

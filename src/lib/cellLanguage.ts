@@ -112,24 +112,46 @@ export const CHAT_LANGUAGE = 'chat';
 export const MOJO_LANGUAGE = 'mojo';
 
 /**
- * The language a notebook's plain `code` cells are written in. Exactly two, and
- * `python` is what an absent declaration means - permanently, so a notebook that
- * never sets it needs no migration and no compatibility shim.
+ * The `metadata.cellar.language` value on a NOTEBOOK that makes it a Rust
+ * notebook. Unlike Mojo - which has no kernel and rides the Python one through a
+ * cell magic - a Rust notebook runs on its OWN kernel, Evcxr (`evcxr_jupyter`), so
+ * this value also decides which kernel the notebook starts (`notebookKernelLanguage`).
  */
-export type NotebookLanguage = 'python' | 'mojo';
+export const RUST_LANGUAGE = 'rust';
+
+/**
+ * The language a notebook's plain `code` cells are written in. `python` is what
+ * an absent declaration means - permanently, so a notebook that never sets it
+ * needs no migration and no compatibility shim.
+ */
+export type NotebookLanguage = 'python' | 'mojo' | 'rust';
 
 /** Every notebook language, in the order the selector offers them. */
-export const NOTEBOOK_LANGUAGES: readonly NotebookLanguage[] = ['python', 'mojo'];
+export const NOTEBOOK_LANGUAGES: readonly NotebookLanguage[] = ['python', 'mojo', 'rust'];
 
 /** How the selector names each notebook language. */
 export const NOTEBOOK_LANGUAGE_LABELS: Record<NotebookLanguage, string> = {
 	python: 'Python',
-	mojo: 'Mojo'
+	mojo: 'Mojo',
+	rust: 'Rust'
 };
 
-/** Is this value one of the two notebook languages? */
+/** Is this value one of the notebook languages? */
 export function isNotebookLanguage(v: unknown): v is NotebookLanguage {
-	return v === 'python' || v === MOJO_LANGUAGE;
+	return typeof v === 'string' && (NOTEBOOK_LANGUAGES as readonly string[]).includes(v);
+}
+
+/**
+ * The language of the KERNEL a notebook of this language runs on. Two, not three:
+ * Mojo has no kernel of its own and runs on the Python one (see `server/mojo.ts`),
+ * while Rust runs on Evcxr. This is the ONE rule behind "does switching the
+ * language need a different kernel process" and "may Python be sent to this
+ * notebook's kernel", so no caller compares notebook languages for that itself.
+ */
+export type KernelLanguage = 'python' | 'rust';
+
+export function notebookKernelLanguage(nbLang: NotebookLanguage): KernelLanguage {
+	return nbLang === RUST_LANGUAGE ? RUST_LANGUAGE : 'python';
 }
 
 /** The minimal notebook-metadata shape the language reader needs. */
@@ -147,7 +169,10 @@ type LanguageMetadata = { cellar?: { language?: unknown } | null } | null | unde
  * that runs the notebook the way it has always run, never to a guess.
  */
 export function notebookLanguageOf(metadata: LanguageMetadata): NotebookLanguage {
-	return metadata?.cellar?.language === MOJO_LANGUAGE ? MOJO_LANGUAGE : 'python';
+	const declared = metadata?.cellar?.language;
+	if (declared === MOJO_LANGUAGE) return MOJO_LANGUAGE;
+	if (declared === RUST_LANGUAGE) return RUST_LANGUAGE;
+	return 'python';
 }
 
 /**
@@ -160,7 +185,7 @@ export function notebookLanguageOf(metadata: LanguageMetadata): NotebookLanguage
 export function cellLanguage(
 	cell: LanguageCell,
 	nbLang: NotebookLanguage = 'python'
-): 'sql' | 'chat' | 'mojo' | 'python' {
+): 'sql' | 'chat' | NotebookLanguage {
 	const tag = cell?.metadata?.cellar?.language;
 	if (tag === SQL_LANGUAGE) return SQL_LANGUAGE;
 	if (tag === CHAT_LANGUAGE) return CHAT_LANGUAGE;
@@ -197,6 +222,16 @@ export function isMojoCell(cell: LanguageCell, nbLang: NotebookLanguage = 'pytho
 }
 
 /**
+ * True for a cell whose source is RUST: a plain `code` cell (not SQL, not chat)
+ * in a notebook whose declared language is `rust`. Sent to the Evcxr kernel
+ * verbatim - there is no compilation step on Cellar's side - and excluded from
+ * every Python-semantics engine by `isPythonCodeCell` / `hasPythonDataflow`.
+ */
+export function isRustCell(cell: LanguageCell, nbLang: NotebookLanguage = 'python'): boolean {
+	return cell?.cell_type === 'code' && cellLanguage(cell, nbLang) === RUST_LANGUAGE;
+}
+
+/**
  * How the type menu's `code` OPTION reads, for a notebook of this language.
  *
  * Choosing that option produces a cell in the NOTEBOOK's language (`applyCellType`
@@ -216,10 +251,14 @@ export function isMojoCell(cell: LanguageCell, nbLang: NotebookLanguage = 'pytho
  * naming an action; they are two presentations and folding them together would
  * decide one's casing from the other.
  */
+const CODE_TYPE_MENU_LABELS: Record<NotebookLanguage, { label: string; hint: string }> = {
+	python: { label: 'Python', hint: 'python3' },
+	mojo: { label: 'Mojo', hint: '%%mojo' },
+	rust: { label: 'Rust', hint: 'evcxr' }
+};
+
 export function codeTypeMenuLabel(nbLang: NotebookLanguage): { label: string; hint: string } {
-	return nbLang === MOJO_LANGUAGE
-		? { label: 'Mojo', hint: '%%mojo' }
-		: { label: 'Python', hint: 'python3' };
+	return CODE_TYPE_MENU_LABELS[nbLang];
 }
 
 /**
@@ -335,30 +374,59 @@ export const TEXT_NOTEBOOK_CHAT_MESSAGE =
 export const TEXT_NOTEBOOK_MOJO_MESSAGE =
 	'A .py notebook cannot be a Mojo notebook: a .py (jupytext / Databricks source) notebook is rebuilt from its CELLS on every save and stores no notebook metadata, so the language would be lost and after a reload every cell would be a RUNNABLE Python cell holding Mojo source. Convert it to .ipynb first.';
 
+/** The same refusal for Rust, whose loss is the same: the declaration has nowhere to live. */
+export const TEXT_NOTEBOOK_RUST_MESSAGE =
+	'A .py notebook cannot be a Rust notebook: a .py (jupytext / Databricks source) notebook is rebuilt from its CELLS on every save and stores no notebook metadata, so the language would be lost and after a reload every cell would be a RUNNABLE Python cell holding Rust source. Convert it to .ipynb first.';
+
+/** The route-facing refusal code for Rust on a `.py` notebook. */
+export const RUST_UNSUPPORTED_REASON = 'rust-in-py-notebook';
+
+/** A notebook language a `.py` text notebook cannot declare - every one but Python. */
+export type TextNotebookRefusedLanguage = Exclude<NotebookLanguage, 'python'>;
+
 /**
- * A `.py` TEXT notebook was asked to become a MOJO notebook.
+ * Message + refusal code per refused language, in ONE record keyed over the
+ * union (the `PY_UNSUPPORTED_COPY` shape), so a language added to
+ * `NotebookLanguage` with no copy here is a compile error rather than a refusal
+ * that silently borrows another language's sentence.
+ */
+const TEXT_NOTEBOOK_LANGUAGE_COPY: Record<TextNotebookRefusedLanguage, { message: string; reason: string }> = {
+	mojo: { message: TEXT_NOTEBOOK_MOJO_MESSAGE, reason: MOJO_UNSUPPORTED_REASON },
+	rust: { message: TEXT_NOTEBOOK_RUST_MESSAGE, reason: RUST_UNSUPPORTED_REASON }
+};
+
+/**
+ * A `.py` TEXT notebook was asked to become a notebook of another language.
  *
  * The notebook-level sibling of `TextNotebookCellTypeError`, and refused for the
  * identical reason one level up: such a document is written back from its cells
  * alone, so the declaration would live only in memory and every cell would come
- * back Python after a reload. It carries `MOJO_UNSUPPORTED_REASON` so a route
- * reports it in the same `{reason, message}` shape as the cell-type refusals.
+ * back Python after a reload. It carries the language's own reason code so a
+ * route reports it in the same `{reason, message}` shape as the cell-type
+ * refusals. `language` defaults to `mojo`, the original (and for a long time
+ * only) refused language.
  */
 export class TextNotebookLanguageError extends Error {
-	readonly reason = MOJO_UNSUPPORTED_REASON;
-	constructor() {
-		super(TEXT_NOTEBOOK_MOJO_MESSAGE);
+	readonly reason: string;
+	readonly language: TextNotebookRefusedLanguage;
+	constructor(language: TextNotebookRefusedLanguage = MOJO_LANGUAGE) {
+		const copy = TEXT_NOTEBOOK_LANGUAGE_COPY[language];
+		super(copy.message);
 		this.name = 'TextNotebookLanguageError';
+		this.reason = copy.reason;
+		this.language = language;
 	}
 }
 
 /** The refusal above, as a throwable (mirrors `textNotebookCellTypeError`). */
-export function textNotebookLanguageError(): TextNotebookLanguageError {
-	return new TextNotebookLanguageError();
+export function textNotebookLanguageError(
+	language: TextNotebookRefusedLanguage = MOJO_LANGUAGE
+): TextNotebookLanguageError {
+	return new TextNotebookLanguageError(language);
 }
 
 /**
- * The notebook language asked for is not one Cellar has (`python`/`mojo`).
+ * The notebook language asked for is not one Cellar has (see `NOTEBOOK_LANGUAGES`).
  *
  * A TYPED refusal rather than a bare `Error` for the `InvalidExportTargetError`
  * reason, and it is load-bearing rather than tidiness: `setNotebookLanguage`

@@ -299,7 +299,7 @@ describe('the schemas and the doctrine an agent is billed for', () => {
 		expect(tool, 'set_notebook_language must be registered').toBeTruthy();
 		const enums = cellTypeEnums(tool!.inputSchema).filter((e) => e.includes('python'));
 		expect(enums.length).toBe(1);
-		expect([...enums[0]].sort()).toEqual(['mojo', 'python']);
+		expect([...enums[0]].sort()).toEqual(['mojo', 'python', 'rust']);
 	});
 
 	it('states the no-state-between-cells rule BEFORE any tool schema is read', async () => {
@@ -315,7 +315,7 @@ describe('the schemas and the doctrine an agent is billed for', () => {
 		expect(instructions).toContain('NOTHING carries from one cell to the next');
 		expect(instructions).toContain('complete program with its own');
 		// The notebook-level model itself, and the tool that reaches it.
-		expect(instructions).toContain('A notebook is Python or Mojo, never both');
+		expect(instructions).toContain('A notebook is Python, Mojo or Rust, never a mix');
 		expect(instructions).toContain('there is NO mojo cell_type');
 		expect(instructions).toContain('set_notebook_language');
 		// And the facts about what a Mojo notebook is NOT - narrowed to its CODE cells,

@@ -20,6 +20,8 @@ import { StyleModule } from 'style-mod';
 import { pythonLanguage } from '@codemirror/lang-python';
 import { markdownLanguage } from '@codemirror/lang-markdown';
 import { StandardSQL } from '@codemirror/lang-sql';
+import { StreamLanguage } from '@codemirror/language';
+import { rust as rustMode } from '@codemirror/legacy-modes/mode/rust';
 import { cellarHighlightStyle } from '$lib/editorTheme';
 import { DIRECTIVE_CLASS, directiveCommentRanges } from '$lib/directiveComment';
 
@@ -27,7 +29,15 @@ import { DIRECTIVE_CLASS, directiveCommentRanges } from '$lib/directiveComment';
  *  text for a downstream tool and not a language to guess at. It matches the
  *  editor, which reconfigures its language Compartment to an empty extension for
  *  the same cell - the pixel-for-pixel contract this module exists to keep. */
-export type StaticLang = 'python' | 'markdown' | 'sql' | 'plain';
+export type StaticLang = 'python' | 'markdown' | 'sql' | 'rust' | 'plain';
+
+/**
+ * The Rust grammar, shared by the live editor and this static render so the two
+ * highlight alike. Rust has no Lezer grammar installed, so it is the official
+ * stream mode, as TOML is in `FileTab.svelte`. Defined once: `StreamLanguage.define`
+ * mints a new language per call.
+ */
+export const rustLanguage = StreamLanguage.define(rustMode);
 
 // Above this source size we skip the parse+highlight and fall back to plain
 // escaped text. A cell this large is rare, and highlighting it eagerly for every
@@ -41,6 +51,8 @@ function parserFor(lang: StaticLang) {
 			return markdownLanguage.parser;
 		case 'sql':
 			return StandardSQL.language.parser;
+		case 'rust':
+			return rustLanguage.parser;
 		default:
 			return pythonLanguage.parser;
 	}

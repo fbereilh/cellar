@@ -27,7 +27,8 @@ import {
 	getNotebookLanguage
 } from './notebook';
 import { publish } from './events';
-import { isChatCell, isMojoCell, isSqlCell } from '../cellLanguage';
+import { isChatCell, isMojoCell, isSqlCell, notebookKernelLanguage } from '../cellLanguage';
+import { RustKernelMissing, rustKernelMissingOutput } from './rust';
 import { sqlToPython } from './sql';
 import { mojoMissingOutput, mojoToCellSource, type MojoSetup } from './mojo';
 import { executeChatRun, finalizeChatOutputs } from './chat/run-chat';
@@ -41,6 +42,17 @@ import type { Actor, CellOutput, LastRun, SessionId, RunStreamEvent, CellRunResu
  * `prepare` hook so `execute()` sends nothing, and caught by `executeCellRun`,
  * which reports it as the cell's own error output carrying the install command.
  */
+/** A SQL cell asked to run in a Rust notebook, whose kernel cannot run the Python it compiles to. */
+class SqlInRustNotebook extends Error {
+	constructor() {
+		super(
+			'SQL cells run through Spark in a Python kernel, and this is a Rust notebook. ' +
+				'Run this query from a Python notebook, or change this cell to a code cell.'
+		);
+		this.name = 'SqlInRustNotebook';
+	}
+}
+
 class MojoNotReady extends Error {
 	setup: MojoSetup;
 	constructor(setup: MojoSetup) {
@@ -126,7 +138,8 @@ export async function executeCellRun({ nb, cellId, actor, source, originId, onEv
 	// what language the cell it is about to execute is written in, and it is what
 	// makes "the selector's code cells run as Mojo" true for every run path (the UI
 	// route, MCP `run_cell` and the imports cell all funnel through this function).
-	const isMojo = isMojoCell(cell, getNotebookLanguage(nb));
+	const nbLang = getNotebookLanguage(nb);
+	const isMojo = isMojoCell(cell, nbLang);
 	// The pre-flight runs INSIDE `execute()`'s abort window (its `prepare` hook), not
 	// in front of it: it is the first thing that needs the kernel, so on a notebook's
 	// first run it is what waits out the kernel START - and before it moved there, a
@@ -152,6 +165,8 @@ export async function executeCellRun({ nb, cellId, actor, source, originId, onEv
 				if (setup && !setup.ready) throw new MojoNotReady(setup);
 			}
 		: undefined;
+	// A SQL cell compiles to Python (`spark.sql(...)`), which only ipykernel can run.
+	const sqlOnRust = isSqlCell(cell) && notebookKernelLanguage(nbLang) === 'rust';
 	const execSource = isSqlCell(cell) ? sqlToPython(source) : isMojo ? mojoToCellSource(source) : source;
 
 	// Bound + coalesce the run's output across all three consumers (persist, SSE
@@ -204,6 +219,8 @@ export async function executeCellRun({ nb, cellId, actor, source, originId, onEv
 				// namespace, so ran_this_session honestly reads false.
 				status = (await executeChatRun({ nb, cellId, question: source, acc })).status;
 			} else {
+				// Refused before anything reaches the kernel.
+				if (sqlOnRust) throw new SqlInRustNotebook();
 				const reply = await execute(
 					nb,
 					execSource,
@@ -233,6 +250,15 @@ export async function executeCellRun({ nb, cellId, actor, source, originId, onEv
 				// for a failure raised seconds ago.
 				session = err.setup.session ?? null;
 				acc.push(mojoMissingOutput(err.setup));
+				status = 'error';
+			} else if (err instanceof RustKernelMissing) {
+				// Evcxr is not installed, so no kernel was ever started and nothing ran.
+				// The cell's own output names the install command. It is not a
+				// kernel-down either: the sidecar answered, the Rust kernel is simply absent.
+				acc.push(rustKernelMissingOutput(err.message));
+				status = 'error';
+			} else if (err instanceof SqlInRustNotebook) {
+				acc.push({ output_type: 'error', ename: err.name, evalue: err.message, traceback: [err.message] });
 				status = 'error';
 			} else {
 				const message = err instanceof Error ? err.message : String(err);

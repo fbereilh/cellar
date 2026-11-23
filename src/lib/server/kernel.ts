@@ -31,13 +31,15 @@ import { KernelManager, ServerConnection, CommsOverSubshells, KernelAPI } from '
 import type { Kernel, KernelMessage } from '@jupyterlab/services';
 import { clearRunQueue, queueStateFor } from './run-queue';
 import { abortChatRuns, abortChatRunsUnder } from './chat/active';
-import { getActiveNotebookPath, workspaceRelative, resolveNotebookPath } from './notebook';
+import { getActiveNotebookPath, getNotebookLanguage, workspaceRelative, resolveNotebookPath } from './notebook';
 import { workspaceRoot } from './fstree';
 import { addProjectRootToPath, injectDatabricksRuntime, databricksRuntimeVersion } from './ui-state';
 import { projectRootAddCode, projectRootRemoveCode } from './projectRoot';
 import { notebookRoot } from './notebookRoot';
 import { databricksRuntimeEnvCode } from './databricksRuntime';
 import { MOJO_SETUP_CODE, parseMojoSetup, type MojoSetup } from './mojo';
+import { RUST_KERNEL_NAME, ensureRustKernelspec } from './rust';
+import { notebookKernelLanguage, type KernelLanguage } from '$lib/cellLanguage';
 import { CONTROL_COMM_TARGET, RESTART_MAGIC_CODE, controlOp } from './controlMagic';
 import { WIDGETS_SHIM_CODE } from './widgetsShim';
 import { pagePayloadOutputs } from './execPayload';
@@ -104,6 +106,17 @@ interface NotebookKernel {
 	 * as it was and is not verified.
 	 */
 	codeRootKind: 'workspace' | 'worktree' | null;
+	/**
+	 * Which KERNEL this process is: ipykernel (`python`, which also runs a Mojo
+	 * notebook's `%%mojo` cells) or Evcxr (`rust`). Decided once, from the
+	 * notebook's language at start time, and recorded here for the same reason
+	 * `codeRoot` is: a process cannot change what it is, so a language change that
+	 * moves this FREES the kernel (see notebook-language-actions) rather than
+	 * leaving the document and the process in disagreement. Everything
+	 * Python-shaped - the startup injections, the widget comms, the probes - is
+	 * gated on this, never on the document's current language.
+	 */
+	kernelLanguage: KernelLanguage;
 	/**
 	 * The `DATABRICKS_RUNTIME_VERSION` this kernel's CURRENT session was actually
 	 * started with, or null when it was started without one. Written by `initKernel`
@@ -1508,6 +1521,13 @@ async function initKernel(
 	{ locked = false, ackTimeoutMs = 0 }: { locked?: boolean; ackTimeoutMs?: number } = {}
 ): Promise<void> {
 	const { nbPath } = nbKernel;
+	// Every injection below is PYTHON. A non-Python kernel gets none of them - sent
+	// to one, they error at best and wedge it at worst - and keeps only the cwd
+	// verification, asked in its own language.
+	if (nbKernel.kernelLanguage !== 'python') {
+		await verifyKernelCwd(nbKernel, kernel, { locked, timeoutMs: ackTimeoutMs });
+		return;
+	}
 	// Coalesce every startup injection into ONE round-trip in front of the first
 	// user result. Each block is independently guarded (a matplotlib/pandas/IPython
 	// failure degrades to a no-op) and defines-then-`del`s its own private temp
@@ -1679,6 +1699,12 @@ function delay(ms: number): Promise<void> {
  * mismatch — refusing on an unverifiable reading would fail starts for a reason
  * nothing observed.
  */
+/** The realpath'd cwd, printed on one line, asked in each kernel's own language. */
+const CWD_PROBE_CODE: Record<KernelLanguage, string> = {
+	python: 'import os as _c_os\nprint(_c_os.path.realpath(_c_os.getcwd()))\ndel _c_os',
+	rust: 'println!("{}", std::env::current_dir().and_then(std::fs::canonicalize).map(|p| p.display().to_string()).unwrap_or_default());'
+};
+
 async function verifyKernelCwd(
 	nbKernel: NotebookKernel,
 	kernel: KernelConnection,
@@ -1689,7 +1715,7 @@ async function verifyKernelCwd(
 	let actual = '';
 	try {
 		actual =
-			(await runCapture(kernel, 'import os as _c_os\nprint(_c_os.path.realpath(_c_os.getcwd()))\ndel _c_os', { locked, timeoutMs })) ?? '';
+			(await runCapture(kernel, CWD_PROBE_CODE[nbKernel.kernelLanguage], { locked, timeoutMs })) ?? '';
 	} catch {
 		// The probe itself failed to run; see the header — silence is not disagreement.
 		return;
@@ -1906,6 +1932,9 @@ export async function applyProjectRootToLiveKernels(enabled: boolean): Promise<v
  * cached start promise is returned; otherwise a fresh kernel process is started,
  * initialized (matplotlib + dataframe formatter + widget wiring), and cached.
  */
+/** The kernelspec each kernel language is started under. */
+const KERNELSPEC_NAME: Record<KernelLanguage, string> = { python: 'python3', rust: RUST_KERNEL_NAME };
+
 function getKernel(nbPath: string): Promise<KernelConnection> {
 	const existing = kernels.get(nbPath);
 	if (existing) return existing.startPromise;
@@ -1917,6 +1946,8 @@ function getKernel(nbPath: string): Promise<KernelConnection> {
 	// `root_dir` and run the notebook against the workspace it declined. Null (no
 	// declaration) is the default and sends no `path` at all, exactly as before.
 	const root = notebookRoot(nbPath);
+	// Which kernel this notebook runs on, read once and fixed for the process's life.
+	const kernelLanguage = notebookKernelLanguage(getNotebookLanguage(nbPath));
 
 	const nbKernel: NotebookKernel = {
 		nbPath,
@@ -1926,6 +1957,7 @@ function getKernel(nbPath: string): Promise<KernelConnection> {
 		execsThisSession: 0,
 		codeRoot: root?.dir ?? workspaceRoot(),
 		codeRootKind: root?.kind ?? null,
+		kernelLanguage,
 		databricksRuntime: null,
 		mojoSetup: null,
 		userRuns: 0,
@@ -1957,9 +1989,13 @@ function getKernel(nbPath: string): Promise<KernelConnection> {
 		// `<ws>/Users/x/repo`, which does not exist, and `cwd_for_path` then walks
 		// UP and starts the kernel somewhere else entirely. The `..`-relative form
 		// escapes cleanly and is returned verbatim (see server/notebookRoot.ts).
-		const startOptions = (root
-			? { name: 'python3', path: root.apiPath }
-			: { name: 'python3' }) as KernelAPI.IKernelOptions;
+		//
+		// A Rust kernel's spec is written (or refused) right here, before the start
+		// that reads it: a missing Evcxr throws `RustKernelMissing`, which the run
+		// renders as an install instruction, and installing it later needs no restart.
+		if (kernelLanguage === 'rust') ensureRustKernelspec();
+		const name = KERNELSPEC_NAME[kernelLanguage];
+		const startOptions = (root ? { name, path: root.apiPath } : { name }) as KernelAPI.IKernelOptions;
 		// Nothing may be sent until the shell has answered - see `awaitShellHandshake`.
 		const kernel = await awaitShellHandshake(mgr, await mgr.startNew(startOptions), nbPath);
 		nbKernel.connection = kernel;
@@ -1978,11 +2014,15 @@ function getKernel(nbPath: string): Promise<KernelConnection> {
 			// Older @jupyterlab/services without the property: nothing to disable.
 		}
 		beginSession(nbKernel);
-		// Register before any user code runs so a widget `comm_open` is never missed.
-		registerWidgetComm(nbKernel, kernel);
-		registerWidgetOutputCapture(kernel);
-		// The control channel `%restart_python` signals the server on.
-		registerControlComm(nbKernel, kernel);
+		// ipywidgets and `%restart_python` are ipykernel features; no other kernel
+		// opens these comms, so nothing is registered for one.
+		if (kernelLanguage === 'python') {
+			// Register before any user code runs so a widget `comm_open` is never missed.
+			registerWidgetComm(nbKernel, kernel);
+			registerWidgetOutputCapture(kernel);
+			// The control channel `%restart_python` signals the server on.
+			registerControlComm(nbKernel, kernel);
+		}
 		// A kernel that dies is restarted by jupyter_server behind our back, which
 		// clears the namespace without any Cellar call. Catch that too, so a cell
 		// stamped before the crash never reads as "ran this session" after it.
@@ -2751,11 +2791,22 @@ async function settleAfterInterrupt(
 export async function wipeKernelVariables(
 	nbPath?: string | null,
 	{ preserve = [] }: { preserve?: string[] } = {}
-): Promise<{ status: string; cleared: string[]; session_id: SessionId | null; probe_failed?: boolean }> {
+): Promise<{
+	status: string;
+	cleared: string[];
+	session_id: SessionId | null;
+	probe_failed?: boolean;
+	/** Set when the kernel is not Python, so the Python wipe probe was never sent. */
+	unsupported?: boolean;
+}> {
 	const abs = resolveNb(nbPath);
 	const nbKernel = kernels.get(abs);
 	// No kernel → nothing in memory to clear. Never boot one just to wipe it.
 	if (!nbKernel || !nbKernel.connection) return { status: 'not_started', cleared: [], session_id: null };
+	// The wipe probe is Python source. A Rust kernel would compile it as Rust and
+	// fail, so nothing is sent and nothing is reported cleared. Restart clears it.
+	if (nbKernel.kernelLanguage !== 'python')
+		return { status: nbKernel.connection.status, cleared: [], session_id: nbKernel.sessionId, unsupported: true };
 	const code = wipeProbeCode(preserve);
 	let stdout = '';
 	let session: SessionId | null = null;
@@ -2873,6 +2924,16 @@ export function kernelSession(nbPath?: string | null) {
  * (and the divergence itself becomes the "restart to apply" signal). Never starts a
  * kernel: `started:false` means there is no session to describe yet.
  */
+/**
+ * Which kernel `nbPath`'s LIVE process is, or null when it has none. Read off
+ * the process, never the document: it answers "what is running", which is what a
+ * Python probe must check before it sends Python, and what a language change
+ * compares against to decide whether the kernel has to be freed.
+ */
+export function liveKernelLanguage(nbPath?: string | null): KernelLanguage | null {
+	return kernels.get(resolveNb(nbPath))?.kernelLanguage ?? null;
+}
+
 export function liveDatabricksRuntime(nbPath?: string | null): {
 	started: boolean;
 	version: string | null;
@@ -2908,6 +2969,9 @@ export async function ensureMojoMagic(nbPath?: string | null): Promise<MojoSetup
 	const kernel = await getKernel(abs);
 	const nbKernel = kernels.get(abs);
 	if (nbKernel?.mojoSetup?.ready) return nbKernel.mojoSetup;
+	// The probe is Python. A kernel of another language observed nothing about the
+	// toolchain, so it is NO VERDICT rather than an absence.
+	if (nbKernel && nbKernel.kernelLanguage !== 'python') return null;
 	// Sampled BEFORE the probe, not around the await: an autorestart landing mid-probe
 	// bumps the live epoch, and stamping the NEW one would claim this probe ran in a
 	// namespace it never touched. Reading the old one instead makes the run read as
@@ -3140,6 +3204,9 @@ function introspectTarget(
 	const nbKernel = kernels.get(abs);
 	// No `getKernel` here, on purpose: see rule 1 above.
 	if (!nbKernel || !nbKernel.connection) return { ok: false, reason: 'no_kernel' };
+	// A Rust (Evcxr) kernel is never asked: the editor's completion and docs are
+	// Python-scoped, so its answer would be read as Python.
+	if (nbKernel.kernelLanguage !== 'python') return { ok: false, reason: 'not_python' };
 	const kernel = nbKernel.connection;
 	if (userRunHoldsKernel(abs)) return { ok: false, reason: 'busy' };
 	switch (kernel.status) {

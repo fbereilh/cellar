@@ -99,8 +99,8 @@ describe('mojo is the NOTEBOOK\'s language, never a cell type', () => {
 		// i.e. exactly the mixed-language notebook the model rules out.
 		expect(LOGICAL_CELL_TYPES).not.toContain('mojo');
 		expect(languageTagFor('code')).toBeNull();
-		// ...while the NOTEBOOK vocabulary is the two languages, and nothing else.
-		expect([...NOTEBOOK_LANGUAGES].sort()).toEqual(['mojo', 'python']);
+		// ...while the NOTEBOOK vocabulary is the three languages, and nothing else.
+		expect([...NOTEBOOK_LANGUAGES].sort()).toEqual(['mojo', 'python', 'rust']);
 		for (const l of NOTEBOOK_LANGUAGES) expect(isNotebookLanguage(l)).toBe(true);
 		for (const bad of ['sql', 'Mojo', '', null, undefined, 0]) expect(isNotebookLanguage(bad)).toBe(false);
 	});

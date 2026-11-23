@@ -54,7 +54,9 @@ import {
 	exportDirectiveOwnsCell,
 	exportMarkedTwice,
 	exportTargetLanguage,
+	languageGeneratesModule,
 	moduleExtension,
+	noModuleLanguageMessage,
 	notebookHoldsExport,
 	type ExportLanguage
 } from '../exportRole';
@@ -74,7 +76,8 @@ import {
 	textNotebookCellTypeError,
 	textNotebookLanguageError,
 	NOTEBOOK_LANGUAGES,
-	type NotebookLanguage
+	type NotebookLanguage,
+	NOTEBOOK_LANGUAGE_LABELS
 } from '../cellLanguage';
 import { foldImportChange, pruneImportBindings } from './importBindings';
 import { stripRuntimeMeta } from './clean';
@@ -1503,6 +1506,11 @@ export function setExportTarget(
 		// which decides how the module is assembled (no `__all__` and one `main` for
 		// Mojo - `$lib/mojoExport`). Anything else is refused for the sharper reason
 		// above: the exporter WRITES this path.
+		const nbLang = notebookLanguageOf(doc.metadata);
+		// A Rust notebook generates no module at all (`languageGeneratesModule`), so a
+		// target there could only name a file no export will ever write. Refused
+		// before the extension is judged, so the message names the real reason.
+		if (!languageGeneratesModule(nbLang)) throw new InvalidExportTargetError(noModuleLanguageMessage(nbLang));
 		const named = exportTargetLanguage(raw);
 		if (!named)
 			throw new InvalidExportTargetError(
@@ -1515,10 +1523,9 @@ export function setExportTarget(
 		// that is not where they asked for it. (`setNotebookLanguage` re-expresses the
 		// STORED target when the language moves, which is the other direction and is a
 		// change to the setting they just made.)
-		const nbLang = notebookLanguageOf(doc.metadata);
 		if (named !== nbLang)
 			throw new InvalidExportTargetError(
-				`export target ${raw} names a ${moduleExtension(named)} module, but this notebook's language is ${nbLang === 'mojo' ? 'Mojo' : 'Python'} - name a ${moduleExtension(nbLang)} module instead, or change the notebook's language first`
+				`export target ${raw} names a ${moduleExtension(named)} module, but this notebook's language is ${NOTEBOOK_LANGUAGE_LABELS[nbLang]} - name a ${moduleExtension(nbLang)} module instead, or change the notebook's language first`
 			);
 		const baseDir = exportBaseDir(doc, wanted); // refuses `git` with no repository
 		let abs: string;
@@ -1854,7 +1861,7 @@ export function setNotebookLanguage(
 			`unknown notebook language ${JSON.stringify(wanted)}: expected ${NOTEBOOK_LANGUAGES.map((l) => JSON.stringify(l)).join(' or ')}`
 		);
 	const doc = docFor(nb);
-	if (wanted !== 'python' && doc.jpFormat) throw textNotebookLanguageError();
+	if (wanted !== 'python' && doc.jpFormat) throw textNotebookLanguageError(wanted);
 	// A genuine no-op writes NOTHING: no persist, no export regeneration, no event.
 	// Two things turn on that. It keeps re-setting the current language free of git
 	// churn (the idempotence every setting here owes), and it is what makes setting
@@ -1870,7 +1877,11 @@ export function setNotebookLanguage(
 	let targetMoved = false;
 	if (typeof stored === 'string' && stored.trim()) {
 		const named = exportTargetLanguage(stored.trim());
-		if (named && named !== wanted) {
+		// Only a language that GENERATES a module has an extension to follow. Switching
+		// to Rust leaves the stored target exactly as it was: it is reported as
+		// unresolvable while the notebook is Rust and is valid again the moment the
+		// notebook switches back, so the round trip rewrites nothing.
+		if (named && named !== wanted && languageGeneratesModule(wanted)) {
 			cellar.export_target = stored.trim().replace(/\.(py|mojo)$/i, moduleExtension(wanted));
 			targetMoved = true;
 		}

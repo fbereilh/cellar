@@ -19,7 +19,7 @@
 	import { EDITOR_THEME } from '$lib/editorTheme';
 	import { directiveCommentHighlight } from '$lib/directiveComment';
 	import StaticCode from '$lib/StaticCode.svelte';
-	import type { StaticLang } from '$lib/staticHighlight';
+	import { rustLanguage, type StaticLang } from '$lib/staticHighlight';
 	import DataFrameGrid from '$lib/DataFrameGrid.svelte';
 	import { parseDataFrameHtml } from '$lib/dataframeHtml';
 	import PlotlyOutput from '$lib/PlotlyOutput.svelte';
@@ -42,7 +42,8 @@
 		EXPORT_STRANDED_BADGE,
 		EXPORT_STRANDED_CELL_TITLE,
 		notebookHoldsExport,
-		type ExportLanguage
+		type ExportLanguage,
+		moduleExtension
 	} from '$lib/exportRole';
 	import { MAIN_DROPPED_BADGE, MAIN_DROPPED_REASON } from '$lib/mojoExport';
 	import { isHiddenFromAgent } from '$lib/agentVisibility';
@@ -58,7 +59,8 @@
 		isPythonCodeCell,
 		offersCellType,
 		logicalCellType,
-		type NotebookLanguage
+		type NotebookLanguage,
+		isRustCell
 	} from '$lib/cellLanguage';
 	import { relativeTime, formatDuration, formatElapsed } from '$lib/relativeTime';
 	import { nowMs, subscribeNow, runNowMs, subscribeRunNow } from '$lib/now.svelte';
@@ -342,6 +344,7 @@
 	// affordances (imports role, staleness) are HIDDEN, each by the shared rule that
 	// already excludes it rather than by a check here.
 	const isMojo = $derived(isMojoCell(cell, notebookLanguage));
+	const isRust = $derived(isRustCell(cell, notebookLanguage));
 	// An nbformat `raw` cell: verbatim text Cellar never executes and never renders
 	// (Quarto/nbdev frontmatter, nbconvert directives). It has NO rendered mode -
 	// the deliberate contrast with markdown - so it is always shown as its source.
@@ -364,7 +367,11 @@
 	// written in - so a Mojo notebook's cells read `mojo` while its SQL, chat,
 	// markdown and raw cells keep their own labels, which the language never touches.
 	const typeLabel = $derived(
-		logicalType === 'code' && isMojo ? 'mojo' : (TYPE_LABELS[logicalType] ?? 'python3')
+		logicalType === 'code' && isMojo
+			? 'mojo'
+			: logicalType === 'code' && isRust
+				? 'rust'
+				: (TYPE_LABELS[logicalType] ?? 'python3')
 	);
 	// The notebook's designated imports cell: user-choosable, marked in the toolbar
 	// with the "imports" badge, and free to live at any index. Only a Python code
@@ -415,7 +422,7 @@
 	// way); with none there is no file to name, so it says only "module" rather than
 	// inventing a `.py` one.
 	const exportModuleLabel = $derived(
-		exportLanguage === null ? 'module' : `${exportLanguage === 'mojo' ? '.mojo' : '.py'} module`
+		exportLanguage === null ? 'module' : `${moduleExtension(exportLanguage)} module`
 	);
 	// Cellar's own flag is set, but this cell can go in no module the notebook
 	// currently names - its own source is Mojo under a `.py` module, or it was
@@ -1549,13 +1556,17 @@
 		// highlight, BESIDE the grammar rather than globally: `#|` is a directive in
 		// that ecosystem, so marking a `#` comment in SQL or markdown would invent a
 		// class those languages do not have. See `directiveComment.ts`.
-		return isSql ? sql() : [python(), directiveCommentHighlight]; // mojo: python(), per Mojo's own language_info
+		if (isSql) return sql();
+		// Rust is its own language with its own kernel, so it gets the Rust grammar and
+		// no `#|` directive highlight (`#` opens an attribute there, not a comment).
+		if (isRust) return rustLanguage;
+		return [python(), directiveCommentHighlight]; // mojo: python(), per Mojo's own language_info
 	}
 	// The same grammar choice, for the static (no-editor) render. Kept in lockstep
 	// with `langFor` so the read-only view highlights like the editor it precedes -
 	// mojo falls through to 'python' there for the reason stated above `langFor`.
 	const staticLang = $derived<StaticLang>(
-		isRaw ? 'plain' : isMarkdown || isChat ? 'markdown' : isSql ? 'sql' : 'python'
+		isRaw ? 'plain' : isMarkdown || isChat ? 'markdown' : isSql ? 'sql' : isRust ? 'rust' : 'python'
 	);
 
 	// Reconfigure the editor language when the cell type OR its SQL/chat/Python
@@ -1570,6 +1581,7 @@
 		const type = cell.cell_type;
 		isSql; // track: code↔sql keeps cell_type 'code' but changes the grammar
 		isChat; // track: code↔chat likewise
+		isRust; // track: a notebook language change to or from Rust swaps the grammar
 		if (view) view.dispatch({ effects: language.reconfigure(langFor()) });
 		if (type !== prevType) {
 			prevType = type;
@@ -2389,6 +2401,14 @@
 						class="badge badge-xs ml-1.5 badge-soft badge-secondary font-medium"
 						title="Chat cell - running it sends the cells above (minus those hidden from AI) to Claude and shows the reply. Re-running always produces a new reply."
 						data-testid="chat-badge">chat</span
+					>
+				{/if}
+				{#if isRust}
+					<!-- Rust indicator. Its tooltip says what differs from Python here. -->
+					<span
+						class="badge badge-xs ml-1.5 badge-soft badge-accent font-medium"
+						title="Rust cell - runs on the Evcxr Jupyter kernel. Variables and definitions carry over between cells. Add a crate with `:dep name = &quot;version&quot;`."
+						data-testid="rust-badge">rust</span
 					>
 				{/if}
 				{#if isMojo}

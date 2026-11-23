@@ -62,6 +62,8 @@ vi.mock('@jupyterlab/services', () => ({
 // The real resolver's contract: relative → absolute against the workspace root,
 // idempotent on an already-absolute path.
 vi.mock('../../src/lib/server/notebook', () => ({
+	// kernel.ts picks the kernel (ipykernel or Evcxr) from the notebook's language.
+	getNotebookLanguage: () => 'python',
 	// kernel.ts resolves each notebook's declared code root through notebookRoot.ts,
 	// which reads it from here. None of these fixtures declares one, so every kernel
 	// starts at the workspace root — the unchanged single-root behavior.

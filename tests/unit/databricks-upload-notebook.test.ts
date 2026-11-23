@@ -40,6 +40,7 @@ const USER = 'me@corp.example.com';
 const state = vi.hoisted(() => ({ session: 1 as number | null }));
 
 vi.mock('../../src/lib/server/kernel', () => ({
+	liveKernelLanguage: () => 'python',
 	execute: async (_nb: string, code: string, onEvent: (e: unknown) => void) => {
 		onEvent({ type: 'kernel', session: state.session });
 		const out = code.includes('_cellar_dbx_ping')

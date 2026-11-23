@@ -257,7 +257,7 @@ describe('every EXPECTED failure is silent - this runs on a keystroke', () => {
 	it('returns null for a refusal the server reached', async () => {
 		// `busy_timeout` is deliberately absent: it is the one refusal that is NOT an
 		// expected state, and it gets its own block below.
-		for (const reason of ['no_kernel', 'busy', 'restarting', 'dead', 'not_connected', 'timeout', 'failed'] as const) {
+		for (const reason of ['no_kernel', 'not_python', 'busy', 'restarting', 'dead', 'not_connected', 'timeout', 'failed'] as const) {
 			expect(await query('myva', 4, fakeHandle({ ok: false, reason }).handle)).toBeNull();
 		}
 	});

@@ -51,6 +51,7 @@
  */
 export type IntrospectRefusal =
 	| 'no_kernel'
+	| 'not_python'
 	| 'busy'
 	| 'busy_timeout'
 	| 'restarting'
@@ -117,6 +118,9 @@ export function refusalMessage(reason: IntrospectRefusal): string {
 	switch (reason) {
 		case 'no_kernel':
 			return 'No kernel is running for this notebook yet - run a cell to start one.';
+		case 'not_python':
+			// The kernel's completer and inspector here are Cellar's Python ones.
+			return 'Completion and docs from the kernel are available in Python notebooks only.';
 		case 'busy':
 			return 'The kernel is busy running a cell, so it was not asked.';
 		case 'busy_timeout':

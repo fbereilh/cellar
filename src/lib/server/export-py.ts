@@ -38,8 +38,15 @@ import { dirname, basename, relative, resolve, sep } from 'node:path';
 import { resolveInWorkspace, workspaceRoot } from './fstree';
 import { gitRootOf } from './git';
 import { logicalLines, stripComments, splitSimpleStatements } from './imports';
-import { isExportCell, exportTargetLanguage, moduleExtension, type ExportLanguage } from '../exportRole';
-import { notebookLanguageOf } from '../cellLanguage';
+import {
+	isExportCell,
+	exportTargetLanguage,
+	languageGeneratesModule,
+	moduleExtension,
+	noModuleLanguageMessage,
+	type ExportLanguage
+} from '../exportRole';
+import { NOTEBOOK_LANGUAGE_LABELS, notebookLanguageOf } from '../cellLanguage';
 import { MAIN_KEPT_COMMENT, mojoModuleSources, planMojoMains, stripMojoMagicHeader } from '../mojoExport';
 import { nbdevDirective, nbdevDirectiveOutsideBlock } from '../nbdevDirectives';
 import { nbdevLibPath } from './nbdev';
@@ -790,7 +797,7 @@ function storedExportTarget(
 				path: mod,
 				base: 'workspace',
 				source: 'default_exp',
-				error: `the #|default_exp directive names ${mod}, a ${moduleExtension(namedByDirective)} module, but this notebook's language is ${nbLang === 'mojo' ? 'Mojo' : 'Python'} - drop the extension (nbdev writes a dotted module name, not a file name), or change the notebook's language`
+				error: `the #|default_exp directive names ${mod}, a ${moduleExtension(namedByDirective)} module, but this notebook's language is ${NOTEBOOK_LANGUAGE_LABELS[nbLang]} - drop the extension (nbdev writes a dotted module name, not a file name), or change the notebook's language`
 			};
 		const rel = mod.endsWith(ext) ? mod : mod.replace(/\./g, '/') + ext;
 		return { ...directiveBase(rel), source: 'default_exp' };
@@ -943,13 +950,18 @@ export function resolveExportTarget(doc: NotebookDoc): ResolvedExportTarget | nu
 	// whole axis exists to remove.
 	const named = exportTargetLanguage(path);
 	const nbLang = notebookLanguageOf(doc.metadata);
+	// A language that generates no module (Rust) resolves NO target, whatever is
+	// stored: the stored path is left alone so switching back restores it, and the
+	// reason is the one sentence every surface shares.
+	if (!languageGeneratesModule(nbLang))
+		return { ok: false, base, path, source, error: noModuleLanguageMessage(nbLang) };
 	if (named && named !== nbLang) {
 		return {
 			ok: false,
 			base,
 			path,
 			source,
-			error: `export target ${path} names a ${moduleExtension(named)} module, but this notebook's language is ${nbLang === 'mojo' ? 'Mojo' : 'Python'} - set the target again (its extension follows the notebook's language), or change the notebook's language`
+			error: `export target ${path} names a ${moduleExtension(named)} module, but this notebook's language is ${NOTEBOOK_LANGUAGE_LABELS[nbLang]} - set the target again (its extension follows the notebook's language), or change the notebook's language`
 		};
 	}
 	if (!isExportBase(base)) {

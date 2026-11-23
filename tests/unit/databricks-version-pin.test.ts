@@ -32,6 +32,7 @@ const state = vi.hoisted(() => ({
 }));
 
 vi.mock('../../src/lib/server/kernel', () => ({
+	liveKernelLanguage: () => 'python',
 	execute: async (nbPath: string, code: string, onEvent: (e: unknown) => void) => {
 		onEvent({ type: 'kernel', session: 1 });
 		let payload: Record<string, unknown>;

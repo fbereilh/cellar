@@ -19,6 +19,7 @@ const h = vi.hoisted(() => ({
 }));
 
 vi.mock('../../src/lib/server/kernel', () => ({
+	liveKernelLanguage: () => 'python',
 	kernelStatus: () => ({ status: h.status, id: 'k1' }),
 	kernelSession: () => ({ session_id: 5 }),
 	currentSessionId: () => 5,
@@ -26,6 +27,8 @@ vi.mock('../../src/lib/server/kernel', () => ({
 }));
 
 vi.mock('../../src/lib/server/notebook', () => ({
+	// kernel.ts picks the kernel (ipykernel or Evcxr) from the notebook's language.
+	getNotebookLanguage: () => 'python',
 	// kernel.ts resolves each notebook's declared code root through notebookRoot.ts,
 	// which reads it from here. None of these fixtures declares one, so every kernel
 	// starts at the workspace root — the unchanged single-root behavior.

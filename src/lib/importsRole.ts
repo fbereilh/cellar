@@ -47,7 +47,7 @@ export function isImportsCell(cell: RoleCell): boolean {
  * than disabled where this is false.
  */
 export function notebookUsesImportsCell(notebookLanguage: NotebookLanguage): boolean {
-	return notebookLanguage !== 'mojo';
+	return notebookLanguage === 'python';
 }
 
 /**

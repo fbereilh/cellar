@@ -30,7 +30,19 @@ export async function POST({ request }) {
 		const nb = path ? resolveNotebookPath(path) : null;
 		// Keep the Databricks session bindings iff a connection is live for this notebook.
 		const preserve = connectionStatus(nb).connected ? ['spark', 'w'] : [];
-		const { status, cleared, session_id, probe_failed } = await wipeKernelVariables(nb, { preserve });
+		const { status, cleared, session_id, probe_failed, unsupported } = await wipeKernelVariables(nb, { preserve });
+		// A non-Python kernel was never asked: the wipe probe is Python. Say so
+		// rather than report a wipe of zero names, which reads as a clean success.
+		if (unsupported) {
+			return json(
+				{
+					ok: false,
+					reason: 'unsupported',
+					message: 'Wipe variables works on a Python kernel only. Restart this kernel to clear its state.'
+				},
+				{ status: 409 }
+			);
+		}
 		// Reflect the wipe in staleness. Normally clear the run stamp of exactly the
 		// cells that defined a wiped name; if the probe could not report the names
 		// (a rare kernel quirk), fall back to clearing every code cell — the safe,
