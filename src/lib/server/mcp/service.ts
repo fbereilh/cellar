@@ -591,6 +591,7 @@ function chatRunStatus(cell: CellView): string {
  *   ok_persisted              saved outputs from a PREVIOUS session; nothing it defines exists now
  *   error_persisted           saved error output from a PREVIOUS session
  *   error_kernel_unavailable  the kernel could not be reached; this failure is LIVE, not leftover
+ *   error_refused             Cellar refused the run before any code reached a kernel; LIVE, not leftover
  *
  * A CHAT cell answers in its own vocabulary instead (see `chatRunStatus`): it is
  * an nbformat code cell, so it reaches this function, but it runs no kernel and
@@ -617,6 +618,10 @@ function runStatus(cell: CellView, sid: SessionId | null): string {
 		return cell.metadata?.cellar?.lastRun?.status === 'ok' ? 'ok_session' : 'error_session';
 	}
 	if (kernelUnavailable(cell, sid)) return 'error_kernel_unavailable';
+	// A refusal (no Evcxr for a Rust notebook, a SQL cell in one) has no session to
+	// stamp. `lastRun` is runtime-only, so its presence means THIS process made the
+	// attempt: the failure is live and must not read as `error_persisted`.
+	if (cell.metadata?.cellar?.lastRun?.refused) return 'error_refused';
 	const outs = cell.outputs || [];
 	if (!outs.length) return 'unrun';
 	return outs.some((o) => o.output_type === 'error') ? 'error_persisted' : 'ok_persisted';

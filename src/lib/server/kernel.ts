@@ -1998,6 +1998,19 @@ function getKernel(nbPath: string): Promise<KernelConnection> {
 		const startOptions = (root ? { name, path: root.apiPath } : { name }) as KernelAPI.IKernelOptions;
 		// Nothing may be sent until the shell has answered - see `awaitShellHandshake`.
 		const kernel = await awaitShellHandshake(mgr, await mgr.startNew(startOptions), nbPath);
+		// A teardown that landed while the process was starting (a language switch that
+		// crosses kernels, a code-root change, a delete) removed this entry while
+		// `connection` was still null, so it had nothing to shut down. Nothing else
+		// holds this process now, so it is shut down here rather than left running
+		// unregistered for the life of the sidecar.
+		if (kernels.get(nbPath) !== nbKernel) {
+			try {
+				await kernel.shutdown();
+			} catch {
+				/* the process may already be gone */
+			}
+			throw new Error(`kernel for ${nbPath} was torn down while it was starting`);
+		}
 		nbKernel.connection = kernel;
 		// Run every comm on the kernel's MAIN shell, not a per-comm-target subshell
 		// (@jupyterlab/services' default under ipykernel 7). Cellar serializes runs

@@ -62,6 +62,12 @@ export interface LastRun {
 	session: SessionId | null;
 	/** Set when execute() threw before any kernel existed (a live kernel-down failure). */
 	kernel_unavailable?: boolean;
+	/**
+	 * Set when Cellar refused the run before any code reached a kernel (no Evcxr for a
+	 * Rust notebook, a SQL cell in a Rust notebook). The failure is live, not a leftover,
+	 * even though no session exists to stamp.
+	 */
+	refused?: boolean;
 }
 
 /**

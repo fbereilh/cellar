@@ -130,7 +130,7 @@ import {
 } from '../databricksDefaultProfile';
 import { PROFILE_REAUTH_CODE, isProfileReauthError, reauthCommand, reauthMessage } from '../databricksReauth';
 import { resolveUploadName, type UploadNameAffixes } from '../databricksUploadName';
-import { notebookIpynb, resolveNotebookPath } from './notebook';
+import { getNotebookLanguage, notebookIpynb, resolveNotebookPath } from './notebook';
 import {
 	databricksRuntimeForced,
 	databricksRuntimePreference,
@@ -141,6 +141,7 @@ import {
 } from './ui-state';
 import { DBX_RUNTIME_KEY, DBX_RUNTIME_VERSION_KEY } from './databricksRuntime';
 import { publishGlobal } from './events';
+import { notebookKernelLanguage, type KernelLanguage } from '../cellLanguage';
 import { logInfo, logWarn, logError } from './logs';
 import { hasUv, installPackages, isValidVenv, venvPython } from './venv.js';
 import type { RunStreamEvent, SessionId } from './types';
@@ -2684,6 +2685,22 @@ export function isSessionClosed(message: unknown): boolean {
  * session was actually built in, and `connectionStatus()` correctly reports it
  * as gone rather than pairing a fresh namespace with a `spark` it never got.
  */
+/**
+ * The kernel language a Databricks op on `nb` would reach: a live non-Python
+ * kernel first, else the one the notebook's declared language starts. Null only
+ * when neither can be read (an unloadable document), which leaves `execute()` to
+ * report the real failure.
+ */
+function kernelLanguageFor(nb: string): KernelLanguage | null {
+	const live = liveKernelLanguage(nb);
+	if (live && live !== 'python') return live;
+	try {
+		return notebookKernelLanguage(getNotebookLanguage(nb));
+	} catch {
+		return live;
+	}
+}
+
 async function runInKernel(nb: string, code: string): Promise<{ result: ProbeResult; session: SessionId | null }> {
 	let stdout = '';
 	let kernelError: string | null = null;
@@ -2691,7 +2708,15 @@ async function runInKernel(nb: string, code: string): Promise<{ result: ProbeRes
 	// Every Databricks kernel op is Python source. A Rust (Evcxr) kernel would
 	// compile it as Rust and fail with a compiler error that names no cause, so it
 	// is refused here, before anything is sent.
-	const lang = liveKernelLanguage(nb);
+	//
+	// Decided from the NOTEBOOK's language, which is what `execute()` starts a kernel
+	// for, and not only from the live process: a Rust notebook that has not run a cell
+	// has no kernel yet, so a live-only check passed and `execute()` then STARTED an
+	// Evcxr kernel just to send it Python (or, with Evcxr absent, its
+	// `RustKernelMissing` was reported as an unreachable Python kernel). The live
+	// process is still asked too, so a kernel that has not yet been freed after a
+	// language switch is refused as well.
+	const lang = kernelLanguageFor(nb);
 	if (lang && lang !== 'python') {
 		throw new DatabricksError(
 			'not_python_kernel',

@@ -245,6 +245,7 @@ export async function executeCellRun({ nb, cellId, actor, source, originId, onEv
 	let status = 'ok';
 	let session: SessionId | null = null;
 	let kernelDown = false;
+	let refused = false;
 	let outputs: CellOutput[];
 	try {
 		try {
@@ -300,9 +301,13 @@ export async function executeCellRun({ nb, cellId, actor, source, originId, onEv
 				// kernel-down either: the sidecar answered, the Rust kernel is simply absent.
 				acc.push(rustKernelMissingOutput(err.message));
 				status = 'error';
+				// No session exists to stamp, so the marker is what tells the agent
+				// surface this failure is live rather than a leftover (`error_refused`).
+				refused = true;
 			} else if (err instanceof SqlInRustNotebook) {
 				acc.push({ output_type: 'error', ename: err.name, evalue: err.message, traceback: [err.message] });
 				status = 'error';
+				refused = true;
 			} else {
 				const message = err instanceof Error ? err.message : String(err);
 				acc.push({
@@ -374,7 +379,8 @@ export async function executeCellRun({ nb, cellId, actor, source, originId, onEv
 		actor,
 		status,
 		session,
-		...(kernelDown ? { kernel_unavailable: true } : {})
+		...(kernelDown ? { kernel_unavailable: true } : {}),
+		...(refused ? { refused: true } : {})
 	};
 	setLastRun(cellId, lastRun, nb);
 	onEvent?.({ type: 'run:end', ...lastRun });

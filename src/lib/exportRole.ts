@@ -41,6 +41,11 @@ type ExportCell =
  */
 export type ExportLanguage = NotebookLanguage;
 
+/** The one sentence every surface says when a module is asked of such a notebook. */
+export function noModuleLanguageMessage(lang: NotebookLanguage): string {
+	return `a ${NOTEBOOK_LANGUAGE_LABELS[lang]} notebook does not export a module: its cells are top-level statements, which a ${MODULE_EXTENSIONS[lang]} module cannot hold. Clear the export target, or change the notebook's language.`;
+}
+
 /**
  * Does a notebook of this language generate a module at all? Python and Mojo do.
  * Rust does NOT yet, and the reason is structural rather than an omission: an
@@ -50,11 +55,6 @@ export type ExportLanguage = NotebookLanguage;
  * threads the notebook's language keeps one type, but no cell is ever eligible
  * for it (`exportLanguageOf`) and no surface offers a target for it.
  */
-/** The one sentence every surface says when a module is asked of such a notebook. */
-export function noModuleLanguageMessage(lang: NotebookLanguage): string {
-	return `a ${NOTEBOOK_LANGUAGE_LABELS[lang]} notebook does not export a module: its cells are top-level statements, which a ${MODULE_EXTENSIONS[lang]} module cannot hold. Clear the export target, or change the notebook's language.`;
-}
-
 export function languageGeneratesModule(lang: NotebookLanguage): boolean {
 	return lang !== 'rust';
 }

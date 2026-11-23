@@ -69,6 +69,7 @@ vi.mock('../../src/lib/server/notebookRoot', () => ({ notebookRoot: () => null }
 vi.mock('../../src/lib/server/run-queue', () => ({ clearRunQueue: vi.fn() }));
 vi.mock('../../src/lib/server/logs', () => ({ logInfo: vi.fn(), logWarn: vi.fn(), logError: vi.fn() }));
 
+import * as kernelModule from '../../src/lib/server/kernel';
 import { completeInKernel, execute, inspectInKernel, liveKernelLanguage, shutdownKernel } from '../../src/lib/server/kernel';
 import { syncKernelToNotebookLanguage } from '../../src/lib/server/notebook-language-actions';
 import { EVCXR_ENV, RustKernelMissing } from '../../src/lib/server/rust';
@@ -211,5 +212,60 @@ describe('syncKernelToNotebookLanguage', () => {
 			namespace_cleared: false
 		});
 		expect(h.startNew).not.toHaveBeenCalled();
+	});
+
+	it('reports a kernel freed before the rebind failed as restarted, with the failure', async () => {
+		await execute(SWITCH, 'x = 1', noop);
+		h.languages.set(SWITCH, 'rust');
+		// teardownKernel drops the entry, then something after it throws.
+		const real = kernelModule.rebindKernel;
+		const spy = vi.spyOn(kernelModule, 'rebindKernel').mockImplementationOnce(async (nb) => {
+			await real(nb);
+			throw new Error('status publish failed');
+		});
+		try {
+			const r = await syncKernelToNotebookLanguage(SWITCH);
+			expect(r).toEqual({ kernel_restarted: true, namespace_cleared: true, kernel_error: 'status publish failed' });
+		} finally {
+			spy.mockRestore();
+		}
+	});
+
+	it('reports a rebind that failed before freeing anything as not restarted, with the failure', async () => {
+		await execute(SWITCH, 'x = 1', noop);
+		h.languages.set(SWITCH, 'rust');
+		const spy = vi.spyOn(kernelModule, 'rebindKernel').mockRejectedValueOnce(new Error('boom'));
+		try {
+			const r = await syncKernelToNotebookLanguage(SWITCH);
+			expect(r).toEqual({ kernel_restarted: false, namespace_cleared: false, kernel_error: 'boom' });
+			expect(liveKernelLanguage(SWITCH)).toBe('python');
+		} finally {
+			spy.mockRestore();
+			await shutdownKernel(SWITCH);
+		}
+	});
+});
+
+describe('a teardown while the kernel is still starting', () => {
+	it('shuts down the process that finishes starting after its entry was dropped', async () => {
+		let release!: () => void;
+		const gate = new Promise<void>((r) => (release = r));
+		let started: { shutdown: ReturnType<typeof vi.fn> } | null = null;
+		h.startNew.mockImplementationOnce(async (opts: { name: string }) => {
+			await gate;
+			const k = await h.startNew.getMockImplementation()!(opts);
+			started = k as unknown as { shutdown: ReturnType<typeof vi.fn> };
+			return k;
+		});
+		const run = execute(SWITCH, 'x = 1', noop).catch((e: unknown) => e);
+		await vi.waitFor(() => expect(h.startNew).toHaveBeenCalledTimes(1));
+		// The notebook switches to Rust mid-start: its entry is torn down with no connection yet.
+		h.languages.set(SWITCH, 'rust');
+		expect((await syncKernelToNotebookLanguage(SWITCH)).kernel_restarted).toBe(true);
+		release();
+		await run;
+		// The run itself was aborted by the teardown; the start finishes on its own.
+		await vi.waitFor(() => expect(started?.shutdown).toHaveBeenCalled());
+		expect(liveKernelLanguage(SWITCH)).toBeNull();
 	});
 });
