@@ -277,7 +277,7 @@ export interface NotebookView {
 	hideAllCode: boolean;
 	/**
 	 * The language this notebook's plain `code` cells are written in - what the
-	 * selector at the top of the notebook sets. `python` for every notebook that
+	 * language selector in the notebook toolbar's menu sets. `python` for every notebook that
 	 * declares nothing, so a pre-selector notebook reports exactly what it is.
 	 */
 	language: NotebookLanguage;

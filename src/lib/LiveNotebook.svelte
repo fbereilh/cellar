@@ -268,8 +268,8 @@
 	// nbdev-style export: the notebook's `.py` module target + how many cells are
 	// marked for export. `exportTarget` mirrors `notebook.metadata.cellar.export_target`
 	// (loaded on mount, kept live via the `notebook:export-target` SSE event); the
-	// count derives from the live cell flags. Rendered as an always-present section
-	// at the top of the notebook (Notebook.svelte), directly below the root bar.
+	// count derives from the live cell flags. Rendered as the export section of the
+	// notebook toolbar's language-and-export menu (Notebook.svelte).
 	let exportTarget = $state<string | null>(null);
 	// The stored target's BASE (`$lib/exportTarget`: workspace / notebook / git;
 	// `workspace` = the absent-key legacy default) plus the server's resolution of
@@ -4821,6 +4821,12 @@
 		// ours: they live inside `.cm-editor`, so the `inEditor` test alone would
 		// hand their Enter and Mod-Enter to the notebook.
 		if (t?.closest?.('.cm-panel')) return;
+		// An open popover (the notebook-settings menu, a cell's ⋮ menu) owns the keys
+		// aimed into it. It sits inside this notebook's DOM, so without this a
+		// command-mode letter would act on the selected cell while focus is on a
+		// menu button, and an Escape consumed here could never reach the browser,
+		// which is what closes the popover.
+		if (t?.closest?.('[popover]')) return;
 		const inEditor = !!t?.closest?.('.cm-editor');
 		// The keystroke's mode is read off the DOM, not off `keyMode`: whatever has
 		// focus decides. That is what guarantees a command-mode letter (`j`, `a`)

@@ -1804,7 +1804,7 @@ export function setHideAllCode(hidden: boolean, nb?: string | null, originId?: s
 
 /**
  * The language every plain `code` cell in this notebook is written in - what the
- * selector at the top of the notebook shows. `python` for a notebook that declares
+ * language selector in the notebook toolbar's menu shows. `python` for a notebook that declares
  * nothing, which is every notebook that predates the selector.
  */
 export function getNotebookLanguage(nb?: string | null): NotebookLanguage {

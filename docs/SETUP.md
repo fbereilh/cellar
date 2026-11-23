@@ -908,7 +908,7 @@ runs two spec files at a time. Install its browser once with `npx playwright ins
   would come back as a runnable Python cell holding Mojo or Rust source. Cellar refuses all
   of them instead - in the type menu (where neither raw nor chat is offered), in the notebook's
   add controls (which withhold the **Chat** button there), on the `r` and `t` chords, and
-  in the notebook chrome, which offers no **Language** bar on a `.py`; an agent's
+  in the notebook chrome, which offers no language menu on a `.py`; an agent's
   `add_cell` / `set_cell_type` is refused for raw, its `set_notebook_language` is refused
   for Mojo and Rust, and it cannot ask for a chat cell at all (no agent write tool takes `chat`).
   Convert the notebook to `.ipynb` (app menu → **Convert to .ipynb**) if you need one. The

@@ -3,7 +3,7 @@ import { type ChildProcess } from 'node:child_process';
 import { mkdtempSync, existsSync, rmSync, writeFileSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { runtimeAvailable, bootCellar, killCellar, openSidebarSection } from './harness';
+import { runtimeAvailable, bootCellar, killCellar, openSidebarSection, openNotebookSettings, closeNotebookSettings } from './harness';
 
 /**
  * The Python-only AFFORDANCES a Mojo notebook does not offer, in the REAL browser.
@@ -126,13 +126,15 @@ async function openFresh(page: Page, name: string, cells?: SeedCell[]): Promise<
 	await openFile(page, name, cells?.[0].id ?? PY_ID);
 }
 
-/** Set the NOTEBOOK's language from the selector at the top - the whole feature. */
+/** Set the NOTEBOOK's language from the language-and-export menu - the whole feature. */
 async function chooseLanguage(page: Page, language: 'python' | 'mojo'): Promise<void> {
+	await openNotebookSettings(page);
 	await languageSelect(page).selectOption(language);
 	await expect(page.locator('[data-testid="language-feedback"]:visible')).toContainText(
 		language === 'mojo' ? 'Mojo' : 'Python',
 		{ timeout: 15_000 }
 	);
+	await closeNotebookSettings(page);
 }
 
 /** Open the palette, read every command title it lists, close it again. */
@@ -232,6 +234,7 @@ test('the ACTIVE notebook decides: tabbing between a Mojo and a Python notebook 
 	await expect(varsSection(page)).toHaveCount(0, { timeout: 15_000 });
 
 	await openFile(page, 'aff-python.ipynb');
+	await openNotebookSettings(page);
 	await expect(languageSelect(page)).toHaveValue('python', { timeout: 30_000 });
 	// The Python notebook is now active, so both come back with no language change
 	// at all - the shell followed the TAB.
@@ -241,6 +244,7 @@ test('the ACTIVE notebook decides: tabbing between a Mojo and a Python notebook 
 
 	// ...and tabbing back to the Mojo notebook takes them away again.
 	await openFile(page, 'aff-mojo.ipynb');
+	await openNotebookSettings(page);
 	await expect(languageSelect(page)).toHaveValue('mojo', { timeout: 15_000 });
 	await expect(varsSection(page)).toHaveCount(0, { timeout: 15_000 });
 	expect(await paletteTitles(page)).not.toContain('Consolidate imports');
@@ -268,6 +272,7 @@ test('a plain FILE tab keeps both: the gate only trusts a language while a NOTEB
 
 	// A PYTHON notebook is now the active one, so both come back...
 	await openFile(page, 'aff-live.ipynb');
+	await openNotebookSettings(page);
 	await expect(languageSelect(page)).toHaveValue('python', { timeout: 30_000 });
 	await expect(varsSection(page)).toBeVisible({ timeout: 15_000 });
 

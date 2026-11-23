@@ -3,7 +3,7 @@ import { type ChildProcess } from 'node:child_process';
 import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { runtimeAvailable, bootCellar, killCellar, removeWorkspace } from './harness';
+import { runtimeAvailable, bootCellar, killCellar, removeWorkspace, openNotebookSettings } from './harness';
 
 /**
  * The per-cell export toggle on a `.py` (jupytext) notebook versus an `.ipynb`.
@@ -56,6 +56,7 @@ test('a .py notebook offers no export toggle, and the server refuses a mark sent
 	// Offered nothing: neither the per-cell toggle nor the notebook's export bar.
 	await expect(cells.first().getByTestId('toggle-export')).toHaveCount(0);
 	await expect(page.locator('[data-testid="toggle-export"]:visible')).toHaveCount(0);
+	await expect(page.locator('[data-testid="notebook-settings"]:visible')).toHaveCount(0);
 	await expect(page.locator('[data-testid="export-bar"]:visible')).toHaveCount(0);
 	// The per-row controls beside it are still there, so the absence is the gate
 	// and not a row that failed to render.
@@ -87,6 +88,7 @@ test('an .ipynb notebook still marks a cell, and the mark survives a reload', as
 	const toggle = page.locator('[data-testid="cell"]:visible').first().getByTestId('toggle-export');
 	await expect(toggle).toBeVisible();
 	await expect(toggle).toHaveAttribute('aria-pressed', 'false');
+	await openNotebookSettings(page);
 	await expect(page.locator('[data-testid="export-bar"]:visible')).toHaveCount(1);
 
 	await toggle.click();
