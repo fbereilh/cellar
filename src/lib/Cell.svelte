@@ -442,7 +442,7 @@
 	// the server's refusals ask too (`notebookHoldsExport`). A `.py` text notebook
 	// cannot: it stores no cell metadata, so the toggle used to show a mark that
 	// lived only in memory and was gone after a relaunch. The control is HIDDEN
-	// there, like the export bar above the cells and every other affordance a
+	// there, like the export section of the notebook menu and every other affordance a
 	// notebook cannot use, rather than rendered and refused on click.
 	const exportOffered = $derived(notebookHoldsExport(isPy));
 	// The accessible NAME. It tracks what the control DOES - clear a stale mark, or
