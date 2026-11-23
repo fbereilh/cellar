@@ -790,30 +790,33 @@
 	function placeSettingsMenu() {
 		if (!settingsMenuEl || !settingsBtnEl) return;
 		const r = settingsBtnEl.getBoundingClientRect();
-		const mw = settingsMenuEl.offsetWidth || 320;
+		const vw = document.documentElement.clientWidth;
+		const mw = settingsMenuEl.offsetWidth;
+		const top = r.bottom + 4;
 		// Right-aligned under the button, clamped inside the viewport, so the menu
-		// opens toward the notebook rather than off the window's right edge.
-		settingsMenuEl.style.left = Math.max(8, Math.min(r.right - mw, window.innerWidth - mw - 8)) + 'px';
-		settingsMenuEl.style.top = r.bottom + 4 + 'px';
+		// opens toward the notebook rather than off the window's right edge. Anchored
+		// by its RIGHT edge so it can be placed before it is shown, while it still
+		// has no width to measure.
+		settingsMenuEl.style.right = Math.max(8, Math.min(vw - r.right, vw - mw - 8)) + 'px';
+		settingsMenuEl.style.top = top + 'px';
+		// The height it may take is what is LEFT below the button, so its last line
+		// stays reachable by scrolling the menu on a short window.
+		settingsMenuEl.style.maxHeight = Math.max(96, window.innerHeight - top - 8) + 'px';
 	}
-	function toggleSettingsMenu() {
-		const el = settingsMenuEl;
-		if (!el) return;
-		if (el.matches(':popover-open')) {
-			el.hidePopover();
-			return;
-		}
-		// `source` names the button as the invoker, so the browser returns focus to
-		// it on close and treats a click on it as inside the popover rather than as
-		// a light dismiss. A browser that predates the option ignores it.
-		(el.showPopover as (opts?: { source?: HTMLElement }) => void)({ source: settingsBtnEl ?? undefined });
-		placeSettingsMenu();
-		// Keyboard reach: put focus on the first control, so a keyboard user who
-		// opened the menu is already inside it.
-		el.querySelector<HTMLElement>('select:not([disabled]), input, button:not([disabled])')?.focus();
+	// The button opens and closes the menu declaratively (`popovertarget`), so the
+	// browser owns the toggle, treats a click on the button as the invoker's rather
+	// than as a light dismiss, and returns focus to it on close.
+	function onSettingsBeforeToggle(e: Event) {
+		if ((e as ToggleEvent).newState === 'open') placeSettingsMenu();
 	}
 	function onSettingsToggle(e: Event) {
 		settingsOpen = (e as ToggleEvent).newState === 'open';
+		if (!settingsOpen) return;
+		placeSettingsMenu();
+		// Keyboard reach without arming a control: focus goes to the menu itself, so
+		// Tab walks into it but no bare keystroke lands on the language select,
+		// which commits on a single arrow or type-ahead letter.
+		settingsMenuEl?.focus({ preventScroll: true });
 	}
 	// The menu is `position: fixed`, so keep it under its button while it is open:
 	// the notebook pane scrolls and the window can resize.
@@ -1366,7 +1369,7 @@
 				<button
 					bind:this={settingsBtnEl}
 					class="btn btn-ghost btn-sm relative ml-auto gap-1.5"
-					onclick={toggleSettingsMenu}
+					popovertarget={settingsMenuId}
 					title={settingsWarning
 						? 'Language and export settings - the export needs attention'
 						: 'Language and export settings'}
@@ -1398,9 +1401,11 @@
 				popover="auto"
 				role="dialog"
 				aria-label="Language and export settings"
+				tabindex="-1"
+				onbeforetoggle={onSettingsBeforeToggle}
 				ontoggle={onSettingsToggle}
-				class="m-0 w-[32rem] max-w-[calc(100vw-1rem)] overflow-y-auto rounded-box border border-base-300 bg-base-100 p-0 text-sm shadow-lg"
-				style="position: fixed; inset: auto; margin: 0; max-height: calc(100vh - 1rem);"
+				class="m-0 w-[32rem] max-w-[calc(100vw-1rem)] overflow-y-auto rounded-box border border-base-300 bg-base-100 p-0 text-sm shadow-lg outline-none"
+				style="position: fixed; inset: auto; margin: 0;"
 				data-testid="notebook-settings-menu"
 			>
 				{#if showLanguageBar}

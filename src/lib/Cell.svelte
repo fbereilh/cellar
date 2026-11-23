@@ -1217,7 +1217,7 @@
 	// menu is the ONLY create path for raw - there is deliberately no
 	// "+ Raw" insert button, it not being worth a button on every gap
 	// (raw is once-per-notebook). Mojo is NOT here at all: a code cell's language is
-	// the NOTEBOOK's, chosen once in the selector at the top, so offering it per cell
+	// the NOTEBOOK's, chosen once in the notebook's language-and-export menu, so offering it per cell
 	// is exactly how a notebook ends up holding two languages. Chat
 	// is different: asking a question recurs through a session the way code and
 	// markdown do, so it IS also creatable directly from the add affordances (the

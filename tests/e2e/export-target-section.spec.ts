@@ -7,7 +7,8 @@ import { join } from 'node:path';
 import { runtimeAvailable, bootCellar, killCellar, openNotebookSettings, closeNotebookSettings } from './harness';
 
 /**
- * The export-target SECTION: always visible, base-aware, honest about
+ * The export-target SECTION: offered in the notebook's language-and-export menu
+ * on every `.ipynb`, base-aware, honest about
  * importability - plus the root bar's new opt-in visibility.
  *
  * The workspace is a SUBDIRECTORY of its git repo (`cd repo/analysis && cellar`),
@@ -637,6 +638,7 @@ test('a module that will not import says so in the bar, live, and clears when fi
 	await openNotebookSettings(page);
 	const hazard = page.locator('[data-testid="export-hazard"]:visible');
 	await expect(hazard).toHaveCount(0);
+	await expect(page.locator('[data-testid="notebook-settings-warning"]:visible')).toHaveCount(0);
 
 	// Mark a cell holding the construct, from OUTSIDE this tab (an agent, or the
 	// user's own save). The bar must learn about it through the live push.
@@ -647,6 +649,10 @@ test('a module that will not import says so in the bar, live, and clears when fi
 
 	await expect(hazard).toBeVisible();
 	await expect(hazard).toContainText('will not import');
+	// Closed, the menu would hide that warning - so the button carries the dot.
+	await closeNotebookSettings(page);
+	await expect(page.locator('[data-testid="notebook-settings-warning"]:visible')).toHaveCount(1);
+	await openNotebookSettings(page);
 	await expect(hazard).toContainText('line of its own');
 	// The module really was written - refusing would have left nothing to explain.
 	await expect.poll(() => existsSync(join(workspace, 'lib', 'hazard.py'))).toBe(true);
@@ -665,6 +671,7 @@ test('a module that will not import says so in the bar, live, and clears when fi
 	});
 	expect(fixed.ok(), await fixed.text()).toBeTruthy();
 	await expect(hazard).toHaveCount(0);
+	await expect(page.locator('[data-testid="notebook-settings-warning"]:visible')).toHaveCount(0);
 });
 
 test('a save leaves the module alone; the button exports, and reports a refusal on the click', async ({

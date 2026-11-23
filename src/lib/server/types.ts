@@ -35,7 +35,7 @@ export type CellType = 'code' | 'markdown' | 'raw';
  *
  * There is deliberately no `mojo` member: a code cell's LANGUAGE is the
  * NOTEBOOK's (`metadata.cellar.language`), not a property of the cell, so Mojo is
- * chosen once at the top rather than per cell. See `$lib/cellLanguage`. */
+ * chosen once in the notebook's language-and-export menu rather than per cell. See `$lib/cellLanguage`. */
 export type LogicalCellType = 'code' | 'markdown' | 'sql' | 'raw' | 'chat';
 
 /** Who initiated a run: a human via the UI, or an agent via MCP. */

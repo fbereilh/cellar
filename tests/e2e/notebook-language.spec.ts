@@ -426,6 +426,85 @@ test('a kept imports mark stays clearable after the switch, greyed and clear-onl
 	expect(errors).toEqual([]);
 });
 
+const settingsBtn = (page: Page) => page.locator('[data-testid="notebook-settings"]:visible');
+const openMenu = (page: Page) => page.locator('[data-testid="notebook-settings-menu"]:popover-open');
+
+test('the menu button names the language, and its own click, Escape and an outside click each close it', async ({
+	page
+}) => {
+	test.setTimeout(120_000);
+	await openFresh(page, 'menu-close.ipynb');
+	await expect(settingsBtn(page)).toContainText('Python');
+
+	// A second click on the button CLOSES the menu rather than reopening it.
+	await settingsBtn(page).click();
+	await expect(openMenu(page)).toHaveCount(1);
+	await settingsBtn(page).click();
+	await expect(openMenu(page)).toHaveCount(0);
+
+	await settingsBtn(page).click();
+	await expect(openMenu(page)).toHaveCount(1);
+	await page.keyboard.press('Escape');
+	await expect(openMenu(page)).toHaveCount(0);
+
+	await settingsBtn(page).click();
+	await expect(openMenu(page)).toHaveCount(1);
+	const box = await openMenu(page).boundingBox();
+	expect(box).not.toBeNull();
+	expect(box!.x).toBeGreaterThan(40);
+	await page.mouse.click(box!.x - 20, box!.y + box!.height / 2);
+	await expect(openMenu(page)).toHaveCount(0);
+
+	await chooseLanguage(page, 'mojo');
+	await page.keyboard.press('Escape');
+	await expect(settingsBtn(page)).toContainText('Mojo');
+});
+
+test('keys pressed in the open menu reach neither the selected cell nor the language select', async ({ page }) => {
+	test.setTimeout(120_000);
+	const name = 'menu-keys.ipynb';
+	await openFresh(page, name);
+	const cell = cellBy(page, PY_ID);
+	const typeOnDisk = () => onDisk(name).cells.find((c) => c.id === PY_ID)?.cell_type;
+
+	// Select the cell in command mode, so a stray `m` or `d d` has a cell to act on.
+	await cell.evaluate((el) => (el as HTMLElement).focus());
+	await expect(cell).toHaveAttribute('data-active', 'true');
+
+	await settingsBtn(page).click();
+	await expect(openMenu(page)).toHaveCount(1);
+	// Focus is on the menu itself, never on the select a bare keystroke commits.
+	await expect(openMenu(page)).toBeFocused();
+	for (const key of ['r', 'm', 'ArrowDown', 'd', 'd']) await page.keyboard.press(key);
+
+	await expect(page.getByTestId('language-select')).toHaveValue('python');
+	await page.keyboard.press('Escape');
+	await expect(openMenu(page)).toHaveCount(0);
+	await expect(cell).toBeVisible();
+	await expect(cell.getByTestId('type-toggle')).toHaveText(/python3/);
+	expect(nbMeta(name).language).toBeUndefined();
+	expect(typeOnDisk()).toBe('code');
+
+	// CONTROL: the same key on the cell itself does convert it, so the silence
+	// above is the menu owning its keys and not a dead keyboard.
+	await cell.evaluate((el) => (el as HTMLElement).focus());
+	await page.keyboard.press('m');
+	await expect.poll(typeOnDisk, { timeout: 15_000 }).toBe('markdown');
+});
+
+test('on a short window the menu ends inside the viewport, so its last line is reachable', async ({ page }) => {
+	test.setTimeout(120_000);
+	await page.setViewportSize({ width: 1280, height: 320 });
+	await openFresh(page, 'menu-short.ipynb');
+	await settingsBtn(page).click();
+	await expect(openMenu(page)).toHaveCount(1);
+	const box = await openMenu(page).boundingBox();
+	expect(box).not.toBeNull();
+	expect(box!.y + box!.height).toBeLessThanOrEqual(320);
+	// The content is taller than the room left, so the menu scrolls instead.
+	expect(await openMenu(page).evaluate((el) => el.scrollHeight > el.clientHeight)).toBe(true);
+});
+
 test('a .py TEXT notebook offers no selector - it can only ever be Python', async ({ page }) => {
 	test.setTimeout(120_000);
 	// Such a document is rebuilt from its cells on save and stores no notebook

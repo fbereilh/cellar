@@ -299,6 +299,13 @@ export async function openSidebarSection(page: Page, section: string, body: stri
  * or driving a control in it, and again after anything that may have closed it.
  * It is idempotent, so calling it when the menu is already open costs nothing.
  */
+export async function openNotebookSettings(page: Page): Promise<void> {
+	const open = page.locator('[data-testid="notebook-settings-menu"]:popover-open');
+	if ((await open.count()) > 0) return;
+	await page.locator('[data-testid="notebook-settings"]:visible').click();
+	await expect(open).toHaveCount(1);
+}
+
 /**
  * Close the notebook's language-and-export menu if it is open. A real click
  * outside it light-dismisses it, but Playwright refuses to click a cell control
@@ -309,11 +316,4 @@ export async function closeNotebookSettings(page: Page): Promise<void> {
 	if ((await open.count()) === 0) return;
 	await open.evaluate((el) => (el as HTMLElement).hidePopover());
 	await expect(open).toHaveCount(0);
-}
-
-export async function openNotebookSettings(page: Page): Promise<void> {
-	const open = page.locator('[data-testid="notebook-settings-menu"]:popover-open');
-	if ((await open.count()) > 0) return;
-	await page.locator('[data-testid="notebook-settings"]:visible').click();
-	await expect(open).toHaveCount(1);
 }
