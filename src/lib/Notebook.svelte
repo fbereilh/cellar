@@ -780,6 +780,7 @@
 	let settingsMenuEl = $state<HTMLElement | null>(null);
 	let settingsBtnEl = $state<HTMLElement | null>(null);
 	let settingsOpen = $state(false);
+	const settingsLabel = $derived(showLanguageBar ? NOTEBOOK_LANGUAGE_LABELS[notebookLanguage] : 'Export');
 	// A closed menu would hide every export warning, so the button carries a dot
 	// whenever one of them is showing inside. Only the WARNINGS count: the
 	// resolved-path echo and the feedback line are information, not problems.
@@ -1373,7 +1374,7 @@
 					title={settingsWarning
 						? 'Language and export settings - the export needs attention'
 						: 'Language and export settings'}
-					aria-label={settingsWarning ? 'Language and export settings (export needs attention)' : 'Language and export settings'}
+					aria-label={`Language and export settings: ${settingsLabel}${settingsWarning ? ' (export needs attention)' : ''}`}
 					aria-haspopup="dialog"
 					aria-expanded={settingsOpen}
 					aria-controls={settingsMenuId}
@@ -1381,7 +1382,7 @@
 					data-warning={settingsWarning ? '' : undefined}
 				>
 					<svg class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 21v-7" /><path d="M4 10V3" /><path d="M12 21v-9" /><path d="M12 8V3" /><path d="M20 21v-5" /><path d="M20 12V3" /><path d="M1 14h6" /><path d="M9 8h6" /><path d="M17 16h6" /></svg>
-					{showLanguageBar ? NOTEBOOK_LANGUAGE_LABELS[notebookLanguage] : 'Export'}
+					{settingsLabel}
 					<svg class="h-3 w-3 opacity-60" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 9 6 6 6-6" /></svg>
 					{#if settingsWarning}
 						<span class="absolute right-1 top-1 h-2 w-2 rounded-full bg-warning" data-testid="notebook-settings-warning" aria-hidden="true"></span>

@@ -435,6 +435,7 @@ test('the menu button names the language, and its own click, Escape and an outsi
 	test.setTimeout(120_000);
 	await openFresh(page, 'menu-close.ipynb');
 	await expect(settingsBtn(page)).toContainText('Python');
+	await expect(settingsBtn(page)).toHaveAccessibleName(/Python/);
 
 	// A second click on the button CLOSES the menu rather than reopening it.
 	await settingsBtn(page).click();
@@ -458,6 +459,7 @@ test('the menu button names the language, and its own click, Escape and an outsi
 	await chooseLanguage(page, 'mojo');
 	await page.keyboard.press('Escape');
 	await expect(settingsBtn(page)).toContainText('Mojo');
+	await expect(settingsBtn(page)).toHaveAccessibleName(/Mojo/);
 });
 
 test('keys pressed in the open menu reach neither the selected cell nor the language select', async ({ page }) => {
