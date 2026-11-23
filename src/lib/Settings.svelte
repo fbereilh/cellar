@@ -5,6 +5,15 @@
 	import { shortcuts, chordFromEvent, chordTokens, formatChord, typesACharacter, typingHazards, shortcutCategories, MODE_LABEL } from '$lib/shortcuts.svelte';
 	import type { VenvInfo } from '$lib/server/venv-bind';
 	import { getUserSettingDefaultOn, getUserSettingFlag, getUserSettingText, setUserSetting, setUserSettingNow } from '$lib/userSettings';
+	import {
+		CUSTOM_INSTRUCTIONS_CHAT_KEY,
+		CUSTOM_INSTRUCTIONS_MCP_KEY,
+		CUSTOM_INSTRUCTIONS_MERGED_KEY,
+		CUSTOM_INSTRUCTIONS_SHARED_KEY,
+		CUSTOM_INSTRUCTIONS_MAX_CHARS,
+		customInstructionsMerged,
+		seedSharedInstructions
+	} from '$lib/customInstructions';
 	import { TREE_AUTO_REVEAL_KEY } from '$lib/treeExpansion';
 	import { CHAT_LEARNING_MODE_KEY, CHAT_MODEL_KEY, CHAT_MODELS, CHAT_OTHER_NOTEBOOKS_KEY, CHAT_WEB_SEARCH_KEY, CHAT_WORKSPACE_READS_KEY, normalizeChatModel } from '$lib/chatCell';
 	import { UPLOAD_PREFIX_DEFAULT_KEY, UPLOAD_POSTFIX_DEFAULT_KEY } from '$lib/uploadDefaults';
@@ -399,6 +408,62 @@
 		// OFF deletes the key rather than storing `false`, like its neighbours:
 		// absent is the default, so an opted-out store matches a fresh one.
 		void setUserSettingNow(CHAT_LEARNING_MODE_KEY, chatLearningMode ? true : null);
+	}
+
+	// ---- Custom instructions ---------------------------------------------------
+	// The person's own standing instructions for the two places Cellar instructs a
+	// model: chat cells and MCP agents. Two texts, or ONE shared text when merged.
+	// The resolution rule is `$lib/customInstructions`, which the server reads too.
+	// The three texts live under separate keys, so merging never overwrites the
+	// two separate ones and un-merging brings them back.
+	let customChat = $state('');
+	let customMcp = $state('');
+	let customShared = $state('');
+	let customMerged = $state(false);
+	let customHydrated = false;
+	$effect(() => {
+		if (!open || customHydrated) return;
+		customHydrated = true;
+		customChat = getUserSettingText(CUSTOM_INSTRUCTIONS_CHAT_KEY);
+		customMcp = getUserSettingText(CUSTOM_INSTRUCTIONS_MCP_KEY);
+		customShared = getUserSettingText(CUSTOM_INSTRUCTIONS_SHARED_KEY);
+		customMerged = customInstructionsMerged(getUserSettingFlag(CUSTOM_INSTRUCTIONS_MERGED_KEY));
+	});
+
+	const CUSTOM_KEYS = {
+		chat: CUSTOM_INSTRUCTIONS_CHAT_KEY,
+		mcp: CUSTOM_INSTRUCTIONS_MCP_KEY,
+		shared: CUSTOM_INSTRUCTIONS_SHARED_KEY
+	} as const;
+	type CustomField = keyof typeof CUSTOM_KEYS;
+
+	function setCustomLocal(field: CustomField, value: string) {
+		if (field === 'chat') customChat = value;
+		else if (field === 'mcp') customMcp = value;
+		else customShared = value;
+	}
+
+	// Typing is debounced. Leaving the field writes at once, because the server
+	// re-reads these keys on a LATER action (a chat run, a new agent session), so
+	// text still in the debounce window would miss it. Empty deletes the key.
+	function typeCustom(field: CustomField, value: string) {
+		setCustomLocal(field, value);
+		setUserSetting(CUSTOM_KEYS[field], value.trim() ? value : null);
+	}
+	function commitCustom(field: CustomField, value: string) {
+		setCustomLocal(field, value);
+		void setUserSettingNow(CUSTOM_KEYS[field], value.trim() ? value : null);
+	}
+
+	function toggleCustomMerged() {
+		customMerged = !customMerged;
+		if (customMerged) {
+			// Start the shared text from what is already written, so merging never
+			// begins from an empty box while a separate text exists.
+			const seeded = seedSharedInstructions(customShared, customChat, customMcp);
+			if (seeded !== customShared) commitCustom('shared', seeded);
+		}
+		void setUserSettingNow(CUSTOM_INSTRUCTIONS_MERGED_KEY, customMerged ? true : null);
 	}
 
 	// ---- Keyboard shortcuts --------------------------------------------------
@@ -894,6 +959,68 @@
 						workspace files) and any jupytext <code>.py</code> notebook stay readable whether
 						this is on or off.
 					</p>
+				</div>
+
+				<div class="divider my-1"></div>
+
+				<!-- Custom instructions: the person's own text, appended to Cellar's
+				     instructions for chat cells and for MCP agents. Two boxes, or one
+				     shared box when merged. Cellar's own rules still come first. -->
+				<div data-testid="custom-instructions-control">
+					<div class="mb-1 text-sm font-medium">Custom instructions</div>
+					<p class="text-xs text-base-content/50">
+						Your own standing instructions, added after Cellar's. Chat cells use them from the next
+						run. Agents read theirs when they connect, so reconnect an agent to apply a change.
+					</p>
+					<label class="mt-2 flex cursor-pointer items-center justify-between gap-4">
+						<span class="text-sm font-medium">Use the same instructions for both</span>
+						<input
+							type="checkbox"
+							class="toggle toggle-primary toggle-sm"
+							checked={customMerged}
+							onchange={toggleCustomMerged}
+							data-testid="settings-custom-instructions-merged"
+						/>
+					</label>
+					{#if customMerged}
+						<label class="mt-2 flex flex-col gap-1">
+							<span class="text-xs text-base-content/60">Chat cells and agents</span>
+							<textarea
+								class="textarea textarea-sm h-20 w-full text-xs leading-snug"
+								maxlength={CUSTOM_INSTRUCTIONS_MAX_CHARS}
+								value={customShared}
+								oninput={(e) => typeCustom('shared', (e.currentTarget as HTMLTextAreaElement).value)}
+								onchange={(e) => commitCustom('shared', (e.currentTarget as HTMLTextAreaElement).value)}
+								placeholder="e.g. Answer in Spanish. Prefer polars over pandas."
+								data-testid="settings-custom-instructions-shared"
+							></textarea>
+						</label>
+					{:else}
+						<label class="mt-2 flex flex-col gap-1">
+							<span class="text-xs text-base-content/60">Chat cells</span>
+							<textarea
+								class="textarea textarea-sm h-20 w-full text-xs leading-snug"
+								maxlength={CUSTOM_INSTRUCTIONS_MAX_CHARS}
+								value={customChat}
+								oninput={(e) => typeCustom('chat', (e.currentTarget as HTMLTextAreaElement).value)}
+								onchange={(e) => commitCustom('chat', (e.currentTarget as HTMLTextAreaElement).value)}
+								placeholder="e.g. Keep answers short. Answer in Spanish."
+								data-testid="settings-custom-instructions-chat"
+							></textarea>
+						</label>
+						<label class="mt-2 flex flex-col gap-1">
+							<span class="text-xs text-base-content/60">Agents (MCP)</span>
+							<textarea
+								class="textarea textarea-sm h-20 w-full text-xs leading-snug"
+								maxlength={CUSTOM_INSTRUCTIONS_MAX_CHARS}
+								value={customMcp}
+								oninput={(e) => typeCustom('mcp', (e.currentTarget as HTMLTextAreaElement).value)}
+								onchange={(e) => commitCustom('mcp', (e.currentTarget as HTMLTextAreaElement).value)}
+								placeholder="e.g. Prefer polars over pandas. Add a markdown cell before each section."
+								data-testid="settings-custom-instructions-mcp"
+							></textarea>
+						</label>
+					{/if}
 				</div>
 
 				<div class="divider my-1"></div>

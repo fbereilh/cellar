@@ -48,6 +48,14 @@ export default defineConfig({
 		// own `~/.cellar/chat-runs` - the registry every real `cellar` launch sweeps.
 		// The suite keeps its records out of it. A test that is ABOUT the registry
 		// still sets its own directory explicitly.
-		env: { CELLAR_CHAT_RUNS_DIR: join(tmpdir(), 'cellar-vitest-chat-runs') }
+		//
+		// Same reason for the user-settings store: the MCP server and the chat run
+		// read the person's custom instructions from it, so left on the default the
+		// suite would read (and a test could write) the developer's own
+		// `~/.cellar/settings.json`. A test about the store sets its own path.
+		env: {
+			CELLAR_CHAT_RUNS_DIR: join(tmpdir(), 'cellar-vitest-chat-runs'),
+			CELLAR_USER_SETTINGS: join(tmpdir(), `cellar-vitest-user-settings-${process.pid}.json`)
+		}
 	}
 });

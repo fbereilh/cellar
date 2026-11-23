@@ -79,6 +79,7 @@ import {
 	type ChatFailureKind
 } from '$lib/chatCell';
 import { asText } from '$lib/outputText';
+import { resolveCustomInstructions } from '$lib/customInstructions';
 import { getUserSettings } from '$lib/server/user-settings';
 import { registerChatRun, unregisterChatRun } from './active';
 import { configDirFor, resolveChatAuth } from './auth';
@@ -246,6 +247,9 @@ export async function executeChatRun({
 			// store and through the same strict `=== true` gate as its neighbours, so
 			// an opt-out takes effect on the very next run.
 			learningMode: chatLearningModeEnabled(settings[CHAT_LEARNING_MODE_KEY]),
+			// The person's own instructions for chat cells (or the shared text when
+			// they merged the two). Read at run time, so an edit applies to the next run.
+			customInstructions: resolveCustomInstructions(settings, 'chat'),
 			signal: ctrl.signal,
 			onDelta: (text) => {
 				if (!text) return;
