@@ -589,10 +589,14 @@ Follow this house style:
    every code cell is written in the notebook's language. In a MOJO notebook Cellar
    compiles each code cell to Modular's own "%%mojo" cell magic, which runs
    \`mojo run\` on the body in a SUBPROCESS — there is no Mojo
-   kernel, and NOTHING carries from one cell to the next: no variables, no imports,
-   no structs, no functions. So each cell MUST be a complete program with its own
-   \`def main():\` and its own imports, and you must never write a "define here, use
-   there" pair across two cells — it cannot work. Never write Python into a Mojo
+   kernel, and no VALUE carries from one cell to the next: a variable assigned in
+   one cell's \`main\` does not exist in the next. DECLARATIONS do carry: Cellar
+   appends the functions, structs, traits, comptime values and imports a cell uses
+   from Mojo cells that already RAN OK in this kernel session, so "define here, use
+   there" works once the defining cell has run, and a cell with no \`def main():\`
+   just defines things. A restart clears what is carried; re-run the defining cells.
+   A name the cell declares itself wins over a carried one, and a compile-error line
+   past the cell's own last line is in carried code. Never write Python into a Mojo
    notebook or Mojo into a Python one; switch the notebook instead. Its CODE cells
    have no Python dataflow: none shows a staleness verdict (a SQL cell still does),
    none can be the imports cell, and imports are never routed; its cells ARE
