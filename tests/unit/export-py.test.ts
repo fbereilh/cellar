@@ -178,7 +178,7 @@ describe('a `#|default_exp` outside the leading block is REPORTED, not silently 
 		// The harm this report exists for is a module the MARKS describe landing
 		// nowhere. A notebook demonstrating nbdev's directives, or quoting one in a
 		// docstring, asked for no module at all - and a standing sentence on the
-		// always-visible export bar claiming "no module is being generated" about one
+		// export bar (and its menu button) claiming "no module is being generated" about one
 		// nobody wanted is the false nag `server/nbdev.ts` warns against.
 		const unmarked = doc({ cells: [{ id: 'a', cell_type: 'code', source: 'x = 1\n#|default_exp core' }] });
 		expect(resolveExportTarget(unmarked)).toBeNull();

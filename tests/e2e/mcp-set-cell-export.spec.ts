@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
-import { runtimeAvailable, bootCellar, killCellar, REPO, removeWorkspace, MCP_CALL_TIMEOUT_MS } from './harness';
+import { runtimeAvailable, bootCellar, killCellar, REPO, removeWorkspace, MCP_CALL_TIMEOUT_MS, openNotebookSettings } from './harness';
 
 /**
  * The nbdev-style export flow END TO END over the wire an agent really uses: a
@@ -134,7 +134,8 @@ test('an agent names a target, marks cells, and a real .py module appears - the 
 	await page.getByText('analysis.ipynb').first().dblclick();
 	await expect(page.getByRole('heading', { name: 'Circle analysis' })).toBeVisible();
 	// Nothing marked, no target: the export bar is PRESENT but unconfigured - it
-	// is now the always-visible section a target is set in BEFORE marking cells.
+	// is the menu section a target is set in BEFORE marking cells.
+	await openNotebookSettings(page);
 	await expect(page.getByTestId('export-bar')).toBeVisible();
 	await expect(page.getByTestId('export-target-input')).toHaveValue('');
 	await expect(page.getByTestId('export-count')).toHaveText('0 cells marked');
@@ -174,6 +175,7 @@ test('an agent names a target, marks cells, and a real .py module appears - the 
 
 	// --- 4. the human's open page reflects it live, no reload ------------------
 	await expect(page.locator('[data-testid="toggle-export"][aria-pressed="true"]')).toHaveCount(2);
+	await openNotebookSettings(page);
 	await expect(page.getByTestId('export-count')).toHaveText(/2 cells marked/);
 	await expect(page.getByTestId('export-target-input')).toHaveValue('lib/circles.py');
 	await shot(page, '02-after-agent-marked.png');
@@ -269,6 +271,7 @@ test('the human half: a refused target is SAID, and the field goes back to what 
 	// rather than watch a field silently keep a value nothing stored.
 	await page.goto(`${baseURL}/?ws=${encodeURIComponent(workspace)}`);
 	await page.getByText('analysis.ipynb').first().dblclick();
+	await openNotebookSettings(page);
 	const input = page.getByTestId('export-target-input');
 	await expect(input).toHaveValue('lib/circles.py');
 

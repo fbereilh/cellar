@@ -3,12 +3,12 @@ import { type ChildProcess } from 'node:child_process';
 import { mkdtempSync, existsSync, writeFileSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { runtimeAvailable, bootCellar, killCellar, removeWorkspace } from './harness';
+import { runtimeAvailable, bootCellar, killCellar, removeWorkspace, openNotebookSettings, closeNotebookSettings } from './harness';
 
 /**
  * The NOTEBOOK LANGUAGE SELECTOR in the REAL browser, against a REAL kernel.
  *
- * A notebook is Python or Mojo and never both, chosen once at the top - so the
+ * A notebook is Python or Mojo and never both, chosen once in the notebook menu - so the
  * things only a real run can establish are all about that ONE control:
  *
  *  1. **A new notebook is Python, and its metadata says nothing.** The default
@@ -84,12 +84,14 @@ async function openFresh(page: Page, name: string): Promise<void> {
 
 /** Convert `cell` to `type` through the type menu - the path a human uses. */
 async function chooseType(cell: Locator, type: string): Promise<void> {
+	await closeNotebookSettings(cell.page());
 	await cell.getByTestId('type-toggle').click();
 	await cell.getByTestId(`type-option-${type}`).click();
 }
 
-/** Set the NOTEBOOK's language from the selector at the top - the whole feature. */
+/** Set the NOTEBOOK's language from the language-and-export menu - the whole feature. */
 async function chooseLanguage(page: Page, language: 'python' | 'mojo'): Promise<void> {
+	await openNotebookSettings(page);
 	await page.getByTestId('language-select').selectOption(language);
 	await expect(page.getByTestId('language-feedback')).toContainText(
 		language === 'mojo' ? 'Mojo' : 'Python',
@@ -103,6 +105,7 @@ const nbMeta = (name: string): Record<string, unknown> =>
 
 /** Build the lazy editor and replace `cell`'s source. */
 async function typeInto(page: Page, cell: Locator, text: string): Promise<void> {
+	await closeNotebookSettings(page);
 	await cell.getByTestId('editor-scroll').click();
 	const editor = cell.locator('.cm-content');
 	await expect(editor).toBeVisible();
@@ -133,8 +136,9 @@ test('a NEW notebook is Python, and its metadata says nothing', async ({ page })
 	const errors = watchErrors(page);
 	await openFresh(page, 'lang-default.ipynb');
 
-	// The selector is standing chrome on every `.ipynb` - the one place that says
+	// The selector is offered on every `.ipynb` - the one place that says
 	// what the notebook is - and it starts on Python.
+	await openNotebookSettings(page);
 	await expect(page.getByTestId('language-bar')).toBeVisible();
 	await expect(page.getByTestId('language-select')).toHaveValue('python');
 	// ...and the default costs NO key in the committed file. That is what makes
@@ -170,6 +174,7 @@ test('flipping the selector to Mojo makes every code cell a Mojo cell', async ({
 	// here is withheld: the imports cell is run by the PYTHON kernel, so the role
 	// can do nothing on a Mojo notebook. The export toggle stays, because a Mojo
 	// notebook's code cells ARE the eligible kind for its `.mojo` module.
+	await closeNotebookSettings(page);
 	await cell.getByTestId('cell-actions').click();
 	await expect(cell.getByTestId('toggle-imports-role')).toHaveCount(0);
 	await expect(cell.getByTestId('toggle-hide-input')).toBeVisible();
@@ -250,6 +255,7 @@ test('the language SURVIVES a reload, which is what makes it a setting', async (
 	await page.reload();
 	await page.locator('[data-testid="tree-file"][data-path="lang-reload.ipynb"]').click();
 	await expect(cellBy(page, PY_ID)).toBeVisible({ timeout: 30_000 });
+	await openNotebookSettings(page);
 	await expect(page.getByTestId('language-select')).toHaveValue('mojo');
 	await expect(cellBy(page, PY_ID).getByTestId('mojo-badge')).toBeVisible();
 });
@@ -259,6 +265,7 @@ test('the export target FOLLOWS the language, so the two can never disagree', as
 	const errors = watchErrors(page);
 	await openFresh(page, 'lang-export.ipynb');
 
+	await openNotebookSettings(page);
 	const target = page.getByTestId('export-target-input');
 	await target.fill('lib/utils.py');
 	await target.blur();
@@ -269,6 +276,7 @@ test('the export target FOLLOWS the language, so the two can never disagree', as
 	await chooseLanguage(page, 'mojo');
 	await expect.poll(() => nbMeta('lang-export.ipynb').export_target, { timeout: 15_000 }).toBe('lib/utils.mojo');
 	await expect(target).toHaveValue('lib/utils.mojo');
+	await openNotebookSettings(page);
 	await expect(page.getByTestId('export-run')).toHaveText(/\.mojo/);
 
 	// ...and a path in the OTHER language is refused rather than silently stored,
@@ -394,6 +402,7 @@ test('a kept imports mark stays clearable after the switch, greyed and clear-onl
 
 	// The control is THERE, greyed, and says why - where a cell that carries no mark
 	// still gets nothing, since marking can never mean anything here.
+	await closeNotebookSettings(page);
 	await marked.getByTestId('cell-actions').click();
 	const item = marked.getByTestId('toggle-imports-role');
 	await expect(item).toBeVisible();
@@ -410,10 +419,92 @@ test('a kept imports mark stays clearable after the switch, greyed and clear-onl
 
 	// And an UNMARKED cell of the same notebook is offered nothing at all.
 	const plain = cellBy(page, 'other00000');
+	await closeNotebookSettings(page);
 	await plain.getByTestId('cell-actions').click();
 	await expect(plain.getByTestId('toggle-imports-role')).toHaveCount(0);
 	await page.keyboard.press('Escape');
 	expect(errors).toEqual([]);
+});
+
+const settingsBtn = (page: Page) => page.locator('[data-testid="notebook-settings"]:visible');
+const openMenu = (page: Page) => page.locator('[data-testid="notebook-settings-menu"]:popover-open');
+
+test('the menu button names the language, and its own click, Escape and an outside click each close it', async ({
+	page
+}) => {
+	test.setTimeout(120_000);
+	await openFresh(page, 'menu-close.ipynb');
+	await expect(settingsBtn(page)).toContainText('Python');
+	await expect(settingsBtn(page)).toHaveAccessibleName(/Python/);
+
+	// A second click on the button CLOSES the menu rather than reopening it.
+	await settingsBtn(page).click();
+	await expect(openMenu(page)).toHaveCount(1);
+	await settingsBtn(page).click();
+	await expect(openMenu(page)).toHaveCount(0);
+
+	await settingsBtn(page).click();
+	await expect(openMenu(page)).toHaveCount(1);
+	await page.keyboard.press('Escape');
+	await expect(openMenu(page)).toHaveCount(0);
+
+	await settingsBtn(page).click();
+	await expect(openMenu(page)).toHaveCount(1);
+	const box = await openMenu(page).boundingBox();
+	expect(box).not.toBeNull();
+	expect(box!.x).toBeGreaterThan(40);
+	await page.mouse.click(box!.x - 20, box!.y + box!.height / 2);
+	await expect(openMenu(page)).toHaveCount(0);
+
+	await chooseLanguage(page, 'mojo');
+	await page.keyboard.press('Escape');
+	await expect(settingsBtn(page)).toContainText('Mojo');
+	await expect(settingsBtn(page)).toHaveAccessibleName(/Mojo/);
+});
+
+test('keys pressed in the open menu reach neither the selected cell nor the language select', async ({ page }) => {
+	test.setTimeout(120_000);
+	const name = 'menu-keys.ipynb';
+	await openFresh(page, name);
+	const cell = cellBy(page, PY_ID);
+	const typeOnDisk = () => onDisk(name).cells.find((c) => c.id === PY_ID)?.cell_type;
+
+	// Select the cell in command mode, so a stray `m` or `d d` has a cell to act on.
+	await cell.evaluate((el) => (el as HTMLElement).focus());
+	await expect(cell).toHaveAttribute('data-active', 'true');
+
+	await settingsBtn(page).click();
+	await expect(openMenu(page)).toHaveCount(1);
+	// Focus is on the menu itself, never on the select a bare keystroke commits.
+	await expect(openMenu(page)).toBeFocused();
+	for (const key of ['r', 'm', 'ArrowDown', 'd', 'd']) await page.keyboard.press(key);
+
+	await expect(page.getByTestId('language-select')).toHaveValue('python');
+	await page.keyboard.press('Escape');
+	await expect(openMenu(page)).toHaveCount(0);
+	await expect(cell).toBeVisible();
+	await expect(cell.getByTestId('type-toggle')).toHaveText(/python3/);
+	expect(nbMeta(name).language).toBeUndefined();
+	expect(typeOnDisk()).toBe('code');
+
+	// CONTROL: the same key on the cell itself does convert it, so the silence
+	// above is the menu owning its keys and not a dead keyboard.
+	await cell.evaluate((el) => (el as HTMLElement).focus());
+	await page.keyboard.press('m');
+	await expect.poll(typeOnDisk, { timeout: 15_000 }).toBe('markdown');
+});
+
+test('on a short window the menu ends inside the viewport, so its last line is reachable', async ({ page }) => {
+	test.setTimeout(120_000);
+	await page.setViewportSize({ width: 1280, height: 320 });
+	await openFresh(page, 'menu-short.ipynb');
+	await settingsBtn(page).click();
+	await expect(openMenu(page)).toHaveCount(1);
+	const box = await openMenu(page).boundingBox();
+	expect(box).not.toBeNull();
+	expect(box!.y + box!.height).toBeLessThanOrEqual(320);
+	// The content is taller than the room left, so the menu scrolls instead.
+	expect(await openMenu(page).evaluate((el) => el.scrollHeight > el.clientHeight)).toBe(true);
 });
 
 test('a .py TEXT notebook offers no selector - it can only ever be Python', async ({ page }) => {
@@ -427,6 +518,7 @@ test('a .py TEXT notebook offers no selector - it can only ever be Python', asyn
 	await page.goto(`${baseURL}/?ws=${encodeURIComponent(workspace)}`);
 	await page.locator('[data-testid="tree-file"][data-path="text-nb.py"]').click();
 	await expect(page.locator('[data-testid="cell"]').first()).toBeVisible({ timeout: 30_000 });
+	await expect(page.locator('[data-testid="notebook-settings"]:visible')).toHaveCount(0);
 	await expect(page.getByTestId('language-bar')).toHaveCount(0);
 	await expect(page.getByTestId('language-select')).toHaveCount(0);
 });
@@ -462,6 +554,7 @@ test('a reply that lands no verdict KEEPS the applied language and says it is un
 			body: '<html><body><h1>502 Bad Gateway</h1></body></html>'
 		});
 	});
+	await openNotebookSettings(page);
 	await page.getByTestId('language-select').selectOption('mojo');
 
 	// The select KEEPS what the user asked for, the cells read as Mojo, and the
@@ -480,6 +573,7 @@ test('a reply that lands no verdict KEEPS the applied language and says it is un
 	await page.goto(`${baseURL}/?ws=${encodeURIComponent(workspace)}`);
 	await page.locator('[data-testid="tree-file"][data-path="lang-noverdict.ipynb"]').click();
 	await expect(cellBy(page, PY_ID)).toBeVisible({ timeout: 30_000 });
+	await openNotebookSettings(page);
 	await expect(page.getByTestId('language-select')).toHaveValue('mojo');
 	await expect(page.getByTestId('language-feedback')).toHaveCount(0);
 });
@@ -500,11 +594,13 @@ test('a REFUSAL the server really made still reverts the select and reports it',
 			body: JSON.stringify({ ok: false, reason: 'bad-language', message: 'unsupported notebook language' })
 		})
 	);
+	await openNotebookSettings(page);
 	await page.getByTestId('language-select').selectOption('mojo');
 
 	await expect(page.getByTestId('language-feedback')).toContainText('unsupported notebook language', {
 		timeout: 15_000
 	});
+	await openNotebookSettings(page);
 	await expect(page.getByTestId('language-select')).toHaveValue('python');
 	await expect(mojoCards(page)).toHaveCount(0);
 	expect(nbMeta('lang-refused.ipynb').language).toBeUndefined();

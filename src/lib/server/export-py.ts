@@ -835,7 +835,7 @@ function storedExportTarget(
  *
  * NARROWED to a notebook with at least one export-MARKED cell, because that is the
  * whole of the harm: the marks describe a module, and it is now landing nowhere.
- * Without that gate the message is standing chrome on the always-visible export bar
+ * Without that gate the message is a standing warning in the export bar (and its menu button)
  * of a notebook that never asked for a module at all - a tutorial DEMONSTRATING
  * nbdev's directives, or a line quoted inside a docstring - asserting "no module is
  * being generated" about one nobody wanted. Under-reporting is the safe direction

@@ -442,7 +442,7 @@
 	// the server's refusals ask too (`notebookHoldsExport`). A `.py` text notebook
 	// cannot: it stores no cell metadata, so the toggle used to show a mark that
 	// lived only in memory and was gone after a relaunch. The control is HIDDEN
-	// there, like the export bar above the cells and every other affordance a
+	// there, like the export section of the notebook menu and every other affordance a
 	// notebook cannot use, rather than rendered and refused on click.
 	const exportOffered = $derived(notebookHoldsExport(isPy));
 	// The accessible NAME. It tracks what the control DOES - clear a stale mark, or
@@ -1217,7 +1217,7 @@
 	// menu is the ONLY create path for raw - there is deliberately no
 	// "+ Raw" insert button, it not being worth a button on every gap
 	// (raw is once-per-notebook). Mojo is NOT here at all: a code cell's language is
-	// the NOTEBOOK's, chosen once in the selector at the top, so offering it per cell
+	// the NOTEBOOK's, chosen once in the notebook's language-and-export menu, so offering it per cell
 	// is exactly how a notebook ends up holding two languages. Chat
 	// is different: asking a question recurs through a session the way code and
 	// markdown do, so it IS also creatable directly from the add affordances (the

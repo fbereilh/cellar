@@ -3,7 +3,7 @@ import { type ChildProcess } from 'node:child_process';
 import { mkdtempSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { runtimeAvailable, bootCellar, killCellar, removeWorkspace } from './harness';
+import { runtimeAvailable, bootCellar, killCellar, removeWorkspace, openNotebookSettings } from './harness';
 
 /**
  * A notebook authored in nbdev, opened in Cellar: `#| export` in the SOURCE marks a
@@ -135,6 +135,7 @@ test('the module really contains the directive-marked cell, and not the plain on
 	await openNotebook(page);
 	// The module is written by an EXPLICIT action and never by a save, so ask for
 	// one: the "Export to .py" button is the plainest of the three.
+	await openNotebookSettings(page);
 	await page.getByTestId('export-run').click();
 
 	const modulePath = join(workspace, 'lib', 'mod.py');

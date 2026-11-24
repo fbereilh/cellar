@@ -288,3 +288,37 @@ export async function openSidebarSection(page: Page, section: string, body: stri
 		await expect(panel).toBeVisible({ timeout: 1_000 });
 	}).toPass({ timeout });
 }
+
+/**
+ * Open the active notebook's language-and-export menu (the `notebook-settings`
+ * button at the right end of the notebook toolbar) unless it is already open.
+ *
+ * The menu is a native `popover="auto"`: it stays in the DOM while closed, so
+ * every control in it is present but not visible, and any click outside it
+ * (a cell, the tab strip, a reload) closes it again. Call this before reading
+ * or driving a control in it, and again after anything that may have closed it.
+ * It is idempotent, so calling it when the menu is already open costs nothing.
+ */
+export async function openNotebookSettings(page: Page): Promise<void> {
+	const open = page.locator('[data-testid="notebook-settings-menu"]:popover-open');
+	if ((await open.count()) > 0) return;
+	const button = page.locator('[data-testid="notebook-settings"]:visible');
+	await button.click();
+	await expect(open).toHaveCount(1);
+	// The menu takes focus from its `toggle` event, which the browser fires a task
+	// AFTER the popover opens. `aria-expanded` flips in that same handler, so wait
+	// for it: a key pressed before it lands would have its focus taken back.
+	await expect(button).toHaveAttribute('aria-expanded', 'true');
+}
+
+/**
+ * Close the notebook's language-and-export menu if it is open. A real click
+ * outside it light-dismisses it, but Playwright refuses to click a cell control
+ * the open menu covers, so a spec closes it before reaching for one.
+ */
+export async function closeNotebookSettings(page: Page): Promise<void> {
+	const open = page.locator('[data-testid="notebook-settings-menu"]:popover-open');
+	if ((await open.count()) === 0) return;
+	await open.evaluate((el) => (el as HTMLElement).hidePopover());
+	await expect(open).toHaveCount(0);
+}

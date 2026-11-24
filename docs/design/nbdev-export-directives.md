@@ -65,7 +65,7 @@ guess is wrong, and the differential is what caught it).
 **The narrowing is REPORTED, not silent.** The rule stays nbdev's - what nbdev ignores,
 Cellar ignores - but a notebook whose `#|default_exp` sat after code (which the old `/m`
 regex honoured) used to generate a committed module and now generates none, and with no
-target AND no error the export bar reads exactly like a notebook that never configured one
+target AND no error the export section of the language and export menu reads exactly like a notebook that never configured one
 while the module on disk quietly goes stale. So when nothing at all resolves and a
 `#|default_exp` line exists OUTSIDE its cell's leading block, that is reported through the
 EXISTING `exportResolveError` channel (`nbdevDirectiveOutsideBlock` +
@@ -80,7 +80,7 @@ Two further rules keep that report honest rather than nagging:
 **It speaks only when a cell is MARKED.** The harm is a module the marks describe landing
 nowhere; a notebook that marks nothing never asked for one, so a tutorial DEMONSTRATING
 nbdev's directives - or a `#|default_exp` quoted inside a docstring - gets silence rather
-than a standing sentence on the always-visible export bar asserting "no module is being
+than a standing sentence in the export section of the language and export menu asserting "no module is being
 generated". Under-reporting is the safe direction for a notice (`server/nbdev.ts` states the
 same for the sibling nbdev warning), and one users learn to ignore protects nothing. The gate
 is on the REPORT only - the leading-block rule is untouched.
@@ -262,7 +262,7 @@ A hazard may not speak over it either. It describes the module these marks make 
 `moduleHazard` says outright that the target WAS written - so over a write the guard
 declined it describes a file that does not and will not exist. The foreign-module
 question is therefore asked BEFORE the hazard, and the precedence is expressed ONCE, in
-`docExportHazards`, which the export bar (through `exportTargetView`) and MCP's
+`docExportHazards`, which the menu's export section (through `exportTargetView`) and MCP's
 `moduleHazard` (through `exportHazardsFor`) both read. It costs a file read only once there
 IS a hazard to suppress, so the ordinary `getNotebook` / persist path is untouched.
 

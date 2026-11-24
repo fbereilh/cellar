@@ -377,6 +377,7 @@
 		onAddCell,
 		onInsertCell
 	}: Props = $props();
+	const uid = $props.id();
 
 	// ---- Windowed rendering (virtualization) ---------------------------------
 	// P2: with `virtualize` on - which since P5 is what the shell passes by default -
@@ -678,11 +679,11 @@
 	const removedLabel = (n: number): string => `${n} ${n === 1 ? 'cell' : 'cells'} removed`;
 
 	// ---- nbdev-style export section ------------------------------------------
-	// A slim section at the top of the notebook (directly below the code-root bar)
-	// to pick the export BASE, set the target `.py` path, and export on demand.
-	// ALWAYS present on a real notebook - a target has to be settable BEFORE any
-	// cell is marked, which is exactly the state a use-it gate hid it in - and
-	// styled as neutral standing chrome rather than a call to action. Hidden only
+	// A section of the notebook-settings menu (the button at the right end of the
+	// notebook toolbar) to pick the export BASE, set the target `.py` path, and
+	// export on demand. ALWAYS offered on a real notebook - a target has to be
+	// settable BEFORE any cell is marked, which is exactly the state a use-it gate
+	// hid it in - rather than gated on the notebook having marks. Hidden only
 	// on a `.py` text notebook, which stores no notebook metadata: the server
 	// refuses a target there, so offering the control would show a setting that
 	// does nothing (the same rule as the root picker's absence). Asked through the
@@ -691,8 +692,8 @@
 	let exportFeedback = $state('');
 	let exporting = $state(false);
 	const showExportBar = $derived(notebookHoldsExport(isPy));
-	// The LANGUAGE selector. Shown on every `.ipynb`, unlike the code-root bar's
-	// opt-in chrome: every notebook HAS a language and it decides how every code cell
+	// The LANGUAGE selector, the menu's other section. Offered on every `.ipynb`,
+	// unlike the code-root bar's opt-in chrome: every notebook HAS a language and it decides how every code cell
 	// in it runs, so the one place that says which is not something to make the user
 	// go and enable. A `.py` text notebook is excluded for the reason it has no root
 	// picker either - it stores no notebook metadata, so it can only ever be Python
@@ -768,6 +769,68 @@
 	const orphanExplanation = $derived(
 		exportOrphanedModule ? orphanedModuleExplanation(exportOrphanedModule, exportResolved) : null
 	);
+	// ---- notebook-settings menu ---------------------------------------------
+	// The two sections above live in ONE popover opened from the toolbar. It is
+	// offered whenever either section applies, so a `.py` text notebook (which
+	// holds neither) gets no button at all.
+	const showSettingsMenu = $derived(showLanguageBar || showExportBar);
+	// Unique per instance: every open notebook stays mounted, so two menus share
+	// the page and `aria-controls` must name the right one.
+	const settingsMenuId = `${uid}-settings`;
+	let settingsMenuEl = $state<HTMLElement | null>(null);
+	let settingsBtnEl = $state<HTMLElement | null>(null);
+	let settingsOpen = $state(false);
+	const settingsLabel = $derived(showLanguageBar ? NOTEBOOK_LANGUAGE_LABELS[notebookLanguage] : 'Export');
+	// A closed menu would hide every export warning, so the button carries a dot
+	// whenever one of them is showing inside. Only the WARNINGS count: the
+	// resolved-path echo and the feedback line are information, not problems.
+	const settingsWarning = $derived(
+		showExportBar &&
+			!!(exportResolveError || exportHazards.length || importWarning || strandedExplanation || orphanExplanation)
+	);
+	function placeSettingsMenu() {
+		if (!settingsMenuEl || !settingsBtnEl) return;
+		const r = settingsBtnEl.getBoundingClientRect();
+		const vw = document.documentElement.clientWidth;
+		const mw = settingsMenuEl.offsetWidth;
+		const top = r.bottom + 4;
+		// Right-aligned under the button, clamped inside the viewport, so the menu
+		// opens toward the notebook rather than off the window's right edge. Anchored
+		// by its RIGHT edge so it can be placed before it is shown, while it still
+		// has no width to measure.
+		settingsMenuEl.style.right = Math.max(8, Math.min(vw - r.right, vw - mw - 8)) + 'px';
+		settingsMenuEl.style.top = top + 'px';
+		// The height it may take is what is LEFT below the button, so its last line
+		// stays reachable by scrolling the menu on a short window.
+		settingsMenuEl.style.maxHeight = Math.max(96, window.innerHeight - top - 8) + 'px';
+	}
+	// The button opens and closes the menu declaratively (`popovertarget`), so the
+	// browser owns the toggle, treats a click on the button as the invoker's rather
+	// than as a light dismiss, and returns focus to it on close.
+	function onSettingsBeforeToggle(e: Event) {
+		if ((e as ToggleEvent).newState === 'open') placeSettingsMenu();
+	}
+	function onSettingsToggle(e: Event) {
+		settingsOpen = (e as ToggleEvent).newState === 'open';
+		if (!settingsOpen) return;
+		placeSettingsMenu();
+		// Keyboard reach without arming a control: focus goes to the menu itself, so
+		// Tab walks into it but no bare keystroke lands on the language select,
+		// which commits on a single arrow or type-ahead letter.
+		settingsMenuEl?.focus({ preventScroll: true });
+	}
+	// The menu is `position: fixed`, so keep it under its button while it is open:
+	// the notebook pane scrolls and the window can resize.
+	$effect(() => {
+		if (!settingsOpen) return;
+		const follow = () => placeSettingsMenu();
+		window.addEventListener('resize', follow);
+		window.addEventListener('scroll', follow, true);
+		return () => {
+			window.removeEventListener('resize', follow);
+			window.removeEventListener('scroll', follow, true);
+		};
+	});
 	// Whether the notebook has any runnable (code) cell — gates the "Run all" button.
 	const hasCodeCell = $derived(cells.some((c) => c.cell_type === 'code'));
 	// Whether THIS notebook's kernel is executing or has work waiting — gates
@@ -1295,57 +1358,247 @@
 					Consolidate imports
 				</button>
 			{/if}
-		</div>
-		{#if showLanguageBar}
-			<!-- The notebook's LANGUAGE: what every plain code cell in it is written in.
-			     First of the notebook-level bars because it is the most fundamental of
-			     them - it decides how every code cell RUNS, and the export bar's own
-			     module extension FOLLOWS it. Same visual family as the two bars below,
-			     and deliberately as quiet: it is a property of the notebook, not a
-			     call to action. -->
-			<div
-				class="mb-4 flex flex-wrap items-center gap-2 rounded-box border border-base-300 bg-base-100 px-3 py-2 text-sm"
-				data-testid="language-bar"
-			>
-				<span class="flex items-center gap-1.5 font-medium text-base-content/70">
-					<svg class="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m8 8-4 4 4 4" /><path d="m16 8 4 4-4 4" /><path d="m13 5-2 14" /></svg>
-					Language
-				</span>
-				<select
-					class="select select-bordered select-xs w-auto pr-7"
-					bind:value={selectedLanguage}
-					onchange={onLanguageSelect}
-					disabled={languageBusy}
-					data-testid="language-select"
-					aria-label="The language this notebook's code cells are written in"
+			<!-- The notebook-settings menu: the notebook's LANGUAGE and its nbdev-style
+			     EXPORT, the two notebook-level settings that used to sit in standing
+			     cards above the cells. They are set once and revisited rarely, so they
+			     live behind one button at the right end of this bar rather than taking
+			     a row of chrome each on every notebook. Rendered only where at least one
+			     applies: a `.py` text notebook holds neither (see `showLanguageBar` /
+			     `showExportBar`). The warning dot carries the one thing a closed menu
+			     would otherwise hide: an export warning the user has to act on. -->
+			{#if showSettingsMenu}
+				<button
+					bind:this={settingsBtnEl}
+					class="btn btn-ghost btn-sm relative ml-auto gap-1.5"
+					popovertarget={settingsMenuId}
+					title={settingsWarning
+						? 'Language and export settings - the export needs attention'
+						: 'Language and export settings'}
+					aria-label={`Language and export settings: ${settingsLabel}${settingsWarning ? ' (export needs attention)' : ''}`}
+					aria-haspopup="dialog"
+					aria-expanded={settingsOpen}
+					aria-controls={settingsMenuId}
+					data-testid="notebook-settings"
+					data-warning={settingsWarning ? '' : undefined}
 				>
-					{#each NOTEBOOK_LANGUAGES as l (l)}
-						<option value={l}>{NOTEBOOK_LANGUAGE_LABELS[l]}</option>
-					{/each}
-				</select>
-				<!-- What it reaches, and what it does NOT cost - the code-root bar states
-				     its kernel-restart price here, and the honest thing to say about this
-				     one is that nothing per-cell is written. Python and Mojo share one kernel,
-				     so a switch between them restarts nothing. Rust runs on its own kernel,
-				     so a switch to or from it frees the kernel - stated here before the click. The
-				     export clause is here because that target is the one OTHER setting
-				     this moves. -->
-				<span class="text-xs text-base-content/55">
-					{#if notebookLanguage === 'rust'}
-						every code cell runs as Rust on the Evcxr kernel, and state carries between
-						cells. A Rust notebook exports no module and runs no SQL cells. Switching away
-						restarts the kernel and clears its variables.
-					{:else}
-						every code cell runs as {NOTEBOOK_LANGUAGE_LABELS[notebookLanguage]}; markdown, raw,
-						SQL and chat cells are unaffected. The export target's extension follows it.
-						Python and Mojo share one kernel, so its variables are kept. Switching to Rust
-						restarts the kernel and clears them.
+					<svg class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 21v-7" /><path d="M4 10V3" /><path d="M12 21v-9" /><path d="M12 8V3" /><path d="M20 21v-5" /><path d="M20 12V3" /><path d="M1 14h6" /><path d="M9 8h6" /><path d="M17 16h6" /></svg>
+					{settingsLabel}
+					<svg class="h-3 w-3 opacity-60" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 9 6 6 6-6" /></svg>
+					{#if settingsWarning}
+						<span class="absolute right-1 top-1 h-2 w-2 rounded-full bg-warning" data-testid="notebook-settings-warning" aria-hidden="true"></span>
 					{/if}
-				</span>
-				{#if languageFeedback}
-					<span class="text-xs text-base-content/70" data-testid="language-feedback"
-						>{languageFeedback}</span
+				</button>
+			{/if}
+		</div>
+		{#if showSettingsMenu}
+			<!-- A native `popover="auto"` in the top layer, the cell "⋮" menu's idiom:
+			     the browser closes it on Escape and on a click outside, and nothing in
+			     the notebook's overflow can clip it. It stays in the DOM while closed,
+			     which is load-bearing: `exportTargetEl` is read by the `pagehide`
+			     flush, and every control keeps its state across open and close. -->
+			<div
+				bind:this={settingsMenuEl}
+				id={settingsMenuId}
+				popover="auto"
+				role="dialog"
+				aria-label="Language and export settings"
+				tabindex="-1"
+				onbeforetoggle={onSettingsBeforeToggle}
+				ontoggle={onSettingsToggle}
+				class="m-0 w-[32rem] max-w-[calc(100vw-1rem)] overflow-y-auto rounded-box border border-base-300 bg-base-100 p-0 text-sm shadow-lg outline-none"
+				style="position: fixed; inset: auto; margin: 0;"
+				data-testid="notebook-settings-menu"
+			>
+				{#if showLanguageBar}
+					<!-- The notebook's LANGUAGE: what every plain code cell in it is written
+					     in. First because it is the most fundamental of the two - it decides
+					     how every code cell RUNS, and the export module's extension FOLLOWS
+					     it. -->
+					<div class="flex flex-col gap-2 px-4 py-3" data-testid="language-bar">
+						<div class="flex flex-wrap items-center gap-2">
+							<span class="flex items-center gap-1.5 font-medium text-base-content/70">
+								<svg class="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m8 8-4 4 4 4" /><path d="m16 8 4 4-4 4" /><path d="m13 5-2 14" /></svg>
+								Language
+							</span>
+							<select
+								class="select select-bordered select-xs w-auto pr-7"
+								bind:value={selectedLanguage}
+								onchange={onLanguageSelect}
+								disabled={languageBusy}
+								data-testid="language-select"
+								aria-label="The language this notebook's code cells are written in"
+							>
+								{#each NOTEBOOK_LANGUAGES as l (l)}
+									<option value={l}>{NOTEBOOK_LANGUAGE_LABELS[l]}</option>
+								{/each}
+							</select>
+						</div>
+						<!-- What it reaches, and what it does NOT cost - the code-root bar states
+						     its kernel-restart price beside its control, and the honest thing to
+						     say about this one is that nothing per-cell is written. Python and
+						     Mojo share one kernel, so a switch between them restarts nothing.
+						     Rust runs on its own kernel, so a switch to or from it frees the
+						     kernel - stated here before the click. The export clause is here
+						     because that target is the one OTHER setting this moves. -->
+						<span class="text-xs text-base-content/55">
+							{#if notebookLanguage === 'rust'}
+								Every code cell runs as Rust on the Evcxr kernel, and state carries between
+								cells. A Rust notebook exports no module and runs no SQL cells. Switching away
+								restarts the kernel and clears its variables.
+							{:else}
+								Every code cell runs as {NOTEBOOK_LANGUAGE_LABELS[notebookLanguage]}; markdown, raw,
+								SQL and chat cells are unaffected. The export target's extension follows it.
+								Python and Mojo share one kernel, so its variables are kept. Switching to Rust
+								restarts the kernel and clears them.
+							{/if}
+						</span>
+						{#if languageFeedback}
+							<span class="text-xs text-base-content/70" data-testid="language-feedback"
+								>{languageFeedback}</span
+							>
+						{/if}
+					</div>
+				{/if}
+				{#if showExportBar}
+					<!-- nbdev-style export: pick the BASE the path is measured from, name the
+					     target module, export on demand. Available whether or not any cell
+					     is marked, so a target can be set BEFORE any cell is marked. The
+					     module is written ONLY by an explicit export action - this button,
+					     or naming the target / marking a cell - never by an ordinary save,
+					     so an edit to a marked cell leaves the module as it was until one of
+					     those. -->
+					<div
+						class="flex flex-col gap-2 px-4 py-3 {showLanguageBar ? 'border-t border-base-300' : ''}"
+						data-testid="export-bar"
 					>
+						<span class="flex items-center gap-1.5 font-medium text-base-content/70">
+							<svg class="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v12" /><path d="m8 11 4 4 4-4" /><path d="M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2" /></svg>
+							Export to
+						</span>
+						<div class="flex flex-wrap items-center gap-2">
+							<select
+								class="select select-bordered select-xs w-auto pr-7"
+								bind:value={selectedExportBase}
+								onchange={onExportBaseSelect}
+								disabled={exportBaseBusy}
+								data-testid="export-base-select"
+								aria-label="What the export path is measured from"
+							>
+								{#each EXPORT_BASES as b (b)}
+									<option value={b}>from {EXPORT_BASE_LABELS[b]}</option>
+								{/each}
+							</select>
+							<input
+								bind:this={exportTargetEl}
+								type="text"
+								class="input input-bordered input-xs min-w-40 flex-1 font-mono"
+								placeholder="utils.py"
+								value={exportTarget ?? ''}
+								onchange={onExportTargetCommit}
+								data-testid="export-target-input"
+								aria-label="Export target module path"
+							/>
+						</div>
+						<div class="flex flex-wrap items-center gap-2">
+							<span class="text-xs text-base-content/55" data-testid="export-count">
+								{exportCount} {exportCount === 1 ? 'cell' : 'cells'} marked
+							</span>
+							<button
+								class="btn btn-primary btn-xs ml-auto gap-1"
+								onclick={doExport}
+								disabled={exporting}
+								data-testid="export-run"
+							>
+								{exporting ? 'Exporting…' : exportButtonLabel}
+							</button>
+						</div>
+					{#if exportResolveError}
+						<!-- A CONFIGURED target that resolves to no writable file: the module is
+						     not being generated, and silence here would read as working. The
+						     warning tint rides the ICON, not the copy (`text-warning` body copy
+						     fails contrast on the light theme - the GitNotebooks rule). -->
+						<span class="flex items-center gap-1 text-xs text-base-content/70" data-testid="export-resolve-error">
+							<svg class="h-3.5 w-3.5 shrink-0 text-warning" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3" /><path d="M12 9v4" /><path d="M12 17h.01" /></svg>
+							{exportResolveError}
+						</span>
+					{:else if exportHazards.length}
+						<!-- What the module these marks describe carries - said in the future
+						     tense on purpose, since under explicit export there may be no
+						     such file yet (the shared wording in `$lib/exportHazard` already
+						     reads that way). The MESSAGE is the shared one, never a sentence
+						     built here: the kinds make DIFFERENT claims (a `.py` module that
+						     will not import; a `.mojo` one that compiles because a `def
+						     main()` was dropped; one that keeps a main and so cannot be
+						     imported by a Python cell), and no single wording can make all
+						     three. EVERY hazard is rendered, not just the first: a set can
+						     carry more than one (a `.py` export reports one per offending
+						     line), and one of them silently going unsaid is the reporting
+						     defect this channel exists to fix. The set is already narrowed
+						     server-side by the ONE human-surface rule, so an agent-only kind
+						     never reaches this bar (`$lib/exportHazard`).
+						     KEYED BY POSITION, which is unique by construction: the list is
+						     built with no dedupe, so two marked cells holding the SAME
+						     offending line yield two hazards with identical `kind` and
+						     identical `statement` - a duplicate key throws during render, and
+						     with no error boundary anywhere in `src/` that takes down the
+						     whole notebook (the DataFrame-grid defect class).
+						     Ranked above the code-root warning: that one says the kernel
+						     cannot reach the module, these say what the module itself is.
+						     Below `exportResolveError`, which means no module can be written
+						     at all. -->
+						{#each exportHazards as hazard, i (i)}
+							<span class="flex items-center gap-1 text-xs text-base-content/70" data-testid="export-hazard">
+								<svg class="h-3.5 w-3.5 shrink-0 text-warning" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3" /><path d="M12 9v4" /><path d="M12 17h.01" /></svg>
+								{hazard.message}
+							</span>
+						{/each}
+					{:else if importWarning}
+						<span class="flex items-center gap-1 text-xs text-base-content/70" data-testid="export-import-warning">
+							<svg class="h-3.5 w-3.5 shrink-0 text-warning" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3" /><path d="M12 9v4" /><path d="M12 17h.01" /></svg>
+							{importWarning}
+						</span>
+					{:else if exportResolved && exportBase !== 'workspace'}
+						<!-- A non-workspace base makes the typed path indirect, so say which
+						     workspace file it names (under the workspace base they are the same
+						     string, and the echo would be noise). -->
+						<span class="font-mono text-xs text-base-content/55" data-testid="export-resolved">→ {exportResolved}</span>
+					{/if}
+					{#if strandedExplanation}
+						<!-- Marks the current target cannot honour, explained ONCE for the
+						     notebook. Each affected cell carries only a short "not exported"
+						     marker beside its greyed toggle: this is a notebook-wide fact, and
+						     repeating a sentence per cell would wrap fifteen toolbar rows to
+						     say one thing (the Databricks runtime card renders its reason once
+						     on the card, not once per control). Rendered OUTSIDE the warning
+						     chain above rather than as another arm of it - a hazard describes
+						     the module these marks build, this describes marks the module
+						     leaves out, and both can be true at once. Warning tint on the ICON,
+						     `base-content` copy (the GitNotebooks contrast rule). -->
+						<span class="flex items-center gap-1 text-xs text-base-content/70" data-testid="export-stranded">
+							<svg class="h-3.5 w-3.5 shrink-0 text-warning" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3" /><path d="M12 9v4" /><path d="M12 17h.01" /></svg>
+							{strandedExplanation}
+						</span>
+					{/if}
+					{#if orphanExplanation}
+						<!-- A module Cellar generated from this notebook that its target no
+						     longer names: the leftover a LANGUAGE switch creates, since
+						     re-expressing the extension renames nothing on disk. Said ONCE for
+						     the notebook, in the same line family as the stranded explanation
+						     above and OUTSIDE the warning chain, because it is a fact about a
+						     FILE rather than about the module these marks build - both can be
+						     true at once. Cellar never deletes a generated module the user's
+						     repository holds, so the path is named and the decision is theirs.
+						     Warning tint on the ICON, `base-content` copy (the GitNotebooks
+						     contrast rule). -->
+						<span class="flex items-center gap-1 text-xs text-base-content/70" data-testid="export-orphan">
+							<svg class="h-3.5 w-3.5 shrink-0 text-warning" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3" /><path d="M12 9v4" /><path d="M12 17h.01" /></svg>
+							{orphanExplanation}
+						</span>
+					{/if}
+					{#if exportFeedback}
+						<span class="text-xs text-base-content/70" data-testid="export-feedback">{exportFeedback}</span>
+					{/if}
+					</div>
 				{/if}
 			</div>
 		{/if}
@@ -1398,144 +1651,6 @@
 				{/if}
 				{#if rootFeedback}
 					<span class="text-xs text-base-content/70" data-testid="root-feedback">{rootFeedback}</span>
-				{/if}
-			</div>
-		{/if}
-		{#if showExportBar}
-			<!-- nbdev-style export: pick the BASE the path is measured from, name the
-			     target `.py` module, export on demand. Always present (directly below
-			     the code-root bar) so a target can be set BEFORE any cell is marked.
-			     The module is written ONLY by an explicit export action - this button,
-			     or naming the target / marking a cell - never by an ordinary save, so
-			     an edit to a marked cell leaves the module as it was until one of
-			     those. Root-bar-neutral styling: standing chrome, not a call to
-			     action. -->
-			<div
-				class="mb-4 flex flex-wrap items-center gap-2 rounded-box border border-base-300 bg-base-100 px-3 py-2 text-sm"
-				data-testid="export-bar"
-			>
-				<span class="flex items-center gap-1.5 font-medium text-base-content/70">
-					<svg class="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v12" /><path d="m8 11 4 4 4-4" /><path d="M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2" /></svg>
-					Export to
-				</span>
-				<select
-					class="select select-bordered select-xs w-auto pr-7"
-					bind:value={selectedExportBase}
-					onchange={onExportBaseSelect}
-					disabled={exportBaseBusy}
-					data-testid="export-base-select"
-					aria-label="What the export path is measured from"
-				>
-					{#each EXPORT_BASES as b (b)}
-						<option value={b}>from {EXPORT_BASE_LABELS[b]}</option>
-					{/each}
-				</select>
-				<input
-					bind:this={exportTargetEl}
-					type="text"
-					class="input input-bordered input-xs w-56 font-mono"
-					placeholder="utils.py"
-					value={exportTarget ?? ''}
-					onchange={onExportTargetCommit}
-					data-testid="export-target-input"
-					aria-label="Export target module path"
-				/>
-				<span class="text-xs text-base-content/55" data-testid="export-count">
-					{exportCount} {exportCount === 1 ? 'cell' : 'cells'} marked
-				</span>
-				<button
-					class="btn btn-primary btn-xs gap-1"
-					onclick={doExport}
-					disabled={exporting}
-					data-testid="export-run"
-				>
-					{exporting ? 'Exporting…' : exportButtonLabel}
-				</button>
-				{#if exportResolveError}
-					<!-- A CONFIGURED target that resolves to no writable file: the module is
-					     not being generated, and silence here would read as working. The
-					     warning tint rides the ICON, not the copy (`text-warning` body copy
-					     fails contrast on the light theme - the GitNotebooks rule). -->
-					<span class="flex items-center gap-1 text-xs text-base-content/70" data-testid="export-resolve-error">
-						<svg class="h-3.5 w-3.5 shrink-0 text-warning" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3" /><path d="M12 9v4" /><path d="M12 17h.01" /></svg>
-						{exportResolveError}
-					</span>
-				{:else if exportHazards.length}
-					<!-- What the module these marks describe carries - said in the future
-					     tense on purpose, since under explicit export there may be no
-					     such file yet (the shared wording in `$lib/exportHazard` already
-					     reads that way). The MESSAGE is the shared one, never a sentence
-					     built here: the kinds make DIFFERENT claims (a `.py` module that
-					     will not import; a `.mojo` one that compiles because a `def
-					     main()` was dropped; one that keeps a main and so cannot be
-					     imported by a Python cell), and no single wording can make all
-					     three. EVERY hazard is rendered, not just the first: a set can
-					     carry more than one (a `.py` export reports one per offending
-					     line), and one of them silently going unsaid is the reporting
-					     defect this channel exists to fix. The set is already narrowed
-					     server-side by the ONE human-surface rule, so an agent-only kind
-					     never reaches this bar (`$lib/exportHazard`).
-					     KEYED BY POSITION, which is unique by construction: the list is
-					     built with no dedupe, so two marked cells holding the SAME
-					     offending line yield two hazards with identical `kind` and
-					     identical `statement` - a duplicate key throws during render, and
-					     with no error boundary anywhere in `src/` that takes down the
-					     whole notebook (the DataFrame-grid defect class).
-					     Ranked above the code-root warning: that one says the kernel
-					     cannot reach the module, these say what the module itself is.
-					     Below `exportResolveError`, which means no module can be written
-					     at all. -->
-					{#each exportHazards as hazard, i (i)}
-						<span class="flex items-center gap-1 text-xs text-base-content/70" data-testid="export-hazard">
-							<svg class="h-3.5 w-3.5 shrink-0 text-warning" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3" /><path d="M12 9v4" /><path d="M12 17h.01" /></svg>
-							{hazard.message}
-						</span>
-					{/each}
-				{:else if importWarning}
-					<span class="flex items-center gap-1 text-xs text-base-content/70" data-testid="export-import-warning">
-						<svg class="h-3.5 w-3.5 shrink-0 text-warning" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3" /><path d="M12 9v4" /><path d="M12 17h.01" /></svg>
-						{importWarning}
-					</span>
-				{:else if exportResolved && exportBase !== 'workspace'}
-					<!-- A non-workspace base makes the typed path indirect, so say which
-					     workspace file it names (under the workspace base they are the same
-					     string, and the echo would be noise). -->
-					<span class="font-mono text-xs text-base-content/55" data-testid="export-resolved">→ {exportResolved}</span>
-				{/if}
-				{#if strandedExplanation}
-					<!-- Marks the current target cannot honour, explained ONCE for the
-					     notebook. Each affected cell carries only a short "not exported"
-					     marker beside its greyed toggle: this is a notebook-wide fact, and
-					     repeating a sentence per cell would wrap fifteen toolbar rows to
-					     say one thing (the Databricks runtime card renders its reason once
-					     on the card, not once per control). Rendered OUTSIDE the warning
-					     chain above rather than as another arm of it - a hazard describes
-					     the module these marks build, this describes marks the module
-					     leaves out, and both can be true at once. Warning tint on the ICON,
-					     `base-content` copy (the GitNotebooks contrast rule). -->
-					<span class="flex items-center gap-1 text-xs text-base-content/70" data-testid="export-stranded">
-						<svg class="h-3.5 w-3.5 shrink-0 text-warning" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3" /><path d="M12 9v4" /><path d="M12 17h.01" /></svg>
-						{strandedExplanation}
-					</span>
-				{/if}
-				{#if orphanExplanation}
-					<!-- A module Cellar generated from this notebook that its target no
-					     longer names: the leftover a LANGUAGE switch creates, since
-					     re-expressing the extension renames nothing on disk. Said ONCE for
-					     the notebook, in the same line family as the stranded explanation
-					     above and OUTSIDE the warning chain, because it is a fact about a
-					     FILE rather than about the module these marks build - both can be
-					     true at once. Cellar never deletes a generated module the user's
-					     repository holds, so the path is named and the decision is theirs.
-					     Warning tint on the ICON, `base-content` copy (the GitNotebooks
-					     contrast rule). -->
-					<span class="flex items-center gap-1 text-xs text-base-content/70" data-testid="export-orphan">
-						<svg class="h-3.5 w-3.5 shrink-0 text-warning" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3" /><path d="M12 9v4" /><path d="M12 17h.01" /></svg>
-						{orphanExplanation}
-					</span>
-				{/if}
-				{#if exportFeedback}
-					<span class="text-xs text-base-content/70" data-testid="export-feedback">{exportFeedback}</span>
 				{/if}
 			</div>
 		{/if}

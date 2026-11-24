@@ -3,7 +3,7 @@ import { type ChildProcess } from 'node:child_process';
 import { existsSync, mkdtempSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { runtimeAvailable, bootCellar, killCellar, removeWorkspace } from './harness';
+import { runtimeAvailable, bootCellar, killCellar, removeWorkspace, openNotebookSettings, closeNotebookSettings } from './harness';
 import { tabPanelDomId } from '../../src/lib/tabIds';
 
 /**
@@ -131,6 +131,7 @@ async function openNotebook(page: Page, rel: string): Promise<void> {
 	}
 	// Per-CELL locators are addressed by cell id instead, which is unique across the
 	// mounted set.
+	await openNotebookSettings(page);
 	await expect(page.locator('[data-testid="export-bar"]:visible')).toBeVisible();
 }
 
@@ -139,6 +140,7 @@ const badgeIn = (page: Page, id: string) =>
 
 /** Replace a cell's whole source by hand, the way a user would. */
 async function retype(page: Page, card: Locator, source: string): Promise<void> {
+	await closeNotebookSettings(page);
 	await card.click();
 	const editor = card.locator('.cm-content');
 	await expect(editor).toBeVisible();
@@ -152,6 +154,7 @@ test('the warning names every cell losing its main, and never the last one', asy
 	await openNotebook(page, 'notebook.ipynb');
 
 	// The button names the file it writes, so it tracks the target's language.
+	await openNotebookSettings(page);
 	await expect(page.locator('[data-testid="export-run"]:visible')).toHaveText('Export to .mojo');
 
 	// Cell 0 loses its main to cell 2; cell 1 never had one; cell 2 keeps it.
@@ -168,6 +171,7 @@ test('the warning names every cell losing its main, and never the last one', asy
 	// valid. The kept-main finding is agent-only and may not appear here: it fires on
 	// the commonest shape a `.mojo` export has, so as standing chrome it was
 	// permanent (`$lib/exportHazard`).
+	await openNotebookSettings(page);
 	const hazards = page.locator('[data-testid="export-hazard"]:visible');
 	await expect(hazards).toHaveCount(1);
 	await expect(hazards.nth(0)).toHaveText(/lost a top-level def main/);
@@ -175,6 +179,7 @@ test('the warning names every cell losing its main, and never the last one', asy
 	await expect(hazards.nth(0)).not.toHaveText(/NO PYTHON CELL CAN IMPORT IT/);
 
 	// ...and the module on disk matches what the badges said.
+	await openNotebookSettings(page);
 	await page.locator('[data-testid="export-run"]:visible').click();
 	await expect.poll(() => readModule('lib/vec.mojo')).toContain('def main():');
 	const text = readModule('lib/vec.mojo')!;
@@ -207,6 +212,7 @@ test('the warning appears and clears as the user edits a LATER cell', async ({ p
 	await expect(badgeIn(page, ids[0])).toHaveCount(0);
 	// Nothing is dropped now, so the bar carries NOTHING: the kept-main finding is
 	// agent-only, and an ordinary Mojo export must not look like it went wrong.
+	await openNotebookSettings(page);
 	await expect(page.locator('[data-testid="export-hazard"]:visible')).toHaveCount(0);
 });
 
@@ -238,6 +244,7 @@ test('a .py module shows no Mojo warning and takes no Mojo cell', async ({ page,
 	expect(cells[0].metadata?.cellar?.export).toBeUndefined();
 
 	await openNotebook(page, rel);
+	await openNotebookSettings(page);
 	await expect(page.locator('[data-testid="export-run"]:visible')).toHaveText('Export to .py');
 	await expect(page.locator('[data-testid="export-count"]:visible')).toHaveText('0 cells marked');
 	await expect(page.locator('[data-testid="main-dropped-badge"]:visible')).toHaveCount(0);
@@ -279,6 +286,7 @@ test('with NO target the badge stays silent - there is no module for it to be ab
 
 	await openNotebook(page, rel);
 	// Both cells really ARE marked - so the silence is the gate, not an empty set.
+	await openNotebookSettings(page);
 	await expect(page.locator('[data-testid="export-count"]:visible')).toHaveText('2 cells marked');
 	await expect(page.locator('[data-testid="main-dropped-badge"]:visible')).toHaveCount(0);
 
@@ -328,6 +336,7 @@ test('the export toggle names the target language, and a stranded mark stays cle
 	const badge = page.locator(`[data-cell-id="${ids[0]}"]`).getByTestId('export-stranded-badge');
 	await expect(badge).toBeVisible();
 	await expect(badge).toHaveText('not exported');
+	await openNotebookSettings(page);
 	const bar = page.locator('[data-testid="export-stranded"]:visible');
 	await expect(bar).toHaveCount(1);
 	await expect(bar).toHaveText(/1 cell is marked for export/);
@@ -336,6 +345,7 @@ test('the export toggle names the target language, and a stranded mark stays cle
 	// target elsewhere could never resolve it.
 	await expect(bar).toHaveText(/no module source/);
 	await expect(bar).toHaveText(/clear the mark/);
+	await openNotebookSettings(page);
 	await expect(page.locator('[data-testid="export-count"]:visible')).toHaveText('0 cells marked');
 
 	// CLEARING the target is a different fact and may not be worded as the first: the
@@ -346,6 +356,7 @@ test('the export toggle names the target language, and a stranded mark stays cle
 	expect(cleared.ok(), await cleared.text()).toBeTruthy();
 	await page.reload();
 	await openNotebook(page, 'labels.ipynb');
+	await openNotebookSettings(page);
 	const noTarget = page.locator('[data-testid="export-stranded"]:visible');
 	await expect(noTarget).toHaveText(/no module source/);
 	await expect(noTarget).not.toHaveText(/\.mojo/);
@@ -354,6 +365,7 @@ test('the export toggle names the target language, and a stranded mark stays cle
 	// Clicking it CLEARS the flag rather than trying to re-mark a cell the server
 	// refuses: the toggle and its note go, and the key leaves the notebook.
 	await page.locator(`[data-cell-id="${ids[0]}"]`).getByTestId('toggle-export').click();
+	await openNotebookSettings(page);
 	await expect(page.locator('[data-testid="export-stranded"]:visible')).toHaveCount(0);
 	await expect(page.locator(`[data-cell-id="${ids[0]}"]`).getByTestId('toggle-export')).toHaveCount(0);
 	await expect
@@ -445,6 +457,7 @@ test('switching the language NAMES the generated module it leaves behind', async
 
 	await openNotebook(page, 'orphan.ipynb');
 	// Nothing left behind yet, so an ordinary notebook shows no such line.
+	await openNotebookSettings(page);
 	await expect(page.locator('[data-testid="export-orphan"]:visible')).toHaveCount(0);
 
 	await page.locator('[data-testid="language-select"]:visible').selectOption('mojo');
@@ -454,6 +467,7 @@ test('switching the language NAMES the generated module it leaves behind', async
 	);
 	// The FILE is still there - that is the fact being reported, not a prediction.
 	expect(readModule('lib/orphan.py')).not.toBeNull();
+	await openNotebookSettings(page);
 	const orphan = page.locator('[data-testid="export-orphan"]:visible');
 	await expect(orphan).toHaveCount(1, { timeout: 30_000 });
 	// It NAMES the path, so the user can find and delete it, and names where the

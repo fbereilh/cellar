@@ -4,10 +4,11 @@ import { spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { runtimeAvailable, bootCellar, killCellar } from './harness';
+import { runtimeAvailable, bootCellar, killCellar, openNotebookSettings, closeNotebookSettings } from './harness';
 
 /**
- * The export-target SECTION: always visible, base-aware, honest about
+ * The export-target SECTION: offered in the notebook's language-and-export menu
+ * on every `.ipynb`, base-aware, honest about
  * importability - plus the root bar's new opt-in visibility.
  *
  * The workspace is a SUBDIRECTORY of its git repo (`cd repo/analysis && cellar`),
@@ -148,8 +149,10 @@ test('a fresh notebook offers the section; a (base, path) choice writes the modu
 
 	// PRESENT BY DEFAULT: no target, nothing marked - the section is how a target
 	// is set before any cell is marked.
+	await openNotebookSettings(page);
 	const bar = page.getByTestId('export-bar');
 	await expect(bar).toBeVisible();
+	await openNotebookSettings(page);
 	await expect(page.getByTestId('export-base-select')).toHaveValue('workspace');
 	await expect(page.getByTestId('export-target-input')).toHaveValue('');
 	await expect(page.getByTestId('export-count')).toHaveText('0 cells marked');
@@ -157,6 +160,7 @@ test('a fresh notebook offers the section; a (base, path) choice writes the modu
 	await expect(page.getByTestId('root-bar')).toHaveCount(0);
 
 	// Choose the base FIRST (client-held until a path exists), then state the path.
+	await openNotebookSettings(page);
 	await page.getByTestId('export-base-select').selectOption('notebook');
 	await page.getByTestId('export-target-input').fill('mods/frombook.py');
 	await page.getByTestId('export-target-input').press('Enter');
@@ -176,11 +180,13 @@ test('a fresh notebook offers the section; a (base, path) choice writes the modu
 	expect(marked.ok(), await marked.text()).toBeTruthy();
 	await expect.poll(() => existsSync(join(workspace, 'mods', 'frombook.py'))).toBe(true);
 	expect(readFileSync(join(workspace, 'mods', 'frombook.py'), 'utf8')).toContain('def fresh():');
+	await openNotebookSettings(page);
 	await expect(page.getByTestId('export-count')).toHaveText('1 cell marked');
 
 	// REOPEN: both halves of the choice come back.
 	await page.reload();
 	await settleDefaultNotebook(page);
+	await openNotebookSettings(page);
 	await expect(page.getByTestId('export-base-select')).toHaveValue('notebook');
 	await expect(page.getByTestId('export-target-input')).toHaveValue('mods/frombook.py');
 	await expect(page.getByTestId('export-resolved')).toHaveText('→ mods/frombook.py');
@@ -190,13 +196,16 @@ test('switching bases re-expresses the SAME file, and workspace restores the leg
 	page
 }) => {
 	await openDefaultNotebook(page);
+	await openNotebookSettings(page);
 	const input = page.getByTestId('export-target-input');
 	await expect(input).toHaveValue('mods/frombook.py');
 
 	// notebook -> git: the git root is the PARENT repo, so the same file gains its
 	// repo-relative spelling - visibly a re-expression, not a retarget.
+	await openNotebookSettings(page);
 	await page.getByTestId('export-base-select').selectOption('git');
 	await expect(input).toHaveValue('analysis/mods/frombook.py');
+	await openNotebookSettings(page);
 	await expect(page.getByTestId('export-resolved')).toHaveText('→ mods/frombook.py');
 	await expect.poll(() => diskCellar('notebook.ipynb')).toMatchObject({
 		export_target: 'analysis/mods/frombook.py',
@@ -205,8 +214,10 @@ test('switching bases re-expresses the SAME file, and workspace restores the leg
 
 	// git -> workspace: same file again, the hint (an echo under this base) goes,
 	// and the base key is DELETED - the absent-key legacy spelling of the default.
+	await openNotebookSettings(page);
 	await page.getByTestId('export-base-select').selectOption('workspace');
 	await expect(input).toHaveValue('mods/frombook.py');
+	await openNotebookSettings(page);
 	await expect(page.getByTestId('export-resolved')).toHaveCount(0);
 	await expect
 		.poll(() => 'export_base' in diskCellar('notebook.ipynb'))
@@ -238,15 +249,18 @@ test('the importability warning tracks whether the module lands under the declar
 	await expect(page.locator('[data-testid="root-bar"]:visible')).toBeVisible();
 	// The module resolves outside `roots/pr-1`, so the kernel cannot import it -
 	// said exactly when it applies.
+	await openNotebookSettings(page);
 	const warning = page.locator('[data-testid="export-import-warning"]:visible');
 	await expect(warning).toBeVisible();
 	await expect(warning).toContainText('cannot import');
 	await expect(warning).toContainText('roots/pr-1');
 
 	// Re-point the module UNDER the root: the warning has nothing to say.
+	await openNotebookSettings(page);
 	const input = page.locator('[data-testid="export-target-input"]:visible');
 	await input.fill('roots/pr-1/helper.py');
 	await input.press('Enter');
+	await openNotebookSettings(page);
 	await expect(page.locator('[data-testid="export-import-warning"]:visible')).toHaveCount(0);
 });
 
@@ -255,6 +269,7 @@ async function activateDefaultNotebook(page: Page): Promise<void> {
 	await page.goto(`${baseURL}/?ws=${encodeURIComponent(workspace)}`);
 	await page.locator('[data-testid="tree-file"][data-path="notebook.ipynb"]').click();
 	await expect(page.locator('[data-testid="cell"]:visible').first()).toBeVisible();
+	await openNotebookSettings(page);
 	await expect(page.locator('[data-testid="export-target-input"]:visible')).toHaveValue(
 		'mods/frombook.py'
 	);
@@ -317,6 +332,7 @@ test('a refused first commit keeps the base the user chose, so the retype lands 
 	await page.locator('[data-testid="tree-file"][data-path="prechoice.ipynb"]').click();
 	await expect(page.locator('[data-testid="cell"]:visible').first()).toBeVisible();
 
+	await openNotebookSettings(page);
 	const select = page.locator('[data-testid="export-base-select"]:visible');
 	const input = page.locator('[data-testid="export-target-input"]:visible');
 	await expect(input).toHaveValue('');
@@ -334,6 +350,7 @@ test('a refused first commit keeps the base the user chose, so the retype lands 
 	// would have been `analysis/helpers.py` inside the workspace - another file.
 	await input.fill('analysis/helpers.py');
 	await input.press('Enter');
+	await openNotebookSettings(page);
 	await expect(page.locator('[data-testid="export-resolved"]:visible')).toHaveText('→ helpers.py');
 	await expect.poll(() => diskCellar(nb)).toMatchObject({
 		export_target: 'analysis/helpers.py',
@@ -369,6 +386,7 @@ test('picking a base right after typing a path waits for the path commit', async
 	await page.locator('[data-testid="tree-file"][data-path="ordering.ipynb"]').click();
 	await expect(page.locator('[data-testid="cell"]:visible').first()).toBeVisible();
 
+	await openNotebookSettings(page);
 	const select = page.locator('[data-testid="export-base-select"]:visible');
 	const input = page.locator('[data-testid="export-target-input"]:visible');
 	await expect(input).toHaveValue('');
@@ -387,6 +405,7 @@ test('picking a base right after typing a path waits for the path commit', async
 	// gains its repo-relative spelling).
 	await expect(input).toHaveValue('analysis/ordering_mod.py');
 	await expect(select).toHaveValue('git');
+	await openNotebookSettings(page);
 	await expect(page.locator('[data-testid="export-resolved"]:visible')).toHaveText(
 		'→ ordering_mod.py'
 	);
@@ -440,11 +459,13 @@ test('the documented repair for an unknown hand-edited base terminates', async (
 	await page.locator(`[data-testid="tree-file"][data-path="${rel}"]`).click();
 	await expect(page.locator('[data-testid="cell"]:visible').first()).toBeVisible();
 
+	await openNotebookSettings(page);
 	const select = page.locator('[data-testid="export-base-select"]:visible');
 	const input = page.locator('[data-testid="export-target-input"]:visible');
 	await expect(input).toHaveValue('mod.py');
 	// Unmatched, not workspace: no option carries this value, so the select shows none.
 	await expect(select).toHaveValue('');
+	await openNotebookSettings(page);
 	await expect(page.locator('[data-testid="export-resolve-error"]:visible')).toContainText(
 		'unknown export base'
 	);
@@ -463,6 +484,7 @@ test('the documented repair for an unknown hand-edited base terminates', async (
 	await expect.poll(() => diskCellar(rel)).toMatchObject({ export_target: 'mod.py' });
 	expect('export_base' in diskCellar(rel)).toBe(false);
 	await expect(select).toHaveValue('workspace');
+	await openNotebookSettings(page);
 	await expect(page.locator('[data-testid="export-resolve-error"]:visible')).toHaveCount(0);
 });
 
@@ -493,7 +515,8 @@ test('a hidden root bar costs no root read, and the toggle populates the picker'
 
 	await page.goto(`${baseURL}/?ws=${encodeURIComponent(workspace)}`);
 	await page.locator(`[data-testid="tree-file"][data-path="${rel}"]`).click();
-	// The export bar is unconditional, so its arrival proves this notebook loaded.
+	// The export section is unconditional on an .ipynb, so its arrival proves this notebook loaded.
+	await openNotebookSettings(page);
 	await expect(page.locator('[data-testid="export-bar"]:visible')).toBeVisible();
 	await expect(page.locator('[data-testid="root-bar"]:visible')).toHaveCount(0);
 	expect(readsFor()).toBe(0);
@@ -545,6 +568,7 @@ test('a base change the server accepted but could not save says exactly that', a
 	await page.locator(`[data-testid="tree-file"][data-path="${nb}"]`).click();
 	await expect(page.locator('[data-testid="cell"]:visible').first()).toBeVisible();
 
+	await openNotebookSettings(page);
 	const select = page.locator('[data-testid="export-base-select"]:visible');
 	const input = page.locator('[data-testid="export-target-input"]:visible');
 	await expect(select).toHaveValue('workspace');
@@ -611,8 +635,10 @@ test('a module that will not import says so in the bar, live, and clears when fi
 	await expect(page.locator('[data-testid="cell"]:visible').first()).toBeVisible();
 
 	// Nothing marked yet: no module, so nothing to warn about.
+	await openNotebookSettings(page);
 	const hazard = page.locator('[data-testid="export-hazard"]:visible');
 	await expect(hazard).toHaveCount(0);
+	await expect(page.locator('[data-testid="notebook-settings-warning"]:visible')).toHaveCount(0);
 
 	// Mark a cell holding the construct, from OUTSIDE this tab (an agent, or the
 	// user's own save). The bar must learn about it through the live push.
@@ -623,11 +649,16 @@ test('a module that will not import says so in the bar, live, and clears when fi
 
 	await expect(hazard).toBeVisible();
 	await expect(hazard).toContainText('will not import');
+	// Closed, the menu would hide that warning - so the button carries the dot.
+	await closeNotebookSettings(page);
+	await expect(page.locator('[data-testid="notebook-settings-warning"]:visible')).toHaveCount(1);
+	await openNotebookSettings(page);
 	await expect(hazard).toContainText('line of its own');
 	// The module really was written - refusing would have left nothing to explain.
 	await expect.poll(() => existsSync(join(workspace, 'lib', 'hazard.py'))).toBe(true);
 
 	// The manual export reports it too, rather than "Exported 1 cell → ...".
+	await openNotebookSettings(page);
 	await page.locator('[data-testid="export-run"]:visible').click();
 	const feedback = page.locator('[data-testid="export-feedback"]:visible');
 	await expect(feedback).toContainText('will not import');
@@ -640,6 +671,7 @@ test('a module that will not import says so in the bar, live, and clears when fi
 	});
 	expect(fixed.ok(), await fixed.text()).toBeTruthy();
 	await expect(hazard).toHaveCount(0);
+	await expect(page.locator('[data-testid="notebook-settings-warning"]:visible')).toHaveCount(0);
 });
 
 test('a save leaves the module alone; the button exports, and reports a refusal on the click', async ({
@@ -696,6 +728,7 @@ test('a save leaves the module alone; the button exports, and reports a refusal 
 	expect(readFileSync(modulePath, 'utf8')).not.toContain('def second():');
 
 	// The BUTTON is what writes it.
+	await openNotebookSettings(page);
 	await page.locator('[data-testid="export-run"]:visible').click();
 	const feedback = page.locator('[data-testid="export-feedback"]:visible');
 	await expect(feedback).toContainText('Exported 1 cell');
@@ -713,6 +746,7 @@ test('a save leaves the module alone; the button exports, and reports a refusal 
 	// assertion below was left pointing at the notice by that change and went
 	// unnoticed because Playwright runs in neither CI nor the gate.
 	writeFileSync(modulePath, '# AUTOGENERATED BY NBDEV\n\ndef theirs():\n    pass\n');
+	await openNotebookSettings(page);
 	await page.locator('[data-testid="export-run"]:visible').click();
 	await expect(feedback).toContainText('was not generated by Cellar');
 	await expect(feedback).toContainText('left untouched');
@@ -769,6 +803,7 @@ test('the export waits for the edit it raced, and says so when that edit never l
 	await page.keyboard.type('def after():\n    return 2');
 	// Straight to the button - no poll, no settle. The blur is what flushes the edit,
 	// and the export must not overtake it.
+	await openNotebookSettings(page);
 	await page.locator('[data-testid="export-run"]:visible').click();
 
 	const feedback = page.locator('[data-testid="export-feedback"]:visible');
@@ -788,9 +823,11 @@ test('the export waits for the edit it raced, and says so when that edit never l
 		await new Promise((r) => setTimeout(r, 1500));
 		await route.abort();
 	});
+	await closeNotebookSettings(page);
 	await editor.click();
 	await page.keyboard.press(process.platform === 'darwin' ? 'Meta+a' : 'Control+a');
 	await page.keyboard.type('def never():\n    return 3');
+	await openNotebookSettings(page);
 	await page.locator('[data-testid="export-run"]:visible').click();
 
 	const notice = page.getByTestId('app-notice');
@@ -851,6 +888,7 @@ async function failSourcePatches(page: Page, ms = 1500): Promise<void> {
 
 /** Summon a cell's editor and replace its whole source, leaving the edit UNFLUSHED. */
 async function retypeCell(page: Page, cell: Locator, source: string): Promise<void> {
+	await closeNotebookSettings(page);
 	await cell.click();
 	const editor = cell.locator('.cm-content');
 	await expect(editor).toBeVisible();
@@ -928,6 +966,7 @@ test('naming the target waits for the edit it raced, so the module holds the new
 	const heldCount = await holdSourcePatches(page);
 	await retypeCell(page, cell, 'def after():\n    return 2');
 	// Focusing the field is what blurs the editor; Enter commits the path.
+	await openNotebookSettings(page);
 	const input = page.locator('[data-testid="export-target-input"]:visible');
 	await input.fill('lib/targetrace.py');
 	await input.press('Enter');
@@ -979,6 +1018,7 @@ test('an unsaved edit refuses the export only when that cell is IN the module', 
 	const cells = page.locator('[data-testid="cell"]:visible');
 	await expect(cells).toHaveCount(2);
 	const notice = page.getByTestId('app-notice');
+	await openNotebookSettings(page);
 	const feedback = page.locator('[data-testid="export-feedback"]:visible');
 
 	// ONE handler for both directions: unrouting between them races a held handler
@@ -989,6 +1029,7 @@ test('an unsaved edit refuses the export only when that cell is IN the module', 
 	// that never lands changes nothing about what the export would produce. The
 	// feedback is the proof the export really RAN rather than being skipped.
 	await retypeCell(page, cells.nth(1), 'def loose():\n    return 99');
+	await openNotebookSettings(page);
 	await page.locator('[data-testid="export-run"]:visible').click();
 	await expect(feedback).toContainText('Exported 1 cell');
 	await expect(notice).toHaveCount(0);
@@ -997,6 +1038,7 @@ test('an unsaved edit refuses the export only when that cell is IN the module', 
 	// DIRECTION 2 - the MARKED cell, the case the wait exists for. Unchanged by the
 	// narrowing: the export still refuses, and still says why.
 	await retypeCell(page, cells.nth(0), 'def kept():\n    return 42');
+	await openNotebookSettings(page);
 	await page.locator('[data-testid="export-run"]:visible').click();
 	await expect(notice).toBeVisible();
 	await expect(notice).toContainText('could not be saved');
