@@ -11,7 +11,8 @@
  *   - every link it gives to a local file resolves, so the index never points at
  *     a note that was renamed or removed;
  *   - every note under `docs/dev-notes/` is listed in the index, so a new note
- *     cannot hide from the agents that need it.
+ *     cannot hide from the agents that need it;
+ *   - CLAUDE.md still imports AGENTS.md, so Claude sessions keep loading it.
  *
  * Raise the budget only when the repo owner explicitly asks for it.
  */
@@ -40,6 +41,30 @@ function localLinks(md: string): string[] {
 	return out;
 }
 
+/** The `## Topic index` section: from its heading to the next heading of the same level. */
+function topicIndex(md: string): string {
+	const lines = md.split('\n');
+	const start = lines.indexOf('## Topic index');
+	if (start < 0) return '';
+	const rest = lines.slice(start + 1);
+	const end = rest.findIndex((l) => /^##? /.test(l));
+	return (end < 0 ? rest : rest.slice(0, end)).join('\n');
+}
+
+/**
+ * Lines of a memory file that the harness reads as an `@path` import. It does
+ * not import from an HTML comment, a fenced code block or an inline code span.
+ */
+function importLines(md: string): string[] {
+	return md
+		.replace(/<!--[\s\S]*?-->/g, '')
+		.replace(/^(`{3,}|~{3,})[\s\S]*?^\1[^\n]*$/gm, '')
+		.replace(/`[^`\n]*`/g, '')
+		.split('\n')
+		.map((l) => l.trim())
+		.filter((l) => l.startsWith('@'));
+}
+
 describe('AGENTS.md stays small', () => {
 	it(`is under ${BUDGET.toLocaleString('en-US')} characters`, () => {
 		expect([...text].length).toBeLessThanOrEqual(BUDGET);
@@ -53,15 +78,15 @@ describe('AGENTS.md stays small', () => {
 	});
 
 	it('lists every note under docs/dev-notes in its index', () => {
-		const linked = new Set(localLinks(text));
+		const linked = new Set(localLinks(topicIndex(text)));
 		const notes = readdirSync(NOTES).filter((f) => f.endsWith('.md'));
 		expect(notes.length).toBeGreaterThan(0);
 		const unlisted = notes.map((f) => `docs/dev-notes/${f}`).filter((p) => !linked.has(p));
 		expect(unlisted).toEqual([]);
 	});
 
-	it('keeps CLAUDE.md as a pointer to AGENTS.md', () => {
+	it('keeps CLAUDE.md importing AGENTS.md', () => {
 		const claude = readFileSync(join(ROOT, 'CLAUDE.md'), 'utf8');
-		expect(claude).toContain('@AGENTS.md');
+		expect(importLines(claude)).toEqual(['@AGENTS.md']);
 	});
 });

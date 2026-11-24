@@ -2,7 +2,7 @@
 
 This file loads into every agent session in this repo, so every line costs context on every task. Keep it short.
 
-**Rule for editing this file.** Add or grow content here only when the repo owner explicitly asks for it. Put design notes, decision records, and per-feature detail in the topic files under `docs/dev-notes/` (index below), and add a line to the index only when you create a new topic file. Correcting or removing a statement here that has become false is always allowed. `tests/unit/agents-md-budget.test.ts` fails when this file passes 40,000 characters or the index points at a missing file.
+**Rule for editing this file.** Add or grow content here only when the repo owner explicitly asks for it. Put design notes, decision records, and per-feature detail in the topic files under `docs/dev-notes/` (index below), and add a line to the index only when you create a new topic file. Correcting or removing a statement here that has become false is always allowed. `tests/unit/agents-md-budget.test.ts` fails when this file passes 40,000 characters, links a missing file, or leaves a `docs/dev-notes/` note out of the index. It also fails when `CLAUDE.md` stops importing this file.
 
 Why the rule exists: this file grew from 5 KB to 1 MB in four months because almost every feature PR appended a paragraph of design notes here. The detail now lives in `docs/dev-notes/`.
 

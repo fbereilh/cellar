@@ -51,7 +51,8 @@ function fakeHandle(reply: (call: InspectCall) => InspectOutcome | Promise<Inspe
  * node, so scoping the lookup there is what keeps one test's tooltip out of the
  * next test's `querySelector`; and the registry is what stops a test that FAILS
  * before its `destroy()` from dragging every later test down with it - the exact
- * shape docs/dev-notes/databricks.md names for the upload-affix specs.
+ * shape docs/dev-notes/databricks.md names for the affix tests in
+ * `tests/e2e/databricks-upload.spec.ts`.
  */
 const mounted: EditorView[] = [];
 function mount(doc: string, pos = doc.length): EditorView {
