@@ -2222,7 +2222,7 @@ const pyLiteral = (cfg: unknown): string => JSON.stringify(JSON.stringify(cfg));
  * `tests/unit/spark-progress.test.ts`.
  *
  * Design facts, all hard-won against a real Databricks cluster (recorded in
- * `AGENTS.md`):
+ * `docs/dev-notes/databricks.md`):
  *   - `registerProgressHandler` is Spark **Connect only** (`@remote_only`), which
  *     is exactly what Cellar's Databricks integration uses. The handler is called
  *     synchronously on the cell-execution thread inside `.collect()`, so a widget

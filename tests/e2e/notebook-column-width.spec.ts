@@ -86,7 +86,7 @@ async function openNotebook(page: Page): Promise<void> {
 	// Settle before probing: the shell paints either the empty state or an already
 	// open notebook, and reading `isVisible()` before either arrives reports the
 	// button invisible, turns the click into a no-op, and then times out for 30s on
-	// a notebook nothing ever opened (see the openNotebook rule in AGENTS.md).
+	// a notebook nothing ever opened (see the openNotebook rule in docs/dev-notes/testing.md).
 	//
 	// `loading…` is the THIRD settled state, and it is this spec's own doing: the
 	// pre-render test HOLDS `/api/notebooks`, so when the server-owned tab session

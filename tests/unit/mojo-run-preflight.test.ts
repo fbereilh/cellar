@@ -310,7 +310,7 @@ describe('THE WEDGE GUARD: a setup that cannot answer must not hang the run', ()
 		// The constants are LARGE ON PURPOSE - do not tidy them back down. What
 		// discriminates is the RATIO, so any pair works in principle, but the slack
 		// either side is HOLD/2 in absolute milliseconds, and this suite runs in a
-		// fork pool where timers drift by hundreds of ms under load (AGENTS.md
+		// fork pool where timers drift by hundreds of ms under load (docs/dev-notes/testing.md
 		// records a measured 28.5s against a 30s ceiling in `databricks-logout`).
 		// At 800/680 the correct path lands at ~800ms against a 1140ms threshold and
 		// the two-budget bug at ~1480ms, so there is ~340ms of slack on both sides

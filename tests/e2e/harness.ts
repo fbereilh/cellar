@@ -271,7 +271,7 @@ export function killCellar(proc: ChildProcess): void {
  * `toBeVisible()` waits out its whole timeout on a panel nothing will reopen.
  * Load does not cause that - it only widens the window, which is why these
  * surfaced as "unrelated flakes" in busy full runs (`databricks-two-card-redesign`
- * and `git-notebook-commits` are named in AGENTS.md for exactly this).
+ * and `git-notebook-commits` are named in docs/dev-notes/testing.md for exactly this).
  *
  * So click only while the panel is REALLY closed, retried until it is visibly
  * open, whatever state this page inherited. Fourteen specs call this; THIRTEEN of

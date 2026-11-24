@@ -185,7 +185,7 @@ function liveKernelCount(page: Page): Promise<number> {
  * the one that ran the cell earlier in the file. These tests share a launcher and a
  * notebook, so an ordering dependency is invisible until a test above them fails -
  * and then every test below fails for a reason that has nothing to do with what it
- * asserts, which is exactly the flake shape AGENTS.md names for the upload-affix
+ * asserts, which is exactly the flake shape docs/dev-notes/databricks.md names for the upload-affix
  * specs. The stream is drained, so this resolves only once the run has finished.
  */
 async function seedLiveNames(page: Page): Promise<void> {

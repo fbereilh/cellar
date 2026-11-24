@@ -64,7 +64,7 @@ async function openNotebook(page: Page, { virtualize = true } = {}): Promise<voi
 	// button invisible, turns the click into a no-op, and then times out on a
 	// notebook nothing ever opened. The 10s here was papering over that - it is a
 	// race, not a slow machine, so a longer probe only moves the threshold. See the
-	// openNotebook rule in AGENTS.md.
+	// openNotebook rule in docs/dev-notes/testing.md.
 	await expect(openButton.or(page.getByTestId('cell').first())).toBeVisible();
 	if (await openButton.isVisible().catch(() => false)) await openButton.click();
 	await expect(page.getByTestId('cell').first()).toBeVisible({ timeout: 30_000 });

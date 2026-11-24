@@ -8,7 +8,7 @@
  * kernel actually runs behaves as claimed.
  *
  * The four hard-won facts under test (all established against the captain's real
- * Databricks cluster — see the AGENTS.md "Live Spark progress" entry):
+ * Databricks cluster — see the "Live Spark progress" entry in docs/dev-notes/databricks.md):
  *   - per-stage counts sum to the right OVERALL completion fraction/label;
  *   - the ~4-5 identical callbacks per tick collapse to ONE render (dedupe);
  *   - a sub-interval (single terminal `done=True`) query never flashes a bar;

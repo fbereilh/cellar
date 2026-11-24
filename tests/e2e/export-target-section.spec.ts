@@ -90,7 +90,7 @@ async function openDefaultNotebook(page: Page): Promise<void> {
 
 /**
  * Settle before probing: the shell paints either the empty state or an
- * already-open notebook (the openNotebook-helper rule from AGENTS.md), so a bare
+ * already-open notebook (the openNotebook-helper rule from docs/dev-notes/testing.md), so a bare
  * `cell` probe reports the button invisible, turns the click into a no-op and then
  * times out for 30s on a notebook nothing ever opened. Needed after a RELOAD as
  * much as after a goto - the tab session decides which of the two is painted, so
