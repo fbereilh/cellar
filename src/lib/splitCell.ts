@@ -20,7 +20,9 @@
 //                         strip it from the new cell anyway).
 //   - `export`            a per-cell designation the user made about the ORIGINAL
 //                         cell; inheriting it silently doubles what the nbdev
-//                         module exports (`.py` or `.mojo` alike).
+//                         module exports (`.py`, `.mojo` or `.rs` alike). The
+//                         Rust main-cell mark (`export_main`) is not inherited
+//                         either, being one per notebook.
 //   - the runtime-only stamps (`lastRun`, `editedAt`, `importBindings`), which the
 //     server strips from any seeded namespace regardless - the new half has run
 //     nothing, so it must not claim otherwise.

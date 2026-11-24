@@ -47,6 +47,7 @@
 		moduleExtension
 	} from '$lib/exportRole';
 	import { mojoMainDroppedIds } from '$lib/mojoExport';
+	import { rustExportDrops, rustMainMarked } from '$lib/rustExport';
 	import { isExportBase } from '$lib/exportTarget';
 	import type { ExportHazard } from '$lib/exportHazard';
 	import type { ExportPyResult } from '$lib/types';
@@ -170,6 +171,7 @@
 		| { type: 'cell:added'; cell?: CellView; afterId?: string | null; index?: number }
 		| { type: 'cell:role'; cellId: string; role?: string | null }
 		| { type: 'cell:export'; cellId: string; exported: boolean }
+		| { type: 'cell:export-main'; cellId: string; main: boolean }
 		| { type: 'cell:hide-input'; cellId: string; hidden: boolean | null }
 		| { type: 'cell:visibility'; cellId: string; hidden: boolean }
 		| { type: 'cell:deleted'; cellId: string }
@@ -306,7 +308,7 @@
 	$effect(() => {
 		onLanguageChange?.(path, notebookLanguage);
 	});
-	// Does this notebook's target name a MODULE at all (`.py`/`.mojo`, versus a
+	// Does this notebook's target name a MODULE at all (`.py`/`.mojo`/`.rs`, versus a
 	// hand-edited `notes.txt` or nothing configured)? Read off the server's
 	// RESOLUTION where there is one and the stored form otherwise, so a target
 	// expressed under a non-workspace base still answers.
@@ -356,6 +358,12 @@
 	 * which is what the server decides eligibility against.
 	 */
 	const mojoMainDropped = $derived(mojoMainDroppedIds(cells, exportModuleLanguage));
+	// The Rust twin: what each exported cell of a Rust notebook loses to the `.rs`
+	// module (its top-level statements, or its own fn main()), read from the same plan
+	// the server's exporter writes. Same nullable-language gate as above.
+	const rustDrops = $derived(rustExportDrops(cells, exportModuleLanguage));
+	// Whether any exported cell is the main cell, so a dropped badge can say what to do.
+	const rustMainIsMarked = $derived(rustMainMarked(cells));
 	// Constructs in the MARKED cells that make the generated module uncompilable
 	// (`$lib/exportHazard`). Server-derived like the three fields above - the rule
 	// needs the Python line tokenizer, which is server-only - seeded on load and
@@ -1806,7 +1814,21 @@
 			if (cell) {
 				const cellar = { ...(cell.metadata?.cellar ?? {}) };
 				if (ev.exported) cellar.export = true;
-				else delete cellar.export;
+				else {
+					delete cellar.export;
+					// The server drops a Rust main mark with the export flag (`setCellExports`).
+					delete cellar.export_main;
+				}
+				cell.metadata = { ...(cell.metadata ?? {}), cellar };
+			}
+		} else if (ev.type === 'cell:export-main') {
+			// The Rust main cell moved. The server emits one event per cell it changed,
+			// so applying each one as it comes keeps at most one cell marked.
+			const cell = findCell(ev.cellId);
+			if (cell) {
+				const cellar = { ...(cell.metadata?.cellar ?? {}) };
+				if (ev.main) cellar.export_main = true;
+				else delete cellar.export_main;
 				cell.metadata = { ...(cell.metadata ?? {}), cellar };
 			}
 		} else if (ev.type === 'cell:hide-input') {
@@ -2747,7 +2769,10 @@
 		if (cell) {
 			const cellar = { ...(cell.metadata?.cellar ?? {}) };
 			if (exported) cellar.export = true;
-			else delete cellar.export;
+			else {
+				delete cellar.export;
+				delete cellar.export_main;
+			}
 			cell.metadata = { ...(cell.metadata ?? {}), cellar };
 		}
 		if ((await settleCellEdits(moduleSourceIds(exported ? [id] : []))).includes('failed'))
@@ -2817,6 +2842,58 @@
 			headers: { 'content-type': 'application/json' },
 			body: JSON.stringify({ hideInput: hidden, nb: path, originId })
 		}).catch(() => {});
+	}
+
+	/**
+	 * Mark (or unmark) the MAIN cell of a Rust notebook's `.rs` module - the one
+	 * exported cell whose statements go inside the generated `fn main()`. One per
+	 * notebook: marking a cell clears every other cell's mark and marks this one for
+	 * export too, mirroring `setCellExportMain` on the server. Applied optimistically;
+	 * the server regenerates the module, and a refusal it reports puts the marks back.
+	 */
+	async function setExportMain(id: string, main: boolean) {
+		// Snapshot only this one key on every cell, never the whole namespace, so a
+		// concurrent change to another key is never undone by a revert.
+		const before = new Map<string, { main: boolean; exported: boolean }>();
+		for (const c of cells)
+			before.set(c.id, {
+				main: c.metadata?.cellar?.export_main === true,
+				exported: c.metadata?.cellar?.export === true
+			});
+		const apply = (c: (typeof cells)[number], m: boolean, exported?: boolean) => {
+			const cellar = { ...(c.metadata?.cellar ?? {}) };
+			if (m) cellar.export_main = true;
+			else delete cellar.export_main;
+			if (exported !== undefined) {
+				if (exported) cellar.export = true;
+				else delete cellar.export;
+			}
+			c.metadata = { ...(c.metadata ?? {}), cellar };
+		};
+		for (const c of cells) {
+			if (c.id === id) apply(c, main, main ? true : undefined);
+			else if (main && c.metadata?.cellar?.export_main === true) apply(c, false);
+		}
+		if (main && (await settleCellEdits(moduleSourceIds([id]))).includes('failed'))
+			onNotice?.(unsavedExportEditNotice('proceeding'));
+		const res = await fetch(`/api/cells/${id}`, {
+			method: 'PATCH',
+			headers: { 'content-type': 'application/json' },
+			body: JSON.stringify({ exportMain: main, nb: path, originId })
+		}).catch(() => null);
+		// A rejected fetch landed no verdict: keep what was applied and let the next
+		// refetch settle it, rather than claim the mark did not take.
+		if (!res || res.ok) return;
+		const verdict = await res
+			.json()
+			.then((b) => (b as { reason?: string; message?: string } | null) ?? null)
+			.catch(() => null);
+		if (!verdict?.reason) return;
+		for (const c of cells) {
+			const b = before.get(c.id);
+			if (b) apply(c, b.main, b.exported);
+		}
+		onNotice?.(verdict.message ?? 'The main cell could not be set.');
 	}
 
 	/**
@@ -3314,7 +3391,7 @@
 	 *
 	 * The route refuses a `.py` text notebook (which stores no cellar metadata), a
 	 * target escaping the workspace and one that names no module Cellar can generate
-	 * (anything but `.py` or `.mojo`), and it emits
+	 * (anything but `.py`, `.mojo` or `.rs`), and it emits
 	 * `notebook:export-target` only on success, which this tab would echo-suppress
 	 * anyway. So without reading the response the input kept showing a rejected path
 	 * and the export bar read as configured over metadata holding nothing, reverting
@@ -4925,6 +5002,9 @@
 			onSetType={setType}
 			onSetRole={setRole}
 			onSetExport={setExport}
+			onSetExportMain={setExportMain}
+			{rustDrops}
+			{rustMainIsMarked}
 			exportTarget={exportTarget}
 			exportCount={exportCount}
 			exportStranded={exportStranded}

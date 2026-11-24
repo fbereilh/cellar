@@ -354,7 +354,7 @@ describe('the schemas and the doctrine an agent is billed for', () => {
 });
 
 describe('set_cell_export on a Rust notebook', () => {
-	async function refusal(name: string, cellar: Record<string, unknown>) {
+	async function mark(name: string, cellar: Record<string, unknown>) {
 		const client = await connect(`s-${name}`);
 		const nb = nbmod.createNotebook(name).path;
 		const cell = nbmod.listCells(nb)[0];
@@ -369,21 +369,18 @@ describe('set_cell_export on a Rust notebook', () => {
 		return { r, nb, cell };
 	}
 
-	it('says a Rust notebook exports no module, and names neither Python code nor a target to set', async () => {
-		const { r, nb, cell } = await refusal('rust-export.ipynb', {});
-		expect(r.isError).toBe(true);
-		const text = bodyOf(r);
-		expect(text).toContain('Rust notebook does not export a module');
-		expect(text).not.toContain('Python code');
-		expect(text).not.toContain('name one with set_export_target');
-		expect(nbmod.getCell(cell.id, nb)?.metadata?.cellar?.export).toBeUndefined();
+	it('marks a Rust code cell for the notebook\'s .rs module', async () => {
+		const { r, nb, cell } = await mark('rust-export.ipynb', {});
+		expect(r.isError).toBeFalsy();
+		expect(nbmod.getCell(cell.id, nb)?.metadata?.cellar?.export).toBe(true);
 	});
 
-	it('says the same over a target kept from before the switch, never a .rs module mismatch', async () => {
-		const { r } = await refusal('rust-export-kept.ipynb', { export_target: 'utils.py' });
-		expect(r.isError).toBe(true);
-		const text = bodyOf(r);
-		expect(text).toContain('Rust notebook does not export a module');
-		expect(text).not.toContain("module is a .rs one");
+	it('still marks the cell over a .py target kept from before the switch', async () => {
+		// The mark is a fact about the cell, which is Rust; the kept target is a
+		// separate fact the map reports as unresolvable until it is renamed.
+		const { r, nb, cell } = await mark('rust-export-kept.ipynb', { export_target: 'utils.py' });
+		expect(r.isError).toBeFalsy();
+		expect(nbmod.getCell(cell.id, nb)?.metadata?.cellar?.export).toBe(true);
+		expect(nbmod.getNotebook(nb).exportResolveError).toMatch(/\.py module/);
 	});
 });

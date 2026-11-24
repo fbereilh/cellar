@@ -1159,7 +1159,7 @@
 		// ("it is not a Cellar-generated module", a non-.py or escaping target).
 		if (!r) return;
 		if (r.reason === 'no-target')
-			showNotice('Set a target module path (.py or .mojo) in the notebook\'s Language and export menu first.');
+			showNotice('Set a target module path (.py, .mojo or .rs) in the notebook\'s Language and export menu first.');
 		else if (r.reason === 'no-cells') showNotice('No cells are marked for export - use the export toggle in a cell’s toolbar.');
 		// A deliberate refusal, not a failure: Cellar never overwrites a file it did
 		// not generate. Said here because nothing else would - this outcome is not an

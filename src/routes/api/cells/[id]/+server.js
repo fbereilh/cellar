@@ -1,5 +1,6 @@
 import { json } from '@sveltejs/kit';
-import { setSource, setCellType, deleteCell, setOutputScrolled, setCellRole, setCellExport, setHideInput, setVisibility } from '$lib/server/notebook';
+import { exportMainRefusalMessage } from '$lib/rustExport';
+import { setSource, setCellType, deleteCell, setOutputScrolled, setCellRole, setCellExport, setCellExportMain, setHideInput, setVisibility } from '$lib/server/notebook';
 import { TextNotebookCellTypeError, isLogicalCellTypeName } from '$lib/cellLanguage';
 
 /** Edit a cell's source, type ('code' | 'sql' | 'markdown' | 'raw'), imports-cell
@@ -97,6 +98,17 @@ export async function PATCH({ params, request }) {
 		const r = setCellExport(params.id, !!body.export, body.nb, body.originId);
 		if (!r.ok && (r.reason === 'export-directive-owns-cell' || r.reason === 'not-code' || r.reason === 'py-notebook'))
 			return json({ ok: false, reason: r.reason, alsoFlagged: !!r.alsoFlagged }, { status: 409 });
+	}
+	// The `.rs` module's main cell. Every refusal is reported, for the same reason
+	// as `export` above: the tab applies the mark optimistically, and `{ok:true}`
+	// over a refused mark would leave a main cell the document does not have.
+	if ('exportMain' in body) {
+		const r = setCellExportMain(params.id, !!body.exportMain, body.nb, body.originId);
+		if (!r.ok)
+			return json(
+				{ ok: false, reason: r.reason, message: exportMainRefusalMessage(r.reason) },
+				{ status: r.reason === 'no-such-cell' ? 404 : 409 }
+			);
 	}
 	if ('scrolled' in body) setOutputScrolled(params.id, body.scrolled, body.nb);
 	if ('role' in body) setCellRole(params.id, body.role, body.nb, body.originId);

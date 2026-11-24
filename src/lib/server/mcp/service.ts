@@ -30,6 +30,7 @@ import {
 	setExportTarget as setExportTargetDoc,
 	InvalidExportTargetError,
 	setCellExports as setCellExportsDoc,
+	setCellExportMain as setCellExportMainDoc,
 	exportTargetInfoFor,
 	exportTargetInfo,
 	isPyTextNotebook,
@@ -75,9 +76,9 @@ import {
 	exportLanguageOf,
 	exportMarkedTwice,
 	exportTargetLanguage,
-	languageGeneratesModule,
 	notebookHoldsExport
 } from '../../exportRole';
+import { isExportMainCell } from '../../rustExport';
 import { hazardReport } from '../../exportHazard';
 import { isHiddenFromAgent } from '../../agentVisibility';
 import { computeHeadingNumbers, outlineHeadings } from '../../headings';
@@ -982,6 +983,7 @@ export async function getNotebookMap(nb?: string | null) {
 		// set_cell_export: it is what lets an agent see which cells the
 		// `display.export_target` module is built from before it changes them.
 		...(isExportCell(c, exportLang) ? { export: true } : {}),
+		...(exportLang === 'rust' && isExportCell(c, exportLang) && isExportMainCell(c) ? { export_main: true } : {}),
 		...hideInputFields(c, view.hideAllCode)
 	});
 	for (const c of cells) {
@@ -2168,7 +2170,7 @@ export function setNotebookLanguage(language: string, nb?: string | null) {
  * `setExportTargetDoc` validates through the exporter's own `resolveInWorkspace`,
  * because the regeneration is best-effort, so such a target would otherwise sit in
  * the metadata generating nothing on every later export while this call reported it
- * set. A path naming no module Cellar can generate (anything but `.py` or `.mojo`)
+ * set. A path naming no module Cellar can generate (anything but `.py`, `.mojo` or `.rs`)
  * is refused the same way and for a sharper
  * reason: the exporter WRITES to it, so an ordinary source file named here would be
  * overwritten the moment a cell is marked. Only a refusal of the PATH is reported as
@@ -2345,7 +2347,6 @@ export function setCellExport(ids: string[], exported: boolean, nb?: string | nu
 	const targetInfo = exportTargetInfoFor(target);
 	const targetLang = targetInfo.language;
 	const lang = targetInfo.eligibility;
-	if (exported && !languageGeneratesModule(lang)) return { ok: false as const, noModule: lang };
 	const full: string[] = [];
 	const seen = new Set<string>();
 	for (const ref of ids) {
@@ -2411,6 +2412,33 @@ export function setCellExport(ids: string[], exported: boolean, nb?: string | nu
 		count: marked.length,
 		...where,
 		...moduleWarning(target, where, wrote)
+	};
+}
+
+/**
+ * Mark (or unmark) the MAIN cell of a Rust notebook's `.rs` module - the one
+ * exported cell whose top-level statements become the generated `fn main()`.
+ * One per notebook, so marking clears every other; marking also marks the cell
+ * for export. The doc layer owns every rule (`setCellExportMain`); this wrapper
+ * only addresses the cell the way `setCellExport` does and reports where the
+ * module lands. A hidden cell is reported missing, as everywhere else.
+ */
+export function setExportMain(ref: string, main: boolean, nb?: string | null) {
+	const target = nb ?? getActiveNotebookPath();
+	const guard = exportWriteGuard(target);
+	if (guard) return guard;
+	const id = asFullId(target, ref);
+	const cell = getCell(id, target);
+	if (!cell || isHidden(cell)) return { ok: false as const, missing: ref };
+	const r = setCellExportMainDoc(id, main, target);
+	if (!r.ok) return { ok: false as const, refused: r.reason };
+	const where = exportTargetFields(target);
+	return {
+		ok: true as const,
+		cell: handleFn(target)(id),
+		main,
+		...where,
+		...moduleWarning(target, where, r.changed)
 	};
 }
 

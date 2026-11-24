@@ -41,13 +41,12 @@ import { logicalLines, stripComments, splitSimpleStatements } from './imports';
 import {
 	isExportCell,
 	exportTargetLanguage,
-	languageGeneratesModule,
 	moduleExtension,
-	noModuleLanguageMessage,
 	type ExportLanguage
 } from '../exportRole';
 import { NOTEBOOK_LANGUAGE_LABELS, notebookLanguageOf } from '../cellLanguage';
 import { MAIN_KEPT_COMMENT, mojoModuleSources, planMojoMains, stripMojoMagicHeader } from '../mojoExport';
+import { RUST_HEADER, generateRustModule, isExportMainCell, planRustExport } from '../rustExport';
 import { nbdevDirective, nbdevDirectiveOutsideBlock } from '../nbdevDirectives';
 import { nbdevLibPath } from './nbdev';
 import { isExportBase, type ExportBase } from '../exportTarget';
@@ -56,6 +55,7 @@ import {
 	humanExportHazards,
 	mojoMainDroppedHazard,
 	mojoMainKeptHazard,
+	rustCodeDroppedHazard,
 	type ExportHazard
 } from '../exportHazard';
 import type { Cell, NotebookDoc } from './types';
@@ -380,6 +380,24 @@ export function mojoExportHazards(cells: readonly Cell[]): ExportHazard[] {
 }
 
 /**
+ * What a `.rs` export leaves out, reported for the NOTEBOOK: the cells whose
+ * top-level statements did not go into `fn main`, and the cells whose own
+ * `fn main` was dropped. Read off the same plan `generateRustModule` writes from,
+ * so the cells named here are the ones the file and the per-cell badges name.
+ */
+export function rustExportHazards(cells: readonly Cell[]): ExportHazard[] {
+	const plan = planRustExport(cells.map((c) => ({ source: c.source, main: isExportMainCell(c) })));
+	const stmts: string[] = [];
+	const mains: string[] = [];
+	plan.drops.forEach((d, i) => {
+		if (d.statements) stmts.push(cellHandle(cells[i]));
+		if (d.main) mains.push(cellHandle(cells[i]));
+	});
+	if (!stmts.length && !mains.length) return [];
+	return [rustCodeDroppedHazard(stmts, mains, plan.mainIndex !== null)];
+}
+
+/**
  * Every hazard a set of exported CELLS carries, for a module of this language -
  * the one seam the exporter, the notebook view and the agent surface share, so
  * none of them can describe the same module differently.
@@ -388,7 +406,9 @@ export function mojoExportHazards(cells: readonly Cell[]): ExportHazard[] {
  * they are different claims), so this is a branch rather than a union.
  */
 export function hazardsFor(cells: readonly Cell[], lang: ExportLanguage): ExportHazard[] {
-	return lang === 'mojo' ? mojoExportHazards(cells) : exportHazards(cells.map((c) => c.source));
+	if (lang === 'mojo') return mojoExportHazards(cells);
+	if (lang === 'rust') return rustExportHazards(cells);
+	return exportHazards(cells.map((c) => c.source));
 }
 
 /**
@@ -412,7 +432,7 @@ function targetNamesModule(info: ResolvedExportTarget): boolean {
  *
  * They are separate because there are THREE states, not two, and each names a
  * different thing to change: no target (name one), a target naming a module
- * (`.py`/`.mojo`, so a cell in the other language is a real mismatch), and a
+ * (`.py`/`.mojo`/`.rs`, so a cell in the other language is a real mismatch), and a
  * target that IS configured but names no module Cellar can build - where the
  * remedy is to fix that target, not to name one and not to change an extension.
  * Collapsed into the language alone, the third state borrowed one of the other
@@ -455,7 +475,7 @@ export function docExportTargetInfo(
 	// caller is unchanged.
 	const eligibility = docExportLanguage(doc);
 	return resolved
-		? { configured: true, language: targetNamesModule(resolved) && languageGeneratesModule(eligibility) ? eligibility : null, eligibility }
+		? { configured: true, language: targetNamesModule(resolved) ? eligibility : null, eligibility }
 		: { configured: false, language: null, eligibility };
 }
 
@@ -671,9 +691,17 @@ function generateMojoModule(exportedSources: string[], sourceName: string): stri
 export function generateModule(
 	exportedSources: string[],
 	sourceName: string,
-	lang: ExportLanguage = 'python'
+	lang: ExportLanguage = 'python',
+	mains: readonly boolean[] = []
 ): string {
 	if (lang === 'mojo') return generateMojoModule(exportedSources, sourceName);
+	// A Rust module needs to know which cell is the main cell (`$lib/rustExport`);
+	// the other two languages read nothing but the sources.
+	if (lang === 'rust')
+		return generateRustModule(
+			exportedSources.map((source, i) => ({ source, main: mains[i] === true })),
+			sourceName
+		);
 	const { future, body: bodySources } = liftFutureImports(exportedSources);
 	const allNames: string[] = [];
 	const seen = new Set<string>();
@@ -950,11 +978,6 @@ export function resolveExportTarget(doc: NotebookDoc): ResolvedExportTarget | nu
 	// whole axis exists to remove.
 	const named = exportTargetLanguage(path);
 	const nbLang = notebookLanguageOf(doc.metadata);
-	// A language that generates no module (Rust) resolves NO target, whatever is
-	// stored: the stored path is left alone so switching back restores it, and the
-	// reason is the one sentence every surface shares.
-	if (!languageGeneratesModule(nbLang))
-		return { ok: false, base, path, source, error: noModuleLanguageMessage(nbLang) };
 	if (named && named !== nbLang) {
 		return {
 			ok: false,
@@ -1110,7 +1133,7 @@ export function exportNotebookToPy(doc: NotebookDoc): ExportResult {
 	// one helper (`$lib/server/fstree`), not here.
 	const abs = info.abs; // already passed `resolveInWorkspace`, whatever the base
 	const sourceName = basename(doc.path);
-	const text = generateModule(exported, sourceName, lang);
+	const text = generateModule(exported, sourceName, lang, exportedCells.map(isExportMainCell));
 
 	if (existsSync(abs)) {
 		const existing = safeRead(abs);
@@ -1195,6 +1218,8 @@ const MODULE_HEAD_BYTES = 4096;
 
 /** The `# Source notebook: <name>` line every generated module carries, verbatim. */
 const SOURCE_NOTEBOOK_PREFIX = '# Source notebook: ';
+/** The same line in a `.rs` module, where `#` is not a comment. */
+const RUST_SOURCE_NOTEBOOK_PREFIX = '// Source notebook: ';
 
 /**
  * The module Cellar generated at the path this notebook's target USED to name,
@@ -1239,7 +1264,9 @@ export function orphanedGeneratedModule(
 ): string | null {
 	if (!resolved || !resolved.ok) return null;
 	const lang = exportTargetLanguage(resolved.target);
-	if (lang === null) return null;
+	// Rust takes no part in the language switch's extension swap (PR 143), so a
+	// switch never re-expresses a `.rs` target and leaves no `.rs` sibling behind.
+	if (lang === null || lang === 'rust') return null;
 	const sibling = resolved.target.replace(
 		/\.(py|mojo)$/i,
 		moduleExtension(lang === 'mojo' ? 'python' : 'mojo')
@@ -1262,7 +1289,12 @@ function generatedFromNotebook(target: string, sourceName: string): boolean {
 		return false; // escapes the workspace ⇒ holds no module of ours
 	}
 	if (head === null || !isGeneratedModule(head)) return false;
-	return head.split('\n').some((l) => l.replace(/\r$/, '') === SOURCE_NOTEBOOK_PREFIX + sourceName);
+	return head
+		.split('\n')
+		.some((l) => {
+			const line = l.replace(/\r$/, '');
+			return line === SOURCE_NOTEBOOK_PREFIX + sourceName || line === RUST_SOURCE_NOTEBOOK_PREFIX + sourceName;
+		});
 }
 
 /** The first `MODULE_HEAD_BYTES` of a file as text, or null when it cannot be read. */
@@ -1297,7 +1329,8 @@ function isForeignModuleText(text: string): boolean {
  * the direction that matters: it can never reject a module Cellar wrote.
  */
 function isGeneratedModule(text: string): boolean {
-	return text.split('\n', 1)[0].replace(/\r$/, '') === HEADER;
+	const first = text.split('\n', 1)[0].replace(/\r$/, '');
+	return first === HEADER || first === RUST_HEADER;
 }
 
 function safeRead(abs: string): string | null {
