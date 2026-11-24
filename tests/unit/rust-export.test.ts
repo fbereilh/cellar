@@ -155,6 +155,21 @@ describe('analyzeRustCell: what is a statement', () => {
 		expect(kinds('safe fn f();')).toEqual(['item']);
 	});
 
+	it('keeps a block statement whole when its header holds a struct pattern', () => {
+		const headers = [
+			'if let Point { x, y } = p { println!("{x}{y}"); }',
+			'while let Foo { .. } = x { break; }',
+			'for Point { x, y } in pts { println!("{x}{y}"); }',
+			'if let A { .. } | B { .. } = v { println!("ab"); } else { println!("no"); }'
+		];
+		for (const h of headers) {
+			const src = `${h}\nfn helper() {}\nlet z = 1;`;
+			expect(kinds(src)).toEqual(['stmt', 'item', 'stmt']);
+			expect(texts(src, 'stmt')[0]).toBe(h);
+			expect(texts(src, 'item')).toEqual(['fn helper() {}']);
+		}
+	});
+
 	it('marks whether a statement is terminated', () => {
 		const t = (src: string) => analyzeRustCell(src).units[0].terminated;
 		expect(t('let x = 1;')).toBe(true);
@@ -564,6 +579,30 @@ describe.skipIf(!RUSTC)(`the generated module against a REAL rustc${why}`, () =>
 			expect(res.stderr.replace(/^warning[\s\S]*?\n\n/gm, '')).not.toMatch(/^error/m);
 			expect(res.ok).toBe(true);
 		});
+	});
+
+	it('compiles and runs block statements whose header holds a struct pattern', () => {
+		const src = generateRustModule(
+			[
+				cell('struct Point { x: i32, y: i32 }\nenum E { A { n: i32 }, B { n: i32 } }'),
+				cell(
+					[
+						'let pts = vec![Point { x: 1, y: 2 }];',
+						'for Point { x, y } in pts { println!("{x}{y}"); }',
+						'fn helper() -> i32 { 9 }',
+						'let v = E::B { n: helper() };',
+						'if let E::A { n } | E::B { n } = v { println!("{n}"); }',
+						'let p = Point { x: 3, y: 4 };',
+						'if let Point { x, y } = p { println!("{x}{y}"); }'
+					].join('\n'),
+					true
+				)
+			],
+			'n.ipynb'
+		);
+		const res = compile('structpat', src, 'bin');
+		expect(res.ok).toBe(true);
+		expect(execFileSync(res.bin, { encoding: 'utf8' })).toBe('12\n9\n34\n');
 	});
 
 	it('a temp dir was really used', () => {

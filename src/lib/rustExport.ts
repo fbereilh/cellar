@@ -418,12 +418,19 @@ function classify(mask: string, q: number): Classified {
 	}
 }
 
-/** Characters/words after a block-like statement's `}` that continue the same statement. */
-function continuesAfterBlock(mask: string, at: number): 'else' | 'chain' | 'semi' | null {
+/**
+ * Characters/words after a block-like statement's `}` that continue the same
+ * statement. `pattern` is a struct pattern in the header (`if let P { x } = p {`,
+ * `for P { x } in ps {`, `if let A { .. } | B { .. } = v {`): its `}` is not the body's.
+ */
+function continuesAfterBlock(mask: string, at: number): 'else' | 'pattern' | 'chain' | 'semi' | null {
 	const p = skipWs(mask, at);
 	if (mask[p] === ';') return 'semi';
 	if (mask[p] === '.' || mask[p] === '?') return 'chain';
-	if (wordAt(mask, p) === 'else') return 'else';
+	const w = wordAt(mask, p);
+	if (w === 'else') return 'else';
+	if (w === 'in') return 'pattern';
+	if ((mask[p] === '=' && mask[p + 1] !== '=') || (mask[p] === '|' && mask[p + 1] !== '|')) return 'pattern';
 	return null;
 }
 
@@ -446,7 +453,7 @@ function unitEnd(mask: string, q: number, c: Classified): number {
 					const cont = continuesAfterBlock(mask, j + 1);
 					if (cont === 'semi') return skipWs(mask, j + 1) + 1;
 					if (cont === 'chain') mode = 'stmt-semi';
-					else if (cont !== 'else') return j + 1;
+					else if (cont !== 'else' && cont !== 'pattern') return j + 1;
 				}
 			}
 			if (depth < 0) depth = 0;
