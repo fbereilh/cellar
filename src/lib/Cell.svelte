@@ -51,6 +51,7 @@
 		RUST_MAIN_TOGGLE_LABEL,
 		rustDropBadge,
 		rustDropReason,
+		rustMainToggleOffered,
 		rustMainToggleTitle,
 		type RustCellDrop
 	} from '$lib/rustExport';
@@ -471,9 +472,7 @@
 	// an exported cell) or that already carries the mark, so a mark is always
 	// clearable where it is. Only in a notebook that writes a Rust module.
 	const isExportMain = $derived(isExportMainCell(cell));
-	const mainToggleOffered = $derived(
-		exportOffered && exportCellLanguage === 'rust' && ((canExport && isExport) || isExportMain)
-	);
+	const mainToggleOffered = $derived(rustMainToggleOffered(cell, exportCellLanguage, exportOffered));
 	const rustDropText = $derived(rustDropBadge(rustDrop));
 	// The accessible NAME. It tracks what the control DOES - clear a stale mark, or
 	// write this cell to the notebook's module - and never the pressed state, which

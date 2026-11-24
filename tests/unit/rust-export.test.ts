@@ -32,6 +32,7 @@ import {
 	rustDropReason,
 	rustExportDrops,
 	rustMainMarked,
+	rustMainToggleOffered,
 	stripEvcxrCommands,
 	type RustExportInput
 } from '../../src/lib/rustExport';
@@ -148,6 +149,12 @@ describe('analyzeRustCell: what is a statement', () => {
 		expect(kinds('if true { vec![1] } else { vec![] }.len();\nfn f() {}')).toEqual(['stmt', 'item']);
 	});
 
+	it('reads a variable named `safe` as a statement, and `safe fn` as an item', () => {
+		expect(kinds('safe = true;')).toEqual(['stmt']);
+		expect(kinds('safe.push(1);\nfn f() {}')).toEqual(['stmt', 'item']);
+		expect(kinds('safe fn f();')).toEqual(['item']);
+	});
+
 	it('marks whether a statement is terminated', () => {
 		const t = (src: string) => analyzeRustCell(src).units[0].terminated;
 		expect(t('let x = 1;')).toBe(true);
@@ -184,6 +191,14 @@ describe('analyzeRustCell: strings and comments are not code', () => {
 			'item',
 			'stmt'
 		]);
+	});
+});
+
+describe('analyzeRustCell: escaped char literals', () => {
+	it("ends `'\\''` at its real closing quote", () => {
+		const src = "let q = ['\\'', ';'];\nfn f() {}\nlet b = '\\\\';\nstruct S;";
+		expect(kinds(src)).toEqual(['stmt', 'item', 'stmt', 'item']);
+		expect(texts(src, 'stmt')).toEqual(["let q = ['\\'', ';'];", "let b = '\\\\';"]);
 	});
 });
 
@@ -311,6 +326,37 @@ describe('generateRustModule', () => {
 	it('is deterministic', () => {
 		const cells = [cell('use std::fmt;\nlet a = 1;'), cell('fn f() {}\nf();', true)];
 		expect(generateRustModule(cells, 'n.ipynb')).toBe(generateRustModule(cells, 'n.ipynb'));
+	});
+});
+
+describe('generateRustModule: a block-form final expression in the main cell', () => {
+	const tail = (src: string) => generateRustModule([cell(src, true)], 'n.ipynb').split('fn main() {\n')[1];
+
+	it('ends a value-yielding `if` or `match` with `;`', () => {
+		expect(tail('let a = true;\nif a { 1 } else { 2 }')).toBe('    let a = true;\n    if a { 1 } else { 2 };\n}\n');
+		expect(tail('match 1 { 1 => "one", _ => "other" } // shown')).toBe(
+			'    match 1 { 1 => "one", _ => "other" }; // shown\n}\n'
+		);
+	});
+
+	it('leaves a statement that already ends in `;` alone, and an earlier block form too', () => {
+		expect(tail('if true { 1 } else { 2 };')).toBe('    if true { 1 } else { 2 };\n}\n');
+		expect(tail('for i in 0..1 {}\nlet x = 1;')).toBe('    for i in 0..1 {}\n    let x = 1;\n}\n');
+	});
+});
+
+describe('rustMainToggleOffered', () => {
+	const c = (cellar: Record<string, unknown>, cell_type = 'code') => ({ cell_type, source: 'let x = 1;', metadata: { cellar } });
+
+	it('is offered on an exported Rust cell or one already marked, and nowhere else', () => {
+		expect(rustMainToggleOffered(c({ export: true }), 'rust', true)).toBe(true);
+		expect(rustMainToggleOffered(c({ export_main: true }), 'rust', true)).toBe(true);
+		expect(rustMainToggleOffered(c({}), 'rust', true)).toBe(false);
+		expect(rustMainToggleOffered(c({ export: true }, 'markdown'), 'rust', true)).toBe(false);
+		expect(rustMainToggleOffered(c({ export: true }), 'python', true)).toBe(false);
+		expect(rustMainToggleOffered(c({ export: true }), 'mojo', true)).toBe(false);
+		expect(rustMainToggleOffered(c({ export: true }), null, true)).toBe(false);
+		expect(rustMainToggleOffered(c({ export: true, export_main: true }), 'rust', false)).toBe(false);
 	});
 });
 
@@ -501,6 +547,23 @@ describe.skipIf(!RUSTC)(`the generated module against a REAL rustc${why}`, () =>
 		const res = compile('cellmain', src, 'bin');
 		expect(res.ok).toBe(true);
 		expect(execFileSync(res.bin, { encoding: 'utf8' })).toBe('2\n');
+	});
+
+	it('compiles a main cell that ends in a value-yielding block form or an escaped quote', () => {
+		const tails = [
+			'let a = true;\nif a { 1 } else { 2 }',
+			'match 3 { 1 => "one", _ => "other" }',
+			'loop { break 7 }',
+			'{ 5 }',
+			'vec! { 1, 2 }',
+			"let q = ['\\'', ';'];\nq[0]",
+			'let mut safe = false;\nsafe = true;\nsafe'
+		];
+		tails.forEach((src, i) => {
+			const res = compile(`tail${i}`, generateRustModule([cell('fn helper() {}'), cell(src, true)], 'n.ipynb'), 'bin');
+			expect(res.stderr.replace(/^warning[\s\S]*?\n\n/gm, '')).not.toMatch(/^error/m);
+			expect(res.ok).toBe(true);
+		});
 	});
 
 	it('a temp dir was really used', () => {

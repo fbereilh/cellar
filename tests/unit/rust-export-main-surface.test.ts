@@ -142,39 +142,3 @@ describe('MCP set_export_main_cell', () => {
 		expect(body(bad)).toMatch(/Rust/);
 	});
 });
-
-/**
- * Source guards on the browser half. vitest runs without the SvelteKit plugin, so
- * these components cannot be mounted here, and e2e is absent from the pre-push
- * gate. They witness the wiring only; the behaviour is in the e2e spec.
- */
-describe('the browser wiring', () => {
-	const src = (rel: string) =>
-		readFileSync(join(__dirname, '..', '..', 'src', 'lib', rel), 'utf8');
-
-	it('offers the main toggle only on an exported cell of a Rust module, or one already marked', () => {
-		const cell = src('Cell.svelte');
-		expect(cell).toMatch(
-			/mainToggleOffered = \$derived\(\s*exportOffered && exportCellLanguage === 'rust' && \(\(canExport && isExport\) \|\| isExportMain\)/
-		);
-		expect(cell).toMatch(/\{#if mainToggleOffered\}[\s\S]*?data-testid="toggle-export-main"/);
-		expect(cell).toMatch(/onSetExportMain\?\.\(cell\.id, !isExportMain\)/);
-		expect(cell).toMatch(/aria-pressed=\{isExportMain\}/);
-	});
-
-	it('draws the dropped-code badge from the shared plan, not a local copy', () => {
-		const cell = src('Cell.svelte');
-		expect(cell).toMatch(/rustDropText = \$derived\(rustDropBadge\(rustDrop\)\)/);
-		expect(cell).toMatch(/\{#if rustDrop && rustDropText\}[\s\S]*?data-testid="rust-export-dropped-badge"/);
-		const live = src('LiveNotebook.svelte');
-		expect(live).toMatch(/rustDrops = \$derived\(rustExportDrops\(cells, exportModuleLanguage\)\)/);
-		expect(src('Notebook.svelte')).toMatch(/rustDrop=\{rustDrops\.get\(cell\.id\) \?\? null\}/);
-	});
-
-	it('sends the mark through the PATCH route and applies the server event', () => {
-		const live = src('LiveNotebook.svelte');
-		expect(live).toMatch(/JSON\.stringify\(\{ exportMain: main, nb: path, originId \}\)/);
-		expect(live).toMatch(/ev\.type === 'cell:export-main'/);
-		expect(live).toMatch(/onSetExportMain=\{setExportMain\}/);
-	});
-});

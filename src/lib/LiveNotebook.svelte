@@ -2874,7 +2874,7 @@
 			if (c.id === id) apply(c, main, main ? true : undefined);
 			else if (main && c.metadata?.cellar?.export_main === true) apply(c, false);
 		}
-		if (main && (await settleCellEdits(moduleSourceIds([id]))).includes('failed'))
+		if ((await settleCellEdits(moduleSourceIds(main ? [id] : []))).includes('failed'))
 			onNotice?.(unsavedExportEditNotice('proceeding'));
 		const res = await fetch(`/api/cells/${id}`, {
 			method: 'PATCH',

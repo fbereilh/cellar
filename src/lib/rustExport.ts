@@ -243,7 +243,7 @@ function scanRust(src: string): Scan {
 		if (c === "'") {
 			let end = -1;
 			if (src[i + 1] === '\\') {
-				let j = i + 2;
+				let j = i + 3;
 				while (j < n && src[j] !== "'" && src[j] !== '\n') j++;
 				if (src[j] === "'") end = j + 1;
 			} else {
@@ -360,6 +360,7 @@ function classify(mask: string, q: number): Classified {
 			const after = next(i + w.length);
 			if (mask[after] === '{' || (w === 'async' && wordAt(mask, after) === 'move')) return stmt();
 			if (w === 'default' && !/^(fn|type|const|unsafe|async|impl)$/.test(wordAt(mask, after))) return stmt();
+			if (w === 'safe' && !/^(fn|static)$/.test(wordAt(mask, after))) return stmt();
 			i = after;
 			w = wordAt(mask, i);
 			continue;
@@ -654,14 +655,16 @@ function indentUnit(text: string, stringLines: Set<number> | undefined): string 
 
 /**
  * A statement written inside `fn main`. A final expression with no terminator is
- * finished so it compiles: `let` gets its `;`, anything else becomes `let _ = ...;`
- * (Evcxr displays a final value; `fn main` must end in `()`).
+ * finished so it compiles: `let` gets its `;`, a block form (`if`, `match`, a loop,
+ * a block, a brace macro) gets a `;` so its value is discarded, anything else
+ * becomes `let _ = ...;` (Evcxr displays a final value; `fn main` must end in `()`).
  */
 function mainStatement(u: Unit, isLast: boolean): string {
-	if (u.terminated || !isLast || u.codeStart === undefined || u.codeEnd === undefined) return u.text;
+	if (!isLast || u.codeStart === undefined || u.codeEnd === undefined) return u.text;
 	const before = u.text.slice(0, u.codeStart);
 	const code = u.text.slice(u.codeStart, u.codeEnd);
 	const after = u.text.slice(u.codeEnd);
+	if (u.terminated) return code.endsWith(';') ? u.text : `${before}${code};${after}`;
 	return u.isLet ? `${before}${code};${after}` : `${before}let _ = ${code};${after}`;
 }
 
@@ -743,6 +746,19 @@ export function generateRustModule(cells: readonly RustExportInput[], sourceName
 /** The cells' main marks, read the one way: `metadata.cellar.export_main === true`. */
 export function isExportMainCell(cell: { metadata?: CellMetadata | null } | null | undefined): boolean {
 	return cell?.metadata?.cellar?.export_main === true;
+}
+
+/**
+ * Is the main-cell toggle offered on this cell? Only in a notebook that can hold
+ * export marks and writes a Rust module, and only on a cell that is exported or
+ * already carries the mark, so a mark is always clearable where it is.
+ */
+export function rustMainToggleOffered(
+	cell: { cell_type?: string; source?: string; metadata?: CellMetadata | null },
+	lang: ExportLanguage | null,
+	holdsExport: boolean
+): boolean {
+	return holdsExport && lang === 'rust' && (isExportCell(cell, 'rust') || isExportMainCell(cell));
 }
 
 type RustExportCell = { id: string; cell_type?: string; source?: string; metadata?: CellMetadata | null };
