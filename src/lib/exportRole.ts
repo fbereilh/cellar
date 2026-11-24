@@ -98,6 +98,18 @@ export function moduleExtension(lang: ExportLanguage): string {
 }
 
 /**
+ * The example path the export field shows while it is empty: `utils.py` in a
+ * Python notebook, `utils.mojo` in a Mojo one. It follows the notebook's language
+ * for the same reason a stored target's extension does - a path in the other
+ * language is refused, so suggesting one would invite the refusal. A Rust notebook
+ * generates no module and refuses every target, so it keeps the Python example
+ * rather than suggesting a `.rs` module that does not exist.
+ */
+export function exportTargetPlaceholder(lang: NotebookLanguage): string {
+	return `utils${moduleExtension(languageGeneratesModule(lang) ? lang : 'python')}`;
+}
+
+/**
  * The language of the module source this cell WOULD contribute, or null when it
  * contributes none.
  *

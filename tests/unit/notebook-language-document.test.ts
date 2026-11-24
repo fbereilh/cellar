@@ -262,6 +262,53 @@ describe('the notebook language survives clean-on-save, and touches no cell', ()
 	});
 });
 
+describe('a language switch re-extensions the stored export target and nothing else', () => {
+	const targetOnDisk = (nb: string): unknown =>
+		(JSON.parse(readFileSync(nb, 'utf8')) as { metadata: { cellar?: { export_target?: unknown } } }).metadata.cellar
+			?.export_target;
+
+	it('keeps the path and swaps only the extension, in both directions', () => {
+		const nb = join(WS, 'target-follows.ipynb');
+		nbmod.createNotebook('target-follows.ipynb');
+		nbmod.setExportTarget('lib/utils.py', nb);
+		nbmod.setNotebookLanguage('mojo', nb);
+		expect(nbmod.getExportTarget(nb)).toBe('lib/utils.mojo');
+		expect(targetOnDisk(nb)).toBe('lib/utils.mojo');
+		nbmod.setNotebookLanguage('python', nb);
+		expect(nbmod.getExportTarget(nb)).toBe('lib/utils.py');
+		expect(targetOnDisk(nb)).toBe('lib/utils.py');
+	});
+
+	it('leaves a notebook with no target without one', () => {
+		const nb = join(WS, 'target-none.ipynb');
+		nbmod.createNotebook('target-none.ipynb');
+		nbmod.setNotebookLanguage('mojo', nb);
+		expect(nbmod.getExportTarget(nb)).toBeNull();
+		expect(targetOnDisk(nb)).toBeUndefined();
+	});
+
+	it('leaves a target naming some other extension untouched', () => {
+		const nb = makeNotebook('target-other.ipynb', [{ source: 'x = 1' }]);
+		const raw = JSON.parse(readFileSync(nb, 'utf8'));
+		raw.metadata = { cellar: { export_target: 'lib/utils.txt' } };
+		writeFileSync(nb, JSON.stringify(raw));
+		nbmod.dropDocs(nb);
+		nbmod.setNotebookLanguage('mojo', nb);
+		expect(nbmod.getExportTarget(nb)).toBe('lib/utils.txt');
+		expect(targetOnDisk(nb)).toBe('lib/utils.txt');
+	});
+
+	it('leaves the target unchanged on a switch to Rust and back', () => {
+		const nb = join(WS, 'target-rust.ipynb');
+		nbmod.createNotebook('target-rust.ipynb');
+		nbmod.setExportTarget('lib/utils.py', nb);
+		nbmod.setNotebookLanguage('rust', nb);
+		expect(nbmod.getExportTarget(nb)).toBe('lib/utils.py');
+		nbmod.setNotebookLanguage('python', nb);
+		expect(nbmod.getExportTarget(nb)).toBe('lib/utils.py');
+	});
+});
+
 describe('a .py TEXT notebook cannot BE a Mojo notebook', () => {
 	it('REFUSES setNotebookLanguage(mojo) and writes nothing', () => {
 		expect(() => nbmod.setNotebookLanguage('mojo', PY)).toThrow(TextNotebookLanguageError);
