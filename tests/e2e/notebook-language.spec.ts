@@ -293,6 +293,26 @@ test('the export target FOLLOWS the language, so the two can never disagree', as
 	await expect(page.getByTestId('cell-render-error')).toHaveCount(0);
 });
 
+test('the empty export field suggests a module in the notebook language', async ({ page }) => {
+	test.setTimeout(120_000);
+	const errors = watchErrors(page);
+	await openFresh(page, 'lang-placeholder.ipynb');
+
+	await openNotebookSettings(page);
+	const target = page.getByTestId('export-target-input');
+	await expect(target).toHaveValue('');
+	await expect(target).toHaveAttribute('placeholder', 'utils.py');
+
+	await chooseLanguage(page, 'mojo');
+	await expect(target).toHaveAttribute('placeholder', 'utils.mojo');
+	// A suggestion is not a setting: nothing was stored for an empty field.
+	expect(nbMeta('lang-placeholder.ipynb').export_target).toBeUndefined();
+
+	await chooseLanguage(page, 'python');
+	await expect(target).toHaveAttribute('placeholder', 'utils.py');
+	expect(errors).toEqual([]);
+});
+
 test('a cell RUNS as Python before the flip and as Mojo after it', async ({ page }) => {
 	test.setTimeout(240_000);
 	const errors = watchErrors(page);

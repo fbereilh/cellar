@@ -25,6 +25,7 @@
 		orphanedModuleExplanation,
 		type ExportLanguage,
 		type ExportStrandedSummary,
+		exportTargetPlaceholder,
 		moduleExtension
 	} from '$lib/exportRole';
 	import { reservedFailureHeight, failureDetail } from '$lib/cellRenderFailure';
@@ -1492,7 +1493,7 @@
 								bind:this={exportTargetEl}
 								type="text"
 								class="input input-bordered input-xs min-w-40 flex-1 font-mono"
-								placeholder="utils.py"
+								placeholder={exportTargetPlaceholder(notebookLanguage)}
 								value={exportTarget ?? ''}
 								onchange={onExportTargetCommit}
 								data-testid="export-target-input"
