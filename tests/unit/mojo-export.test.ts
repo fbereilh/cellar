@@ -1120,7 +1120,7 @@ describe('setExportTarget accepts .mojo and still refuses anything else', () => 
 		await svc.addCells([{ cell_type: 'code', source: 'x = 1' }], null, { nb, routeImports: false });
 		nbmod.setNotebookLanguage('mojo', nb); // the extension follows the language
 		expect(nbmod.setExportTarget('lib/k.mojo', nb).target).toBe('lib/k.mojo');
-		expect(() => nbmod.setExportTarget('src/app.ts', nb)).toThrow(/not a \.py or \.mojo file/);
+		expect(() => nbmod.setExportTarget('src/app.ts', nb)).toThrow(/not a \.py, \.mojo or \.rs file/);
 		expect(nbmod.getExportTarget(nb)).toBe('lib/k.mojo');
 	});
 });

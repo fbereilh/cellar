@@ -29,6 +29,7 @@
 		moduleExtension
 	} from '$lib/exportRole';
 	import { reservedFailureHeight, failureDetail } from '$lib/cellRenderFailure';
+	import type { RustCellDrop } from '$lib/rustExport';
 	import type { ExportPyResult } from '$lib/types';
 	import {
 		planWindow,
@@ -44,6 +45,7 @@
 	const EMPTY_IDS: string[] = [];
 	const EMPTY_SELECTION: ReadonlySet<string> = new Set();
 	const EMPTY_MAIN_DROPPED: ReadonlySet<string> = new Set();
+	const EMPTY_RUST_DROPS: ReadonlyMap<string, RustCellDrop> = new Map();
 
 	interface Props {
 		cells: UICell[];
@@ -121,6 +123,8 @@
 		onSetRole: (id: string, role: string | null) => void;
 		/** Mark this code cell for nbdev-style `.py` export, or unmark it. */
 		onSetExport?: (id: string, exported: boolean) => void;
+		/** Make this cell the main cell of the `.rs` module, or clear the mark. */
+		onSetExportMain?: (id: string, main: boolean) => void;
 		/** The notebook's export target (module path), or null when unset. */
 		exportTarget?: string | null;
 		/**
@@ -145,6 +149,14 @@
 		 * `.py` one. Read per cell rather than pinned, like `selectedIds`.
 		 */
 		mojoMainDropped?: ReadonlySet<string>;
+		/**
+		 * What a `.rs` export leaves out of each exported cell (`$lib/rustExport`):
+		 * statements outside the main cell, or a `fn main()` the main cell replaces.
+		 * Empty unless the notebook writes a Rust module.
+		 */
+		rustDrops?: ReadonlyMap<string, RustCellDrop>;
+		/** Whether any cell is marked as the main cell of the `.rs` module. */
+		rustMainIsMarked?: boolean;
 		/** How many cells are currently marked for export. */
 		exportCount?: number;
 		/**
@@ -302,6 +314,8 @@
 		staleness = {},
 		exportLanguage = null,
 		mojoMainDropped = EMPTY_MAIN_DROPPED,
+		rustDrops = EMPTY_RUST_DROPS,
+		rustMainIsMarked = false,
 		hidden = new Set(),
 		foldedIds = new Set(),
 		hiddenSegs = new Map(),
@@ -327,6 +341,7 @@
 		onSetType,
 		onSetRole,
 		onSetExport,
+		onSetExportMain,
 		exportTarget = null,
 		exportCount = 0,
 		exportStranded = { count: 0, withLanguage: 0 },
@@ -990,7 +1005,7 @@
 		// agent-only kind may neither raise the warning branch nor word it
 		// (`$lib/exportHazard`).
 		const shown = humanExportHazards(r.hazards ?? []);
-		if (r.reason === 'no-target') exportFeedback = 'Set a target module path first (.py or .mojo).';
+		if (r.reason === 'no-target') exportFeedback = 'Set a target module path first (.py, .mojo or .rs).';
 		else if (r.reason === 'no-cells') exportFeedback = 'No cells are marked for export.';
 		// Nothing was written and that is deliberate, so the button may not read as a
 		// dead control: Cellar never overwrites a file it did not generate.
@@ -1221,7 +1236,10 @@
 				{exportLanguage}
 				{notebookLanguage}
 				mainDropped={mojoMainDropped.has(cell.id)}
+				rustDrop={rustDrops.get(cell.id) ?? null}
+				{rustMainIsMarked}
 				onSetExport={onSetExport}
+				{onSetExportMain}
 				onSetScrolled={onSetScrolled}
 				{hideAllCode}
 				{isPy}
@@ -1444,7 +1462,7 @@
 						<span class="text-xs text-base-content/55">
 							{#if notebookLanguage === 'rust'}
 								Every code cell runs as Rust on the Evcxr kernel, and state carries between
-								cells. A Rust notebook exports no module and runs no SQL cells. Switching away
+								cells. A Rust notebook exports a .rs module and runs no SQL cells. Switching away
 								restarts the kernel and clears its variables.
 							{:else}
 								Every code cell runs as {NOTEBOOK_LANGUAGE_LABELS[notebookLanguage]}; markdown, raw,

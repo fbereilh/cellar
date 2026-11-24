@@ -54,12 +54,11 @@ import {
 	exportDirectiveOwnsCell,
 	exportMarkedTwice,
 	exportTargetLanguage,
-	languageGeneratesModule,
 	moduleExtension,
-	noModuleLanguageMessage,
 	notebookHoldsExport,
 	type ExportLanguage
 } from '../exportRole';
+import type { ExportMainRefusal } from '../rustExport';
 import { isHiddenFromAgent } from '../agentVisibility';
 import { isExportBase, type ExportBase } from '../exportTarget';
 import { gitRootOf } from './git';
@@ -1340,6 +1339,10 @@ export function setCellExports(
 			const cellar = cell.metadata?.cellar;
 			if (!cellar || !marked) continue;
 			delete cellar.export;
+			// A Rust main mark means "this exported cell's statements become fn main()".
+			// With the cell no longer exported the mark has nothing to mean, and left in
+			// place it would silently come back the moment the cell is re-marked.
+			delete cellar.export_main;
 		}
 		changed.push(cell);
 	}
@@ -1350,6 +1353,65 @@ export function setCellExports(
 	}
 	for (const cell of changed) emit(doc, 'cell:export', { cellId: cell.id, exported }, originId);
 	return changed.map((c) => c.id);
+}
+
+/** Why a `setCellExportMain` call did not take. */
+export type SetExportMainRefusal = ExportMainRefusal;
+
+/**
+ * Mark (or unmark) the MAIN cell of a Rust notebook's `.rs` module: the one
+ * exported cell whose top-level statements go inside the generated `fn main()`
+ * (`$lib/rustExport`). One per notebook, like the imports role, so marking a cell
+ * clears the mark from every other.
+ *
+ * Marking also marks the cell for export, since a main cell outside the module
+ * would mean nothing. Unmarking leaves the export flag alone - the cell stays in
+ * the module, its statements are then left out like any other cell's. Both persist
+ * and regenerate the module, because choosing the main cell changes what the
+ * module holds - the same rule `setCellExports` follows.
+ *
+ * Refused on a `.py` text notebook (it stores no cell metadata), outside a Rust
+ * notebook (only a `.rs` module has a generated `fn main()`), and on a cell the
+ * module cannot take (`canExportCell`).
+ */
+export function setCellExportMain(
+	id: string,
+	main: boolean,
+	nb?: string | null,
+	originId?: string | null
+): { ok: true; changed: boolean } | { ok: false; reason: SetExportMainRefusal } {
+	const doc = docFor(nb);
+	const cell = find(doc, id);
+	if (!cell) return { ok: false, reason: 'no-such-cell' };
+	const current = cell.metadata?.cellar?.export_main === true;
+	if (!main) {
+		if (!current) return { ok: true, changed: false };
+		delete cell.metadata!.cellar!.export_main;
+		if (!doc.jpFormat) {
+			persist(doc);
+			regenerateExportModule(doc);
+		}
+		emit(doc, 'cell:export-main', { cellId: id, main: false }, originId);
+		return { ok: true, changed: true };
+	}
+	if (!notebookHoldsExport(!!doc.jpFormat)) return { ok: false, reason: 'py-notebook' };
+	const lang = docExportLanguage(doc);
+	if (lang !== 'rust') return { ok: false, reason: 'not-rust' };
+	if (!canExportCell(cell, lang)) return { ok: false, reason: 'not-code' };
+	const others = doc.cells.filter((c) => c !== cell && c.metadata?.cellar?.export_main === true);
+	const wasExported = cell.metadata?.cellar?.export === true;
+	if (current && wasExported && !others.length) return { ok: true, changed: false };
+	for (const c of others) delete c.metadata!.cellar!.export_main;
+	cell.metadata = cell.metadata ?? {};
+	cell.metadata.cellar = cell.metadata.cellar ?? {};
+	cell.metadata.cellar.export = true;
+	cell.metadata.cellar.export_main = true;
+	persist(doc);
+	regenerateExportModule(doc);
+	for (const c of others) emit(doc, 'cell:export-main', { cellId: c.id, main: false }, originId);
+	if (!wasExported) emit(doc, 'cell:export', { cellId: id, exported: true }, originId);
+	emit(doc, 'cell:export-main', { cellId: id, main: true }, originId);
+	return { ok: true, changed: true };
 }
 
 /**
@@ -1421,7 +1483,7 @@ export class InvalidExportTargetError extends Error {
  * would sit in the metadata generating nothing on every later export. Refusing it
  * at the point it is set is the honest moment - the caller has a value to correct.
  *
- * A target that is not a `.py` or `.mojo` file is refused for a sharper reason:
+ * A target that is not a `.py`, `.mojo` or `.rs` file is refused for a sharper reason:
  * the exporter WRITES the generated module to this path, so a target naming an
  * ordinary source file would have that file overwritten the moment a cell is
  * marked. The field is documented (here, in both tool descriptions and in nbdev
@@ -1507,14 +1569,10 @@ export function setExportTarget(
 		// Mojo - `$lib/mojoExport`). Anything else is refused for the sharper reason
 		// above: the exporter WRITES this path.
 		const nbLang = notebookLanguageOf(doc.metadata);
-		// A Rust notebook generates no module at all (`languageGeneratesModule`), so a
-		// target there could only name a file no export will ever write. Refused
-		// before the extension is judged, so the message names the real reason.
-		if (!languageGeneratesModule(nbLang)) throw new InvalidExportTargetError(noModuleLanguageMessage(nbLang));
 		const named = exportTargetLanguage(raw);
 		if (!named)
 			throw new InvalidExportTargetError(
-				`export target ${raw} is not a .py or .mojo file: the generated module is written to this path, so it must name a .py or .mojo module`
+				`export target ${raw} is not a .py, .mojo or .rs file: the generated module is written to this path, so it must name a .py, .mojo or .rs module`
 			);
 		// The module's language is the NOTEBOOK's (`docExportLanguage`), so the
 		// extension FOLLOWS it and may not contradict it - that contradiction is the
@@ -1877,11 +1935,11 @@ export function setNotebookLanguage(
 	let targetMoved = false;
 	if (typeof stored === 'string' && stored.trim()) {
 		const named = exportTargetLanguage(stored.trim());
-		// Only a language that GENERATES a module has an extension to follow. Switching
-		// to Rust leaves the stored target exactly as it was: it is reported as
-		// unresolvable while the notebook is Rust and is valid again the moment the
-		// notebook switches back, so the round trip rewrites nothing.
-		if (named && named !== wanted && languageGeneratesModule(wanted)) {
+		// Rust takes no part in the swap (PR 143 covers .py and .mojo only): a switch
+		// to or from Rust leaves the stored target exactly as it was. It reads as a
+		// mismatched target until the notebook switches back, so the round trip
+		// rewrites nothing.
+		if (named && named !== wanted && named !== 'rust' && wanted !== 'rust') {
 			cellar.export_target = stored.trim().replace(/\.(py|mojo)$/i, moduleExtension(wanted));
 			targetMoved = true;
 		}
@@ -2014,6 +2072,7 @@ const DURABLE_CELLAR_KEYS = [
 	'language',
 	'role',
 	'export',
+	'export_main',
 	'hide_input',
 	'output_scrolled',
 	'hidden_from_agent',
@@ -2057,6 +2116,11 @@ function seedCellar(doc: NotebookDoc, cell: CellWithCellar, cellar: unknown): vo
 	// go to whichever came first.
 	if (cell.metadata.cellar.role === IMPORTS_ROLE && doc.cells.some((c) => isImportsCell(c))) {
 		delete cell.metadata.cellar.role;
+	}
+	// The Rust main mark is one per notebook for the same reason: a module has one
+	// fn main(). A pasted copy beside its marked original does not claim it.
+	if (cell.metadata.cellar.export_main === true && doc.cells.some((c) => c.metadata?.cellar?.export_main === true)) {
+		delete cell.metadata.cellar.export_main;
 	}
 }
 

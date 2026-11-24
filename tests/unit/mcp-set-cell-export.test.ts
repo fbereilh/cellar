@@ -633,7 +633,7 @@ describe('a regeneration that FAILED is reported, never read as a success', () =
 
 		const r = svc.setExportTarget('precious.ts', target);
 		expect('invalid' in r && r.ok).toBe(false);
-		expect('invalid' in r ? r.invalid : '').toMatch(/not a \.py or \.mojo file/);
+		expect('invalid' in r ? r.invalid : '').toMatch(/not a \.py, \.mojo or \.rs file/);
 		expect(nbmod.getExportTarget(target)).toBe(null);
 
 		// And the chain the refusal breaks: marking a cell cannot reach that file.

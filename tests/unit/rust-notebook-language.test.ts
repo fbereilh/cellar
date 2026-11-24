@@ -3,7 +3,7 @@
  *
  * The rule that decides the most is `notebookKernelLanguage`: Python and Mojo
  * share ipykernel, Rust runs on Evcxr. Everything Python-shaped (the dataflow
- * graph, the imports cell, the variable inspector, module export) must answer
+ * graph, the imports cell, the variable inspector) must answer
  * "no" for a Rust notebook, and unchanged for the other two.
  */
 import { describe, it, expect } from 'vitest';
@@ -25,9 +25,8 @@ import {
 	canExportCell,
 	exportLanguageOf,
 	exportModuleLanguage,
-	languageGeneratesModule,
-	moduleExtension,
-	noModuleLanguageMessage
+	exportTargetLanguage,
+	moduleExtension
 } from '../../src/lib/exportRole';
 import { notebookUsesImportsCell } from '../../src/lib/importsRole';
 
@@ -88,29 +87,22 @@ describe('the Python-only machinery', () => {
 });
 
 describe('module export', () => {
-	it('generates no module for Rust, and still does for the other two', () => {
-		expect(languageGeneratesModule('rust')).toBe(false);
-		expect(languageGeneratesModule('python')).toBe(true);
-		expect(languageGeneratesModule('mojo')).toBe(true);
+	it('makes a plain code cell of a Rust notebook eligible for the .rs module', () => {
+		expect(exportLanguageOf(code, 'rust')).toBe('rust');
+		expect(canExportCell(code, 'rust')).toBe(true);
+		// A markdown or SQL cell has no module source in any language.
+		expect(canExportCell(markdown, 'rust')).toBe(false);
+		expect(canExportCell(sql, 'rust')).toBe(false);
 	});
 
-	it('makes every cell of a Rust notebook ineligible', () => {
-		expect(exportLanguageOf(code, 'rust')).toBeNull();
-		expect(canExportCell(code, 'rust')).toBe(false);
-		// The control: the same cell in a Python notebook is eligible.
-		expect(canExportCell(code, 'python')).toBe(true);
-	});
-
-	it('names no module language for a Rust notebook, even with a target kept from before the switch', () => {
-		expect(exportModuleLanguage('rust', true)).toBeNull();
+	it('names Rust as the module language once a target names a module', () => {
+		expect(exportModuleLanguage('rust', true)).toBe('rust');
 		expect(exportModuleLanguage('rust', false)).toBeNull();
-		// The control: a named module in the other two languages is in that language.
-		expect(exportModuleLanguage('python', true)).toBe('python');
-		expect(exportModuleLanguage('mojo', true)).toBe('mojo');
 	});
 
-	it('says why, naming the language', () => {
-		expect(noModuleLanguageMessage('rust')).toContain('Rust');
+	it('reads a .rs target as Rust', () => {
+		expect(exportTargetLanguage('lib.rs')).toBe('rust');
+		expect(exportTargetLanguage('lib.py')).toBe('python');
 	});
 
 	it('still names an extension per language', () => {

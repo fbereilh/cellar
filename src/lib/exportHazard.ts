@@ -9,7 +9,7 @@
  * signal was the eventual import failure.
  *
  * A hazard is a POSITIVE, DETECTED finding about the module the export just wrote
- * that the user would otherwise learn only from the file. There are THREE KINDS,
+ * that the user would otherwise learn only from the file. There are FOUR KINDS,
  * and no two of them are the same claim - the `kind` discriminant exists so one
  * can never be worded as another:
  *
@@ -32,6 +32,12 @@
  *     exactly what makes it un-importable from a Python cell. Certain and
  *     whole-module, hence a hazard; never worded as a compile failure, because it
  *     is not one.
+ *   - `rust-code-dropped` (a `.rs` target): the module was written and code was
+ *     LEFT OUT of it - top-level statements of exported cells other than the main
+ *     cell (a `.rs` file holds only items), or a cell's own `fn main()` that lost
+ *     to the main cell or to a later one (`$lib/rustExport`). Like
+ *     `mojo-main-dropped` it is the notebook-level summary of a loss each affected
+ *     cell also carries as a badge, and it is never worded as a compile failure.
  *
  * ## NOT EVERY KIND REACHES EVERY SURFACE (`humanExportHazards`)
  *
@@ -108,7 +114,11 @@
 export const HAZARD_STATEMENT_MAX = 80;
 
 /** Which finding fired. Each kind makes a DIFFERENT claim - see this file's header. */
-export type ExportHazardKind = 'future-import-joined' | 'mojo-main-dropped' | 'mojo-main-kept';
+export type ExportHazardKind =
+	| 'future-import-joined'
+	| 'mojo-main-dropped'
+	| 'mojo-main-kept'
+	| 'rust-code-dropped';
 
 /** A detected finding about the generated module the user must be told about. */
 export interface ExportHazard {
@@ -117,8 +127,7 @@ export interface ExportHazard {
 	/**
 	 * What the finding is ABOUT, whitespace-folded and bounded to
 	 * `HAZARD_STATEMENT_MAX`: the offending logical line for
-	 * `future-import-joined`, the affected cell handles for the two `mojo-main-*`
-	 * kinds.
+	 * `future-import-joined`, the affected cell handles for the other kinds.
 	 */
 	statement: string;
 	/** A complete, plain-language sentence: what happened, and what to change. */
@@ -246,6 +255,57 @@ export function mojoMainKeptHazard(keptHandle: string): ExportHazard {
 }
 
 /**
+ * The ONE wording for the code a `.rs` export left out.
+ *
+ * `statementHandles` are the exported cells whose top-level statements were left
+ * out, `mainHandles` the ones whose own `fn main()` was. `mainMarked` says whether
+ * the notebook has a main cell, because the remedy differs: with none, marking one
+ * is the only way statements reach the module at all. Like the Mojo wording it
+ * opens with the finding and carries no lead of its own.
+ */
+export function rustCodeDroppedHazardMessage(
+	statementHandles: readonly string[],
+	mainHandles: readonly string[],
+	mainMarked: boolean
+): string {
+	const parts: string[] = [];
+	if (statementHandles.length) {
+		const n = statementHandles.length;
+		parts.push(
+			`${n === 1 ? 'one exported cell' : `${n} exported cells`} had top-level statements left out of the .rs module ` +
+				`(${statementHandles.join(', ')}): a .rs file holds only items (fn, struct, use, ...), and only the main cell's ` +
+				'statements go into fn main(). ' +
+				(mainMarked
+					? 'Move the statements you need into the main cell.'
+					: 'No cell is marked as the main cell; mark one to put its statements in fn main().')
+		);
+	}
+	if (mainHandles.length) {
+		const n = mainHandles.length;
+		parts.push(
+			`${n === 1 ? 'one exported cell' : `${n} exported cells`} had a fn main() left out (${mainHandles.join(', ')}): ` +
+				"a Rust module defines main only once, so the main cell's statements or the last cell's fn main() took that place."
+		);
+	}
+	parts.push('Every item in those cells is exported unchanged.');
+	return parts.join(' ');
+}
+
+/** Build the `rust-code-dropped` hazard. Exported so the server never re-derives the wording. */
+export function rustCodeDroppedHazard(
+	statementHandles: readonly string[],
+	mainHandles: readonly string[],
+	mainMarked: boolean
+): ExportHazard {
+	const all = [...statementHandles, ...mainHandles.filter((h) => !statementHandles.includes(h))];
+	return {
+		kind: 'rust-code-dropped',
+		statement: quoteStatement(all.join(', ')),
+		message: rustCodeDroppedHazardMessage(statementHandles, mainHandles, mainMarked)
+	};
+}
+
+/**
  * The kinds a HUMAN surface may not show - see this file's header for why
  * `mojo-main-kept` is one and `mojo-main-dropped` deliberately is not.
  */
@@ -294,7 +354,7 @@ export function hazardReport(hazards: readonly ExportHazard[]): string {
 export function hazardSummaryClause(hazards: readonly ExportHazard[]): string {
 	const kinds = new Set(hazards.map((h) => h.kind));
 	if (kinds.has('future-import-joined')) return 'it will not import';
-	if (kinds.has('mojo-main-dropped')) return 'code was dropped';
+	if (kinds.has('mojo-main-dropped') || kinds.has('rust-code-dropped')) return 'code was dropped';
 	if (kinds.has('mojo-main-kept')) return 'no Python cell can import it';
 	return 'see the warning';
 }

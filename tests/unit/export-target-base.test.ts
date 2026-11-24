@@ -517,6 +517,14 @@ describe('exportImportWarning (the importability rule)', () => {
 		expect(exportImportWarning('lib/x.py', '..')).toMatch(/cannot import/);
 	});
 
+	it('is silent for a Rust or Mojo module outside the root, where a Python one warns', () => {
+		const { exportImportWarning } = exportTargetLib;
+		expect(exportImportWarning('lib/x.rs', 'roots/pr1')).toBeNull();
+		expect(exportImportWarning('lib/x.rs', '../wt')).toBeNull();
+		expect(exportImportWarning('lib/x.mojo', 'roots/pr1')).toBeNull();
+		expect(exportImportWarning('lib/x.py', 'roots/pr1')).toMatch(/cannot import/);
+	});
+
 	it('respects the path-segment boundary (pr10 is not under pr1)', () => {
 		const { exportImportWarning } = exportTargetLib;
 		expect(exportImportWarning('roots/pr10/x.py', 'roots/pr1')).toMatch(/cannot import/);
