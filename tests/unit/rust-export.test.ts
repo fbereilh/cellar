@@ -344,6 +344,34 @@ describe('generateRustModule', () => {
 	});
 });
 
+describe('generateRustModule: duplicate `use` items', () => {
+	const count = (out: string, needle: string) => out.split(needle).length - 1;
+
+	it('removes a repeat that differs only in whitespace or a comment', () => {
+		const out = generateRustModule(
+			[cell('use std::collections::{HashMap, HashSet};'), cell('use std::collections::{HashMap,\n    HashSet}; // again\nfn f() {}')],
+			'n.ipynb'
+		);
+		expect(count(out, 'use std::collections')).toBe(1);
+		expect(out).toContain('fn f() {}');
+	});
+
+	it('keeps a `use` whose attributes differ', () => {
+		const out = generateRustModule(
+			[
+				cell('#[cfg(test)]\nuse foo::Bar;'),
+				cell('use foo::Bar;'),
+				cell('#[cfg(feature = "a")]\nuse foo::Baz;'),
+				cell('#[cfg(feature = "b")]\nuse foo::Baz;')
+			],
+			'n.ipynb'
+		);
+		expect(count(out, 'use foo::Bar;')).toBe(2);
+		expect(out).toContain('#[cfg(test)]\nuse foo::Bar;');
+		expect(count(out, 'use foo::Baz;')).toBe(2);
+	});
+});
+
 describe('generateRustModule: a block-form final expression in the main cell', () => {
 	const tail = (src: string) => generateRustModule([cell(src, true)], 'n.ipynb').split('fn main() {\n')[1];
 

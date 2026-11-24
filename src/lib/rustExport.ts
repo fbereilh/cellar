@@ -684,10 +684,15 @@ function joinPieces(pieces: { text: string; blankBefore: boolean }[]): string {
 	return out;
 }
 
-/** Collapse whitespace in a `use` item's code so equal declarations compare equal. */
+/**
+ * A `use` item with comments dropped and whitespace collapsed, attributes and
+ * string contents kept, so only truly equal declarations compare equal.
+ */
 function useKey(text: string): string {
 	const mask = scanRust(text).mask;
-	return mask.replace(/#\s*\[[^\]]*\]/g, '').replace(/\s+/g, ' ').trim();
+	let key = '';
+	for (let k = 0; k < text.length; k++) key += mask[k] === STR ? text[k] : mask[k];
+	return key.replace(/\s+/g, ' ').trim();
 }
 
 /**
