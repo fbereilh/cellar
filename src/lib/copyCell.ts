@@ -2,8 +2,8 @@
 //
 // Pure and browser-safe (no DOM, no `$lib/server`), so it reads the cell MODEL -
 // `cell.outputs` - never a rendered node. That is what makes the copy buttons
-// windowing-safe: most of a large notebook has no DOM at all (see the cell
-// virtualization entry in CLAUDE.md), so a DOM-scraping copy would silently
+// windowing-safe: most of a large notebook has no DOM at all (see
+// docs/dev-notes/virtualization.md), so a DOM-scraping copy would silently
 // return nothing for a cell that is merely scrolled away.
 //
 // THE RULE: copy gives you, as text, what the cell SHOWS. So the mime priority
