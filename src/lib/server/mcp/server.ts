@@ -25,7 +25,8 @@ import { runAsAgent, digestFor, deletionNote, currentSeq, DIGEST_PREFIX } from '
 import { CellRefError } from './cellHandle';
 import { isNotebookUnavailable } from '../notebook';
 import { NOTEBOOK_LANGUAGE_LABELS, TextNotebookCellTypeError, type NotebookLanguage } from '../../cellLanguage';
-import { moduleExtension, noModuleLanguageMessage } from '../../exportRole';
+import { moduleExtension } from '../../exportRole';
+import { exportMainRefusalMessage } from '../../rustExport';
 import { reasonWithoutServerPath } from '../../serverMessage';
 import { customInstructionsBlock, resolveCustomInstructions } from '../../customInstructions';
 import { getUserSettings } from '../user-settings';
@@ -423,14 +424,14 @@ Follow this house style:
    set_export_target(path, base) names the file (path:null clears it) and
    set_cell_export(ids, export:true|false) marks the cells in it. The module's
    language is the NOTEBOOK's (clause 12), so the path's extension follows it and a
-   mismatch is refused. A .mojo module defines main once, so only the LAST marked cell with
-   one keeps it - the rest lose that block (reported in module). Pass a path back
-   in the base it was reported under, never the resolved one; an omitted base
-   keeps the current. THOSE TWO CALLS are what rewrite the module (while a target
-   is set AND a cell stays marked); editing or running one does NOT - after
-   changing a marked cell's source, call set_export_target with the SAME path and
-   base, which always regenerates (re-marking writes nothing). Unmark the last one
-   and the old file stays as it was. Never hand-write an #|export line: nbdev's
+   mismatch is refused. A .mojo module keeps the LAST marked main; a .rs one holds
+   only items, plus fn main() from the ONE cell set_export_main_cell picks (the
+   rest lose their statements). Pass a path back in its reported base, never the
+   resolved one; an omitted base keeps the current. THOSE CALLS rewrite the module
+   (while a target is set AND a cell stays marked); editing or running one does
+   NOT - after changing a marked cell's source, call set_export_target with the
+   SAME path and base, which always regenerates. Unmark the last one and the old
+   file stays as it was. Never hand-write an #|export line: nbdev's
    directive ALSO marks the cell, and set_cell_export then cannot unmark it - only
    deleting that line can.
 
@@ -618,7 +619,8 @@ Follow this house style:
    Python and Mojo share one kernel and keep it. A Rust notebook has no Python
    namespace: kernel_state and the variable tools report python_namespace:false,
    no cell shows a staleness verdict, there is no imports cell, a sql cell and the
-   Databricks session tools are refused, and it exports no module. If Evcxr is
+   Databricks session tools are refused, and it exports to a .rs module (clause
+   5) whose target a language switch does not rename. If Evcxr is
    missing the cell fails with the exact \`cargo install\` command — relay it.
 
 The goal: a notebook a human would be happy to have written — imports up top,
@@ -852,7 +854,7 @@ export function registerTools(server: McpServer) {
 	// touched), but it is NOT display: it decides how every code cell RUNS. The
 	// `.py`-notebook refusal is reported by reason like the cell-type ones, since
 	// its cause and its remedy are the same (that document stores no metadata).
-	server.registerTool('set_notebook_language', { description: 'Set the notebook\'s LANGUAGE: "python", "mojo" or "rust". A notebook is exactly one, never a mix - every plain code cell in it is written in this language (there is no mojo cell type). Switching touches NO cell: markdown, raw, sql and chat cells are unaffected, and code cells simply run as the new language (doctrine clause 12). The nbdev export target follows it - a stored `utils.py` becomes `utils.mojo` and back - so the two can never disagree; the reply reports the target so you can name it again correctly. A switch to or from "rust" changes the KERNEL (Evcxr vs ipykernel): a live kernel is freed, kernel_restarted/namespace_cleared report it, and every variable is gone; a Rust notebook exports no module, so its target is reported unresolvable until it switches back. Refused on a `.py` text notebook, which stores no notebook metadata. Returns {language, export_target, ...}.', inputSchema: { language: z.enum(['python', 'mojo', 'rust']), ...notebookParam } }, async ({ language, notebook }, extra: ToolExtra) => {
+	server.registerTool('set_notebook_language', { description: 'Set the notebook\'s LANGUAGE: "python", "mojo" or "rust". A notebook is exactly one, never a mix - every plain code cell in it is written in this language (there is no mojo cell type). Switching touches NO cell: markdown, raw, sql and chat cells are unaffected, and code cells simply run as the new language (doctrine clause 12). The nbdev export target follows it - a stored `utils.py` becomes `utils.mojo` and back - so the two can never disagree; the reply reports the target so you can name it again correctly. A switch to or from "rust" changes the KERNEL (Evcxr vs ipykernel): a live kernel is freed, kernel_restarted/namespace_cleared report it, and every variable is gone; the target is not renamed on a switch to or from "rust" (a Rust notebook exports a .rs module), so a mismatched one is reported unresolvable until you set it again. Refused on a `.py` text notebook, which stores no notebook metadata. Returns {language, export_target, ...}.', inputSchema: { language: z.enum(['python', 'mojo', 'rust']), ...notebookParam } }, async ({ language, notebook }, extra: ToolExtra) => {
 		const target = targetOf(extra, notebook);
 		const r = svc.setNotebookLanguage(language, target);
 		// Checked FIRST, and it is NOT the write failure below: the document could not
@@ -921,7 +923,6 @@ export function registerTools(server: McpServer) {
 		// setter rejects on every branch that carried it. `set_notebook_language` is
 		// what moves the module's language, and it re-expresses the stored target with
 		// it, so branches 3 and 4 name it beside the target action each still needs.
-		if ('noModule' in r && r.noModule) return notFound(`no cell was marked for export: ${noModuleLanguageMessage(r.noModule)}`);
 		if ('notCode' in r)
 			return notFound(
 				r.cellLanguage == null
@@ -946,7 +947,18 @@ export function registerTools(server: McpServer) {
 			);
 		return notFound(r.missing ? `cell ${asGiven(r.missing)} not found` : 'ids must not be empty');
 	});
-	server.registerTool('set_export_target', { description: 'Set (or clear) your notebook\'s EXPORT TARGET: the module export-marked cells go to. Its extension FOLLOWS set_notebook_language (.py/.mojo); a mismatch is refused. `base` = what `path` is measured from: workspace, notebook (its folder), git (repo root); OMIT to KEEP the stored. path:null or "" clears the SETTING (a `#|default_exp` directive in a cell is NOT). Rewritten while a cell stays marked (set_cell_export); module = the write failed, or it will not import / lost main(). Refused: a path outside the workspace, git with no repo, a `.py` text notebook. Returns export_target (RESOLVED workspace-relative; a directive flags export_target_source) + export_base/export_path for other bases.', inputSchema: { path: z.string().nullable(), base: z.enum(['workspace', 'notebook', 'git']).optional(), ...notebookParam } }, async ({ path, base, notebook }, extra: ToolExtra) => {
+	server.registerTool('set_export_main_cell', { description: 'Rust notebooks only: choose the ONE exported cell whose top-level statements become the .rs module\'s fn main() (main:true; marks it for export too, and clears the mark from any other cell). main:false unmarks it. Statements in every other exported cell are dropped from the module. Returns {ok, cell, main, export_target}; module = what the regeneration left on disk.', inputSchema: { id: z.string(), main: z.boolean(), ...notebookParam } }, async ({ id, main, notebook }, extra: ToolExtra) => {
+		const target = targetOf(extra, notebook);
+		const res = resolveOne(target, id, extra?.sessionId);
+		if ('error' in res) return res.error;
+		const r = svc.setExportMain(res.id, main, target);
+		if (r.ok) return text(r);
+		if ('unavailable' in r)
+			return notFound(`the notebook could not be opened, so the main cell is unchanged: ${String(r.unavailable ?? '')}`);
+		if ('missing' in r) return notFound(`cell ${id} not found`);
+		return notFound(exportMainRefusalMessage(r.refused));
+	});
+	server.registerTool('set_export_target', { description: 'Set (or clear) your notebook\'s EXPORT TARGET: the module export-marked cells go to. Its extension FOLLOWS set_notebook_language (.py/.mojo/.rs); a mismatch is refused. `base` = what `path` is measured from: workspace, notebook (its folder), git (repo root); OMIT keeps it. path:null or "" clears the SETTING (a `#|default_exp` directive in a cell is NOT). Rewritten while a cell stays marked (set_cell_export); module = the write failed, or it will not import / lost main(). Refused: a path outside the workspace, git with no repo, a `.py` text notebook. Returns export_target (RESOLVED workspace-relative; a directive flags export_target_source) + export_base/export_path for other bases.', inputSchema: { path: z.string().nullable(), base: z.enum(['workspace', 'notebook', 'git']).optional(), ...notebookParam } }, async ({ path, base, notebook }, extra: ToolExtra) => {
 		const r = svc.setExportTarget(path, targetOf(extra, notebook), base);
 		// The notebook could not be OPENED: nothing was applied, so this may not be
 		// worded as the accepted-but-unsaved case below, which claims the target took.
@@ -955,7 +967,7 @@ export function registerTools(server: McpServer) {
 				`the notebook could not be opened, so its export target is unchanged: ${String(r.unavailable ?? '')}`
 			);
 		if ('refused' in r) return notFound(pyNotebookRefusal('an export target cannot be stored'));
-		if ('invalid' in r) return notFound(`refused: ${r.invalid} - the export target must be a .py or .mojo path that resolves inside the workspace`);
+		if ('invalid' in r) return notFound(`refused: ${r.invalid} - the export target must be a .py, .mojo or .rs path that resolves inside the workspace`);
 		// A valid path the notebook write could not save: say what happened, and do NOT
 		// hand back the invalid-path remedy above - the path is fine, and the notebook
 		// in memory already carries it, so retrying the same call once the write can

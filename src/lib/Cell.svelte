@@ -46,6 +46,15 @@
 		moduleExtension
 	} from '$lib/exportRole';
 	import { MAIN_DROPPED_BADGE, MAIN_DROPPED_REASON } from '$lib/mojoExport';
+	import {
+		isExportMainCell,
+		RUST_MAIN_TOGGLE_LABEL,
+		rustDropBadge,
+		rustDropReason,
+		rustMainToggleOffered,
+		rustMainToggleTitle,
+		type RustCellDrop
+	} from '$lib/rustExport';
 	import { isHiddenFromAgent } from '$lib/agentVisibility';
 	import { isPageOutput } from '$lib/pageOutput';
 	import { isCodeHidden } from '$lib/hideInput';
@@ -147,6 +156,14 @@
 		 * the warning.
 		 */
 		mainDropped?: boolean;
+		/**
+		 * What a `.rs` export leaves out of this cell, or null when it loses nothing.
+		 * Decided for the notebook in `LiveNotebook` from the exporter's own split
+		 * (`$lib/rustExport`); the cell only draws the badge.
+		 */
+		rustDrop?: RustCellDrop | null;
+		/** Whether any cell in the notebook is the main cell of the `.rs` module. */
+		rustMainIsMarked?: boolean;
 		dragging?: boolean;
 		/** Fold keys of every collapsed heading in the notebook. */
 		foldedIds?: Set<string>;
@@ -174,6 +191,8 @@
 		onSetRole: (id: string, role: string | null) => void;
 		/** Mark this code cell for nbdev-style `.py` export, or unmark it. */
 		onSetExport?: (id: string, exported: boolean) => void;
+		/** Make this cell the main cell of the `.rs` module, or clear the mark. */
+		onSetExportMain?: (id: string, main: boolean) => void;
 		onSetHiddenFromAgent?: (id: string, hidden: boolean) => void;
 		onSetScrolled?: (id: string, scrolled: boolean) => void;
 		/** Notebook-wide "hide all code inputs" default (a per-cell choice overrides it). */
@@ -239,6 +258,8 @@
 		exportLanguage = null,
 		notebookLanguage = 'python',
 		mainDropped = false,
+		rustDrop = null,
+		rustMainIsMarked = false,
 		dragging = false,
 		foldedIds = new Set(),
 		segHidden = NO_SEGS_HIDDEN,
@@ -257,6 +278,7 @@
 		onSetType,
 		onSetRole,
 		onSetExport,
+		onSetExportMain,
 		onSetHiddenFromAgent,
 		onSetScrolled,
 		hideAllCode = false,
@@ -445,6 +467,13 @@
 	// there, like the export section of the notebook menu and every other affordance a
 	// notebook cannot use, rather than rendered and refused on click.
 	const exportOffered = $derived(notebookHoldsExport(isPy));
+	// The `.rs` module's main cell: its statements become the body of `fn main()`.
+	// Offered on a cell that is already exported (marking main is a choice ABOUT
+	// an exported cell) or that already carries the mark, so a mark is always
+	// clearable where it is. Only in a notebook that writes a Rust module.
+	const isExportMain = $derived(isExportMainCell(cell));
+	const mainToggleOffered = $derived(rustMainToggleOffered(cell, exportCellLanguage, exportOffered));
+	const rustDropText = $derived(rustDropBadge(rustDrop));
 	// The accessible NAME. It tracks what the control DOES - clear a stale mark, or
 	// write this cell to the notebook's module - and never the pressed state, which
 	// is `aria-pressed`'s job.
@@ -1282,6 +1311,9 @@
 		// module), so the plain negation would try to MARK it again - the one thing
 		// the server refuses. The only honest action there is to clear the flag.
 		onSetExport?.(cell.id, exportStranded ? false : !isExport);
+	}
+	function toggleExportMain() {
+		onSetExportMain?.(cell.id, !isExportMain);
 	}
 	function toggleAgentHidden() {
 		onSetHiddenFromAgent?.(cell.id, !agentHidden);
@@ -2341,6 +2373,25 @@
 						<span class="text-xs text-base-content/50" data-testid="export-stranded-badge">{EXPORT_STRANDED_BADGE}</span>
 					{/if}
 				{/if}
+				{#if mainToggleOffered}
+					<!-- The `.rs` module's MAIN CELL: its statements go inside `fn main()`,
+					     every other exported cell keeps only its items. One per notebook
+					     (the server clears any other mark). Same shape and same ON tint as the
+					     export toggle beside it, so the two read as one family; the flag
+					     glyph says "this one", the label says what it means. -->
+					<button
+						class="btn btn-ghost btn-xs btn-square {isExportMain
+							? 'bg-accent/15 text-accent hover:bg-accent/25'
+							: 'text-base-content/60 hover:text-base-content/90'}"
+						onclick={toggleExportMain}
+						aria-pressed={isExportMain}
+						title={rustMainToggleTitle(isExportMain)}
+						aria-label={RUST_MAIN_TOGGLE_LABEL}
+						data-testid="toggle-export-main"
+					>
+						<svg class="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 21V4" /><path d="M5 4h11l-2.5 4L16 12H5" /></svg>
+					</button>
+				{/if}
 				<!-- Withhold this cell from every agent surface. The sparkle is Cellar's own
 				     agent glyph (the `run-actor` badge uses it), struck through when hidden - so
 				     the ON state reads as "the AI cannot see this" rather than as a second copy
@@ -2523,6 +2574,20 @@
 					>
 						<svg class="h-3 w-3 text-warning" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z" /><path d="M12 9v4" /><path d="M12 17h.01" /></svg>
 						{MAIN_DROPPED_BADGE}
+					</span>
+				{/if}
+				{#if rustDrop && rustDropText}
+					<!-- What a `.rs` export leaves out of this exported cell: its statements
+					     (only the main cell's go inside `fn main()`) or its own `fn main()`
+					     (the generated one replaces it). Same shape and colour rule as the
+					     Mojo badge above; the visible text says WHAT, the title says WHY. -->
+					<span
+						class="ml-2 inline-flex items-center gap-1 rounded bg-warning/15 px-1.5 py-0.5 text-[11px] font-medium text-base-content/80"
+						data-testid="rust-export-dropped-badge"
+						title={rustDropReason(rustDrop, rustMainIsMarked)}
+					>
+						<svg class="h-3 w-3 text-warning" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z" /><path d="M12 9v4" /><path d="M12 17h.01" /></svg>
+						{rustDropText}
 					</span>
 				{/if}
 			</div>

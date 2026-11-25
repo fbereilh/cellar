@@ -151,10 +151,10 @@ Detail: [Databricks](docs/dev-notes/databricks.md).
 | [notebook-ui](docs/dev-notes/notebook-ui.md) | Cell UI, copy input/output, collapse, folding, directive highlighting, KaTeX, rendered links, row toggles, code block extraction, layout tokens, render error boundary. |
 | [mcp](docs/dev-notes/mcp.md) | MCP tools, live vs persisted run status, images, ergonomics rules, per-session notebooks, user-activity digest, run tools and the queue. |
 | [databricks](docs/dev-notes/databricks.md) | Connect and auth, re-auth, liveness and reconnect, panel states, logout, upload, default profile, Spark progress, `dbutils.widgets`, runtime toggle. |
-| [export](docs/dev-notes/export.md) | nbdev `.py` and `.mojo` module export, export target and base, hazards, nbdev metadata protection, HTML export. |
+| [export](docs/dev-notes/export.md) | nbdev `.py` and `.mojo` module export, export target and base, hazards, nbdev metadata protection, HTML export. Rust `.rs` export is in notebook-languages. |
 | [staleness-and-sql](docs/dev-notes/staleness-and-sql.md) | Dataflow probe, staleness rules, import-binding exemption, bulk runs, notebook toolbar, SQL result binding. |
 | [chat-cells](docs/dev-notes/chat-cells.md) | Chat cells, claude CLI engine, workspace reads confinement, tool lines, account slots, custom instructions. |
-| [notebook-languages](docs/dev-notes/notebook-languages.md) | Python, Mojo (`%%mojo`, declaration carry-over, `.mojo` export), Rust on Evcxr. |
+| [notebook-languages](docs/dev-notes/notebook-languages.md) | Python, Mojo (`%%mojo`, declaration carry-over, `.mojo` export), Rust on Evcxr (`.rs` export). |
 | [outputs](docs/dev-notes/outputs.md) | DataFrame grid, HTML-to-grid parsing, HTML table styling, ipywidgets. |
 | [shell-and-sidebar](docs/dev-notes/shell-and-sidebar.md) | App shell, foreign-action refresh, navbar, sidebar sections, kernel cards, shell backend, sidebar Git section. |
 | [file-tabs-and-tree](docs/dev-notes/file-tabs-and-tree.md) | File tabs, markdown and HTML previews, external edit sync, file tree, git decorations and blame, file management, drag moves, tab session and reordering. |

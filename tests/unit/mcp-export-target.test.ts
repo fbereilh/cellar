@@ -405,7 +405,7 @@ describe('a .py text notebook is refused, like its pair set_cell_export', () => 
 		expect(await refused.json()).toMatchObject({
 			ok: false,
 			target: 'lib/held.py',
-			message: expect.stringMatching(/not a \.py or \.mojo file/)
+			message: expect.stringMatching(/not a \.py, \.mojo or \.rs file/)
 		});
 		expect(nbmod.getExportTarget(nb)).toBe('lib/held.py');
 	});
@@ -660,7 +660,7 @@ describe('a refused path and a failed write are told apart', () => {
 		expect(escaping).not.toHaveProperty('writeFailed');
 
 		const notPy = svc.setExportTarget('src/app.ts', nb);
-		expect(notPy).toMatchObject({ ok: false, invalid: expect.stringMatching(/not a \.py or \.mojo file/) });
+		expect(notPy).toMatchObject({ ok: false, invalid: expect.stringMatching(/not a \.py, \.mojo or \.rs file/) });
 		expect(notPy).not.toHaveProperty('writeFailed');
 
 		// Validation runs before the mutation, so a refusal changes nothing.

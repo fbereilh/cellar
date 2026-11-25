@@ -102,11 +102,18 @@ export interface CellarNamespace {
 	/**
 	 * nbdev-style export flag: include this cell in the generated module. Which cells
 	 * MAY carry it is TARGET-AWARE - the target's extension names the module language
-	 * (`.py` or `.mojo`) and a code cell is eligible iff its own language matches - so
+	 * (`.py`, `.mojo` or `.rs`) and a code cell is eligible iff its own language matches - so
 	 * the eligibility test lives in `exportRole.ts` (`canExportCell`/`isExportCell`),
 	 * which every surface reads; a stale or hand-edited flag anywhere else is inert.
 	 */
 	export?: boolean;
+	/**
+	 * Rust module export only: this exported cell is the MAIN cell, so its top-level
+	 * statements go inside the generated `fn main() { ... }`. One per notebook
+	 * (`setCellExportMain` clears the others); counted only on a cell that is
+	 * exported into a `.rs` module - see `$lib/rustExport`.
+	 */
+	export_main?: boolean;
 	/** Runtime-only run stamp (never persisted). */
 	lastRun?: LastRun;
 	/** Runtime-only wall-clock ms the source last changed (never persisted). */
@@ -297,10 +304,10 @@ export interface NotebookCellarNamespace {
 	 * nbdev-style export target: the generated module's path, relative to the
 	 * recorded `export_base` (workspace-relative when that key is absent - the
 	 * permanent legacy meaning). Its EXTENSION names the module's language and
-	 * therefore which cells may go in it (`.py` or `.mojo`, see
+	 * therefore which cells may go in it (`.py`, `.mojo` or `.rs`, see
 	 * `exportTargetLanguage`). Always STORED relative to its base, whatever a
 	 * caller passed - `setExportTarget` validates the path (resolving inside the
-	 * workspace, and naming one of those two extensions, since the exporter
+	 * workspace, and naming one of those extensions, since the exporter
 	 * WRITES it) and normalizes it there, so the committed `.ipynb` stays
 	 * portable.
 	 */

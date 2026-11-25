@@ -3,8 +3,8 @@
  * and the `.py` text-notebook refusal.
  *
  * Rust differs from Mojo in two document rules, and both are pinned here:
- *   - it generates no export module, so a target is refused and a stored one is
- *     reported as unresolvable without being rewritten,
+ *   - it exports a `.rs` module, but a language switch never rewrites a stored
+ *     target's extension, so a target kept from Python is reported as a mismatch,
  *   - a round trip through Rust leaves the file as it was.
  * The imports sweep is checked too, since a Rust `use` line is not a Python import.
  */
@@ -12,13 +12,13 @@ import { describe, it, expect, beforeAll, afterAll, vi } from 'vitest';
 import { mkdtempSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { RUST_HEADER } from '../../src/lib/rustExport';
 import {
 	RUST_LANGUAGE,
 	RUST_UNSUPPORTED_REASON,
 	TEXT_NOTEBOOK_RUST_MESSAGE,
 	TextNotebookLanguageError
 } from '../../src/lib/cellLanguage';
-import { noModuleLanguageMessage } from '../../src/lib/exportRole';
 
 vi.mock('../../src/lib/server/run', () => ({
 	executeCellRun: vi.fn(async () => ({ outputs: [], status: 'ok', session: 1, kernelDown: false })),
@@ -95,46 +95,134 @@ describe('the stored setting', () => {
 	});
 });
 
-describe('a Rust notebook exports no module', () => {
-	it('refuses a new export target and names the reason', () => {
-		const nb = makeNotebook('no-target.ipynb', ['let x = 1;'], { language: 'rust' });
-		expect(() => nbmod.setExportTarget('lib.py', nb)).toThrow(noModuleLanguageMessage('rust'));
+describe('a Rust notebook exports a .rs module', () => {
+	it('accepts a .rs target and refuses a .py one as a mismatch', () => {
+		const nb = makeNotebook('target.ipynb', ['let x = 1;'], { language: 'rust' });
+		expect(() => nbmod.setExportTarget('lib.py', nb)).toThrow(/\.rs/);
 		expect(onDisk(nb).metadata.cellar.export_target).toBeUndefined();
+		nbmod.setExportTarget('lib.rs', nb);
+		expect(onDisk(nb).metadata.cellar.export_target).toBe('lib.rs');
+		expect(nbmod.exportTargetInfoFor(nb).language).toBe('rust');
 	});
 
 	it('still lets a stored target be cleared', () => {
-		const nb = makeNotebook('clear.ipynb', ['let x = 1;'], { language: 'rust', export_target: 'lib.py' });
+		const nb = makeNotebook('clear.ipynb', ['let x = 1;'], { language: 'rust', export_target: 'lib.rs' });
 		nbmod.setExportTarget(null, nb);
 		expect(onDisk(nb).metadata.cellar.export_target).toBeUndefined();
 	});
 
-	it('keeps a stored target across a switch to Rust and reports it unresolvable', () => {
+	it('keeps a stored .py target across a switch to Rust and reports the mismatch', () => {
 		const nb = makeNotebook('keep.ipynb', ['x = 1'], { export_target: 'utils.py' });
 		nbmod.setNotebookLanguage('rust', nb);
 		expect(onDisk(nb).metadata.cellar.export_target).toBe('utils.py');
 		const info = nbmod.exportTargetInfo(nb);
-		expect(info && !info.ok && info.error).toBe(noModuleLanguageMessage('rust'));
+		expect(info && !info.ok && info.error).toMatch(/\.py module/);
 		// Back to Python, the same target resolves again.
 		nbmod.setNotebookLanguage('python', nb);
 		expect(onDisk(nb).metadata.cellar.export_target).toBe('utils.py');
 		expect(nbmod.exportTargetInfo(nb)?.ok).toBe(true);
 	});
 
-	it('reports no module language for a target kept across the switch', () => {
+	it('reports the notebook language and the mismatch for a target kept across the switch', () => {
+		// The same rule a hand-edited mismatch follows in a Mojo notebook: the module
+		// language is the notebook's, and the target's own resolution carries the
+		// refusal, so nothing reads the stale extension back as the language.
 		const nb = makeNotebook('kept-lang.ipynb', ['x = 1'], { export_target: 'utils.py' });
 		expect(nbmod.exportTargetInfoFor(nb).language).toBe('python');
 		nbmod.setNotebookLanguage('rust', nb);
 		const info = nbmod.exportTargetInfoFor(nb);
 		expect(info.configured).toBe(true);
-		expect(info.language).toBeNull();
-		expect(nbmod.getNotebook(nb).exportLanguage).toBeNull();
+		expect(info.language).toBe('rust');
+		const view = nbmod.getNotebook(nb);
+		expect(view.exportResolveError).toMatch(/\.py module/);
+		expect(view.exportResolved).toBeNull();
 	});
 
-	it('refuses to mark a cell for export', () => {
+	it('marks a code cell for export', () => {
 		const nb = makeNotebook('mark.ipynb', ['fn f() {}'], { language: 'rust' });
 		const res = nbmod.setCellExport('cell0', true, nb);
-		expect(res.ok).toBe(false);
-		expect(onDisk(nb).cells[0].metadata.cellar?.export).toBeUndefined();
+		expect(res.ok).toBe(true);
+		expect(onDisk(nb).cells[0].metadata.cellar?.export).toBe(true);
+	});
+});
+
+describe('the main cell mark', () => {
+	const cellarOf = (nb: string, i: number) => onDisk(nb).cells[i].metadata.cellar ?? {};
+
+	it('marks one cell, exports it, and moves when another cell is marked', () => {
+		const nb = makeNotebook('main-move.ipynb', ['let a = 1;', 'let b = 2;'], { language: 'rust' });
+		expect(nbmod.setCellExportMain('cell0', true, nb)).toEqual({ ok: true, changed: true });
+		expect(cellarOf(nb, 0)).toEqual({ export: true, export_main: true });
+		expect(nbmod.setCellExportMain('cell1', true, nb)).toEqual({ ok: true, changed: true });
+		// One main per notebook: the first cell keeps its export mark, loses the main one.
+		expect(cellarOf(nb, 0)).toEqual({ export: true });
+		expect(cellarOf(nb, 1)).toEqual({ export: true, export_main: true });
+	});
+
+	it('reports no change for a mark the cell already holds, in both directions', () => {
+		const nb = makeNotebook('main-idem.ipynb', ['let a = 1;'], { language: 'rust' });
+		expect(nbmod.setCellExportMain('cell0', false, nb)).toEqual({ ok: true, changed: false });
+		nbmod.setCellExportMain('cell0', true, nb);
+		expect(nbmod.setCellExportMain('cell0', true, nb)).toEqual({ ok: true, changed: false });
+		expect(nbmod.setCellExportMain('cell0', false, nb)).toEqual({ ok: true, changed: true });
+		// Clearing the main mark leaves the cell exported.
+		expect(cellarOf(nb, 0)).toEqual({ export: true });
+	});
+
+	it('clears the main mark when the cell stops being exported', () => {
+		const nb = makeNotebook('main-unexport.ipynb', ['let a = 1;'], { language: 'rust' });
+		nbmod.setCellExportMain('cell0', true, nb);
+		nbmod.setCellExport('cell0', false, nb);
+		expect(cellarOf(nb, 0)).toEqual({});
+	});
+
+	it('refuses an unknown cell, a Python notebook and a non-code cell', () => {
+		const rust = makeNotebook('main-refuse.ipynb', ['let a = 1;'], { language: 'rust' });
+		expect(nbmod.setCellExportMain('nope', true, rust)).toEqual({ ok: false, reason: 'no-such-cell' });
+		const py = makeNotebook('main-python.ipynb', ['x = 1']);
+		expect(nbmod.setCellExportMain('cell0', true, py)).toEqual({ ok: false, reason: 'not-rust' });
+		expect(cellarOf(py, 0)).toEqual({});
+		nbmod.setCellType('cell0', 'markdown', rust);
+		expect(nbmod.setCellExportMain('cell0', true, rust)).toEqual({ ok: false, reason: 'not-code' });
+	});
+
+	it('writes statements of the main cell into fn main() and drops the rest', () => {
+		const nb = makeNotebook(
+			'main-write.ipynb',
+			[':dep rand = "0.8"\nfn add(a: i32, b: i32) -> i32 { a + b }\nlet stray = 1;', 'let x = add(1, 2);\nprintln!("{x}");'],
+			{ language: 'rust', export_target: 'lib.rs' }
+		);
+		nbmod.setCellExport('cell0', true, nb);
+		nbmod.setCellExportMain('cell1', true, nb);
+		const res = nbmod.exportPy(nb);
+		expect(res.written || res.reason === 'unchanged').toBe(true);
+		const text = readFileSync(join(WS, 'lib.rs'), 'utf8');
+		expect(text.split('\n')[0]).toBe(RUST_HEADER);
+		expect(text).toContain('fn add(a: i32, b: i32) -> i32 { a + b }');
+		expect(text).toMatch(/fn main\(\) \{\n\s+let x = add\(1, 2\);\n\s+println!\("\{x\}"\);\n\}/);
+		expect(text).not.toContain('let stray');
+		expect(text).not.toMatch(/^:dep/m);
+		expect(text).toContain('rand = "0.8"');
+		expect(res.hazards.map((h) => h.kind)).toEqual(['rust-code-dropped']);
+	});
+
+	it('refuses to overwrite a .rs file Cellar did not write', () => {
+		writeFileSync(join(WS, 'mine.rs'), 'fn mine() {}\n');
+		const nb = makeNotebook('main-foreign.ipynb', ['fn f() {}'], { language: 'rust', export_target: 'mine.rs' });
+		nbmod.setCellExport('cell0', true, nb);
+		const res = nbmod.exportPy(nb);
+		expect(res).toMatchObject({ written: false, reason: 'foreign-module' });
+		expect(readFileSync(join(WS, 'mine.rs'), 'utf8')).toBe('fn mine() {}\n');
+	});
+
+	it('does not let a pasted copy claim the main mark beside its original', () => {
+		const nb = makeNotebook('main-paste.ipynb', ['let a = 1;'], { language: 'rust' });
+		nbmod.setCellExportMain('cell0', true, nb);
+		const pasted = nbmod.addCell('cell0', 'code', nb, null, 'let a = 1;', { export: true, export_main: true });
+		const cellar = onDisk(nb).cells.find((c: { id: string }) => c.id === pasted.id).metadata.cellar;
+		expect(cellar.export).toBe(true);
+		expect(cellar.export_main).toBeUndefined();
+		expect(cellarOf(nb, 0).export_main).toBe(true);
 	});
 });
 

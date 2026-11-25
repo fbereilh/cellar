@@ -69,7 +69,9 @@ export const EXPORT_BASE_LABELS: Record<ExportBase, string> = {
  * same namespace, so a boundary-aware prefix test decides containment.
  *
  * The rule, stated so it warns ONLY when it applies:
- *  - a `.mojo` target → null, ALWAYS. Every clause of this warning is about
+ *  - a target that is not a Python module (`.mojo`, `.rs`) → null, ALWAYS. An
+ *    Evcxr kernel does not import through `sys.path` either, so the same
+ *    reasoning covers Rust. For Mojo: every clause of this warning is about
  *    PYTHON import: the kernel's `sys.path` carries the code root
  *    (`projectRootAddCode`), which is why a module outside it is unreachable
  *    from a code cell. A `%%mojo` cell reaches the Mojo compiler through a
@@ -101,7 +103,7 @@ export const EXPORT_BASE_LABELS: Record<ExportBase, string> = {
  */
 export function exportImportWarning(resolved: string | null, root: string | null): string | null {
 	if (!resolved || !root) return null;
-	if (exportTargetLanguage(resolved) === 'mojo') return null;
+	if (exportTargetLanguage(resolved) !== 'python') return null;
 	let shape: RootShape;
 	try {
 		shape = classifyRootPath(root);
