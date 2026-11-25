@@ -493,7 +493,7 @@ test('a `..` path that RESOLVES outside is refused - the matcher normalizes befo
 	// `<ws>/../outside/secret.txt` is LEXICALLY inside `//<ws>/**`: under a purely
 	// textual `**` glob it would match and the secret would be read. So this is
 	// what distinguishes a normalizing matcher from a textual one, and it is a
-	// claim the module header, AGENTS.md and the user-facing Settings copy all
+	// claim the module header, docs/dev-notes/chat-cells.md and the user-facing Settings copy all
 	// make ("paths outside it are refused, including through `..` or a symlink").
 	const fx = makeFixture();
 	try {

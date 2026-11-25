@@ -124,7 +124,7 @@ every surface says so rather than reporting a change the notebook did not take:
 
 - `setCellExport` returns `{ok:false, reason:'export-directive-owns-cell'}`.
 - `PATCH /api/cells/[id]` answers 409 with that reason, and with `not-code` beside it
-  (see AGENTS.md's nbdev-export entry for why that one was widened once eligibility became
+  (see the nbdev-export entry in docs/dev-notes/export.md for why that one was widened once eligibility became
   target-aware). `no-such-cell` stays silent exactly as before - widening it is a separate
   change.
 - MCP `set_cell_export` refuses all-or-nothing, naming the handle the agent supplied and

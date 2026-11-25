@@ -109,7 +109,7 @@ async function mojoNotebook(api: APIRequestContext, rel: string, sources: string
 async function openNotebook(page: Page, rel: string): Promise<void> {
 	await page.goto(`${baseURL}/?ws=${encodeURIComponent(workspace)}`);
 	// Settle before probing: the shell paints either the empty state or an
-	// already-open notebook (the openNotebook-helper rule from AGENTS.md).
+	// already-open notebook (the openNotebook-helper rule from docs/dev-notes/testing.md).
 	// Every open notebook stays MOUNTED (hidden), so even the settle probe has to be
 	// `:visible`-scoped: `getByTestId('cell').first()` can resolve to a cell in a
 	// BACKGROUND pane, which is never visible and never will be.

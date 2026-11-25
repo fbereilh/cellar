@@ -137,9 +137,9 @@ specs.
   git history by [git-cliff](https://git-cliff.org) (run `make changelog` to
   regenerate; see below) - never edit it by hand. Your Conventional-Commits
   commit title is what lands in it.
-- Match the surrounding code's style, comment density, and naming. Cellar's
-  in-repo agent/architecture notes live in `CLAUDE.md`; skim the relevant entry
-  before changing a subsystem.
+- Match the surrounding code's style, comment density, and naming. `AGENTS.md`
+  holds the rules every change must follow, and `docs/dev-notes/` holds the
+  design notes by topic. Skim the relevant note before changing a subsystem.
 
 ## Releasing (maintainers)
 

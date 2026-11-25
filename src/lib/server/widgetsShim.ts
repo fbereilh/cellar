@@ -241,7 +241,7 @@ class _CellarEntryPoint:
     # databricks_utils.py). Every method a probing library reaches for must exist
     # and return an honest undefined/None so attribute/method access never raises;
     # otherwise the AttributeError propagates and kills the import (mlflow only
-    # catches _NoDbutilsError). See AGENTS.md.
+    # catches _NoDbutilsError). See docs/dev-notes/databricks.md.
     def getDbutils(self, *a, **k):
         return _CellarDbutilsProxy()
     def getDriverConf(self, *a, **k):

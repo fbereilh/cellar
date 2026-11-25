@@ -17,4 +17,4 @@ on `main`.
 - [ ] I ran the CI gate locally and it passes: `npm run build && npm run check && npm run test`
 - [ ] E2E run locally if my change needs the full stack (`npm run test:e2e`), or N/A
 - [ ] This PR branches off `main` and is focused on a single change
-- [ ] Docs/comments updated where behavior changed (incl. `CLAUDE.md` if a subsystem's contract changed)
+- [ ] Docs/comments updated where behavior changed (incl. the matching `docs/dev-notes/` note if a subsystem's contract changed)

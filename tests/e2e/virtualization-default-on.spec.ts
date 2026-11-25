@@ -169,7 +169,7 @@ test('with NO url param a large notebook is windowed (P5 default-on)', async ({ 
 	// button invisible, turns the click into a no-op, and then times out on a
 	// notebook nothing ever opened. The 10s here was papering over that - it is a
 	// race, not a slow machine, so a longer probe only moves the threshold. See the
-	// openNotebook rule in AGENTS.md.
+	// openNotebook rule in docs/dev-notes/testing.md.
 	await expect(openBtn.or(page.getByTestId('cell').first())).toBeVisible();
 	if (await openBtn.isVisible().catch(() => false)) await openBtn.click();
 	await expect.poll(() => cells(page), { timeout: 30_000 }).toBeGreaterThan(0);

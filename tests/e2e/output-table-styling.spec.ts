@@ -213,7 +213,7 @@ const SCAN_STEP_PX = 500;
  * cell's output, so by the last one the notebook is tall enough that the bottom
  * cells start as spacers - which have no `run` button AND do not count towards
  * that locator, so an index silently addresses the wrong cell. This spec runs at
- * the shipped windowing default (see the virtualization entry in AGENTS.md); its
+ * the shipped windowing default (see the virtualization entry in docs/dev-notes/virtualization.md); its
  * subject is the CSS cascade, so it mounts what it needs rather than opting out.
  *
  * The sweep runs inside `expect.poll` for one load-bearing reason: `Notebook.svelte`

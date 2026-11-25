@@ -94,7 +94,7 @@ async function openNotebook(page: Page): Promise<void> {
 	// Settle before probing: the shell paints either the empty state or an already
 	// open notebook, and reading `isVisible()` before either arrives reports the
 	// button invisible, turns the click into a no-op, and then times out for 30s on
-	// a notebook nothing ever opened (see the openNotebook rule in AGENTS.md).
+	// a notebook nothing ever opened (see the openNotebook rule in docs/dev-notes/testing.md).
 	await expect(openBtn.or(page.getByTestId('cell').first())).toBeVisible({ timeout: 30_000 });
 	if (await openBtn.isVisible().catch(() => false)) await openBtn.click();
 	else if (!(await page.getByTestId('cell').first().isVisible().catch(() => false))) {

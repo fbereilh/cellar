@@ -46,7 +46,7 @@ const SHELL = readFileSync(join(process.cwd(), 'src/routes/+page.svelte'), 'utf8
  * for an anchor that was renamed or moved above `start`, and `slice(start, -1)`
  * then quietly returns almost the whole file - so every needle below would be
  * satisfied by unrelated code, including a state where the function under guard
- * had lost the very thing being guarded. AGENTS.md records exactly that failure
+ * had lost the very thing being guarded. docs/dev-notes/staleness-and-sql.md records exactly that failure
  * mode for the `notebook-toolbar-guards` anchor.
  */
 function region(src: string, from: string, to: string): string {
