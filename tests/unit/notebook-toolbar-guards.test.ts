@@ -1,5 +1,5 @@
 /**
- * Source guards for the notebook toolbar's whole-notebook actions.
+ * Source guards for the notebook toolbar's four whole-notebook actions.
  *
  * WHAT THESE PROVE, AND WHAT THEY DO NOT — read this before adding one. vitest
  * runs without the SvelteKit plugin (see `vitest.config.ts`), so no Svelte
@@ -47,14 +47,7 @@ import type { AppCommandHandlers, NotebookCommandHandle } from '../../src/lib/co
 const NOTEBOOK = readFileSync(join(process.cwd(), 'src/lib/Notebook.svelte'), 'utf8');
 const LIVE = readFileSync(join(process.cwd(), 'src/lib/LiveNotebook.svelte'), 'utf8');
 
-const TOOLBAR_ACTIONS = [
-	'run-all',
-	'interrupt-all',
-	'restart-kernel',
-	'clear-all-outputs',
-	'consolidate-imports',
-	'toolbar-export'
-];
+const TOOLBAR_ACTIONS = ['run-all', 'interrupt-all', 'clear-all-outputs', 'consolidate-imports'];
 
 const NAVBAR = readFileSync(join(process.cwd(), 'src/lib/Navbar.svelte'), 'utf8');
 
@@ -142,8 +135,8 @@ function registeredApiProps(): string[] {
 	return propertyNames(balanced(args, brace, '{', '}'));
 }
 
-describe('notebook toolbar: the whole-notebook actions', () => {
-	it('renders every whole-notebook action together', () => {
+describe('notebook toolbar: the four whole-notebook actions', () => {
+	it('renders Run all, Interrupt, Clear all outputs and Consolidate imports together', () => {
 		for (const id of TOOLBAR_ACTIONS) {
 			expect(TOOLBAR, `${id} is not in the toolbar`).toContain(`data-testid="${id}"`);
 		}
@@ -152,8 +145,8 @@ describe('notebook toolbar: the whole-notebook actions', () => {
 	it('gives each button a title and an aria-label', () => {
 		for (const id of TOOLBAR_ACTIONS) {
 			const btn = buttonWith(id);
-			expect(btn, `${id} has no title`).toMatch(/\btitle=["{]/);
-			expect(btn, `${id} has no aria-label`).toMatch(/aria-label=["{]/);
+			expect(btn, `${id} has no title`).toMatch(/title="/);
+			expect(btn, `${id} has no aria-label`).toMatch(/aria-label="/);
 		}
 	});
 });
@@ -198,9 +191,6 @@ describe('one pointed surface per action', () => {
 				`data-testid="${id}"`
 			);
 		}
-		// The menu's own spelling of the export, which left it when Export joined the bar.
-		expect(NAVBAR).not.toContain('data-testid="export-py-menu"');
-		expect(NAVBAR).not.toContain('onExportPy');
 	});
 
 	it('offers Export to module from the command palette', () => {

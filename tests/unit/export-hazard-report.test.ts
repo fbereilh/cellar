@@ -489,7 +489,7 @@ describe('the two Svelte halves - source SHAPE guards, not behaviour', () => {
 		// and branch on what is left BEFORE the success wording, so an agent-only kind
 		// can neither raise the warning nor be dropped from a set that does.
 		const nb = read('lib/Notebook.svelte');
-		const fn = nb.slice(nb.indexOf('async function doExport('), nb.indexOf('</script>'));
+		const fn = nb.slice(nb.indexOf('async function doExport()'), nb.indexOf('</script>'));
 		expect(fn).toContain('humanExportHazards(r.hazards ?? [])');
 		expect(fn).toContain('shown.length');
 		expect(fn.indexOf('shown.length')).toBeLessThan(fn.indexOf('exportFeedback = `Exported'));

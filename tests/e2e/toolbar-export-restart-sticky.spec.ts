@@ -9,7 +9,11 @@ import { tabPanelDomId } from '../../src/lib/tabIds';
 /**
  * E2E: the notebook toolbar's Export and Restart buttons, and its sticky compact form.
  *
- *  - Export with a target runs the menu's export and says so on the notice line.
+ *  - Export with a target writes the module, says so on the notice line and
+ *    shows the new file in the tree. A hazard is worded in full on that line.
+ *  - The menu's own Export button shows a new module in the tree too.
+ *  - The navbar Options menu no longer offers the export.
+ *  - The editor keeps the cursor below the pinned toolbar.
  *  - Export with no target writes nothing: it opens the language-and-export menu
  *    with the cursor in the target field.
  *  - Restart sends the existing kernel restart for THIS notebook.
@@ -23,16 +27,25 @@ let launcher: ChildProcess | null = null;
 let workspace = '';
 let baseURL = '';
 
-const NB = { target: 'target.ipynb', bare: 'bare.ipynb', long: 'long.ipynb' } as const;
+const NB = {
+	target: 'target.ipynb',
+	bare: 'bare.ipynb',
+	long: 'long.ipynb',
+	menu: 'menu.ipynb',
+	hazard: 'hazard.ipynb',
+	tall: 'tall.ipynb'
+} as const;
 
-function notebook(cellCount: number, target: string | null): string {
+const EXPORTED = 'def add(a, b):\n    return a + b';
+
+function notebook(cellCount: number, target: string | null, first = EXPORTED): string {
 	const cells = Array.from({ length: cellCount }, (_, i) => ({
 		cell_type: 'code',
 		id: `c${i}`,
 		metadata: i === 0 ? { cellar: { export: true } } : {},
 		execution_count: null,
 		outputs: [],
-		source: [i === 0 ? 'def add(a, b):\n    return a + b' : `# cell ${i}\nx${i} = ${i}\nprint(x${i})`]
+		source: [i === 0 ? first : `# cell ${i}\nx${i} = ${i}\nprint(x${i})`]
 	}));
 	return JSON.stringify({
 		cells,
@@ -68,6 +81,12 @@ test.beforeAll(async () => {
 	writeFileSync(join(workspace, NB.target), notebook(2, 'mod_target.py'));
 	writeFileSync(join(workspace, NB.bare), notebook(2, null));
 	writeFileSync(join(workspace, NB.long), notebook(60, 'mod_long.py'));
+	writeFileSync(join(workspace, NB.menu), notebook(2, 'mod_menu.py'));
+	// A `__future__` import sharing its line cannot be hoisted: the export writes
+	// the module and reports that hazard.
+	writeFileSync(join(workspace, NB.hazard), notebook(2, 'mod_hazard.py', 'x = 1; from __future__ import annotations'));
+	const tall = Array.from({ length: 200 }, (_, i) => `line_${i} = ${i}`).join('\n');
+	writeFileSync(join(workspace, NB.tall), notebook(1, null, tall));
 	const boot = await bootCellar(workspace);
 	launcher = boot.proc;
 	baseURL = boot.url;
@@ -89,8 +108,52 @@ test('Export with a target writes the module and says so', async ({ page }) => {
 	await button.click();
 	await expect(page.getByTestId('app-notice')).toContainText('Exported 1 cell', { timeout: 30_000 });
 	expect(readFileSync(join(workspace, 'mod_target.py'), 'utf8')).toContain('def add(a, b):');
+	// The new file shows in the tree without a manual refresh.
+	await expect(page.getByTestId('tree-file').filter({ hasText: 'mod_target.py' })).toBeVisible();
 	// The menu stays closed: the click exported, it did not open settings.
 	await expect(page.locator('[data-testid="notebook-settings-menu"]:popover-open')).toHaveCount(0);
+});
+
+test('the menu Export button shows the new module in the file tree', async ({ page }) => {
+	await openNotebook(page, NB.menu);
+	const pane = paneFor(page, NB.menu);
+	await pane.getByTestId('notebook-settings').click();
+	await pane.getByTestId('export-run').click();
+	await expect.poll(() => existsSync(join(workspace, 'mod_menu.py')), { timeout: 30_000 }).toBe(true);
+	await expect(page.getByTestId('tree-file').filter({ hasText: 'mod_menu.py' })).toBeVisible();
+});
+
+test('Export with a hazard words the warning in full on the notice line', async ({ page }) => {
+	await openNotebook(page, NB.hazard);
+	await paneFor(page, NB.hazard).getByTestId('toolbar-export').click();
+	const notice = page.getByTestId('app-notice');
+	await expect(notice).toContainText('Wrote mod_hazard.py, but', { timeout: 30_000 });
+	// The menu that holds the standing warning is closed, so the line may not point at it.
+	await expect(notice).not.toContainText('see the warning');
+});
+
+test('the navbar Options menu does not offer Export to module', async ({ page }) => {
+	await openNotebook(page, NB.target);
+	await page.getByTestId('app-menu').click();
+	await expect(page.getByTestId('save-as-py')).toBeVisible();
+	await expect(page.getByRole('button', { name: /Export to module/ })).toHaveCount(0);
+});
+
+test('the editor keeps the cursor below the pinned toolbar', async ({ page }) => {
+	await openNotebook(page, NB.tall);
+	const pane = paneFor(page, NB.tall);
+	const bar = pane.getByTestId('notebook-toolbar');
+	// Put the cursor on the last line, then walk it up past the top of the pane.
+	await pane.getByTestId('cell').first().getByTestId('editor-scroll').click();
+	await page.keyboard.press('ControlOrMeta+End');
+	await expect(bar).toHaveAttribute('data-compact', '');
+	for (let i = 0; i < 120; i++) await page.keyboard.press('ArrowUp');
+	await expect(bar).toHaveAttribute('data-compact', '');
+	const [barBottom, cursorTop] = await Promise.all([
+		bar.evaluate((el) => el.getBoundingClientRect().bottom),
+		pane.locator('.cm-focused .cm-activeLine').evaluate((el) => el.getBoundingClientRect().top)
+	]);
+	expect(cursorTop, 'the cursor line is under the toolbar').toBeGreaterThanOrEqual(barBottom);
 });
 
 test('Export with no target opens the menu at the target field and writes nothing', async ({ page }) => {

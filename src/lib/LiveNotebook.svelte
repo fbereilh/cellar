@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { scrollParent, stickyTopInset } from '$lib/scrollPane';
 	import { onMount, tick, untrack } from 'svelte';
 	import Notebook from '$lib/Notebook.svelte';
 	import { subscribeEvents, originId } from '$lib/events-client';
@@ -133,6 +134,12 @@
 		 * the keyboard being broken.
 		 */
 		onNotice?: (message: string) => void;
+		/** An export wrote this notebook's module file: the shell refreshes the
+		 *  file tree and git decorations. */
+		onModuleWritten?: () => void;
+		/** The shell's export of the active notebook, which posts the result on its
+		 *  notice line. The toolbar Export button runs it. */
+		onExportModule?: () => Promise<void> | void;
 		/** (path, handle|null): lets the Outline drive this notebook's folds. */
 		onRegisterFolds?: (path: string, handle: FoldRegistryHandle | null) => void;
 		/** (path, api|null): lets the sidebar drop a cell in here. */
@@ -242,6 +249,8 @@
 		onRunStateChange,
 		onSelectionChange,
 		onNotice,
+		onModuleWritten,
+		onExportModule,
 		onRegisterFolds,
 		onRegisterNumbering,
 		onRegisterApi,
@@ -1047,16 +1056,6 @@
 		};
 	});
 
-	// The scrollable ancestor the notebook lives in (the shell gives each notebook
-	// tab its own `overflow-y-auto` pane). Falls back to the viewport.
-	function scrollParent(el: HTMLElement): HTMLElement | null {
-		for (let p = el.parentElement; p; p = p.parentElement) {
-			const oy = getComputedStyle(p).overflowY;
-			if (oy === 'auto' || oy === 'scroll') return p;
-		}
-		return null;
-	}
-
 	// "Already visible" means the cell's TOP edge is on screen with room to spare:
 	// the run affordance (accent bar, spinner) lives at the top, so a tall cell
 	// scrolled past its header is not actually showing the user anything.
@@ -1066,13 +1065,6 @@
 		const r = el.getBoundingClientRect();
 		const top = view.top + (parent ? stickyTopInset(parent) : 0);
 		return r.top >= top - 4 && r.top <= view.bottom - Math.min(r.height, 96);
-	}
-
-	// The band at the top of the pane the notebook toolbar's sticky compact row
-	// covers, read from the pane's own `scroll-padding-top` so the native
-	// `scrollIntoView` paths and these hand-rolled ones keep one number.
-	function stickyTopInset(parent: HTMLElement): number {
-		return parseFloat(getComputedStyle(parent).scrollPaddingTop) || 0;
 	}
 
 	function reducedMotion(): boolean {
@@ -3744,6 +3736,7 @@
 			});
 			const body = await res.json().catch(() => ({}));
 			if (!res.ok) throw new Error(body?.message || 'export failed');
+			if (body.written) onModuleWritten?.();
 			return body as ExportPyResult;
 		} catch (err) {
 			onNotice?.(`Export failed: ${(err as Error)?.message || 'export failed'}`);
@@ -5006,7 +4999,7 @@
 			onRunAll={runAll}
 			onInterrupt={onInterruptKernel}
 			onRestart={onRestartKernel}
-			{onNotice}
+			{onExportModule}
 			onClear={clearCell}
 			onClearAll={clearAll}
 			onConsolidateImports={onConsolidateImports}

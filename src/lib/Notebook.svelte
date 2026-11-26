@@ -180,9 +180,10 @@
 		onSetExportTarget?: (target: string, opts?: { keepalive?: boolean }) => void;
 		/** Regenerate the `.py` module now; resolves with the server result. */
 		onExportPy?: () => Promise<ExportPyResult | null>;
-		/** The shell's transient notice line. The toolbar Export button posts its
-		 *  result there, since the menu's own result line is hidden while it is closed. */
-		onNotice?: (message: string) => void;
+		/** The shell's export of the active notebook, which posts the result on its notice
+		 *  line. The toolbar Export button runs it, since the menu's own result line
+		 *  is hidden while the menu is closed. */
+		onExportModule?: () => Promise<void> | void;
 		/** What the stored export path is measured from (`$lib/exportTarget`);
 		 *  `workspace` for the absent-key legacy default. */
 		exportBase?: string;
@@ -353,7 +354,7 @@
 		exportStranded = { count: 0, withLanguage: 0 },
 		onSetExportTarget,
 		onExportPy,
-		onNotice,
+		onExportModule,
 		exportBase = 'workspace',
 		exportResolved = null,
 		exportResolveError = null,
@@ -1037,7 +1038,7 @@
 		window.addEventListener('pagehide', onUnload);
 		return () => window.removeEventListener('pagehide', onUnload);
 	});
-	async function doExport(fromToolbar = false) {
+	async function doExport() {
 		if (exporting) return;
 		exporting = true;
 		exportFeedback = '';
@@ -1072,23 +1073,28 @@
 		else if (shown.length)
 			exportFeedback = `Wrote ${r.count} ${r.count === 1 ? 'cell' : 'cells'} → ${r.target}, but ${hazardSummaryClause(shown)} - see the warning.`;
 		else exportFeedback = `Exported ${r.count} ${r.count === 1 ? 'cell' : 'cells'} → ${r.target}`;
-		// The toolbar button runs this same export, but the line above sits in the
-		// closed menu. Post the same words on the notice line so the click is seen.
-		if (fromToolbar && !settingsOpen && exportFeedback) onNotice?.(exportFeedback);
 	}
 	// The toolbar Export button beside the menu button. With a target that names a
-	// module it runs `doExport`. With none there is nothing it could honestly
+	// module it runs the shell's export, whose result lands on the notice line:
+	// the menu's own result line is hidden. With none there is nothing it could honestly
 	// write, so it opens the menu instead and puts the cursor in the target field.
 	// That half is DECLARATIVE (`popovertarget`), like the menu button, so the
 	// browser owns the toggle and returns focus to this button on close.
 	const exportOpensMenu = $derived(exportLanguage === null);
 	let focusExportTargetOnOpen = false;
-	function onToolbarExport() {
+	async function onToolbarExport() {
 		if (exportOpensMenu) {
 			focusExportTargetOnOpen = !settingsOpen;
 			return;
 		}
-		void doExport(true);
+		if (exporting) return;
+		exporting = true;
+		exportFeedback = '';
+		try {
+			await onExportModule?.();
+		} finally {
+			exporting = false;
+		}
 	}
 </script>
 

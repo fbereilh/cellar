@@ -17,6 +17,7 @@
 	import { sql } from '@codemirror/lang-sql';
 	import { renderChatReply, renderMarkdown, renderOutputMarkdown } from '$lib/markdown';
 	import { EDITOR_THEME } from '$lib/editorTheme';
+	import { scrollParent, stickyTopInset } from '$lib/scrollPane';
 	import { directiveCommentHighlight } from '$lib/directiveComment';
 	import StaticCode from '$lib/StaticCode.svelte';
 	import { rustLanguage, type StaticLang } from '$lib/staticHighlight';
@@ -308,6 +309,7 @@
 
 	let cardEl: HTMLDivElement | undefined; // the cell's outer card: what holds focus in command mode
 	let scrollBoxEl: HTMLDivElement | undefined; // the overflow/height-clamp box (measured for auto-collapse)
+	let scrollPane: HTMLElement | null = null; // the notebook pane this cell scrolls in, found on first use
 	let editorEl: HTMLDivElement | undefined; // the CodeMirror mount point (empty until the editor is built)
 	let view: EditorView | undefined;
 	// The heavy CodeMirror `EditorView` is built lazily, on first edit-intent
@@ -1658,6 +1660,12 @@
 					// simply decline there.
 					kernelCompletion(kernelIntrospectFor),
 					kernelDocTooltip,
+					// The notebook toolbar's sticky row covers the top of the pane, and
+					// CodeMirror does not read `scroll-padding`: keep the cursor below it.
+					EditorView.scrollMargins.of(() => {
+						if (scrollBoxEl) scrollPane ??= scrollParent(scrollBoxEl);
+						return scrollPane ? { top: stickyTopInset(scrollPane) } : null;
+					}),
 					// No run/escape keymap here on purpose: every notebook shortcut,
 					// edit-mode ones included, is declared in `shortcuts.svelte.js` and
 					// dispatched by LiveNotebook's capture-phase handler (which runs
