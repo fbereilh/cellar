@@ -422,7 +422,8 @@ describe('server: duplicate and paste from another app (fstree)', () => {
 		});
 
 		it('refuses a body a cross-site page can send without a preflight', async () => {
-			for (const headers of [{}, { 'content-type': 'text/plain' }, { 'content-type': 'multipart/form-data' }]) {
+			const bodies: Record<string, string>[] = [{}, { 'content-type': 'text/plain' }, { 'content-type': 'multipart/form-data' }];
+			for (const headers of bodies) {
 				await expect(POST(send('POST', query, headers, 'hi'))).rejects.toMatchObject({ status: 415 });
 			}
 			expect(existsSync(join(WS, 'src/note.txt'))).toBe(false);
