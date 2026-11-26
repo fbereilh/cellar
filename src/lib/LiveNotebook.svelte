@@ -607,6 +607,12 @@
 	// (the load itself is the initial sync).
 	let canonicalId: string | null = null;
 	let lastSeq: number | null = null; // last per-notebook `seq` seen (gap detection → refetch)
+	// The latest `notebook:export-derived` push per notebook id that arrived before
+	// the first load resolved. The server answers that load from its last workspace
+	// scan and starts a fresh one, whose result can reach this tab before
+	// `canonicalId` is known. Derived state is published only when it changes, so a
+	// dropped push would never come again. `load()` applies this tab's entry.
+	const earlyExportDerived = new Map<string, PublishedEvent>();
 
 	// ---- Staleness -----------------------------------------------------------
 	// Per-cell staleness verdict (id → {state, reason, upstream}), computed on the
@@ -1703,6 +1709,9 @@
 			exportHazards = body.notebook.exportHazards ?? []; // why the generated module would not import
 			exportOrphanedModule = body.notebook.exportOrphanedModule ?? null; // a generated module this notebook stopped writing
 			exportOtherModules = body.notebook.exportOtherModules ?? []; // where each `#| export <module>` cell goes
+			const early = earlyExportDerived.get(canonicalId);
+			earlyExportDerived.clear();
+			if (early) applyStructuralEvent(early as unknown as StructuralEvent);
 			headerNumbering = body.notebook.headerNumbering ?? []; // display-only heading numbering
 			hideAllCode = !!body.notebook.hideAllCode; // notebook-wide hide-code (report view)
 			// The notebook's language, read back through the shared guard so a hand-edited
@@ -2139,7 +2148,11 @@
 			}
 			// Past this point every event is a per-notebook `PublishedEvent`.
 			const pe = ev as PublishedEvent;
-			if (!canonicalId || pe.nb !== canonicalId) return;
+			if (!canonicalId) {
+				if (pe.type === 'notebook:export-derived') earlyExportDerived.set(pe.nb, pe);
+				return;
+			}
+			if (pe.nb !== canonicalId) return;
 			// A gap in this notebook's monotonic seq means we missed events → refetch.
 			if (lastSeq !== null && pe.seq > lastSeq + 1) load();
 			lastSeq = pe.seq; // advance even for our own echo, so it isn't seen as a gap
