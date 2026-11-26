@@ -351,10 +351,36 @@ const UPLOAD_ID = /^[a-z0-9]{8,64}$/;
 /** How many names (`x`, `x copy`, `x copy 2`, ...) a paste tries before it gives up. */
 const MAX_UPLOAD_NAME_TRIES = 1000;
 
-/** This workspace's own staging folder for part files, under the OS temp dir. */
+/**
+ * The staging root, under the OS temp dir and named for the user. On Linux the
+ * temp dir is shared by every user of the machine, so no folder here may be.
+ * Windows has no user id, and its temp dir is already per user.
+ */
+function uploadStagingRoot(): string {
+	const uid = process.getuid?.();
+	return join(tmpdir(), uid === undefined ? 'cellar-uploads' : `cellar-uploads-${uid}`);
+}
+
+/** This workspace's own staging folder for part files, inside the user's staging root. */
 export function uploadStagingDir(): string {
 	const key = createHash('sha256').update(resolve(workspaceRoot())).digest('hex').slice(0, 16);
-	return join(tmpdir(), 'cellar-uploads', key);
+	return join(uploadStagingRoot(), key);
+}
+
+/**
+ * Create this workspace's staging folder, owner-only. Refuses a staging root
+ * that is not a real folder owned by this user: someone else made it, so part
+ * files written there would be theirs to read or swap.
+ */
+function ensureUploadStagingDir(): void {
+	const root = uploadStagingRoot();
+	mkdirSync(root, { recursive: true, mode: 0o700 });
+	const st = lstatSync(root);
+	const uid = process.getuid?.();
+	if (!st.isDirectory() || (uid !== undefined && st.uid !== uid)) {
+		throw new Error(`upload staging folder ${root} is not a folder owned by this user`);
+	}
+	mkdirSync(uploadStagingDir(), { recursive: true, mode: 0o700 });
 }
 
 /**
@@ -426,7 +452,7 @@ export function writeUploadChunk(opts: {
 		throw new Error(`file too large to paste (over the ${Math.round(MAX_UPLOAD_BYTES / (1024 * 1024))} MB limit)`);
 	}
 	if (offset === 0) {
-		mkdirSync(dirname(part), { recursive: true, mode: 0o700 });
+		ensureUploadStagingDir();
 		writeFileSync(part, opts.bytes, { flag: 'wx', mode: 0o600 });
 	} else {
 		const have = existsSync(part) ? statSync(part).size : -1;

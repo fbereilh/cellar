@@ -3,7 +3,7 @@
  * lands, which clipboard a paste reads, and the chunked upload a paste from
  * another app goes through. The server half runs over a real temp workspace.
  */
-import { describe, it, expect, beforeAll, beforeEach, afterAll, vi } from 'vitest';
+import { describe, it, expect, beforeAll, beforeEach, afterAll, afterEach, vi } from 'vitest';
 import {
 	existsSync,
 	lstatSync,
@@ -12,11 +12,12 @@ import {
 	readdirSync,
 	readFileSync,
 	rmSync,
+	statSync,
 	symlinkSync,
 	writeFileSync
 } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { copyName, freeName, pasteSource, pasteTargetDir, uploadChunks, UPLOAD_CHUNK_BYTES } from '$lib/filePaste';
 
 /**
@@ -35,6 +36,13 @@ vi.mock('node:fs', async (importOriginal) => {
 			throw Object.assign(new Error('EXDEV: cross-device link not permitted'), { code: 'EXDEV' });
 		}
 	};
+});
+
+/** A test can point the OS temp dir at a scratch folder, so the staging root is its own. */
+const os = vi.hoisted(() => ({ tmp: null as null | string }));
+vi.mock('node:os', async (importOriginal) => {
+	const real = await importOriginal<typeof import('node:os')>();
+	return { ...real, tmpdir: () => os.tmp ?? real.tmpdir() };
 });
 
 describe('copyName / freeName', () => {
@@ -281,6 +289,58 @@ describe('server: duplicate and paste from another app (fstree)', () => {
 			})
 		).toThrow(/out of order/);
 		expect(existsSync(join(WS, 'src/big.bin'))).toBe(false);
+	});
+
+	describe('staging root', () => {
+		let TMP: string;
+		const firstChunk = () =>
+			fs.writeUploadChunk({
+				dir: 'src',
+				name: 'big.bin',
+				id: 'jjjjjjjj',
+				offset: 0,
+				bytes: Buffer.from('ab'),
+				last: false
+			});
+
+		beforeEach(() => {
+			TMP = mkdtempSync(join(tmpdir(), 'cellar-file-paste-tmp-'));
+			os.tmp = TMP;
+		});
+		afterEach(() => {
+			os.tmp = null;
+			rmSync(TMP, { recursive: true, force: true });
+		});
+
+		it.skipIf(process.getuid === undefined)('shares no folder with another user of the temp dir', () => {
+			firstChunk();
+			const [root, ...others] = readdirSync(TMP);
+			expect(others).toEqual([]);
+			expect(root.endsWith(`-${process.getuid!()}`)).toBe(true);
+			expect(dirname(fs.uploadStagingDir())).toBe(join(TMP, root));
+			for (const dir of [join(TMP, root), fs.uploadStagingDir()]) {
+				expect(statSync(dir).mode & 0o777).toBe(0o700);
+			}
+			expect(statSync(join(fs.uploadStagingDir(), 'jjjjjjjj.part')).mode & 0o777).toBe(0o600);
+		});
+
+		it('clears the staged part at server start', () => {
+			firstChunk();
+			expect(stagedParts()).toEqual(['jjjjjjjj.part']);
+			fs.sweepStagedUploads();
+			expect(stagedParts()).toEqual([]);
+		});
+
+		it('refuses a staging root that someone else planted', () => {
+			const elsewhere = mkdtempSync(join(tmpdir(), 'cellar-file-paste-planted-'));
+			try {
+				symlinkSync(elsewhere, dirname(fs.uploadStagingDir()));
+				expect(firstChunk).toThrow(/not a folder owned by this user/);
+				expect(readdirSync(elsewhere)).toEqual([]);
+			} finally {
+				rmSync(elsewhere, { recursive: true, force: true });
+			}
+		});
 	});
 
 	it('steps past a broken symlink that holds the name', () => {
