@@ -4,7 +4,7 @@
 **Scope:** the NARROW slice the captain authorized on 2026-08-28 - Cellar reads nbdev's
 `#| export` directive as a source of a cell's export mark, and resolves a `#|default_exp`
 target through the project's `lib_path`. Everything else in the nbdev convergence menu was
-explicitly excluded; see §5.
+explicitly excluded; see §5. A later change added the valued `#| export <module>`; see §6.
 
 Background: `firstmate/data/cellar-nbdev-compat-scout/report.md` (§2.2, §2.3, §5.2, §6.1)
 is the investigation this implements. It is not repeated here.
@@ -24,6 +24,7 @@ is what keeps it honest, and it already caught one rule that reasoning got backw
 | Where does a `#\|default_exp` module land? | `src/lib/server/export-py.ts` - `storedExportTarget` / `directiveBase` |
 | nbdev's `lib_path` | `src/lib/server/nbdev.ts` - `nbdevLibPath` |
 | Refusals | `notebook.ts` `setCellExport`, the `PATCH /api/cells/[id]` route, MCP `set_cell_export` |
+| `#\| export <module>` into another notebook's module (§6) | `exportRole.ts` `exportOtherModuleName`; `export-py.ts` `otherModuleCells` / `composeModule`; `server/export-peers.ts` |
 
 Tests: `nbdev-directives` (the scanner + the differential), `nbdev-export-directive` (the
 mark, end to end through the real doc layer / exporter / agent surface),
@@ -207,7 +208,7 @@ the failure is visible rather than silent.
 
 ## 5. What is deliberately NOT read, and what that costs
 
-Only a **bare** `#| export`, and only that exact name.
+Only `#| export`, bare or valued (§6), and only that exact name.
 
 | Directive | nbdev's module behaviour (measured) | Cellar |
 |---|---|---|
@@ -215,13 +216,11 @@ Only a **bare** `#| export`, and only that exact name.
 | `exports` | module code + `__all__` - *identical for the module*; differs only in docs rendering | not read |
 | `exporti` | module code, NOT in `__all__` | not read |
 | `exportd` | docstring, not module code | not read |
-| `export <module>` | a SECOND module beside the `default_exp` one | not read |
+| `export <module>` | the named module INSTEAD of the `default_exp` one | **read: into that module** (§6) |
 
 `exporti` and `exportd` genuinely cannot be expressed by a single boolean, and a wrong
 guess writes an unwanted public name or a markdown blob into a file that is committed to
-git. A valued `#| export other` names a module Cellar's one-target-per-notebook model
-cannot express, so reading it as a mark would be the §5.2 wrong-file write reached from
-the cell side.
+git.
 
 **`exports` is the one worth flagging back.** The captain's exclusion rested on "Cellar's
 single boolean cannot express them", and for `exports` that premise is FALSE as measured -
@@ -288,3 +287,48 @@ reads, so it is recorded rather than done here.
 Also out of this slice, per the captain: the docs-pipeline directives (`hide`, `hide_line`,
 `echo`, `output`, `code-fold`, `eval: false`, `exec_doc`, `filter_stream`); mirroring
 Cellar metadata into `metadata.nbdev`; and adopting nbdev's exporter or tooling.
+
+---
+
+## 6. `#| export <module>`: a cell into another notebook's module
+
+nbdev's `#| export othermod` sends a cell to `othermod` instead of the notebook's own
+`default_exp` module, and adds its names to that module's `__all__`
+(`nbdev/export.py`, `nbdev/maker.py`, read in nbdev 3.3.31).
+
+**The module is composed from every notebook that feeds it.** The notebook whose own export
+target is the module (an explicit `export_target` or a `#|default_exp`) is its owner, and
+its marked cells come first. Then every `#| export <module>` cell naming that file follows,
+notebook by notebook in workspace-relative path order, each notebook's cells in document
+order. `__all__` takes the public names of all of them. The header keeps its
+`# Source notebook:` line for the owner and adds one `# Also from notebook: <path>` line
+per other notebook, so a module only one notebook writes is byte-identical to before.
+
+**Every export rebuilds the whole file.** Exporting the owner or any contributor builds the
+same bytes from all of them, so a repeated export is a no-op and a removed directive drops
+its cell. nbdev instead appends to the file the previous notebook wrote, in file-name order,
+so its result depends on which notebook it reaches first. That order difference is the one
+deliberate divergence.
+
+**Resolution reuses `#|default_exp`'s.** The module is the value's first token, resolved by
+`directiveModulePath` exactly as `#|default_exp <module>` would be: dotted name under the
+nbdev `lib_path`, else the workspace, through the same refusals. A cell carrying it never
+goes into its own notebook's module, even with Cellar's flag set, and Cellar cannot mark or
+unmark it, because the line owns it.
+
+**Refuse, never drop.** A cell goes into no module, with a reason on a warning badge on the
+cell and in `ExportResult.refused`, when:
+
+- the module cannot be resolved;
+- no notebook owns that file, or more than one does;
+- the notebook is Mojo or Rust. The valued form is read only in Python notebooks.
+
+**Finding the other notebooks.** `server/export-peers.ts` walks the workspace for `.ipynb`
+files on nbdev's `nbglob` skip rule (no `.` or `_` names) and the file tree's noise folders.
+An open notebook is read from its live document, any other from disk with a stat-keyed
+parse cache. A `.py` text notebook takes no part. The cell badges ask only when the notebook
+carries a valued `#| export`, so an ordinary notebook pays nothing.
+
+The UI: a fed cell's export toggle shows ON, and a neutral chip beside it names the file it
+goes into. Its title names the module, its owner, and the line to remove.
+

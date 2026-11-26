@@ -194,6 +194,18 @@ describe('a directive target resolves under lib_path', () => {
 		});
 	});
 
+	it('resolves a `#| export <module>` cell under lib_path too, into the owner module', () => {
+		pyproject('[project]\nname = "pkg"\n[tool.nbdev]\nlib_path = "nbs/pkg"\n');
+		directiveNb('sub.tools');
+		const fed = writeNb(`fed-${NB}`, [{ id: 'f', source: '#| export sub.tools\ndef fed(): return 2' }]);
+		expect(nbmod.exportPy(fed).modules).toMatchObject([
+			{ target: 'pkg/sub/tools.py', owner: NB, written: true, count: 1 }
+		]);
+		const text = readFileSync(join(WS, 'pkg/sub/tools.py'), 'utf8');
+		expect(text).toContain("__all__ = ['marked', 'fed']");
+		expect(text).toContain(`# Also from notebook: fed-${NB}`);
+	});
+
 	it('refuses when lib_path resolves OUTSIDE the workspace, rather than writing there', () => {
 		// The nbdev project legitimately sits above the workspace, so its library can
 		// too. The module may only ever be written inside the workspace, and the

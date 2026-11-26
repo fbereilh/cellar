@@ -38,6 +38,7 @@ import { IMPORTS_ROLE, isImportsCell, clampMoveIndex } from '../importsRole';
 import { moveSelectionPlan } from '../cellSelection';
 import {
 	exportNotebookToPy,
+	otherModuleView,
 	resolveExportTarget,
 	docExportHazards,
 	docHumanExportHazards,
@@ -49,6 +50,7 @@ import {
 	type ResolvedExportTarget
 } from './export-py';
 import type { ExportHazard } from '../exportHazard';
+import type { OtherModuleView } from '../exportRole';
 import {
 	canExportCell,
 	exportDirectiveOwnsCell,
@@ -63,6 +65,7 @@ import { isHiddenFromAgent } from '../agentVisibility';
 import { isExportBase, type ExportBase } from '../exportTarget';
 import { gitRootOf } from './git';
 import { resolveInWorkspace } from './fstree';
+import { exportPeers } from './export-peers';
 import {
 	InvalidNotebookLanguageError,
 	isLogicalCellType,
@@ -307,11 +310,19 @@ function persist(doc: NotebookDoc): void {
 function regenerateExportModule(doc: NotebookDoc): void {
 	if (doc.jpFormat) return; // `.py` text notebooks carry no cellar cell metadata
 	try {
-		exportNotebookToPy(doc);
+		exportNotebookToPy(doc, peersOf(doc));
 		doc.lastExportError = null;
 	} catch (err) {
 		doc.lastExportError = String((err as Error)?.message ?? err);
 	}
+}
+
+/**
+ * Every other notebook in the workspace, for `#| export <module>` (`export-peers.ts`):
+ * an open one as its live document.
+ */
+function peersOf(doc: NotebookDoc): NotebookDoc[] {
+	return exportPeers(doc.path, (abs) => docs.get(abs));
 }
 
 /**
@@ -391,10 +402,19 @@ function publishExportDerived(doc: NotebookDoc): void {
 	// differently. It is in the key too, so a leftover appearing or being deleted is
 	// itself a change worth one event.
 	const orphanedModule = orphanedGeneratedModule(doc, info);
-	const key = [resolved ?? '', resolveError ?? '', orphanedModule ?? '', ...hazards.map((h) => h.message)].join('\u0000');
+	// Where each `#| export <module>` cell goes, or why it goes nowhere. Empty, with
+	// no workspace scan, for a notebook without such a cell.
+	const otherModules = otherModuleView(doc, () => peersOf(doc));
+	const key = [
+		resolved ?? '',
+		resolveError ?? '',
+		orphanedModule ?? '',
+		...hazards.map((h) => h.message),
+		...otherModules.map((o) => [o.id, o.target ?? '', o.error ?? ''].join('\u0001'))
+	].join('\u0000');
 	if (key === doc.lastExportDerivedKey) return;
 	doc.lastExportDerivedKey = key;
-	emit(doc, 'notebook:export-derived', { resolved, resolveError, hazards, orphanedModule });
+	emit(doc, 'notebook:export-derived', { resolved, resolveError, hazards, orphanedModule, otherModules });
 }
 
 /**
@@ -583,6 +603,7 @@ function exportTargetView(doc: NotebookDoc): {
 	exportResolveError: string | null;
 	exportHazards: ExportHazard[];
 	exportOrphanedModule: string | null;
+	exportOtherModules: OtherModuleView[];
 } {
 	const info = resolveExportTarget(doc);
 	return {
@@ -604,7 +625,10 @@ function exportTargetView(doc: NotebookDoc): {
 		// stays and this notebook stops writing it. Threaded the SAME `info` rather than
 		// resolved again, and narrowed before it touches the filesystem, so an ordinary
 		// notebook pays nothing (`orphanedGeneratedModule`).
-		exportOrphanedModule: orphanedGeneratedModule(doc, info)
+		exportOrphanedModule: orphanedGeneratedModule(doc, info),
+		// Each `#| export <module>` cell's module, or why it goes into none. Empty,
+		// with no workspace scan, for a notebook without such a cell.
+		exportOtherModules: otherModuleView(doc, () => peersOf(doc))
 	};
 }
 
@@ -1986,7 +2010,7 @@ export function exportPy(nb?: string | null): ExportResult {
 	const doc = docFor(nb);
 	if (!notebookHoldsExport(!!doc.jpFormat)) throw new Error('cannot export a .py text notebook to a module');
 	try {
-		const res = exportNotebookToPy(doc);
+		const res = exportNotebookToPy(doc, peersOf(doc));
 		doc.lastExportError = null;
 		return res;
 	} catch (err) {

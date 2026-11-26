@@ -498,7 +498,7 @@ describe('the two Svelte halves - source SHAPE guards, not behaviour', () => {
 		const notice = page.slice(page.indexOf('async function exportPy()'), page.indexOf('// Toggle the active notebook'));
 		expect(notice).toContain('humanExportHazards(r.hazards ?? [])');
 		expect(notice).toContain('shown.length');
-		expect(notice.indexOf('shown.length')).toBeLessThan(notice.indexOf('showNotice(`Exported'));
+		expect(notice.indexOf('shown.length')).toBeLessThan(notice.indexOf('say(`Exported'));
 		// EVERY message, through the one shared joining rule - never `hazards[0]`,
 		// which silently dropped every finding after the first.
 		expect(notice).toContain('hazardReport(shown)');

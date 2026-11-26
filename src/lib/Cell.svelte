@@ -42,6 +42,7 @@
 		EXPORT_STRANDED_BADGE,
 		EXPORT_STRANDED_CELL_TITLE,
 		notebookHoldsExport,
+		type OtherModuleView,
 		type ExportLanguage,
 		moduleExtension
 	} from '$lib/exportRole';
@@ -164,6 +165,12 @@
 		rustDrop?: RustCellDrop | null;
 		/** Whether any cell in the notebook is the main cell of the `.rs` module. */
 		rustMainIsMarked?: boolean;
+		/**
+		 * This cell's `#| export <module>`: the module another notebook owns that it
+		 * goes into, or why it goes into none. Null for every other cell. Decided on
+		 * the server, which can see the workspace's other notebooks.
+		 */
+		otherModule?: OtherModuleView | null;
 		dragging?: boolean;
 		/** Fold keys of every collapsed heading in the notebook. */
 		foldedIds?: Set<string>;
@@ -259,6 +266,7 @@
 		notebookLanguage = 'python',
 		mainDropped = false,
 		rustDrop = null,
+		otherModule = null,
 		rustMainIsMarked = false,
 		dragging = false,
 		foldedIds = new Set(),
@@ -501,6 +509,16 @@
 	// The shared rule (`exportMarkedTwice`) is what keeps this tooltip, the shell's
 	// refusal notice and MCP's saying the same true thing about the same cell.
 	const exportMarkedBoth = $derived(exportMarkedTwice(cell, exportCellLanguage));
+	// A `#| export <module>` line sends this cell to the module ANOTHER notebook
+	// owns. The toggle shows ON (the cell is exported), and a chip beside it names
+	// the file, because ON alone reads as this notebook's own module. A refused one
+	// shows OFF: it goes into no module, and its warning badge says why.
+	const exportOther = $derived(otherModule && !otherModule.error && otherModule.target ? otherModule : null);
+	const exportOtherTitle = $derived(
+		exportOther
+			? `Exported to ${exportOther.target}, the module of ${exportOther.owner}, by the "#| export ${exportOther.module}" line in this cell - remove that line to stop exporting it there`
+			: null
+	);
 	// Withheld from every agent surface (`cellar.hidden_from_agent`, the shared
 	// predicate MCP filters every read through). Deliberately UNGATED: unlike export
 	// and hide-code this applies to every cell type - a markdown cell's prose is as
@@ -1310,7 +1328,7 @@
 		// A STRANDED mark reads `isExport === false` (the cell is eligible for no
 		// module), so the plain negation would try to MARK it again - the one thing
 		// the server refuses. The only honest action there is to clear the flag.
-		onSetExport?.(cell.id, exportStranded ? false : !isExport);
+		onSetExport?.(cell.id, exportStranded ? false : !(isExport || exportOther));
 	}
 	function toggleExportMain() {
 		onSetExportMain?.(cell.id, !isExportMain);
@@ -2341,20 +2359,24 @@
 					<button
 						class="btn btn-ghost btn-xs btn-square {exportStranded
 							? 'bg-base-content/5 text-base-content/35 hover:text-base-content/60'
-							: isExport
+							: isExport || exportOther
 								? 'bg-accent/15 text-accent hover:bg-accent/25'
 								: 'text-base-content/60 hover:text-base-content/90'}"
 						onclick={toggleExport}
-						aria-pressed={isExport || exportStranded}
+						aria-pressed={isExport || exportStranded || !!exportOther}
 						title={exportStranded
 							? EXPORT_STRANDED_CELL_TITLE
-							: exportMarkedBoth
-								? 'Exported twice - by the "#| export" line in this cell AND by Cellar\'s own flag. Remove that line, then unmark it here to clear the flag'
-								: exportByDirective
-									? 'Exported by the "#| export" line in this cell - remove that line to stop exporting it'
-									: isExport
-										? `Exported to the notebook's ${exportModuleLabel} - click to unmark`
-										: `Mark for export to the notebook's ${exportModuleLabel}`}
+							: exportOtherTitle
+								? exportOtherTitle
+								: otherModule?.error
+									? `Not exported - ${otherModule.error}`
+									: exportMarkedBoth
+										? 'Exported twice - by the "#| export" line in this cell AND by Cellar\'s own flag. Remove that line, then unmark it here to clear the flag'
+										: exportByDirective
+											? 'Exported by the "#| export" line in this cell - remove that line to stop exporting it'
+											: isExport
+												? `Exported to the notebook's ${exportModuleLabel} - click to unmark`
+												: `Mark for export to the notebook's ${exportModuleLabel}`}
 						aria-label={exportToggleName}
 						data-directive-export={exportByDirective ? 'true' : undefined}
 						data-export-stranded={exportStranded ? 'true' : undefined}
@@ -2371,6 +2393,17 @@
 						     reason once on the card, not once per control). Weight matched to
 						     the sibling `main not exported` badge. -->
 						<span class="text-xs text-base-content/50" data-testid="export-stranded-badge">{EXPORT_STRANDED_BADGE}</span>
+					{/if}
+					{#if exportOther}
+						<!-- Where this cell's `#| export <module>` line sends it: another
+						     notebook's module. Neutral, the badges' shape without their
+						     warning hue - nothing is wrong. Truncated so a deep path cannot
+						     push the row's controls out of the card. -->
+						<span
+							class="inline-flex max-w-56 items-center truncate rounded bg-base-content/5 px-1.5 py-0.5 font-mono text-[11px] text-base-content/70"
+							data-testid="export-other-module-chip"
+							title={exportOtherTitle}
+						>→ {exportOther.target}</span>
 					{/if}
 				{/if}
 				{#if mainToggleOffered}
@@ -2574,6 +2607,20 @@
 					>
 						<svg class="h-3 w-3 text-warning" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z" /><path d="M12 9v4" /><path d="M12 17h.01" /></svg>
 						{MAIN_DROPPED_BADGE}
+					</span>
+				{/if}
+				{#if otherModule?.error}
+					<!-- A `#| export <module>` cell that goes into NO module: nothing owns
+					     that module, it cannot be resolved, or this is not a Python
+					     notebook. Same shape and colour rule as the badges beside it: the
+					     text says WHAT, the title says WHY and what to change. -->
+					<span
+						class="ml-2 inline-flex items-center gap-1 rounded bg-warning/15 px-1.5 py-0.5 text-[11px] font-medium text-base-content/80"
+						data-testid="export-other-refused-badge"
+						title={otherModule.error}
+					>
+						<svg class="h-3 w-3 text-warning" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z" /><path d="M12 9v4" /><path d="M12 17h.01" /></svg>
+						{otherModule.module} not exported
 					</span>
 				{/if}
 				{#if rustDrop && rustDropText}

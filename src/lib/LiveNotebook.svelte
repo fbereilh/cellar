@@ -39,12 +39,14 @@
 		exportLanguageOf,
 		exportModuleLanguage as exportModuleLanguageOf,
 		exportMarkedTwice,
+		exportOtherModuleName,
 		exportStrandedSummary,
 		exportTargetLanguage,
 		isExportCell,
 		notebookHoldsExport,
 		TEXT_NOTEBOOK_EXPORT_MARK_MESSAGE,
-		moduleExtension
+		moduleExtension,
+		type OtherModuleView
 	} from '$lib/exportRole';
 	import { mojoMainDroppedIds } from '$lib/mojoExport';
 	import { rustExportDrops, rustMainMarked } from '$lib/rustExport';
@@ -187,6 +189,7 @@
 				resolved?: string | null;
 				resolveError?: string | null;
 				orphanedModule?: string | null;
+				otherModules?: OtherModuleView[];
 		  }
 		| { type: 'notebook:root'; root: string | null }
 		| { type: 'notebook:header-numbering'; levels: number[] }
@@ -381,6 +384,11 @@
 	// the server can see it), seeded on load and kept live by the same
 	// `notebook:export-derived` push as the three fields above.
 	let exportOrphanedModule = $state<string | null>(null);
+	// Each `#| export <module>` cell: the module another notebook owns that it goes
+	// into, or why it goes into none. Server-derived (it needs the workspace's other
+	// notebooks), seeded on load and kept live by the same push as the fields above.
+	let exportOtherModules = $state<OtherModuleView[]>([]);
+	const otherModules = $derived(new Map(exportOtherModules.map((o) => [o.id, o])));
 	let exportBaseBusy = $state(false);
 	// Code root: the workspace-relative directory THIS notebook's kernel runs in and
 	// imports from (null = the workspace root, the default and today's behavior).
@@ -1694,6 +1702,7 @@
 			exportResolveError = body.notebook.exportResolveError ?? null; // or why it cannot resolve
 			exportHazards = body.notebook.exportHazards ?? []; // why the generated module would not import
 			exportOrphanedModule = body.notebook.exportOrphanedModule ?? null; // a generated module this notebook stopped writing
+			exportOtherModules = body.notebook.exportOtherModules ?? []; // where each `#| export <module>` cell goes
 			headerNumbering = body.notebook.headerNumbering ?? []; // display-only heading numbering
 			hideAllCode = !!body.notebook.hideAllCode; // notebook-wide hide-code (report view)
 			// The notebook's language, read back through the shared guard so a hand-edited
@@ -1871,6 +1880,7 @@
 			exportResolveError = ev.resolveError ?? null;
 			exportHazards = (ev.hazards ?? []) as ExportHazard[];
 			exportOrphanedModule = ev.orphanedModule ?? null;
+			exportOtherModules = ev.otherModules ?? [];
 		} else if (ev.type === 'notebook:root') {
 			// The code root changed in another tab or from an agent (this tab's own
 			// change is echo-suppressed by originId and refreshes the list itself). The
@@ -2492,7 +2502,8 @@
 	 */
 	function moduleSourceIds(addressed: readonly string[] = []): string[] {
 		const ids = new Set(addressed);
-		for (const c of cells) if (isExportCell(c, exportLanguage)) ids.add(c.id);
+		for (const c of cells)
+			if (isExportCell(c, exportLanguage) || exportOtherModuleName(c, exportLanguage) !== null) ids.add(c.id);
 		return [...ids];
 	}
 
@@ -2754,6 +2765,15 @@
 		// refreshed for a MOUNTED cell whose remote edit is stashed behind the "changed
 		// on server" banner. In that window the directive is on the server's copy and
 		// not on ours, so the server's own refusal below is what keeps the promise.
+		// A `#| export <module>` line decides BOTH directions: the cell goes into that
+		// module and never into this notebook's, so a mark here would change nothing.
+		const otherModule = exportOtherModuleName(cell, exportLanguage);
+		if (otherModule !== null) {
+			onNotice?.(
+				`That cell's "#| export ${otherModule}" line sends it to another module, so Cellar cannot mark or unmark it here - edit or remove that line instead.`
+			);
+			return;
+		}
 		if (!exported && exportDirectiveOwnsCell(cell, exportLanguage)) {
 			onNotice?.(exportDirectiveNotice(exportMarkedTwice(cell, exportLanguage)));
 			return;
@@ -5005,6 +5025,7 @@
 			onSetExportMain={setExportMain}
 			{rustDrops}
 			{rustMainIsMarked}
+			{otherModules}
 			exportTarget={exportTarget}
 			exportCount={exportCount}
 			exportStranded={exportStranded}
