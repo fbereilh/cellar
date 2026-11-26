@@ -505,16 +505,12 @@ describe('the two Svelte halves - source SHAPE guards, not behaviour', () => {
 		const first = futureImportJoinedHazard(JOINED);
 		const second = futureImportJoinedHazard('from __future__ import division; y = 2');
 		const hazardous = exportShellNotice({ written: true, target: 'm.py', count: 2, hazards: [first, second] });
-		expect(hazardous.text.startsWith('Wrote m.py, but ')).toBe(true);
-		expect(hazardous.text).not.toContain('Exported');
-		expect(hazardous.text).toContain(first.message);
-		expect(hazardous.text).toContain(second.message);
-		expect(hazardous.refresh).toBe(true);
+		expect(hazardous.startsWith('Wrote m.py, but ')).toBe(true);
+		expect(hazardous).not.toContain('Exported');
+		expect(hazardous).toContain(first.message);
+		expect(hazardous).toContain(second.message);
 
-		expect(exportShellNotice({ written: true, target: 'm.py', count: 2, hazards: [] })).toEqual({
-			text: 'Exported 2 cells → m.py.',
-			refresh: true
-		});
+		expect(exportShellNotice({ written: true, target: 'm.py', count: 2, hazards: [] })).toBe('Exported 2 cells → m.py.');
 
 		// What the `#| export <module>` cells did follows the own module's sentence.
 		const fed = exportShellNotice({
@@ -524,7 +520,7 @@ describe('the two Svelte halves - source SHAPE guards, not behaviour', () => {
 			hazards: [],
 			modules: [{ target: 'core.py', owner: 'core.ipynb', written: true, count: 1, hazards: [] }]
 		});
-		expect(fed.text).toBe('Exported 1 cell → m.py. Wrote 1 cell into core.py, the module of core.ipynb.');
+		expect(fed).toBe('Exported 1 cell → m.py. Wrote 1 cell into core.py, the module of core.ipynb.');
 
 		// A notebook with no module of its own reports only the fed module.
 		expect(
@@ -535,8 +531,7 @@ describe('the two Svelte halves - source SHAPE guards, not behaviour', () => {
 				reason: 'no-target',
 				modules: [{ target: 'core.py', owner: 'core.ipynb', written: true, count: 1, hazards: [] }]
 			})
-		).toEqual({ text: 'Wrote 1 cell into core.py, the module of core.ipynb.', refresh: true });
-		expect(exportShellNotice({ written: false, target: null, count: 0, reason: 'no-target' }).refresh).toBe(false);
+		).toBe('Wrote 1 cell into core.py, the module of core.ipynb.');
 	});
 
 	it('LiveNotebook mentions the load seed and the live event in its dispatcher', () => {

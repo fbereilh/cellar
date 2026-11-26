@@ -193,6 +193,19 @@ describe('one pointed surface per action', () => {
 		}
 	});
 
+	it('offers Export to module from the command palette', () => {
+		let ran = 0;
+		const app = { exportModule: () => ran++ } as unknown as AppCommandHandlers;
+		const notebook = { dispatch() {}, runAll() {}, clearAll() {} } as NotebookCommandHandle;
+		const cmd = buildCommands({ notebook, app }).find((c) => c.id === 'export-module');
+		expect(cmd, 'the palette does not offer export-module').toBeDefined();
+		expect(cmd!.disabled).toBe(false);
+		cmd!.run();
+		expect(ran, 'the palette entry does not reach the shell handler').toBe(1);
+		const none = buildCommands({ notebook: null, app }).find((c) => c.id === 'export-module');
+		expect(none!.disabled, 'enabled with no notebook').toBe(true);
+	});
+
 	// `commands.ts` is plain TypeScript with no Svelte dependency, so unlike every
 	// guard above this one has a real executable interface: build the palette and
 	// invoke the entry.

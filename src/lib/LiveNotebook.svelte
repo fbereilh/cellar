@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { scrollParent, stickyTopInset } from '$lib/scrollPane';
 	import { onMount, tick, untrack } from 'svelte';
 	import Notebook from '$lib/Notebook.svelte';
 	import { subscribeEvents, originId } from '$lib/events-client';
@@ -135,6 +136,12 @@
 		 * the keyboard being broken.
 		 */
 		onNotice?: (message: string) => void;
+		/** An export wrote this notebook's module file: the shell refreshes the
+		 *  file tree and git decorations. */
+		onModuleWritten?: () => void;
+		/** The shell's export of the active notebook, which posts the result on its
+		 *  notice line. The toolbar Export button runs it. */
+		onExportModule?: () => Promise<void> | void;
 		/** (path, handle|null): lets the Outline drive this notebook's folds. */
 		onRegisterFolds?: (path: string, handle: FoldRegistryHandle | null) => void;
 		/** (path, api|null): lets the sidebar drop a cell in here. */
@@ -150,6 +157,9 @@
 		onRunEnd?: () => void;
 		/** Interrupt this notebook's kernel (same handler the Kernels sidebar uses). */
 		onInterruptKernel?: () => void;
+		/** Restart this notebook's kernel (same handler the Kernels sidebar and the
+		 *  palette use); resolves once the request settles. */
+		onRestartKernel?: () => Promise<void> | void;
 		/**
 		 * Consolidate THIS notebook's imports (the shell owns the request, and binds
 		 * it to this notebook's path the way `onInterruptKernel` is bound).
@@ -242,6 +252,8 @@
 		onRunStateChange,
 		onSelectionChange,
 		onNotice,
+		onModuleWritten,
+		onExportModule,
 		onRegisterFolds,
 		onRegisterNumbering,
 		onRegisterApi,
@@ -249,6 +261,7 @@
 		onRunStart,
 		onRunEnd,
 		onInterruptKernel,
+		onRestartKernel,
 		onConsolidateImports,
 		consolidating = false,
 		onBlame,
@@ -1057,16 +1070,6 @@
 		};
 	});
 
-	// The scrollable ancestor the notebook lives in (the shell gives each notebook
-	// tab its own `overflow-y-auto` pane). Falls back to the viewport.
-	function scrollParent(el: HTMLElement): HTMLElement | null {
-		for (let p = el.parentElement; p; p = p.parentElement) {
-			const oy = getComputedStyle(p).overflowY;
-			if (oy === 'auto' || oy === 'scroll') return p;
-		}
-		return null;
-	}
-
 	// "Already visible" means the cell's TOP edge is on screen with room to spare:
 	// the run affordance (accent bar, spinner) lives at the top, so a tall cell
 	// scrolled past its header is not actually showing the user anything.
@@ -1074,7 +1077,8 @@
 		const parent = scrollParent(el);
 		const view = parent ? parent.getBoundingClientRect() : { top: 0, bottom: window.innerHeight };
 		const r = el.getBoundingClientRect();
-		return r.top >= view.top - 4 && r.top <= view.bottom - Math.min(r.height, 96);
+		const top = view.top + (parent ? stickyTopInset(parent) : 0);
+		return r.top >= top - 4 && r.top <= view.bottom - Math.min(r.height, 96);
 	}
 
 	function reducedMotion(): boolean {
@@ -1139,7 +1143,9 @@
 	// otherwise top-pinned near the pane's top so the cell's header + first outputs
 	// are what the user sees (centering a tall cell would push its top off screen).
 	function reframeDelta(parent: HTMLElement, el: HTMLElement): number {
-		const view = parent.getBoundingClientRect();
+		const inset = stickyTopInset(parent);
+		const box = parent.getBoundingClientRect();
+		const view = { top: box.top + inset, height: box.height - inset };
 		const r = el.getBoundingClientRect();
 		const margin = 24;
 		return r.height + margin * 2 <= view.height
@@ -3769,6 +3775,8 @@
 			});
 			const body = await res.json().catch(() => ({}));
 			if (!res.ok) throw new Error(body?.message || 'export failed');
+			// Another notebook's module this export rebuilt counts too.
+			if (body.written || body.modules?.some((m: { written: boolean }) => m.written)) onModuleWritten?.();
 			return body as ExportPyResult;
 		} catch (err) {
 			onNotice?.(`Export failed: ${(err as Error)?.message || 'export failed'}`);
@@ -5030,6 +5038,8 @@
 			onRunAbove={runAboveCell}
 			onRunAll={runAll}
 			onInterrupt={onInterruptKernel}
+			onRestart={onRestartKernel}
+			{onExportModule}
 			onClear={clearCell}
 			onClearAll={clearAll}
 			onConsolidateImports={onConsolidateImports}

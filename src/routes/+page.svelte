@@ -1083,6 +1083,9 @@
 
 	// Bump to make the sidebar re-read the file tree + git status (after saves).
 	let fsRefreshSignal = $state(0);
+	function refreshFsTree() {
+		fsRefreshSignal++;
+	}
 
 	// ---- Consolidate imports --------------------------------------------------
 	// Sweep the active notebook's module-level imports into one pinned cell at the
@@ -1149,9 +1152,9 @@
 		// Deliberately NO pre-emptive clear: every branch below (and every failure
 		// path inside `LiveNotebook.exportPy`) ends in exactly one message, so there
 		// is nothing to clear that this action does not itself replace. Clearing up
-		// front instead erased a message the user had not read yet - opening the app
-		// menu BLURS the target input, so its `change` commit has usually already
-		// SETTLED and posted its refusal reason by the time the item is clicked.
+		// front instead erased a message the user had not read yet - opening the palette
+		// BLURS the target input, so its `change` commit has usually already
+		// SETTLED and posted its refusal reason by the time the command runs.
 		const r = await api.exportPy();
 		// A failure already reported the SERVER's own reason through this same channel
 		// (`LiveNotebook.exportPy`). A generic string here would REPLACE it - one
@@ -1159,10 +1162,9 @@
 		// ("it is not a Cellar-generated module", a non-.py or escaping target).
 		if (!r) return;
 		// Worded by the pure `exportShellNotice`: the own module's line, then what the
-		// `#| export <module>` cells did.
-		const notice = exportShellNotice(r);
-		if (notice.refresh) fsRefreshSignal++; // a new/updated module on disk → refresh the tree + git decorations
-		showNotice(notice.text);
+		// `#| export <module>` cells did. `LiveNotebook` refreshes the file tree when a
+		// module was written (`onModuleWritten`).
+		showNotice(exportShellNotice(r));
 	}
 
 	// Toggle the active notebook's notebook-wide "hide all code" (report view).
@@ -1833,7 +1835,8 @@
 				interruptKernel: () => interruptKernel(activeNotebookPath ?? ''),
 				restartKernel: () => restartKernel(activeNotebookPath ?? ''),
 				newNotebook,
-				consolidateImports
+				consolidateImports,
+				exportModule: exportPy
 			}
 		})
 	);
@@ -1954,7 +1957,6 @@
 		{tabRunState}
 		{sidebarOpen}
 		kernelInfo={displayKernel}
-		canExportPy={!!activeNotebookPath}
 		canSaveAsPy={!!activeNotebookPath}
 		canConvertToIpynb={activeNotebookIsPy}
 		{converting}
@@ -1972,7 +1974,6 @@
 		onPromoteTab={promoteTab}
 		onReorderTabs={reorderTabs}
 		onToggleSidebar={() => (sidebarOpen = !sidebarOpen)}
-		onExportPy={exportPy}
 		onSaveAsPy={openSaveAsPy}
 		onConvertToIpynb={convertToIpynb}
 		onExportHtml={exportHtml}
@@ -2063,9 +2064,11 @@
 			<!-- Every open notebook stays mounted (editor + run state preserved),
 			     just hidden. The default notebook and opened `.ipynb` files use the
 			     same live component; each persists to its own file. -->
+			<!-- `scroll-pt-12` reserves the notebook toolbar's sticky compact row, so a
+			     cell scrolled into view lands below it rather than under it. -->
 			{#if notebookOpen}
 				<div
-					class="h-full overflow-y-auto {activeTabId === 'notebook' ? '' : 'hidden'}"
+					class="h-full scroll-pt-12 overflow-y-auto {activeTabId === 'notebook' ? '' : 'hidden'}"
 					role="tabpanel"
 					id={tabPanelDomId('notebook')}
 					aria-labelledby={tabDomId('notebook')}
@@ -2085,6 +2088,8 @@
 						onRunStateChange={handleRunStateChange}
 						onSelectionChange={handleSelectionChange}
 						onNotice={showNotice}
+						onModuleWritten={refreshFsTree}
+						onExportModule={exportPy}
 						onRegisterFolds={registerFolds}
 						onRegisterNumbering={registerNumbering}
 						onRegisterApi={registerNotebookApi}
@@ -2092,6 +2097,7 @@
 						onRunStart={onRunStart}
 						onRunEnd={onRunEnd}
 						onInterruptKernel={() => interruptKernel(canonicalNotebookRel)}
+						onRestartKernel={() => restartKernel(canonicalNotebookRel)}
 						onConsolidateImports={() => consolidateImports(canonicalNotebookRel)}
 						consolidating={consolidatingPaths.has(canonicalNotebookRel)}
 						onBlame={handleBlame}
@@ -2102,7 +2108,7 @@
 
 			{#each ipynbTabs as tab (tab.id)}
 				<div
-					class="h-full overflow-y-auto {activeTabId === tab.id ? '' : 'hidden'}"
+					class="h-full scroll-pt-12 overflow-y-auto {activeTabId === tab.id ? '' : 'hidden'}"
 					role="tabpanel"
 					id={tabPanelDomId(tab.id)}
 					aria-labelledby={tabDomId(tab.id)}
@@ -2122,6 +2128,8 @@
 						onRunStateChange={handleRunStateChange}
 						onSelectionChange={handleSelectionChange}
 						onNotice={showNotice}
+						onModuleWritten={refreshFsTree}
+						onExportModule={exportPy}
 						onRegisterFolds={registerFolds}
 						onRegisterNumbering={registerNumbering}
 						onRegisterApi={registerNotebookApi}
@@ -2129,6 +2137,7 @@
 						onRunStart={onRunStart}
 						onRunEnd={onRunEnd}
 						onInterruptKernel={() => interruptKernel(tab.path)}
+						onRestartKernel={() => restartKernel(tab.path)}
 						onConsolidateImports={() => consolidateImports(tab.path)}
 						consolidating={consolidatingPaths.has(tab.path)}
 						onBlame={handleBlame}
