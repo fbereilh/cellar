@@ -1354,8 +1354,8 @@
 		     interrupting cancels the whole batch.
 		     An action promoted to this bar leaves the navbar Options menu rather than
 		     appearing in both: Run all / Interrupt / Clear all outputs are toolbar +
-		     palette only, and Consolidate imports now follows them. The menu keeps
-		     what this bar does NOT carry (run stale/above/below, Export to .py, …).
+		     palette only, and Consolidate imports, Restart and Export follow them. The menu keeps
+		     what this bar does NOT carry (run stale/above/below, …).
 		     `flex-wrap` so a narrow window (or a wide sidebar) wraps the bar onto a
 		     second row instead of pushing buttons out of reach — the same rule the
 		     per-cell toolbar row follows. Below a 54rem bar, Interrupt, Restart,

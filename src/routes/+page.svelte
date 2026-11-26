@@ -1149,9 +1149,9 @@
 		// Deliberately NO pre-emptive clear: every branch below (and every failure
 		// path inside `LiveNotebook.exportPy`) ends in exactly one message, so there
 		// is nothing to clear that this action does not itself replace. Clearing up
-		// front instead erased a message the user had not read yet - opening the app
-		// menu BLURS the target input, so its `change` commit has usually already
-		// SETTLED and posted its refusal reason by the time the item is clicked.
+		// front instead erased a message the user had not read yet - opening the palette
+		// BLURS the target input, so its `change` commit has usually already
+		// SETTLED and posted its refusal reason by the time the command runs.
 		const r = await api.exportPy();
 		// A failure already reported the SERVER's own reason through this same channel
 		// (`LiveNotebook.exportPy`). A generic string here would REPLACE it - one
@@ -1852,7 +1852,8 @@
 				interruptKernel: () => interruptKernel(activeNotebookPath ?? ''),
 				restartKernel: () => restartKernel(activeNotebookPath ?? ''),
 				newNotebook,
-				consolidateImports
+				consolidateImports,
+				exportModule: exportPy
 			}
 		})
 	);
@@ -1973,7 +1974,6 @@
 		{tabRunState}
 		{sidebarOpen}
 		kernelInfo={displayKernel}
-		canExportPy={!!activeNotebookPath}
 		canSaveAsPy={!!activeNotebookPath}
 		canConvertToIpynb={activeNotebookIsPy}
 		{converting}
@@ -1991,7 +1991,6 @@
 		onPromoteTab={promoteTab}
 		onReorderTabs={reorderTabs}
 		onToggleSidebar={() => (sidebarOpen = !sidebarOpen)}
-		onExportPy={exportPy}
 		onSaveAsPy={openSaveAsPy}
 		onConvertToIpynb={convertToIpynb}
 		onExportHtml={exportHtml}

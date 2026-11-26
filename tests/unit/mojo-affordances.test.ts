@@ -63,6 +63,7 @@ function ctx(over: Partial<CommandContext> = {}): CommandContext {
 			restartKernel: noop,
 			newNotebook: noop,
 			consolidateImports: noop,
+			exportModule: noop,
 			openSettings: noop
 		},
 		...over
