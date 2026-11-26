@@ -170,6 +170,45 @@ test.describe(runtimeAvailable() ? 'file tree: paste and duplicate' : `file tree
 		expect(existsSync(join(ws, 'shot.png'))).toBe(true);
 	});
 
+	test('an older tree load that answers late does not undo the selection of a duplicate', async ({ page }) => {
+		await openTree(page);
+		const signal = () => {
+			let fire = () => {};
+			const done = new Promise<void>((resolve) => (fire = resolve));
+			return { fire, done };
+		};
+		const staleHeld = signal();
+		const releaseStale = signal();
+		const freshAsked = signal();
+		const releaseFresh = signal();
+		let first = true;
+		await page.route('**/api/fs/tree', async (route) => {
+			if (first) {
+				first = false;
+				// Answered by the server now, before the copy exists, delivered later.
+				const response = await route.fetch();
+				staleHeld.fire();
+				await releaseStale.done;
+				await route.fulfill({ response });
+				return;
+			}
+			if (existsSync(join(ws, 'notes copy.md'))) freshAsked.fire();
+			await releaseFresh.done;
+			await route.continue();
+		});
+
+		await page.getByRole('button', { name: 'Refresh file tree' }).click();
+		await staleHeld.done;
+		await menu(page, fileRow(page, 'notes.md'), 'ctx-duplicate');
+		await freshAsked.done;
+		releaseStale.fire();
+		await page.evaluate(() => new Promise((resolve) => setTimeout(resolve, 200)));
+		releaseFresh.fire();
+
+		await expect(fileRow(page, 'notes copy.md')).toBeVisible();
+		await expect(fileRow(page, 'notes copy.md')).toHaveAttribute('data-selected', 'true');
+	});
+
 	test('a paste with no files and nothing copied says so', async ({ page }) => {
 		await openTree(page);
 		await pasteFiles(page, fileRow(page, 'notes.md'), []);

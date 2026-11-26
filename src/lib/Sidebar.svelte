@@ -442,11 +442,16 @@
 	let gitBranch = $state('');
 	let gitDetached = $state(false);
 	const ignoredMatcher = $derived(makeIgnoredMatcher(gitIgnored));
+	// Loads overlap (a save refresh, then a file op). Only the newest one may
+	// apply its answer: an older tree predates what the newer one will show.
+	let treeLoad = 0;
 	async function loadTree() {
+		const load = ++treeLoad;
 		try {
 			const res = await fetch('/api/fs/tree');
 			if (!res.ok) throw new Error('failed to list workspace');
 			const next: TreeRoot = await res.json();
+			if (load !== treeLoad) return;
 			treeRoot = next;
 			treeError = '';
 			// A deleted folder's entry must not linger and pop a later folder of the
@@ -458,6 +463,7 @@
 			pendingFocus = false;
 			if (pending) revealInTree(pending, focus);
 		} catch (err) {
+			if (load !== treeLoad) return;
 			treeError = String((err as Error)?.message ?? err);
 		}
 	}
