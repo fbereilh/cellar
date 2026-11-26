@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { scrollParent } from '$lib/scrollPane';
 	import Cell from '$lib/Cell.svelte';
 	import type { LogicalCellType } from '$lib/server/types';
 	import {
@@ -424,14 +425,6 @@
 	const heights = new Map<string, number>();
 	let heightsVersion = $state(0);
 
-	function scrollParentOf(el: HTMLElement): HTMLElement | null {
-		for (let p = el.parentElement; p; p = p.parentElement) {
-			const oy = getComputedStyle(p).overflowY;
-			if (oy === 'auto' || oy === 'scroll') return p;
-		}
-		return null;
-	}
-
 	// A per-id cell lookup + document index, built only while windowing is on. The
 	// ON render iterates the plan (not `cells`), so it resolves each mounted item's
 	// cell object + index (for git decorations + drag targets) through these.
@@ -561,7 +554,7 @@
 	// consumes these directly.
 	$effect(() => {
 		if (!virtualize || !containerEl) return;
-		const parent = scrollParentOf(containerEl);
+		const parent = scrollParent(containerEl);
 		if (!parent) return;
 		let raf = 0;
 		const read = () => {
@@ -873,7 +866,7 @@
 	$effect(() => {
 		const el = toolbarSentinel;
 		if (!el || !containerEl) return;
-		const root = scrollParentOf(containerEl);
+		const root = scrollParent(containerEl);
 		const io = new IntersectionObserver(
 			([e]) => {
 				const top = e.rootBounds?.top;

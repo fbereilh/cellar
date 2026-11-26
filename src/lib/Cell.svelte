@@ -1661,10 +1661,23 @@
 					kernelCompletion(kernelIntrospectFor),
 					kernelDocTooltip,
 					// The notebook toolbar's sticky row covers the top of the pane, and
-					// CodeMirror does not read `scroll-padding`: keep the cursor below it.
-					EditorView.scrollMargins.of(() => {
-						if (scrollBoxEl) scrollPane ??= scrollParent(scrollBoxEl);
-						return scrollPane ? { top: stickyTopInset(scrollPane) } : null;
+					// CodeMirror does not read `scroll-padding`. After its own scroll has
+					// brought the cursor into the pane, move the pane by whatever part of
+					// the cursor line the row still covers. Not `scrollMargins`: CodeMirror
+					// also hides every tooltip anchored inside that margin.
+					EditorView.scrollHandler.of((v, range) => {
+						v.requestMeasure({
+							read: () => {
+								if (scrollBoxEl) scrollPane ??= scrollParent(scrollBoxEl);
+								const at = scrollPane && v.coordsAtPos(range.head);
+								if (!scrollPane || !at) return 0;
+								return scrollPane.getBoundingClientRect().top + stickyTopInset(scrollPane) - at.top;
+							},
+							write: (covered) => {
+								if (covered > 0 && scrollPane) scrollPane.scrollTop -= covered;
+							}
+						});
+						return false;
 					}),
 					// No run/escape keymap here on purpose: every notebook shortcut,
 					// edit-mode ones included, is declared in `shortcuts.svelte.js` and

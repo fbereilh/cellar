@@ -13,7 +13,8 @@ import { tabPanelDomId } from '../../src/lib/tabIds';
  *    shows the new file in the tree. A hazard is worded in full on that line.
  *  - The menu's own Export button shows a new module in the tree too.
  *  - The navbar Options menu no longer offers the export.
- *  - The editor keeps the cursor below the pinned toolbar.
+ *  - The editor keeps the cursor below the pinned toolbar, and a completion on
+ *    a cell's first line still shows.
  *  - Export with no target writes nothing: it opens the language-and-export menu
  *    with the cursor in the target field.
  *  - Restart sends the existing kernel restart for THIS notebook.
@@ -154,6 +155,18 @@ test('the editor keeps the cursor below the pinned toolbar', async ({ page }) =>
 		pane.locator('.cm-focused .cm-activeLine').evaluate((el) => el.getBoundingClientRect().top)
 	]);
 	expect(cursorTop, 'the cursor line is under the toolbar').toBeGreaterThanOrEqual(barBottom);
+});
+
+test('a completion on the first line of a cell shows on screen', async ({ page }) => {
+	await openNotebook(page, NB.bare);
+	const cell = paneFor(page, NB.bare).getByTestId('cell').nth(1);
+	await cell.getByTestId('editor-scroll').click();
+	await expect(cell.locator('.cm-content')).toBeVisible();
+	await page.keyboard.press('ControlOrMeta+a');
+	await page.keyboard.type('pri');
+	// CodeMirror parks a tooltip it decides to hide far off screen, so on-screen is the check.
+	const popup = cell.locator('.cm-tooltip-autocomplete');
+	await expect(popup.locator('li').filter({ hasText: 'print' }).first()).toBeInViewport({ timeout: 30_000 });
 });
 
 test('Export with no target opens the menu at the target field and writes nothing', async ({ page }) => {
