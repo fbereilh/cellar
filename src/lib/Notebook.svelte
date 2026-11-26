@@ -1390,6 +1390,9 @@
 		     top of the pane with the same labelled buttons (`toolbarPinned`). Pinning
 		     adds only a bottom edge and a shadow, so the bar keeps its size and no
 		     cell moves. It spans the content column, edge to edge with the cells.
+		     Two side box-shadows in the page color fill the column's 1rem gutters, so
+		     a cell's git change bar never peeks out beside the pinned bar. A shadow
+		     paints without adding scrollable overflow, which a wider child would.
 		     The pane's `scroll-padding-top` follows its height, so scrolled-to cells
 		     land below it. While the find bar is open, the shell's
 		     `--cellar-find-reserve` pads the bar's bottom into a band the find bar
@@ -1397,9 +1400,9 @@
 		<div bind:this={toolbarSentinel} class="h-0" aria-hidden="true"></div>
 		<div
 			bind:this={toolbarEl}
-			class="@container sticky top-0 z-30 mb-3 flex before:absolute before:inset-y-0 before:-inset-x-4 before:-z-10 before:bg-(--cellar-surface-page) flex-wrap items-center gap-2 border-b bg-(--cellar-surface-page) pt-1 pb-[calc(0.25rem+var(--cellar-find-reserve,0px))] transition-[border-color,box-shadow] duration-150 motion-reduce:transition-none {toolbarPinned
-				? 'border-base-300 shadow-sm'
-				: 'border-transparent'}"
+			class="@container sticky top-0 z-30 mb-3 flex flex-wrap items-center gap-2 border-b bg-(--cellar-surface-page) pt-1 pb-[calc(0.25rem+var(--cellar-find-reserve,0px))] transition-[border-color,box-shadow] duration-150 motion-reduce:transition-none {toolbarPinned
+				? 'border-base-300 shadow-[-1rem_0_0_var(--cellar-surface-page),1rem_0_0_var(--cellar-surface-page),0_1px_3px_0_rgb(0_0_0/0.1),0_1px_2px_-1px_rgb(0_0_0/0.1)]'
+				: 'border-transparent shadow-[-1rem_0_0_var(--cellar-surface-page),1rem_0_0_var(--cellar-surface-page)]'}"
 			data-pinned={toolbarPinned ? '' : undefined}
 			data-testid="notebook-toolbar"
 		>
