@@ -321,7 +321,6 @@ describe('server: duplicate and paste from another app (fstree)', () => {
 			for (const dir of [join(TMP, root), fs.uploadStagingDir()]) {
 				expect(statSync(dir).mode & 0o777).toBe(0o700);
 			}
-			expect(statSync(join(fs.uploadStagingDir(), 'jjjjjjjj.part')).mode & 0o777).toBe(0o600);
 		});
 
 		it('clears the staged part at server start', () => {
@@ -375,6 +374,16 @@ describe('server: duplicate and paste from another app (fstree)', () => {
 		expect(readFileSync(join(WS, 'src/report.txt'), 'utf8')).toBe('made meanwhile');
 		expect(readFileSync(join(WS, 'src/report copy.txt'), 'utf8')).toBe('pasted');
 		expect(stagedParts()).toEqual([]);
+	});
+
+	it.skipIf(process.platform === 'win32')('gives a pasted file the same permissions as a new file', () => {
+		const modeOf = (rel: string) => statSync(join(WS, rel)).mode & 0o777;
+		const expected = modeOf(fs.createEntry('src', 'new.txt', 'file').path);
+		const paste = (name: string, id: string) =>
+			fs.writeUploadChunk({ dir: 'src', name, id, offset: 0, bytes: Buffer.from('x'), last: true }) as { path: string };
+		expect(modeOf(paste('linked.txt', 'kkkkkkkk').path)).toBe(expected);
+		link.crossDevice = () => {};
+		expect(modeOf(paste('copied.txt', 'llllllll').path)).toBe(expected);
 	});
 
 	it('refuses a hidden destination folder', () => {

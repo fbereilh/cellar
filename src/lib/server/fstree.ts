@@ -453,7 +453,7 @@ export function writeUploadChunk(opts: {
 	}
 	if (offset === 0) {
 		ensureUploadStagingDir();
-		writeFileSync(part, opts.bytes, { flag: 'wx', mode: 0o600 });
+		writeFileSync(part, opts.bytes, { flag: 'wx' });
 	} else {
 		const have = existsSync(part) ? statSync(part).size : -1;
 		if (have !== offset) throw new Error('upload chunk out of order');
