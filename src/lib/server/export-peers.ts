@@ -16,12 +16,15 @@
  * synchronous, so that is what is on disk. Any other notebook is read from disk,
  * and the parse is cached on the file's size and mtime, without the cells'
  * outputs: an export reads only source and metadata. An entry is dropped once
- * the walk no longer lists its file. A file whose text says
- * neither `export` nor `default_exp` can neither own nor feed a module, so it is
- * not parsed at all. A file that cannot be read or parsed takes no part: nothing
- * about it is known.
+ * the walk no longer lists its file. A file whose text names no module
+ * (`NAMES_A_MODULE`) can neither own nor feed one, so it is not parsed at all. A
+ * file that cannot be read or parsed takes no part: nothing about it is known.
+ *
+ * The scan is asynchronous (`refreshExportPeers`), so it never blocks the process
+ * that carries the kernel sockets. `exportPeers` answers from the last finished
+ * scan. An export action awaits a fresh scan first; a persist or a load does not.
  */
-import { readdirSync, readFileSync, statSync } from 'node:fs';
+import { readdir, readFile, stat } from 'node:fs/promises';
 import { join, relative, resolve, sep } from 'node:path';
 import { IGNORE_DIRS, MAX_DEPTH, workspaceRoot } from './fstree';
 import { deserialize, isIpynbPath } from './ipynb';
@@ -29,6 +32,9 @@ import type { NotebookDoc } from './types';
 
 /** The parse of one notebook file, kept while its size and mtime hold. */
 const parsed = new Map<string, { size: number; mtimeMs: number; doc: NotebookDoc | null }>();
+
+/** The notebook paths the last finished scan listed, sorted. Null before the first one. */
+let walked: string[] | null = null;
 
 /** What one export reads of the workspace around its notebook. */
 export interface ExportPeers {
@@ -45,26 +51,62 @@ export interface ExportPeers {
 
 /**
  * The notebooks one export of `self` reads, and whether `self` is among the
- * notebooks every other export reads.
- *
- * The folders are listed afresh on every call, so a notebook created a moment
- * ago is seen as an owner at once. Only a notebook carrying a `#| export
- * <module>` cell, or an export, pays for the walk.
+ * notebooks every other export reads. Answered from the last finished scan
+ * (`refreshExportPeers`) and never from the disk, so it is safe on a persist or
+ * a load. Null while no scan has finished: nothing is known yet.
  */
-export function exportPeers(self: string, live: (abs: string) => NotebookDoc | undefined): ExportPeers {
+export function exportPeers(self: string, live: (abs: string) => NotebookDoc | undefined): ExportPeers | null {
+	if (!walked) return null;
 	const peers: NotebookDoc[] = [];
 	let reached = false;
-	const paths = new Set(notebookPaths());
-	for (const abs of parsed.keys()) if (!paths.has(abs)) parsed.delete(abs);
-	for (const abs of paths) {
+	for (const abs of walked) {
 		if (abs === self) {
 			reached = true;
 			continue;
 		}
-		const doc = live(abs) ?? readPeer(abs);
+		const doc = live(abs) ?? parsed.get(abs)?.doc;
 		if (doc) peers.push(doc);
 	}
 	return { peers, excluded: reached ? null : skipReason(self) };
+}
+
+let running: Promise<boolean> | null = null;
+let queued: Promise<boolean> | null = null;
+
+/**
+ * Scan the workspace again, without blocking: the folders are listed afresh, so
+ * a notebook created a moment ago is seen as an owner. Resolves to whether what
+ * `exportPeers` answers may have changed. A call made while a scan runs waits
+ * for one that starts after it, so the caller never gets a scan older than its
+ * own request.
+ */
+export function refreshExportPeers(): Promise<boolean> {
+	if (!running) {
+		running = scan().finally(() => {
+			running = null;
+		});
+		return running;
+	}
+	const next = () => {
+		queued = null;
+		return refreshExportPeers();
+	};
+	queued ??= running.then(next, next);
+	return queued;
+}
+
+async function scan(): Promise<boolean> {
+	const paths = await notebookPaths();
+	let changed = walked === null || walked.length !== paths.length || paths.some((p, i) => p !== walked![i]);
+	const listed = new Set(paths);
+	for (const abs of parsed.keys()) {
+		if (listed.has(abs)) continue;
+		if (parsed.get(abs)?.doc) changed = true;
+		parsed.delete(abs);
+	}
+	for (const abs of paths) if (await readPeer(abs)) changed = true;
+	walked = paths;
+	return changed;
 }
 
 /** Why the walk left this notebook out, worded from its path. */
@@ -78,13 +120,13 @@ function skipReason(abs: string): string {
 	return 'the scan of the workspace for notebooks did not reach it';
 }
 
-function notebookPaths(): string[] {
+async function notebookPaths(): Promise<string[]> {
 	const root = resolve(workspaceRoot());
 	const paths: string[] = [];
-	const walk = (dir: string, depth: number) => {
+	const walk = async (dir: string, depth: number): Promise<void> => {
 		let entries;
 		try {
-			entries = readdirSync(dir, { withFileTypes: true });
+			entries = await readdir(dir, { withFileTypes: true });
 		} catch {
 			return;
 		}
@@ -92,29 +134,38 @@ function notebookPaths(): string[] {
 			if (e.name.startsWith('.') || e.name.startsWith('_')) continue;
 			const abs = join(dir, e.name);
 			if (e.isDirectory()) {
-				if (!IGNORE_DIRS.has(e.name) && depth < MAX_DEPTH) walk(abs, depth + 1);
+				if (!IGNORE_DIRS.has(e.name) && depth < MAX_DEPTH) await walk(abs, depth + 1);
 			} else if (e.isFile() && isIpynbPath(e.name)) paths.push(abs);
 		}
 	};
-	walk(root, 0);
-	return paths;
+	await walk(root, 0);
+	return paths.sort();
 }
 
-function readPeer(abs: string): NotebookDoc | null {
+/**
+ * Can a notebook with this raw text own or feed a module? It must hold a valued
+ * `#| export <module>` line, a `#|default_exp` line or an `export_target` key.
+ * Tested on the file's JSON text before any parse, so a notebook that only says
+ * `export` in its code or outputs is never parsed. It errs toward parsing.
+ */
+const NAMES_A_MODULE = /#(?: |\\t)*\|(?: |\\t)*export(?: |\\t|:)+[^ :"\\]|default_exp|"export_target"/;
+
+/** Refresh one file's cached parse. True when its document appeared, went or changed. */
+async function readPeer(abs: string): Promise<boolean> {
 	let st;
 	try {
-		st = statSync(abs);
+		st = await stat(abs);
 	} catch {
+		const had = !!parsed.get(abs)?.doc;
 		parsed.delete(abs);
-		return null;
+		return had;
 	}
 	const hit = parsed.get(abs);
-	if (hit && hit.size === st.size && hit.mtimeMs === st.mtimeMs) return hit.doc;
+	if (hit && hit.size === st.size && hit.mtimeMs === st.mtimeMs) return false;
 	let doc: NotebookDoc | null = null;
 	try {
-		const text = readFileSync(abs, 'utf8');
-		// `export_target` and every `#| export` line contain `export`; `default_exp` does not.
-		if (text.includes('export') || text.includes('default_exp')) {
+		const text = await readFile(abs, 'utf8');
+		if (NAMES_A_MODULE.test(text)) {
 			const nb = deserialize(JSON.parse(text));
 			doc = { path: abs, cells: nb.cells.map(({ outputs: _outputs, ...cell }) => cell), metadata: nb.metadata };
 		}
@@ -122,5 +173,5 @@ function readPeer(abs: string): NotebookDoc | null {
 		doc = null;
 	}
 	parsed.set(abs, { size: st.size, mtimeMs: st.mtimeMs, doc });
-	return doc;
+	return doc !== null || !!hit?.doc;
 }

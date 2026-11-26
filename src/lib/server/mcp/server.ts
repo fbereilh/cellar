@@ -23,7 +23,7 @@ import { INSPECT_HEAD_ROWS, INSPECT_ARRAY_HEAD_ROWS, INSPECT_ARRAY_ITEMS, INSPEC
 import { McpSessionRegistry, SESSION_IDLE_MS, REAPER_INTERVAL_MS } from './sessions';
 import { runAsAgent, digestFor, deletionNote, currentSeq, DIGEST_PREFIX } from './userActivity';
 import { CellRefError } from './cellHandle';
-import { isNotebookUnavailable } from '../notebook';
+import { isNotebookUnavailable, syncExportPeers } from '../notebook';
 import { NOTEBOOK_LANGUAGE_LABELS, TextNotebookCellTypeError, type NotebookLanguage } from '../../cellLanguage';
 import { moduleExtension } from '../../exportRole';
 import { exportMainRefusalMessage } from '../../rustExport';
@@ -856,6 +856,7 @@ export function registerTools(server: McpServer) {
 	// its cause and its remedy are the same (that document stores no metadata).
 	server.registerTool('set_notebook_language', { description: 'Set the notebook\'s LANGUAGE: "python", "mojo" or "rust". A notebook is exactly one, never a mix - every plain code cell in it is written in this language (there is no mojo cell type). Switching touches NO cell: markdown, raw, sql and chat cells are unaffected, and code cells simply run as the new language (doctrine clause 12). The nbdev export target follows it - a stored `utils.py` becomes `utils.mojo` and back - so the two can never disagree; the reply reports the target so you can name it again correctly. A switch to or from "rust" changes the KERNEL (Evcxr vs ipykernel): a live kernel is freed, kernel_restarted/namespace_cleared report it, and every variable is gone; the target is not renamed on a switch to or from "rust" (a Rust notebook exports a .rs module), so a mismatched one is reported unresolvable until you set it again. Refused on a `.py` text notebook, which stores no notebook metadata. Returns {language, export_target, ...}.', inputSchema: { language: z.enum(['python', 'mojo', 'rust']), ...notebookParam } }, async ({ language, notebook }, extra: ToolExtra) => {
 		const target = targetOf(extra, notebook);
+		await syncExportPeers();
 		const r = svc.setNotebookLanguage(language, target);
 		// Checked FIRST, and it is NOT the write failure below: the document could not
 		// be OPENED, so nothing was applied at all. Reported as a failed save it would
@@ -887,6 +888,7 @@ export function registerTools(server: McpServer) {
 		const target = targetOf(extra, notebook);
 		const res = resolveMany(target, ids, extra?.sessionId);
 		if ('error' in res) return res.error;
+		await syncExportPeers();
 		const r = svc.setCellExport(res.ids, exported, target);
 		if (r.ok) return text(r);
 		// Checked BEFORE every other refusal, because it is the one that happened
@@ -955,6 +957,7 @@ export function registerTools(server: McpServer) {
 		const target = targetOf(extra, notebook);
 		const res = resolveOne(target, id, extra?.sessionId);
 		if ('error' in res) return res.error;
+		await syncExportPeers();
 		const r = svc.setExportMain(res.id, main, target);
 		if (r.ok) return text(r);
 		if ('unavailable' in r)
@@ -963,6 +966,7 @@ export function registerTools(server: McpServer) {
 		return notFound(exportMainRefusalMessage(r.refused));
 	});
 	server.registerTool('set_export_target', { description: 'Set (or clear) your notebook\'s EXPORT TARGET: the module export-marked cells go to. Its extension FOLLOWS set_notebook_language (.py/.mojo/.rs); a mismatch is refused. `base` = what `path` is measured from: workspace, notebook (its folder), git (repo root); OMIT keeps it. path:null or "" clears the SETTING (a `#|default_exp` directive in a cell is NOT). Rewritten while a cell stays marked (set_cell_export); module = the write failed, or it will not import / lost main(). Refused: a path outside the workspace, git with no repo, a `.py` text notebook. Returns export_target (RESOLVED workspace-relative; a directive flags export_target_source) + export_base/export_path for other bases.', inputSchema: { path: z.string().nullable(), base: z.enum(['workspace', 'notebook', 'git']).optional(), ...notebookParam } }, async ({ path, base, notebook }, extra: ToolExtra) => {
+		await syncExportPeers();
 		const r = svc.setExportTarget(path, targetOf(extra, notebook), base);
 		// The notebook could not be OPENED: nothing was applied, so this may not be
 		// worded as the accepted-but-unsaved case below, which claims the target took.

@@ -337,9 +337,17 @@ the PATCH route and MCP `set_cell_export`: the cell never goes into the notebook
 
 **Finding the other notebooks.** `server/export-peers.ts` walks the workspace for `.ipynb`
 files on nbdev's `nbglob` skip rule (no `.` or `_` names) and the file tree's noise folders.
-An open notebook is read from its live document, any other from disk with a stat-keyed
-parse cache that keeps no cell outputs. A `.py` text notebook takes no part. The cell badges ask only when the notebook
-carries a valued `#| export`, so an ordinary notebook pays nothing.
+The scan is asynchronous, so it never blocks the process that carries the kernel sockets. A
+file is parsed only when its raw text holds a valued `#| export <module>` line, a
+`#|default_exp` line or an `export_target` key, and the parse is cached on size and mtime
+without cell outputs. An open notebook is read from its live document. A `.py` text notebook
+takes no part.
+
+Every export action (the export button, a cell's export toggle, setting the target or the
+language, and the matching MCP tools) awaits a fresh scan first (`syncExportPeers`). A load
+or a persist never waits: the cell badges answer from the last finished scan, a notebook
+with a valued `#| export` starts one scan in the background, and a changed result arrives
+as a `notebook:export-derived` event. Before the first scan finishes no badge is shown.
 
 The UI: a fed cell's export toggle shows ON, and a neutral chip beside it names the file it
 goes into. Its title names the module, its owner, and the line to remove.

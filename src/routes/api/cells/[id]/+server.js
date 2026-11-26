@@ -1,6 +1,6 @@
 import { json } from '@sveltejs/kit';
 import { exportMainRefusalMessage } from '$lib/rustExport';
-import { setSource, setCellType, deleteCell, setOutputScrolled, setCellRole, setCellExport, setCellExportMain, setHideInput, setVisibility } from '$lib/server/notebook';
+import { setSource, setCellType, deleteCell, setOutputScrolled, setCellRole, setCellExport, setCellExportMain, setHideInput, setVisibility, syncExportPeers } from '$lib/server/notebook';
 import { TextNotebookCellTypeError, isLogicalCellTypeName } from '$lib/cellLanguage';
 
 /** Edit a cell's source, type ('code' | 'sql' | 'markdown' | 'raw'), imports-cell
@@ -51,6 +51,7 @@ import { TextNotebookCellTypeError, isLogicalCellTypeName } from '$lib/cellLangu
  *  of it. */
 export async function PATCH({ params, request }) {
 	const body = await request.json();
+	if ('export' in body || 'exportMain' in body) await syncExportPeers();
 	if (body.cell_type != null) {
 		if (!isLogicalCellTypeName(body.cell_type)) return json({ ok: false, reason: 'bad-cell-type' }, { status: 400 });
 		try {

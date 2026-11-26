@@ -311,9 +311,7 @@ export function hasExportDirective(cell: ExportCell): boolean {
  * question (`server/export-py.ts`'s `otherModuleCells`).
  */
 export function exportOtherModuleName(cell: ExportCell, lang: ExportLanguage = 'python'): string | null {
-	const src = cell?.source;
-	if (!src || !src.includes('export')) return null;
-	const value = nbdevDirective(src, 'export');
+	const value = nbdevDirective(cell?.source, 'export');
 	if (!value) return null;
 	const mod = value.trim().split(/\s+/)[0];
 	return mod && canExportCell(cell, lang) ? mod : null;

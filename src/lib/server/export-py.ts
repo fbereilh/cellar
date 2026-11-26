@@ -1179,7 +1179,8 @@ export function exportNotebookToPy(doc: NotebookDoc, around: ExportPeers = ALONE
 	const refused = cells.flatMap((o) => (o.ok ? [] : [{ cell: cellHandle(o.cell), module: o.module, reason: o.error }]));
 	// The modules this notebook's cells feed but another notebook owns, each rebuilt
 	// whole. A cell naming this notebook's OWN target was already written above.
-	const ownTarget = own.target;
+	const ownInfo = resolveExportTarget(doc);
+	const ownTarget = ownInfo?.ok ? ownInfo.target : null;
 	const byTarget = new Map<string, Extract<OtherModuleCell, { ok: true }>[]>();
 	for (const o of cells) {
 		if (!o.ok || o.target === ownTarget) continue;
@@ -1510,11 +1511,12 @@ function modulesLeft(
  * `around` never called, for a notebook without one - so an ordinary notebook
  * pays nothing for the workspace scan.
  */
-export function otherModuleView(doc: NotebookDoc, around: () => ExportPeers): OtherModuleView[] {
+export function otherModuleView(doc: NotebookDoc, around: () => ExportPeers | null): OtherModuleView[] {
 	if (doc.jpFormat) return [];
 	const lang = docExportLanguage(doc);
 	if (!doc.cells.some((c: Cell) => exportOtherModuleName(c, lang) !== null)) return [];
 	const ws = lang === 'python' ? around() : ALONE;
+	if (!ws) return [];
 	return otherModuleCells(doc, contributorsOf(doc, ws), ws.excluded).map((o) => ({
 		id: o.cell.id,
 		module: o.module,

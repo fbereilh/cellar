@@ -66,7 +66,7 @@ import { isHiddenFromAgent } from '../agentVisibility';
 import { isExportBase, type ExportBase } from '../exportTarget';
 import { gitRootOf } from './git';
 import { resolveInWorkspace } from './fstree';
-import { exportPeers, type ExportPeers } from './export-peers';
+import { exportPeers, refreshExportPeers, type ExportPeers } from './export-peers';
 import {
 	InvalidNotebookLanguageError,
 	isLogicalCellType,
@@ -311,7 +311,7 @@ function persist(doc: NotebookDoc): void {
 function regenerateExportModule(doc: NotebookDoc): void {
 	if (doc.jpFormat) return; // `.py` text notebooks carry no cellar cell metadata
 	try {
-		exportNotebookToPy(doc, peersOf(doc));
+		exportNotebookToPy(doc, peersOf(doc) ?? undefined);
 		doc.lastExportError = null;
 	} catch (err) {
 		doc.lastExportError = String((err as Error)?.message ?? err);
@@ -322,9 +322,36 @@ function regenerateExportModule(doc: NotebookDoc): void {
  * Every other notebook in the workspace, for `#| export <module>` (`export-peers.ts`):
  * an open one as its live document.
  */
-function peersOf(doc: NotebookDoc): ExportPeers {
+function peersOf(doc: NotebookDoc): ExportPeers | null {
 	return exportPeers(doc.path, (abs) => docs.get(abs));
 }
+
+/**
+ * Scan the workspace for the notebooks `#| export <module>` reads, without
+ * blocking, and publish every open notebook's derived export state when the
+ * result changed. Every export action awaits this before it regenerates, so it
+ * builds from the workspace as it is now.
+ */
+export async function syncExportPeers(): Promise<void> {
+	if (await refreshExportPeers()) for (const doc of docs.values()) publishExportDerived(doc);
+}
+
+/**
+ * The last scan's answer for the cell badges, with a fresh scan started in the
+ * background. A persist or a load never waits for the workspace: a changed
+ * result arrives as a `notebook:export-derived` event.
+ */
+function peersForView(doc: NotebookDoc): ExportPeers | null {
+	viewSync ??= syncExportPeers()
+		.catch(() => {})
+		.finally(() => {
+			viewSync = null;
+		});
+	return peersOf(doc);
+}
+
+/** The one background scan a view may have in flight, so views never stack scans. */
+let viewSync: Promise<void> | null = null;
 
 /**
  * Broadcast everything the export DERIVES - the target's RESOLUTION and the marks'
@@ -405,7 +432,7 @@ function publishExportDerived(doc: NotebookDoc): void {
 	const orphanedModule = orphanedGeneratedModule(doc, info);
 	// Where each `#| export <module>` cell goes, or why it goes nowhere. Empty, with
 	// no workspace scan, for a notebook without such a cell.
-	const otherModules = otherModuleView(doc, () => peersOf(doc));
+	const otherModules = otherModuleView(doc, () => peersForView(doc));
 	const key = [
 		resolved ?? '',
 		resolveError ?? '',
@@ -629,7 +656,7 @@ function exportTargetView(doc: NotebookDoc): {
 		exportOrphanedModule: orphanedGeneratedModule(doc, info),
 		// Each `#| export <module>` cell's module, or why it goes into none. Empty,
 		// with no workspace scan, for a notebook without such a cell.
-		exportOtherModules: otherModuleView(doc, () => peersOf(doc))
+		exportOtherModules: otherModuleView(doc, () => peersForView(doc))
 	};
 }
 
@@ -2023,7 +2050,7 @@ export function exportPy(nb?: string | null): ExportResult {
 	const doc = docFor(nb);
 	if (!notebookHoldsExport(!!doc.jpFormat)) throw new Error('cannot export a .py text notebook to a module');
 	try {
-		const res = exportNotebookToPy(doc, peersOf(doc));
+		const res = exportNotebookToPy(doc, peersOf(doc) ?? undefined);
 		doc.lastExportError = null;
 		return res;
 	} catch (err) {
