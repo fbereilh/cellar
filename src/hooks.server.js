@@ -13,6 +13,8 @@
  *    open file tab reflects an edit made to its file on disk from outside Cellar.
  * 5. Stop every live chat run when this process stops, so no `claude` process
  *    tree is left behind a Cellar that is gone (chat/active.ts).
+ * 6. Clear this workspace's staged paste uploads (fstree.ts), so a paste that a
+ *    reload or a restart cut short does not keep its part file.
  */
 import { stopChatRunsOnShutdown } from '$lib/server/chat/active';
 import { installConsoleCapture } from '$lib/server/logs';
@@ -20,6 +22,7 @@ import { startMcpServer } from '$lib/server/mcp/server';
 import { startParentWatch } from '$lib/server/parent-watch';
 import { onExternalChange, fileChangedEvent } from '$lib/server/fileWatch';
 import { publishGlobal } from '$lib/server/events';
+import { sweepStagedUploads } from '$lib/server/fstree';
 
 installConsoleCapture();
 
@@ -51,6 +54,13 @@ for (const sig of ['SIGTERM', 'SIGINT']) {
 //    SIGHUP is deliberately absent from the logging loop above, whose listener
 //    would suppress the default disposition it re-raises into.
 stopChatRunsOnShutdown();
+
+// 6. Drop part files a cut-short paste left in this workspace's staging folder.
+try {
+	sweepStagedUploads();
+} catch (err) {
+	console.warn(`[cellar] could not clear staged uploads: ${String(err?.message ?? err)}`);
+}
 
 startMcpServer();
 startParentWatch();

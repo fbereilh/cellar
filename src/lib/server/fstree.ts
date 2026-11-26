@@ -18,11 +18,22 @@ import {
 	mkdirSync,
 	renameSync,
 	rmSync,
-	cpSync
+	cpSync,
+	appendFileSync,
+	openSync,
+	fsyncSync,
+	closeSync,
+	linkSync,
+	lstatSync,
+	copyFileSync,
+	constants
 } from 'node:fs';
-import { join, resolve, relative, sep, basename, dirname, extname } from 'node:path';
+import { tmpdir } from 'node:os';
+import { createHash } from 'node:crypto';
+import { join, resolve, relative, sep, basename, dirname } from 'node:path';
 import { isHtmlPath } from '$lib/htmlPreview';
-import { MAX_FILE_BYTES, MAX_HTML_FILE_BYTES } from '$lib/server/limits.js';
+import { copyName, freeName } from '$lib/filePaste';
+import { MAX_FILE_BYTES, MAX_HTML_FILE_BYTES, MAX_UPLOAD_BYTES } from '$lib/server/limits.js';
 
 // Directories that are noise for a workspace file tree.
 const IGNORE_DIRS = new Set([
@@ -227,18 +238,11 @@ function assertSimpleName(name: string | null | undefined): string {
  * Given a desired absolute destination, return a non-colliding variant by
  * appending " copy", " copy 2", … before the extension (VS Code-style). Used on
  * paste so a move/copy into an occupied name never clobbers the existing entry.
+ * The naming rule itself is `$lib/filePaste`'s `freeName`, shared with the tests.
  */
 function dedupeDest(destAbs: string): string {
-	if (!existsSync(destAbs)) return destAbs;
 	const dir = dirname(destAbs);
-	const base = basename(destAbs);
-	const ext = extname(base);
-	const stem = ext ? base.slice(0, -ext.length) : base;
-	for (let i = 1; ; i++) {
-		const suffix = i === 1 ? ' copy' : ` copy ${i}`;
-		const candidate = join(dir, `${stem}${suffix}${ext}`);
-		if (!existsSync(candidate)) return candidate;
-	}
+	return join(dir, freeName(basename(destAbs), (name) => existsSync(join(dir, name))));
 }
 
 /**
@@ -332,4 +336,153 @@ export function copyEntry(fromRel: string, destDirRel: string): FsOpFromResult {
 	const destAbs = dedupeDest(join(destDirAbs, basename(fromAbs)));
 	cpSync(fromAbs, destAbs, { recursive: true });
 	return { from: toRel(fromAbs), path: toRel(destAbs) };
+}
+
+// ---- Paste from the system clipboard (chunked upload) ---------------------
+// A file pasted into the explorer from Finder or another app arrives in the
+// browser as bytes, and adapter-node caps every request body (see
+// `$lib/saveLimit.ts`). So the browser sends it in chunks: each one appends to
+// a part file, and the last one places it in the destination folder under a
+// free name. The part file is staged in the OS temp dir, never in the project
+// folder, so an interrupted paste leaves nothing for `git status` to find.
+
+const UPLOAD_ID = /^[a-z0-9]{8,64}$/;
+
+/** How many names (`x`, `x copy`, `x copy 2`, ...) a paste tries before it gives up. */
+const MAX_UPLOAD_NAME_TRIES = 1000;
+
+/**
+ * The staging root, under the OS temp dir and named for the user. On Linux the
+ * temp dir is shared by every user of the machine, so no folder here may be.
+ * Windows has no user id, and its temp dir is already per user.
+ */
+function uploadStagingRoot(): string {
+	const uid = process.getuid?.();
+	return join(tmpdir(), uid === undefined ? 'cellar-uploads' : `cellar-uploads-${uid}`);
+}
+
+/** This workspace's own staging folder for part files, inside the user's staging root. */
+export function uploadStagingDir(): string {
+	const key = createHash('sha256').update(resolve(workspaceRoot())).digest('hex').slice(0, 16);
+	return join(uploadStagingRoot(), key);
+}
+
+/**
+ * Create this workspace's staging folder, owner-only. Refuses a staging root
+ * that is not a real folder owned by this user: someone else made it, so part
+ * files written there would be theirs to read or swap.
+ */
+function ensureUploadStagingDir(): void {
+	const root = uploadStagingRoot();
+	mkdirSync(root, { recursive: true, mode: 0o700 });
+	const st = lstatSync(root);
+	const uid = process.getuid?.();
+	if (!st.isDirectory() || (uid !== undefined && st.uid !== uid)) {
+		throw new Error(`upload staging folder ${root} is not a folder owned by this user`);
+	}
+	mkdirSync(uploadStagingDir(), { recursive: true, mode: 0o700 });
+}
+
+/**
+ * Drop every part file staged for this workspace. Runs at server start: one
+ * server owns a workspace, so any part file found then belongs to a paste that
+ * a reload, a closed tab or a restart cut short.
+ */
+export function sweepStagedUploads(): void {
+	rmSync(uploadStagingDir(), { recursive: true, force: true });
+}
+
+function uploadPartPath(id: string): string {
+	if (!UPLOAD_ID.test(id ?? '')) throw new Error('invalid upload id');
+	return join(uploadStagingDir(), `${id}.part`);
+}
+
+function uploadDir(dirRel: string): string {
+	const dirAbs = resolveInWorkspace(dirRel);
+	if (toRel(dirAbs).split('/').some((segment) => segment.startsWith('.'))) {
+		throw new Error('hidden folders are not shown in the explorer');
+	}
+	if (!existsSync(dirAbs) || !statSync(dirAbs).isDirectory()) throw new Error('destination is not a folder');
+	return dirAbs;
+}
+
+/** Whether a name is taken. A broken symlink counts, which `existsSync` misses. */
+function entryExists(abs: string): boolean {
+	return lstatSync(abs, { throwIfNoEntry: false }) !== undefined;
+}
+
+/**
+ * Put the staged file at `dest` without ever replacing an entry there. A hard
+ * link is one step on one filesystem. Where the staging folder is on another
+ * filesystem, or hard links are unsupported, an exclusive copy does the same.
+ * Both throw EEXIST when `dest` is taken.
+ */
+function placeUpload(part: string, dest: string): void {
+	try {
+		linkSync(part, dest);
+	} catch (err) {
+		const code = (err as NodeJS.ErrnoException)?.code;
+		if (code !== 'EXDEV' && code !== 'EPERM' && code !== 'ENOTSUP' && code !== 'ENOSYS') throw err;
+		copyFileSync(part, dest, constants.COPYFILE_EXCL);
+	}
+}
+
+/**
+ * Append one chunk of a pasted file. `offset` must equal the bytes already
+ * received, so a lost or repeated chunk is refused rather than corrupting the
+ * file. On the `last` chunk the file is flushed to disk and placed in the
+ * folder under `name`, or the next free ` copy` name. Placing never replaces an
+ * existing entry, so a file created in the meantime cannot be clobbered.
+ */
+export function writeUploadChunk(opts: {
+	dir: string;
+	name: string;
+	id: string;
+	offset: number;
+	bytes: Uint8Array;
+	last: boolean;
+}): FsOpPathResult | { received: number } {
+	const cleanName = assertSimpleName(opts.name);
+	const dirAbs = uploadDir(opts.dir);
+	const part = uploadPartPath(opts.id);
+	const offset = Number(opts.offset);
+	if (!Number.isSafeInteger(offset) || offset < 0) throw new Error('invalid upload offset');
+	if (offset + opts.bytes.length > MAX_UPLOAD_BYTES) {
+		rmSync(part, { force: true });
+		throw new Error(`file too large to paste (over the ${Math.round(MAX_UPLOAD_BYTES / (1024 * 1024))} MB limit)`);
+	}
+	if (offset === 0) {
+		ensureUploadStagingDir();
+		writeFileSync(part, opts.bytes, { flag: 'wx' });
+	} else {
+		const have = existsSync(part) ? statSync(part).size : -1;
+		if (have !== offset) throw new Error('upload chunk out of order');
+		appendFileSync(part, opts.bytes);
+	}
+	const received = offset + opts.bytes.length;
+	if (!opts.last) return { received };
+	const fd = openSync(part, 'r+');
+	try {
+		fsyncSync(fd);
+	} finally {
+		closeSync(fd);
+	}
+	for (let n = 0; n < MAX_UPLOAD_NAME_TRIES; n++) {
+		const dest = join(dirAbs, n === 0 ? cleanName : copyName(cleanName, n));
+		if (entryExists(dest)) continue;
+		try {
+			placeUpload(part, dest);
+		} catch (err) {
+			if ((err as NodeJS.ErrnoException)?.code === 'EEXIST') continue;
+			throw err;
+		}
+		rmSync(part, { force: true });
+		return { path: toRel(dest) };
+	}
+	throw new Error(`no free name for ${cleanName} in this folder (tried ${MAX_UPLOAD_NAME_TRIES})`);
+}
+
+/** Drop the part file of an upload the browser gave up on. */
+export function abortUpload(id: string): void {
+	rmSync(uploadPartPath(id), { force: true });
 }
