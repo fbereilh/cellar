@@ -3,11 +3,39 @@
  * lands, which clipboard a paste reads, and the chunked upload a paste from
  * another app goes through. The server half runs over a real temp workspace.
  */
-import { describe, it, expect, beforeAll, beforeEach, afterAll } from 'vitest';
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { describe, it, expect, beforeAll, beforeEach, afterAll, vi } from 'vitest';
+import {
+	existsSync,
+	lstatSync,
+	mkdirSync,
+	mkdtempSync,
+	readdirSync,
+	readFileSync,
+	rmSync,
+	symlinkSync,
+	writeFileSync
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { copyName, freeName, pasteSource, pasteTargetDir, uploadChunks, UPLOAD_CHUNK_BYTES } from '$lib/filePaste';
+
+/**
+ * The one seam into the filesystem: a test can make the next hard link fail the
+ * way a link across filesystems does (EXDEV), after running `before` first.
+ * Everything else in `node:fs` stays real.
+ */
+const link = vi.hoisted(() => ({ crossDevice: null as null | ((dest: string) => void) }));
+vi.mock('node:fs', async (importOriginal) => {
+	const real = await importOriginal<typeof import('node:fs')>();
+	return {
+		...real,
+		linkSync: (from: string, to: string) => {
+			if (!link.crossDevice) return real.linkSync(from, to);
+			link.crossDevice(to);
+			throw Object.assign(new Error('EXDEV: cross-device link not permitted'), { code: 'EXDEV' });
+		}
+	};
+});
 
 describe('copyName / freeName', () => {
 	it('keeps the extension last', () => {
@@ -104,20 +132,37 @@ describe('uploadChunks', () => {
 describe('server: duplicate and paste from another app (fstree)', () => {
 	let WS: string;
 	let fs: typeof import('../../src/lib/server/fstree');
+	let POST: (evt: { request: Request; url: URL }) => Promise<Response>;
+	let DELETE: (evt: { request: Request; url: URL }) => Response;
 	const prev = process.env.CELLAR_WORKSPACE;
+
+	/** Every entry under the workspace, hidden ones included. */
+	const allEntries = () => (readdirSync(WS, { recursive: true }) as string[]).sort();
+	const stagedParts = () => (existsSync(fs.uploadStagingDir()) ? readdirSync(fs.uploadStagingDir()) : []);
+
+	const send = (method: 'POST' | 'DELETE', query: Record<string, string>, headers: Record<string, string>, body?: string) => {
+		const href = `http://localhost:4000/api/fs/upload?${new URLSearchParams(query)}`;
+		return { request: new Request(href, { method, headers, body }), url: new URL(href) };
+	};
 
 	beforeAll(async () => {
 		WS = mkdtempSync(join(tmpdir(), 'cellar-file-paste-'));
 		process.env.CELLAR_WORKSPACE = WS;
 		fs = await import('../../src/lib/server/fstree');
+		const route = await import('../../src/routes/api/fs/upload/+server.js');
+		POST = route.POST as unknown as typeof POST;
+		DELETE = route.DELETE as unknown as typeof DELETE;
 	});
 	afterAll(() => {
+		fs.sweepStagedUploads();
 		rmSync(WS, { recursive: true, force: true });
 		if (prev === undefined) delete process.env.CELLAR_WORKSPACE;
 		else process.env.CELLAR_WORKSPACE = prev;
 	});
 	beforeEach(() => {
 		process.env.CELLAR_WORKSPACE = WS;
+		link.crossDevice = null;
+		fs.sweepStagedUploads();
 		for (const n of readdirSync(WS)) rmSync(join(WS, n), { recursive: true, force: true });
 		mkdirSync(join(WS, 'src/pkg'), { recursive: true });
 		writeFileSync(join(WS, 'src/utils.py'), 'x = 1\n');
@@ -193,8 +238,155 @@ describe('server: duplicate and paste from another app (fstree)', () => {
 				last: true
 			})
 		).toThrow(/out of order/);
-		fs.abortUpload('src', id);
+		expect(stagedParts()).toEqual([`${id}.part`]);
+		fs.abortUpload(id);
+		expect(stagedParts()).toEqual([]);
 		expect(readdirSync(join(WS, 'src'))).toEqual(['pkg', 'utils.py']);
+	});
+
+	it('stages an unfinished paste outside the project folder', () => {
+		const before = allEntries();
+		fs.writeUploadChunk({
+			dir: 'src',
+			name: 'big.bin',
+			id: 'dddddddd',
+			offset: 0,
+			bytes: Buffer.from('ab'),
+			last: false
+		});
+		expect(allEntries()).toEqual(before);
+		expect(fs.uploadStagingDir().startsWith(WS)).toBe(false);
+	});
+
+	it('clears a cut-short paste at server start', () => {
+		const id = 'eeeeeeee';
+		fs.writeUploadChunk({
+			dir: 'src',
+			name: 'big.bin',
+			id,
+			offset: 0,
+			bytes: Buffer.from('ab'),
+			last: false
+		});
+		fs.sweepStagedUploads();
+		expect(stagedParts()).toEqual([]);
+		expect(() =>
+			fs.writeUploadChunk({
+				dir: 'src',
+				name: 'big.bin',
+				id,
+				offset: 2,
+				bytes: Buffer.from('c'),
+				last: true
+			})
+		).toThrow(/out of order/);
+		expect(existsSync(join(WS, 'src/big.bin'))).toBe(false);
+	});
+
+	it('steps past a broken symlink that holds the name', () => {
+		symlinkSync('no-such-target', join(WS, 'src/shot.png'));
+		const res = fs.writeUploadChunk({
+			dir: 'src',
+			name: 'shot.png',
+			id: 'ffffffff',
+			offset: 0,
+			bytes: Buffer.from('png'),
+			last: true
+		});
+		expect(res).toEqual({ path: 'src/shot copy.png' });
+		expect(readFileSync(join(WS, 'src/shot copy.png'), 'utf8')).toBe('png');
+		expect(lstatSync(join(WS, 'src/shot.png')).isSymbolicLink()).toBe(true);
+	});
+
+	it('copies when a hard link is not possible, and never replaces a file made meanwhile', () => {
+		link.crossDevice = (dest) => {
+			if (!existsSync(dest)) writeFileSync(dest, 'made meanwhile');
+			link.crossDevice = () => {};
+		};
+		const res = fs.writeUploadChunk({
+			dir: 'src',
+			name: 'report.txt',
+			id: 'gggggggg',
+			offset: 0,
+			bytes: Buffer.from('pasted'),
+			last: true
+		});
+		expect(res).toEqual({ path: 'src/report copy.txt' });
+		expect(readFileSync(join(WS, 'src/report.txt'), 'utf8')).toBe('made meanwhile');
+		expect(readFileSync(join(WS, 'src/report copy.txt'), 'utf8')).toBe('pasted');
+		expect(stagedParts()).toEqual([]);
+	});
+
+	it('refuses a hidden destination folder', () => {
+		mkdirSync(join(WS, '.venv/lib'), { recursive: true });
+		mkdirSync(join(WS, 'src/.cache'), { recursive: true });
+		for (const dir of ['.venv', '.venv/lib', 'src/.cache']) {
+			expect(() =>
+				fs.writeUploadChunk({
+					dir,
+					name: 'sitecustomize.py',
+					id: 'hhhhhhhh',
+					offset: 0,
+					bytes: Buffer.from('x'),
+					last: true
+				})
+			).toThrow(/hidden folders/);
+		}
+		expect(readdirSync(join(WS, '.venv/lib'))).toEqual([]);
+		expect(readdirSync(join(WS, 'src/.cache'))).toEqual([]);
+		expect(stagedParts()).toEqual([]);
+	});
+
+	describe('upload route', () => {
+		const query = { dir: 'src', name: 'note.txt', id: 'iiiiiiii', offset: '0', last: '1' };
+		const octet = { 'content-type': 'application/octet-stream' };
+
+		it('writes a same-origin octet-stream paste', async () => {
+			const res = await POST(send('POST', query, { ...octet, origin: 'http://localhost:4000' }, 'hi'));
+			expect(await res.json()).toEqual({ ok: true, path: 'src/note.txt' });
+			expect(readFileSync(join(WS, 'src/note.txt'), 'utf8')).toBe('hi');
+		});
+
+		it('writes when the client sends no Origin header', async () => {
+			const res = await POST(send('POST', query, octet, 'hi'));
+			expect(await res.json()).toEqual({ ok: true, path: 'src/note.txt' });
+		});
+
+		it('refuses a body a cross-site page can send without a preflight', async () => {
+			for (const headers of [{}, { 'content-type': 'text/plain' }, { 'content-type': 'multipart/form-data' }]) {
+				await expect(POST(send('POST', query, headers, 'hi'))).rejects.toMatchObject({ status: 415 });
+			}
+			expect(existsSync(join(WS, 'src/note.txt'))).toBe(false);
+			expect(stagedParts()).toEqual([]);
+		});
+
+		it('refuses a paste from another origin', async () => {
+			for (const origin of ['http://evil.example', 'http://localhost:4001', 'null']) {
+				await expect(POST(send('POST', query, { ...octet, origin }, 'hi'))).rejects.toMatchObject({ status: 403 });
+			}
+			expect(existsSync(join(WS, 'src/note.txt'))).toBe(false);
+			expect(stagedParts()).toEqual([]);
+		});
+
+		it('refuses a hidden destination folder', async () => {
+			mkdirSync(join(WS, '.venv'));
+			await expect(POST(send('POST', { ...query, dir: '.venv' }, octet, 'hi'))).rejects.toMatchObject({
+				status: 400,
+				body: { message: expect.stringMatching(/hidden folders/) }
+			});
+			expect(readdirSync(join(WS, '.venv'))).toEqual([]);
+		});
+
+		it('aborts only for its own origin', async () => {
+			await POST(send('POST', { ...query, last: '0' }, octet, 'hi'));
+			expect(stagedParts()).toEqual(['iiiiiiii.part']);
+			expect(() => DELETE(send('DELETE', { id: 'iiiiiiii' }, { origin: 'http://evil.example' }))).toThrow(
+				expect.objectContaining({ status: 403 })
+			);
+			expect(stagedParts()).toEqual(['iiiiiiii.part']);
+			DELETE(send('DELETE', { id: 'iiiiiiii' }, { origin: 'http://localhost:4000' }));
+			expect(stagedParts()).toEqual([]);
+		});
 	});
 
 	it('keeps every path inside the workspace', () => {

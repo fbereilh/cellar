@@ -875,7 +875,7 @@
 			}
 			return path;
 		} catch (err) {
-			const q = new URLSearchParams({ dir, id });
+			const q = new URLSearchParams({ id });
 			void fetch(`/api/fs/upload?${q}`, { method: 'DELETE' }).catch(() => {});
 			throw err;
 		}

@@ -24,11 +24,15 @@ import {
 	fsyncSync,
 	closeSync,
 	linkSync,
-	unlinkSync
+	lstatSync,
+	copyFileSync,
+	constants
 } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { createHash } from 'node:crypto';
 import { join, resolve, relative, sep, basename, dirname } from 'node:path';
 import { isHtmlPath } from '$lib/htmlPreview';
-import { freeName } from '$lib/filePaste';
+import { copyName, freeName } from '$lib/filePaste';
 import { MAX_FILE_BYTES, MAX_HTML_FILE_BYTES, MAX_UPLOAD_BYTES } from '$lib/server/limits.js';
 
 // Directories that are noise for a workspace file tree.
@@ -338,29 +342,70 @@ export function copyEntry(fromRel: string, destDirRel: string): FsOpFromResult {
 // A file pasted into the explorer from Finder or another app arrives in the
 // browser as bytes, and adapter-node caps every request body (see
 // `$lib/saveLimit.ts`). So the browser sends it in chunks: each one appends to
-// a hidden part file in the destination folder, and the last one links it into
-// place under a free name. The part file is dot-led, so the tree never lists
-// it, and it sits in the destination folder so the final step is one rename on
-// one filesystem.
+// a part file, and the last one places it in the destination folder under a
+// free name. The part file is staged in the OS temp dir, never in the project
+// folder, so an interrupted paste leaves nothing for `git status` to find.
 
 const UPLOAD_ID = /^[a-z0-9]{8,64}$/;
 
-function uploadPartPath(dirAbs: string, id: string): string {
+/** How many names (`x`, `x copy`, `x copy 2`, ...) a paste tries before it gives up. */
+const MAX_UPLOAD_NAME_TRIES = 1000;
+
+/** This workspace's own staging folder for part files, under the OS temp dir. */
+export function uploadStagingDir(): string {
+	const key = createHash('sha256').update(resolve(workspaceRoot())).digest('hex').slice(0, 16);
+	return join(tmpdir(), 'cellar-uploads', key);
+}
+
+/**
+ * Drop every part file staged for this workspace. Runs at server start: one
+ * server owns a workspace, so any part file found then belongs to a paste that
+ * a reload, a closed tab or a restart cut short.
+ */
+export function sweepStagedUploads(): void {
+	rmSync(uploadStagingDir(), { recursive: true, force: true });
+}
+
+function uploadPartPath(id: string): string {
 	if (!UPLOAD_ID.test(id ?? '')) throw new Error('invalid upload id');
-	return join(dirAbs, `.cellar-upload-${id}.part`);
+	return join(uploadStagingDir(), `${id}.part`);
 }
 
 function uploadDir(dirRel: string): string {
 	const dirAbs = resolveInWorkspace(dirRel);
+	if (toRel(dirAbs).split('/').some((segment) => segment.startsWith('.'))) {
+		throw new Error('hidden folders are not shown in the explorer');
+	}
 	if (!existsSync(dirAbs) || !statSync(dirAbs).isDirectory()) throw new Error('destination is not a folder');
 	return dirAbs;
+}
+
+/** Whether a name is taken. A broken symlink counts, which `existsSync` misses. */
+function entryExists(abs: string): boolean {
+	return lstatSync(abs, { throwIfNoEntry: false }) !== undefined;
+}
+
+/**
+ * Put the staged file at `dest` without ever replacing an entry there. A hard
+ * link is one step on one filesystem. Where the staging folder is on another
+ * filesystem, or hard links are unsupported, an exclusive copy does the same.
+ * Both throw EEXIST when `dest` is taken.
+ */
+function placeUpload(part: string, dest: string): void {
+	try {
+		linkSync(part, dest);
+	} catch (err) {
+		const code = (err as NodeJS.ErrnoException)?.code;
+		if (code !== 'EXDEV' && code !== 'EPERM' && code !== 'ENOTSUP' && code !== 'ENOSYS') throw err;
+		copyFileSync(part, dest, constants.COPYFILE_EXCL);
+	}
 }
 
 /**
  * Append one chunk of a pasted file. `offset` must equal the bytes already
  * received, so a lost or repeated chunk is refused rather than corrupting the
- * file. On the `last` chunk the file is flushed to disk and linked into the
- * folder under `name`, or the next free ` copy` name. A link never replaces an
+ * file. On the `last` chunk the file is flushed to disk and placed in the
+ * folder under `name`, or the next free ` copy` name. Placing never replaces an
  * existing entry, so a file created in the meantime cannot be clobbered.
  */
 export function writeUploadChunk(opts: {
@@ -373,7 +418,7 @@ export function writeUploadChunk(opts: {
 }): FsOpPathResult | { received: number } {
 	const cleanName = assertSimpleName(opts.name);
 	const dirAbs = uploadDir(opts.dir);
-	const part = uploadPartPath(dirAbs, opts.id);
+	const part = uploadPartPath(opts.id);
 	const offset = Number(opts.offset);
 	if (!Number.isSafeInteger(offset) || offset < 0) throw new Error('invalid upload offset');
 	if (offset + opts.bytes.length > MAX_UPLOAD_BYTES) {
@@ -381,7 +426,8 @@ export function writeUploadChunk(opts: {
 		throw new Error(`file too large to paste (over the ${Math.round(MAX_UPLOAD_BYTES / (1024 * 1024))} MB limit)`);
 	}
 	if (offset === 0) {
-		writeFileSync(part, opts.bytes, { flag: 'wx' });
+		mkdirSync(dirname(part), { recursive: true, mode: 0o700 });
+		writeFileSync(part, opts.bytes, { flag: 'wx', mode: 0o600 });
 	} else {
 		const have = existsSync(part) ? statSync(part).size : -1;
 		if (have !== offset) throw new Error('upload chunk out of order');
@@ -395,24 +441,22 @@ export function writeUploadChunk(opts: {
 	} finally {
 		closeSync(fd);
 	}
-	for (;;) {
-		const dest = dedupeDest(join(dirAbs, cleanName));
+	for (let n = 0; n < MAX_UPLOAD_NAME_TRIES; n++) {
+		const dest = join(dirAbs, n === 0 ? cleanName : copyName(cleanName, n));
+		if (entryExists(dest)) continue;
 		try {
-			linkSync(part, dest);
-			unlinkSync(part);
+			placeUpload(part, dest);
 		} catch (err) {
-			const code = (err as NodeJS.ErrnoException)?.code;
-			if (code === 'EEXIST') continue; // taken since dedupe: pick again
-			// A filesystem without hard links (exFAT, some network mounts). The
-			// name was free a moment ago, so a plain rename is the same outcome.
-			if (code !== 'EPERM' && code !== 'ENOTSUP' && code !== 'ENOSYS') throw err;
-			renameSync(part, dest);
+			if ((err as NodeJS.ErrnoException)?.code === 'EEXIST') continue;
+			throw err;
 		}
+		rmSync(part, { force: true });
 		return { path: toRel(dest) };
 	}
+	throw new Error(`no free name for ${cleanName} in this folder (tried ${MAX_UPLOAD_NAME_TRIES})`);
 }
 
 /** Drop the part file of an upload the browser gave up on. */
-export function abortUpload(dirRel: string, id: string): void {
-	rmSync(uploadPartPath(uploadDir(dirRel), id), { force: true });
+export function abortUpload(id: string): void {
+	rmSync(uploadPartPath(id), { force: true });
 }
