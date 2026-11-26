@@ -568,15 +568,18 @@
 		void tick().then(() => {
 			const row = filesBodyEl?.querySelector<HTMLElement>(`[data-path="${CSS.escape(path)}"]`);
 			row?.scrollIntoView({ block: 'nearest' });
-			if (focus) row?.focus();
+			const active = document.activeElement;
+			if (focus && (!active || active === document.body || filesBodyEl?.contains(active))) row?.focus();
 		});
 		return true;
 	}
 
 	/**
-	 * Select and focus an entry a file op just created (a paste or a duplicate),
-	 * so the keyboard acts on it next. The tree reload that will hold it is
-	 * usually still in flight, so the reveal waits for it when it must.
+	 * Select an entry a file op just created (a paste or a duplicate), and focus
+	 * it so the keyboard acts on it next. Focus moves only while it is still in
+	 * the Files section or on nothing: a slow op must not pull the keyboard out
+	 * of an editor the person moved to meanwhile. The tree reload that will hold
+	 * the entry is usually still in flight, so the reveal waits for it when it must.
 	 */
 	let pendingFocus = false;
 	function selectCreated(path: string) {

@@ -141,6 +141,35 @@ test.describe(runtimeAvailable() ? 'file tree: paste and duplicate' : `file tree
 		await expect(fileRow(page, 'src/shot copy.png')).toBeVisible();
 	});
 
+	test('a slow paste selects the new file without taking focus from an editor', async ({ page }) => {
+		await openTree(page);
+		await fileRow(page, 'notes.md').click();
+		const editor = page.locator('.cm-content').filter({ hasText: '# notes' });
+		await expect(editor).toBeVisible();
+
+		let release = () => {};
+		const held = new Promise<void>((resolve) => (release = resolve));
+		let reached = () => {};
+		const uploading = new Promise<void>((resolve) => (reached = resolve));
+		await page.route('**/api/fs/upload**', async (route) => {
+			reached();
+			await held;
+			await route.continue();
+		});
+
+		await pasteFiles(page, fileRow(page, 'notes.md'), [{ name: 'shot.png', type: 'image/png', size: 10 }]);
+		await uploading;
+		await editor.click();
+		await expect(editor).toBeFocused();
+		release();
+
+		await expect(fileRow(page, 'shot.png')).toHaveAttribute('data-selected', 'true');
+		await expect(editor).toBeFocused();
+		await page.keyboard.type('still typing here');
+		await expect(editor).toContainText('still typing here');
+		expect(existsSync(join(ws, 'shot.png'))).toBe(true);
+	});
+
 	test('a paste with no files and nothing copied says so', async ({ page }) => {
 		await openTree(page);
 		await pasteFiles(page, fileRow(page, 'notes.md'), []);
