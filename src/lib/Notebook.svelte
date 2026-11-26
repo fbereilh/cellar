@@ -1397,7 +1397,7 @@
 		<div bind:this={toolbarSentinel} class="h-0" aria-hidden="true"></div>
 		<div
 			bind:this={toolbarEl}
-			class="@container sticky top-0 z-30 mb-3 flex flex-wrap items-center gap-2 border-b bg-(--cellar-surface-page) pt-1 pb-[calc(0.25rem+var(--cellar-find-reserve,0px))] transition-[border-color,box-shadow] duration-150 motion-reduce:transition-none {toolbarPinned
+			class="@container sticky top-0 z-30 mb-3 flex before:absolute before:inset-y-0 before:-inset-x-4 before:-z-10 before:bg-(--cellar-surface-page) flex-wrap items-center gap-2 border-b bg-(--cellar-surface-page) pt-1 pb-[calc(0.25rem+var(--cellar-find-reserve,0px))] transition-[border-color,box-shadow] duration-150 motion-reduce:transition-none {toolbarPinned
 				? 'border-base-300 shadow-sm'
 				: 'border-transparent'}"
 			data-pinned={toolbarPinned ? '' : undefined}

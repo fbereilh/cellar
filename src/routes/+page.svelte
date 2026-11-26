@@ -352,22 +352,33 @@
 		const main = mainEl;
 		const height = findHeight;
 		const pane = activeTabId ? document.getElementById(tabPanelDomId(activeTabId)) : null;
-		const bar = pane?.querySelector<HTMLElement>('[data-testid="notebook-toolbar"]') ?? null;
+		let bar: HTMLElement | null = null;
 		const place = () => {
 			const box = bar?.getBoundingClientRect();
 			const area = main.getBoundingClientRect();
 			findTop = box?.height ? Math.round(box.bottom - area.top - FIND_GAP - height) : 12;
 			findRight = box?.height ? Math.max(0, Math.round(area.right - box.right)) : 16;
 		};
+		const ro = new ResizeObserver(place);
+		const attach = () => {
+			const next = pane?.querySelector<HTMLElement>('[data-testid="notebook-toolbar"]') ?? null;
+			if (next === bar) return;
+			if (bar) ro.unobserve(bar);
+			bar = next;
+			if (bar) ro.observe(bar, { box: 'border-box' });
+			place();
+		};
+		const mo = new MutationObserver(attach);
+		if (pane) mo.observe(pane, { childList: true, subtree: true });
+		attach();
 		place();
 		pane?.addEventListener('scroll', place, { passive: true });
 		window.addEventListener('resize', place);
-		const ro = bar ? new ResizeObserver(place) : null;
-		if (bar) ro?.observe(bar, { box: 'border-box' });
 		return () => {
 			pane?.removeEventListener('scroll', place);
 			window.removeEventListener('resize', place);
-			ro?.disconnect();
+			mo.disconnect();
+			ro.disconnect();
 		};
 	});
 	$effect(() => {
