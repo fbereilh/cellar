@@ -148,6 +148,9 @@
 		onRunEnd?: () => void;
 		/** Interrupt this notebook's kernel (same handler the Kernels sidebar uses). */
 		onInterruptKernel?: () => void;
+		/** Restart this notebook's kernel (same handler the Kernels sidebar and the
+		 *  palette use); resolves once the request settles. */
+		onRestartKernel?: () => Promise<void> | void;
 		/**
 		 * Consolidate THIS notebook's imports (the shell owns the request, and binds
 		 * it to this notebook's path the way `onInterruptKernel` is bound).
@@ -246,6 +249,7 @@
 		onRunStart,
 		onRunEnd,
 		onInterruptKernel,
+		onRestartKernel,
 		onConsolidateImports,
 		consolidating = false,
 		onBlame,
@@ -1060,7 +1064,15 @@
 		const parent = scrollParent(el);
 		const view = parent ? parent.getBoundingClientRect() : { top: 0, bottom: window.innerHeight };
 		const r = el.getBoundingClientRect();
-		return r.top >= view.top - 4 && r.top <= view.bottom - Math.min(r.height, 96);
+		const top = view.top + (parent ? stickyTopInset(parent) : 0);
+		return r.top >= top - 4 && r.top <= view.bottom - Math.min(r.height, 96);
+	}
+
+	// The band at the top of the pane the notebook toolbar's sticky compact row
+	// covers, read from the pane's own `scroll-padding-top` so the native
+	// `scrollIntoView` paths and these hand-rolled ones keep one number.
+	function stickyTopInset(parent: HTMLElement): number {
+		return parseFloat(getComputedStyle(parent).scrollPaddingTop) || 0;
 	}
 
 	function reducedMotion(): boolean {
@@ -1125,7 +1137,9 @@
 	// otherwise top-pinned near the pane's top so the cell's header + first outputs
 	// are what the user sees (centering a tall cell would push its top off screen).
 	function reframeDelta(parent: HTMLElement, el: HTMLElement): number {
-		const view = parent.getBoundingClientRect();
+		const inset = stickyTopInset(parent);
+		const box = parent.getBoundingClientRect();
+		const view = { top: box.top + inset, height: box.height - inset };
 		const r = el.getBoundingClientRect();
 		const margin = 24;
 		return r.height + margin * 2 <= view.height
@@ -4991,6 +5005,8 @@
 			onRunAbove={runAboveCell}
 			onRunAll={runAll}
 			onInterrupt={onInterruptKernel}
+			onRestart={onRestartKernel}
+			{onNotice}
 			onClear={clearCell}
 			onClearAll={clearAll}
 			onConsolidateImports={onConsolidateImports}

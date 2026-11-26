@@ -2082,9 +2082,11 @@
 			<!-- Every open notebook stays mounted (editor + run state preserved),
 			     just hidden. The default notebook and opened `.ipynb` files use the
 			     same live component; each persists to its own file. -->
+			<!-- `scroll-pt-12` reserves the notebook toolbar's sticky compact row, so a
+			     cell scrolled into view lands below it rather than under it. -->
 			{#if notebookOpen}
 				<div
-					class="h-full overflow-y-auto {activeTabId === 'notebook' ? '' : 'hidden'}"
+					class="h-full scroll-pt-12 overflow-y-auto {activeTabId === 'notebook' ? '' : 'hidden'}"
 					role="tabpanel"
 					id={tabPanelDomId('notebook')}
 					aria-labelledby={tabDomId('notebook')}
@@ -2111,6 +2113,7 @@
 						onRunStart={onRunStart}
 						onRunEnd={onRunEnd}
 						onInterruptKernel={() => interruptKernel(canonicalNotebookRel)}
+						onRestartKernel={() => restartKernel(canonicalNotebookRel)}
 						onConsolidateImports={() => consolidateImports(canonicalNotebookRel)}
 						consolidating={consolidatingPaths.has(canonicalNotebookRel)}
 						onBlame={handleBlame}
@@ -2121,7 +2124,7 @@
 
 			{#each ipynbTabs as tab (tab.id)}
 				<div
-					class="h-full overflow-y-auto {activeTabId === tab.id ? '' : 'hidden'}"
+					class="h-full scroll-pt-12 overflow-y-auto {activeTabId === tab.id ? '' : 'hidden'}"
 					role="tabpanel"
 					id={tabPanelDomId(tab.id)}
 					aria-labelledby={tabDomId(tab.id)}
@@ -2148,6 +2151,7 @@
 						onRunStart={onRunStart}
 						onRunEnd={onRunEnd}
 						onInterruptKernel={() => interruptKernel(tab.path)}
+						onRestartKernel={() => restartKernel(tab.path)}
 						onConsolidateImports={() => consolidateImports(tab.path)}
 						consolidating={consolidatingPaths.has(tab.path)}
 						onBlame={handleBlame}

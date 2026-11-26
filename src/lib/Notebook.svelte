@@ -103,6 +103,8 @@
 		/** Run every code cell in the notebook, top to bottom. */
 		onRunAll?: () => void;
 		onInterrupt?: () => void;
+		/** Restart this notebook's kernel; resolves once the request settles. */
+		onRestart?: () => Promise<void> | void;
 		onClear: (id: string) => void;
 		/** Clear every cell's outputs — the same action as the palette's "Clear all outputs". */
 		onClearAll?: () => void;
@@ -178,6 +180,9 @@
 		onSetExportTarget?: (target: string, opts?: { keepalive?: boolean }) => void;
 		/** Regenerate the `.py` module now; resolves with the server result. */
 		onExportPy?: () => Promise<ExportPyResult | null>;
+		/** The shell's transient notice line. The toolbar Export button posts its
+		 *  result there, since the menu's own result line is hidden while it is closed. */
+		onNotice?: (message: string) => void;
 		/** What the stored export path is measured from (`$lib/exportTarget`);
 		 *  `workspace` for the absent-key legacy default. */
 		exportBase?: string;
@@ -330,6 +335,7 @@
 		onRunAbove,
 		onRunAll,
 		onInterrupt,
+		onRestart,
 		onClear,
 		onClearAll,
 		onConsolidateImports,
@@ -347,6 +353,7 @@
 		exportStranded = { count: 0, withLanguage: 0 },
 		onSetExportTarget,
 		onExportPy,
+		onNotice,
 		exportBase = 'workspace',
 		exportResolved = null,
 		exportResolveError = null,
@@ -828,8 +835,17 @@
 	}
 	function onSettingsToggle(e: Event) {
 		settingsOpen = (e as ToggleEvent).newState === 'open';
+		const toTarget = focusExportTargetOnOpen;
+		focusExportTargetOnOpen = false;
 		if (!settingsOpen) return;
 		placeSettingsMenu();
+		// Opened by the toolbar Export button with no target set: the field is
+		// what the user came to fill, and a text input commits nothing on a key.
+		if (toTarget && exportTargetEl) {
+			exportTargetEl.focus({ preventScroll: true });
+			exportTargetEl.scrollIntoView({ block: 'nearest' });
+			return;
+		}
 		// Keyboard reach without arming a control: focus goes to the menu itself, so
 		// Tab walks into it but no bare keystroke lands on the language select,
 		// which commits on a single arrow or type-ahead letter.
@@ -847,6 +863,36 @@
 			window.removeEventListener('scroll', follow, true);
 		};
 	});
+	// The toolbar turns compact once its top has scrolled past the top of the pane:
+	// a zero-height sentinel sits where the bar starts, and the bar is stuck exactly
+	// while the sentinel is above the pane's top edge. A hidden pane reports no
+	// bounds, so a background notebook stays in the full form.
+	let toolbarSentinel = $state<HTMLElement | null>(null);
+	let toolbarCompact = $state(false);
+	$effect(() => {
+		const el = toolbarSentinel;
+		if (!el || !containerEl) return;
+		const root = scrollParentOf(containerEl);
+		const io = new IntersectionObserver(
+			([e]) => {
+				const top = e.rootBounds?.top;
+				toolbarCompact = !e.isIntersecting && top !== undefined && e.boundingClientRect.top < top;
+			},
+			{ root, threshold: 0 }
+		);
+		io.observe(el);
+		return () => io.disconnect();
+	});
+	let restarting = $state(false);
+	async function restartKernel() {
+		if (restarting) return;
+		restarting = true;
+		try {
+			await onRestart?.();
+		} finally {
+			restarting = false;
+		}
+	}
 	// Whether the notebook has any runnable (code) cell — gates the "Run all" button.
 	const hasCodeCell = $derived(cells.some((c) => c.cell_type === 'code'));
 	// Whether THIS notebook's kernel is executing or has work waiting — gates
@@ -991,7 +1037,7 @@
 		window.addEventListener('pagehide', onUnload);
 		return () => window.removeEventListener('pagehide', onUnload);
 	});
-	async function doExport() {
+	async function doExport(fromToolbar = false) {
 		if (exporting) return;
 		exporting = true;
 		exportFeedback = '';
@@ -1026,6 +1072,23 @@
 		else if (shown.length)
 			exportFeedback = `Wrote ${r.count} ${r.count === 1 ? 'cell' : 'cells'} → ${r.target}, but ${hazardSummaryClause(shown)} - see the warning.`;
 		else exportFeedback = `Exported ${r.count} ${r.count === 1 ? 'cell' : 'cells'} → ${r.target}`;
+		// The toolbar button runs this same export, but the line above sits in the
+		// closed menu. Post the same words on the notice line so the click is seen.
+		if (fromToolbar && !settingsOpen && exportFeedback) onNotice?.(exportFeedback);
+	}
+	// The toolbar Export button beside the menu button. With a target that names a
+	// module it runs `doExport`. With none there is nothing it could honestly
+	// write, so it opens the menu instead and puts the cursor in the target field.
+	// That half is DECLARATIVE (`popovertarget`), like the menu button, so the
+	// browser owns the toggle and returns focus to this button on close.
+	const exportOpensMenu = $derived(exportLanguage === null);
+	let focusExportTargetOnOpen = false;
+	function onToolbarExport() {
+		if (exportOpensMenu) {
+			focusExportTargetOnOpen = !settingsOpen;
+			return;
+		}
+		void doExport(true);
 	}
 </script>
 
@@ -1295,10 +1358,25 @@
 		     what this bar does NOT carry (run stale/above/below, Export to .py, …).
 		     `flex-wrap` so a narrow window (or a wide sidebar) wraps the bar onto a
 		     second row instead of pushing buttons out of reach — the same rule the
-		     per-cell toolbar row follows. -->
-		<div class="mb-4 flex flex-wrap items-center gap-2" data-testid="notebook-toolbar">
+		     per-cell toolbar row follows. Below a 54rem bar, Interrupt, Restart,
+		     Clear all outputs and Export drop their words and keep icon, tooltip and
+		     accessible name, so the whole bar stays on one row at an ordinary width.
+		     STICKY: once the user scrolls past it, this same bar stays pinned to the
+		     top of the pane in its compact form (`toolbarCompact`), every button an
+		     icon with its tooltip, name, state and action unchanged. Both forms are
+		     one 2rem row, so the switch moves no cell. The pane's `scroll-padding-top`
+		     keeps scrolled-to cells clear of it, and the compact icons pack to the
+		     left so the find bar at the pane's top right never covers them. -->
+		<div bind:this={toolbarSentinel} class="h-0" aria-hidden="true"></div>
+		<div
+			class="@container group sticky top-0 z-30 -mx-4 mb-3 flex flex-wrap items-center gap-2 border-b px-4 py-1 {toolbarCompact
+				? 'border-base-300 bg-(--cellar-surface-page) shadow-sm'
+				: 'border-transparent'}"
+			data-compact={toolbarCompact ? '' : undefined}
+			data-testid="notebook-toolbar"
+		>
 			<button
-				class="btn btn-ghost btn-sm gap-1.5 text-success"
+				class="btn btn-ghost btn-sm gap-1.5 text-success group-data-compact:btn-square"
 				onclick={() => onRunAll?.()}
 				disabled={!hasCodeCell}
 				title="Run all cells top to bottom"
@@ -1306,7 +1384,7 @@
 				data-testid="run-all"
 			>
 				<svg class="h-4 w-4" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M8 5v14l11-7z" /></svg>
-				Run all
+				<span class="group-data-compact:hidden">Run all</span>
 			</button>
 			<!-- Disabled only while this notebook looks idle from here, so no interrupt
 			     request is fired at a kernel with nothing to stop and no queue to drop.
@@ -1315,7 +1393,7 @@
 			     run being enqueued and the `queue:changed` broadcast landing, the
 			     button is briefly disabled while there really is something to cancel. -->
 			<button
-				class="btn btn-ghost btn-sm gap-1.5"
+				class="btn btn-ghost btn-sm gap-1.5 @max-[54rem]:btn-square group-data-compact:btn-square"
 				onclick={() => onInterrupt?.()}
 				disabled={!notebookBusy}
 				title="Interrupt the kernel (stop the running cell and drop this notebook's queued runs)"
@@ -1323,10 +1401,28 @@
 				data-testid="interrupt-all"
 			>
 				<svg class="h-4 w-4" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><rect x="6" y="6" width="12" height="12" rx="1.5" /></svg>
-				Interrupt
+				<span class="@max-[54rem]:hidden group-data-compact:hidden">Interrupt</span>
+			</button>
+			<!-- The palette's and the Kernels card's restart, bound to this notebook's
+			     kernel. Like theirs it asks no confirmation. Disabled only while its own
+			     request is in flight, so one click sends one restart. -->
+			<button
+				class="btn btn-ghost btn-sm gap-1.5 @max-[54rem]:btn-square group-data-compact:btn-square"
+				onclick={restartKernel}
+				disabled={restarting}
+				title="Restart the kernel - clear this notebook's variables from memory (keeps the notebook)"
+				aria-label="Restart the kernel"
+				data-testid="restart-kernel"
+			>
+				{#if restarting}
+					<span class="loading loading-spinner loading-xs"></span>
+				{:else}
+					<svg class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 12a9 9 0 0 1 15-6.7L21 8" /><path d="M21 3v5h-5" /><path d="M21 12a9 9 0 0 1-15 6.7L3 16" /><path d="M3 21v-5h5" /></svg>
+				{/if}
+				<span class="@max-[54rem]:hidden group-data-compact:hidden">Restart</span>
 			</button>
 			<button
-				class="btn btn-ghost btn-sm gap-1.5"
+				class="btn btn-ghost btn-sm gap-1.5 @max-[54rem]:btn-square group-data-compact:btn-square"
 				onclick={() => onClearAll?.()}
 				disabled={!hasOutputs}
 				title="Clear every cell's outputs"
@@ -1336,7 +1432,7 @@
 				<svg class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
 					<path d="m7 21-4.3-4.3a1 1 0 0 1 0-1.4l9.3-9.3a1 1 0 0 1 1.4 0l5.6 5.6a1 1 0 0 1 0 1.4L13 21" /><path d="M22 21H7" /><path d="m5 11 9 9" />
 				</svg>
-				Clear all outputs
+				<span class="@max-[54rem]:hidden group-data-compact:hidden">Clear all outputs</span>
 			</button>
 			<!-- HIDDEN outright on a Mojo notebook, not disabled: the sweep lifts
 			     top-level PYTHON imports into the Python-kernel imports cell, and a Mojo
@@ -1356,7 +1452,7 @@
 			     a new claim, not the same button in a new place. -->
 			{#if offersConsolidateImports}
 				<button
-					class="btn btn-ghost btn-sm gap-1.5"
+					class="btn btn-ghost btn-sm gap-1.5 group-data-compact:btn-square"
 					onclick={() => onConsolidateImports?.()}
 					disabled={consolidating}
 					title="Move every top-level import into one pinned cell at the top of the notebook, and run it"
@@ -1374,7 +1470,7 @@
 						     distinct and the right direction. -->
 						<svg class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 3h14" /><path d="M12 21V9" /><path d="m7 14 5-5 5 5" /></svg>
 					{/if}
-					Consolidate imports
+					<span class="group-data-compact:hidden">Consolidate imports</span>
 				</button>
 			{/if}
 			<!-- The notebook-settings menu: the notebook's LANGUAGE and its nbdev-style
@@ -1386,9 +1482,35 @@
 			     `showExportBar`). The warning dot carries the one thing a closed menu
 			     would otherwise hide: an export warning the user has to act on. -->
 			{#if showSettingsMenu}
+				<!-- One group at the right end, so a wrap moves Export and the menu
+				     button together and Export always sits beside the language. -->
+				<div class="ml-auto flex items-center gap-2 group-data-compact:ml-0">
+				{#if showExportBar}
+					<!-- One-click export, the menu's own Export action without opening the
+					     menu (`onToolbarExport`). With no target set it opens the menu at
+					     the target field instead of pretending to export. -->
+					<button
+						class="btn btn-ghost btn-sm gap-1.5 @max-[54rem]:btn-square group-data-compact:btn-square"
+						onclick={onToolbarExport}
+						popovertarget={exportOpensMenu ? settingsMenuId : undefined}
+						disabled={exporting}
+						title={exportOpensMenu
+							? 'Set an export target module path first'
+							: `Export the marked cells to ${exportTarget}`}
+						aria-label={exportOpensMenu ? 'Export: set an export target first' : `Export to ${exportTarget}`}
+						data-testid="toolbar-export"
+					>
+						{#if exporting}
+							<span class="loading loading-spinner loading-xs"></span>
+						{:else}
+							<svg class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v12" /><path d="m8 11 4 4 4-4" /><path d="M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2" /></svg>
+						{/if}
+						<span class="@max-[54rem]:hidden group-data-compact:hidden">Export</span>
+					</button>
+				{/if}
 				<button
 					bind:this={settingsBtnEl}
-					class="btn btn-ghost btn-sm relative ml-auto gap-1.5"
+					class="btn btn-ghost btn-sm relative gap-1.5 group-data-compact:btn-square"
 					popovertarget={settingsMenuId}
 					title={settingsWarning
 						? 'Language and export settings - the export needs attention'
@@ -1401,12 +1523,13 @@
 					data-warning={settingsWarning ? '' : undefined}
 				>
 					<svg class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 21v-7" /><path d="M4 10V3" /><path d="M12 21v-9" /><path d="M12 8V3" /><path d="M20 21v-5" /><path d="M20 12V3" /><path d="M1 14h6" /><path d="M9 8h6" /><path d="M17 16h6" /></svg>
-					{settingsLabel}
-					<svg class="h-3 w-3 opacity-60" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 9 6 6 6-6" /></svg>
+					<span class="group-data-compact:hidden">{settingsLabel}</span>
+					<svg class="h-3 w-3 opacity-60 group-data-compact:hidden" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 9 6 6 6-6" /></svg>
 					{#if settingsWarning}
 						<span class="absolute right-1 top-1 h-2 w-2 rounded-full bg-warning" data-testid="notebook-settings-warning" aria-hidden="true"></span>
 					{/if}
 				</button>
+				</div>
 			{/if}
 		</div>
 		{#if showSettingsMenu}
@@ -1524,7 +1647,7 @@
 							</span>
 							<button
 								class="btn btn-primary btn-xs ml-auto gap-1"
-								onclick={doExport}
+								onclick={() => doExport()}
 								disabled={exporting}
 								data-testid="export-run"
 							>

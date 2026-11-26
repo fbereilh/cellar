@@ -375,10 +375,10 @@ test('the toolbar stays reachable as the window narrows', async ({ page }) => {
 			};
 		});
 
-	// Five buttons: Run all, Interrupt, Clear all outputs, Consolidate imports and
-	// the language-and-export menu at the right end. One row at an ordinary window
-	// width, every button on it.
-	const BUTTONS = 5;
+	// Seven buttons: Run all, Interrupt, Restart, Clear all outputs, Consolidate
+	// imports, Export and the language-and-export menu at the right end. One row at
+	// an ordinary window width, every button on it.
+	const BUTTONS = 7;
 	await page.setViewportSize({ width: 1280, height: 800 });
 	const wide = await measure();
 	expect(wide.count).toBe(BUTTONS);
@@ -386,9 +386,10 @@ test('the toolbar stays reachable as the window narrows', async ({ page }) => {
 	expect(wide.overflows).toBe(false);
 	expect(wide.pageScrolls).toBe(false);
 
-	// The fifth button moved the one-row limit: measured at ~940px with the sidebar
-	// at its default width (four buttons fit down to ~820px). Pinned with headroom
-	// for font metrics, so a wider toolbar fails here and not only at 1280px.
+	// Below a 54rem bar, Interrupt, Restart, Clear all outputs and Export drop their
+	// words and keep their icons, so seven buttons still fit one row here: measured
+	// at 539px of a 708px bar with the sidebar at its default width. Pinned so a
+	// wider toolbar fails here and not only at 1280px.
 	await page.setViewportSize({ width: 1000, height: 800 });
 	expect((await measure()).rows, 'the bar wraps at 1000px').toBe(1);
 
