@@ -248,4 +248,14 @@ test('a wrapped toolbar turning compact does not move the cells', async ({ page 
 	expect(fullHeight - (await barHeight()), 'the full toolbar did not wrap at this width').toBeGreaterThan(20);
 	await expect.poll(cellOffset).toBeCloseTo(before, 0);
 	await expect(bar).toHaveAttribute('data-compact', '');
+
+	// Widened while compact, the full form fits one row: the two-row measure may not outlive it.
+	await page.setViewportSize({ width: 1400, height: 720 });
+	await pane.evaluate((el) => (el.scrollTop = 0));
+	await expect(bar).not.toHaveAttribute('data-compact');
+	const oneRow = await cellOffset();
+	expect(await barHeight(), 'the full toolbar still wraps at this width').toBeLessThan(fullHeight - 20);
+	await pane.evaluate((el) => (el.scrollTop = 150));
+	await expect(bar).toHaveAttribute('data-compact', '');
+	await expect.poll(cellOffset).toBeCloseTo(oneRow, 0);
 });

@@ -868,7 +868,8 @@
 		if (!el || !containerEl) return;
 		const root = scrollParent(containerEl);
 		const io = new IntersectionObserver(
-			([e]) => {
+			(entries) => {
+				const e = entries[entries.length - 1];
 				const top = e.rootBounds?.top;
 				toolbarCompact = !e.isIntersecting && top !== undefined && e.boundingClientRect.top < top;
 			},
@@ -895,6 +896,14 @@
 		});
 		ro.observe(el);
 		return () => ro.disconnect();
+	});
+	// Back in the full form the reserve is spent, and the full height is measured
+	// again: a one-row full bar is the compact bar's size, so no resize reports it.
+	$effect(() => {
+		if (toolbarCompact || !toolbarEl) return;
+		toolbarReserve = 0;
+		const height = toolbarEl.getBoundingClientRect().height;
+		if (height) toolbarFullHeight = height;
 	});
 	let restarting = $state(false);
 	async function restartKernel() {
