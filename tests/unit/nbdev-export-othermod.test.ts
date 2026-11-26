@@ -483,6 +483,24 @@ describe('a contributor notebook that cannot be parsed', () => {
 		expect(nbmod.lastExportError(core)).toContain(`${T}/extra.ipynb`);
 	});
 
+	it.each([
+		['emptied', ''],
+		['truncated', '{\n "cells": [\n  {\n   "cell_type": "code",']
+	])('refuses to rebuild a module whose header lists it once it is %s', async (_how, text) => {
+		// The broken text no longer names the module, so only the header ties it to core.py.
+		const core = writeNb(`${T}/core.ipynb`, [{ id: 'c', source: `#| default_exp ${T}.core\n#| export\nA = 1` }]);
+		writeNb(`${T}/extra.ipynb`, [{ id: 'e', source: `#| export ${T}.core\nB = 2` }]);
+		await exportPy(core);
+		const before = read(`${T}/core.py`);
+		expect(before).toContain('B = 2');
+
+		writeFileSync(join(WS, T, 'extra.ipynb'), text);
+		await expect(exportPy(core)).rejects.toThrow(
+			new RegExp(`refusing to rebuild ${T}/core\\.py: ${T}/extra\\.ipynb .* could not be parsed as a notebook`)
+		);
+		expect(read(`${T}/core.py`)).toBe(before);
+	});
+
 	it('refuses a module it names even before that module ever listed it', async () => {
 		const core = writeNb(`${T}/core.ipynb`, [{ id: 'c', source: `#| default_exp ${T}.core\n#| export\nA = 1` }]);
 		writeNb(`${T}/extra.ipynb`, [{ id: 'e', source: `#| export ${T}.core\nB = 2` }]);

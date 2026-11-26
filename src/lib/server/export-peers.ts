@@ -17,8 +17,9 @@
  * and the parse is cached on the file's size and mtime, without the cells'
  * outputs: an export reads only source and metadata. An entry is dropped once
  * the walk no longer lists its file. A file whose text names no module
- * (`NAMES_A_MODULE`) can neither own nor feed one, so it is not parsed at all. A
- * file that cannot be read or parsed gives no document. It is reported as unread
+ * (`NAMES_A_MODULE`) can neither own nor feed one, so it is not parsed at all,
+ * only checked to be whole (`looksWhole`). A file that cannot be read or parsed,
+ * or is not whole, gives no document. It is reported as unread
  * (`ExportPeers.unread`), so an export refuses to rebuild a module it feeds.
  *
  * The scan is asynchronous (`refreshExportPeers`), so it never blocks the process
@@ -204,7 +205,20 @@ async function readPeer(abs: string): Promise<boolean> {
 				modules: [...text.matchAll(VALUED_EXPORT)].map((m) => m[1])
 			};
 		}
+	} else if (text !== null && !looksWhole(text)) {
+		unread = { reason: 'could not be parsed as a notebook', modules: [] };
 	}
 	parsed.set(abs, { size: st.size, mtimeMs: st.mtimeMs, doc, ...(unread ? { unread } : {}) });
 	return doc !== null || !!hit?.doc || !!unread || !!hit?.unread;
+}
+
+/**
+ * Could this text, which names no module, be a whole notebook? It is not parsed,
+ * so this is a structural check only: a JSON object with no git conflict marker.
+ * An empty, truncated or conflicted file fails it and is reported unread, so a
+ * module whose header lists it is never rebuilt without its cells.
+ */
+function looksWhole(text: string): boolean {
+	const t = text.trim();
+	return t.startsWith('{') && t.endsWith('}') && !/^(?:<{7}|={7}|>{7})(?: |$)/m.test(t);
 }
