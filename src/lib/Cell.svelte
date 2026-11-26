@@ -2833,7 +2833,7 @@
 		     `display:none`, so expanding gives back exactly what was collapsed. -->
 		{#if isMarkdown && mode === 'rendered' && !cellCollapsed}
 			<div
-				class="cellar-md px-4 py-3 text-sm leading-relaxed"
+				class="cellar-md px-4 py-3"
 				data-testid="markdown-rendered"
 				role="button"
 				tabindex="0"
@@ -3034,7 +3034,7 @@
 							{:else if o.markdownHtml != null}
 								<!-- A chat reply / Markdown() display: rendered prose, same
 								     container class as a rendered markdown cell. -->
-								<div class="cellar-md px-3 py-2 text-sm leading-relaxed" data-testid="output-markdown">
+								<div class="cellar-md px-3 py-2" data-testid="output-markdown">
 									{@html o.markdownHtml}
 								</div>
 							{:else if o.segments}

@@ -14,7 +14,7 @@
 	const isEmpty = $derived(!source.trim());
 </script>
 
-<div class="cellar-md mx-auto max-w-[clamp(48rem,92%,88rem)] px-6 py-5 text-sm leading-relaxed" data-testid="markdown-preview">
+<div class="cellar-md mx-auto max-w-[clamp(48rem,92%,88rem)] px-6 py-5" data-testid="markdown-preview">
 	{#if isEmpty}
 		<span class="text-base-content/30">Empty file</span>
 	{:else}
