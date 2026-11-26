@@ -945,6 +945,10 @@ export function registerTools(server: McpServer) {
 					? `cell ${asGiven(r.exportDirective)} is marked TWICE - by an nbdev \`#| export\` directive in its own source AND by metadata - so removing the line alone will not stop the export: remove it (edit_cell), then call this again to clear the flag`
 					: `cell ${asGiven(r.exportDirective)} is marked by an nbdev \`#| export\` directive in its own source, not by metadata, so it cannot be unmarked here - remove that line from the cell (edit_cell) to stop exporting it`
 			);
+		if ('otherModule' in r)
+			return notFound(
+				`cell ${asGiven(r.otherModule)} carries an nbdev \`#| export ${r.module}\` line in its own source, which names the module ${r.module} for it, so it never goes into this notebook's own module and cannot be marked here - edit or remove that line (edit_cell)`
+			);
 		return notFound(r.missing ? `cell ${asGiven(r.missing)} not found` : 'ids must not be empty');
 	});
 	server.registerTool('set_export_main_cell', { description: 'Rust notebooks only: choose the ONE exported cell whose top-level statements become the .rs module\'s fn main() (main:true; marks it for export too, and clears the mark from any other cell). main:false unmarks it. Statements in every other exported cell are dropped from the module. Returns {ok, cell, main, export_target}; module = what the regeneration left on disk.', inputSchema: { id: z.string(), main: z.boolean(), ...notebookParam } }, async ({ id, main, notebook }, extra: ToolExtra) => {

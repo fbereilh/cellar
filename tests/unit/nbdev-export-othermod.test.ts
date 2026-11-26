@@ -204,6 +204,126 @@ describe('two notebooks into one module', () => {
 	});
 });
 
+describe('a module is the same bytes whichever notebook exports', () => {
+	// Oracle for this block: nbdev's `nbglob` skips `_`-prefixed notebooks, and the
+	// design rule that a module's bytes never depend on which notebook exported.
+
+	it('a notebook the workspace walk skips feeds no module, and says why', () => {
+		const core = writeNb(`${T}/core.ipynb`, [{ id: 'c', source: `#| default_exp ${T}.core\n#| export\nA = 1` }]);
+		const draft = writeNb(`${T}/_draft.ipynb`, [{ id: 'draftcell1', source: `#| export ${T}.core\nD = 4` }]);
+		nbmod.exportPy(core);
+		const fromOwner = read(`${T}/core.py`);
+		expect(fromOwner).not.toContain('D = 4');
+
+		const res = nbmod.exportPy(draft);
+		expect(res.modules).toBeUndefined();
+		expect(res.refused).toHaveLength(1);
+		expect(res.refused?.[0]).toMatchObject({ cell: 'draftcel', module: `${T}.core` });
+		expect(res.refused?.[0].reason).toContain('"_draft.ipynb" starts with "_"');
+		expect(read(`${T}/core.py`)).toBe(fromOwner);
+		expect(nbmod.getNotebook(draft).exportOtherModules).toEqual([
+			{ id: 'draftcell1', module: `${T}.core`, target: null, owner: null, error: res.refused?.[0].reason }
+		]);
+	});
+
+	it('names the skipped folder when the notebook sits inside one', () => {
+		writeNb(`${T}/core.ipynb`, [{ id: 'c', source: `#| default_exp ${T}.core\n#| export\nA = 1` }]);
+		const nb = writeNb(`${T}/_wip/extra.ipynb`, [{ id: 'w', source: `#| export ${T}.core\nW = 1` }]);
+		expect(nbmod.exportPy(nb).refused?.[0].reason).toContain('"_wip" starts with "_"');
+		expect(existsSync(join(WS, T, 'core.py'))).toBe(false);
+	});
+
+	it('a skipped owner writes only its own cells, matching the badge its contributors show', () => {
+		const owner = writeNb(`${T}/_core.ipynb`, [{ id: 'c', source: `#| default_exp ${T}.core\n#| export\nA = 1` }]);
+		const extra = writeNb(`${T}/extra.ipynb`, [{ id: 'e', source: `#| export ${T}.core\nB = 2` }]);
+		const res = nbmod.exportPy(owner);
+		expect(res).toMatchObject({ written: true, target: `${T}/core.py`, count: 1 });
+		expect(res.contributors).toBeUndefined();
+		const fromOwner = read(`${T}/core.py`);
+		expect(fromOwner).not.toContain('B = 2');
+		expect(fromOwner).not.toContain('Also from notebook');
+
+		const fed = nbmod.exportPy(extra);
+		expect(fed.modules).toBeUndefined();
+		expect(fed.refused?.[0].reason).toContain(`no notebook in this workspace has ${T}/core.py`);
+		expect(read(`${T}/core.py`)).toBe(fromOwner);
+	});
+
+	it('drops a fed cell when the contributor removes its line and exports itself', () => {
+		const core = writeNb(`${T}/core.ipynb`, [{ id: 'c', source: `#| default_exp ${T}.core\n#| export\nA = 1` }]);
+		const extra = writeNb(`${T}/extra.ipynb`, [{ id: 'e', source: `#| export ${T}.core\nB = 2` }]);
+		nbmod.exportPy(extra);
+		expect(read(`${T}/core.py`)).toContain(`# Also from notebook: ${T}/extra.ipynb`);
+
+		nbmod.setSource('e', 'B = 2', extra);
+		const res = nbmod.exportPy(extra);
+		expect(res.modules).toEqual([
+			{ target: `${T}/core.py`, owner: `${T}/core.ipynb`, written: true, count: 0, hazards: [] }
+		]);
+		const text = read(`${T}/core.py`);
+		expect(text).not.toContain('B = 2');
+		expect(text).not.toContain('Also from notebook');
+		// The owner's export then has nothing left to change.
+		expect(nbmod.exportPy(core)).toMatchObject({ written: false, reason: 'unchanged' });
+		expect(nbmod.exportPy(extra).modules).toBeUndefined();
+	});
+
+	it('moves a fed cell when the contributor retargets its line and exports itself', () => {
+		writeNb(`${T}/core.ipynb`, [{ id: 'c', source: `#| default_exp ${T}.core\n#| export\nA = 1` }]);
+		writeNb(`${T}/io.ipynb`, [{ id: 'i', source: `#| default_exp ${T}.io\n#| export\nI = 1` }]);
+		const extra = writeNb(`${T}/extra.ipynb`, [{ id: 'e', source: `#| export ${T}.core\nB = 2` }]);
+		nbmod.exportPy(extra);
+		nbmod.setSource('e', `#| export ${T}.io\nB = 2`, extra);
+		expect(nbmod.exportPy(extra).modules).toMatchObject([
+			{ target: `${T}/core.py`, written: true, count: 0 },
+			{ target: `${T}/io.py`, written: true, count: 1 }
+		]);
+		expect(read(`${T}/core.py`)).not.toContain('B = 2');
+		expect(read(`${T}/core.py`)).not.toContain('Also from notebook');
+		expect(read(`${T}/io.py`)).toContain('B = 2');
+	});
+
+	it('claims no fed cells for an own module it declined to overwrite', () => {
+		const core = writeNb(`${T}/core.ipynb`, [{ id: 'c', source: `#| default_exp ${T}.core\n#| export\nA = 1` }]);
+		writeNb(`${T}/extra.ipynb`, [{ id: 'e', source: `#| export ${T}.core\nB = 2` }]);
+		writeFileSync(join(WS, T, 'core.py'), '# hand written\n');
+		const res = nbmod.exportPy(core);
+		expect(res).toMatchObject({ written: false, reason: 'foreign-module' });
+		expect(res.contributors).toBeUndefined();
+		expect(res.contributed).toBeUndefined();
+		expect(role.otherModulesReport(res)).toBe('');
+	});
+});
+
+describe('marking a cell its own line sends elsewhere', () => {
+	// Oracle: nbdev sends a valued `#| export <module>` cell to that module INSTEAD
+	// of the notebook's own, so a mark for the own module can never be satisfied.
+
+	it('refuses the mark in the document layer and names the module', () => {
+		const nb = writeNb(`${T}/extra.ipynb`, [{ id: 'e', source: `#| export ${T}.core\nB = 2` }]);
+		expect(nbmod.setCellExport('e', true, nb)).toEqual({ ok: false, reason: 'export-other-module', module: `${T}.core` });
+		expect(nbmod.getNotebook(nb).cells[0].metadata?.cellar?.export).toBeUndefined();
+	});
+
+	it('refuses the mark through the MCP service, for the whole batch', async () => {
+		const svc = await import('../../src/lib/server/mcp/service');
+		const nb = writeNb(
+			`${T}/extra.ipynb`,
+			[
+				{ id: 'plain', source: 'P = 1' },
+				{ id: 'valued', source: `#| export ${T}.core\nB = 2` }
+			],
+			{ export_target: `${T}/extra.py` }
+		);
+		expect(svc.setCellExport(['plain', 'valued'], true, join(WS, nb))).toEqual({
+			ok: false,
+			otherModule: 'valued',
+			module: `${T}.core`
+		});
+		expect(nbmod.getNotebook(nb).cells[0].metadata?.cellar?.export).toBeUndefined();
+	});
+});
+
 describe('a fed cell that cannot go anywhere is refused, with the reason', () => {
 	it('refuses a module no notebook owns, and writes nothing for it', () => {
 		const nb = writeNb(`${T}/lonely.ipynb`, [{ id: 'abcdef1234', source: `#| export ${T}.nowhere\nX = 1` }]);
@@ -265,6 +385,10 @@ describe('the export report', () => {
 			'Wrote 2 cells into pkg/core.py, the module of nbs/core.ipynb. pkg/io.py, the module of nbs/io.ipynb, already holds this cell. 1 cell went into no module - hover the "not exported" badge on it for why.'
 		);
 		expect(role.otherModulesReport({})).toBe('');
+		// A module the notebook used to feed: rebuilt, and holding none of its cells.
+		expect(
+			role.otherModulesReport({ modules: [{ target: 'm.py', owner: 'o.ipynb', written: true, count: 0, hazards: [] }] })
+		).toBe("Rebuilt m.py, the module of o.ipynb, without this notebook's cells.");
 		// A fed module WITH a hazard says so; one without never borrows the clause.
 		expect(
 			role.otherModulesReport(

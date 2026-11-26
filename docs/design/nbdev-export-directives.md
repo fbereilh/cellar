@@ -306,7 +306,10 @@ per other notebook, so a module only one notebook writes is byte-identical to be
 
 **Every export rebuilds the whole file.** Exporting the owner or any contributor builds the
 same bytes from all of them, so a repeated export is a no-op and a removed directive drops
-its cell. nbdev instead appends to the file the previous notebook wrote, in file-name order,
+its cell. That holds when the contributor itself exports after removing or retargeting the
+line: an export also rebuilds every generated module, owned by exactly one walked notebook,
+whose `# Also from notebook:` header still lists the exporting notebook. The result lists
+such a module with a count of zero. nbdev instead appends to the file the previous notebook wrote, in file-name order,
 so its result depends on which notebook it reaches first. That order difference is the one
 deliberate divergence.
 
@@ -321,7 +324,13 @@ cell and in `ExportResult.refused`, when:
 
 - the module cannot be resolved;
 - no notebook owns that file, or more than one does;
-- the notebook is Mojo or Rust. The valued form is read only in Python notebooks.
+- the notebook is Mojo or Rust. The valued form is read only in Python notebooks;
+- the workspace walk skips the notebook itself (a `.` or `_` name, a noise folder, too deep).
+  No other notebook's export reads it, so it feeds no module, and a skipped owner writes only
+  its own cells. The module's bytes never depend on which notebook exported.
+
+A mark request on such a cell is refused too (`export-other-module`), by the document layer,
+the PATCH route and MCP `set_cell_export`: the cell never goes into the notebook's own module.
 
 **Finding the other notebooks.** `server/export-peers.ts` walks the workspace for `.ipynb`
 files on nbdev's `nbglob` skip rule (no `.` or `_` names) and the file tree's noise folders.

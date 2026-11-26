@@ -2700,6 +2700,11 @@
 			: 'That cell is marked for export by an "#| export" line in its own source - remove that line to stop exporting it.';
 	}
 
+	/** What to say when a cell's own `#| export <module>` line decides where it goes. */
+	function exportOtherModuleNotice(module: string): string {
+		return `That cell's "#| export ${module}" line sends it to another module, so Cellar cannot mark or unmark it here - edit or remove that line instead.`;
+	}
+
 	/**
 	 * What to say when the server refuses a MARK because the cell is not eligible.
 	 *
@@ -2769,9 +2774,7 @@
 		// module and never into this notebook's, so a mark here would change nothing.
 		const otherModule = exportOtherModuleName(cell, exportLanguage);
 		if (otherModule !== null) {
-			onNotice?.(
-				`That cell's "#| export ${otherModule}" line sends it to another module, so Cellar cannot mark or unmark it here - edit or remove that line instead.`
-			);
+			onNotice?.(exportOtherModuleNotice(otherModule));
 			return;
 		}
 		if (!exported && exportDirectiveOwnsCell(cell, exportLanguage)) {
@@ -2809,9 +2812,9 @@
 		// put the toggle back ON over a cell nothing said is exported.
 		const verdict = await res
 			.json()
-			.then((b) => (b as { reason?: string; alsoFlagged?: boolean } | null) ?? null)
+			.then((b) => (b as { reason?: string; alsoFlagged?: boolean; module?: string } | null) ?? null)
 			.catch(() => null);
-		// THREE refusals revert (`py-notebook` is the server backstop for the gate
+		// FOUR refusals revert (`py-notebook` is the server backstop for the gate
 		// above), and `not-code` is the one this tab could not predict at
 		// all: eligibility is a NOTEBOOK-level fact mirrored over SSE, so a target
 		// change still in flight lets this tab offer a mark the document refuses.
@@ -2821,6 +2824,7 @@
 		// `notebook:export-target` event lands - so no cross-tab coordination is
 		// involved.
 		if (
+			verdict?.reason !== 'export-other-module' &&
 			verdict?.reason !== 'export-directive-owns-cell' &&
 			verdict?.reason !== 'not-code' &&
 			verdict?.reason !== 'py-notebook'
@@ -2840,7 +2844,9 @@
 				? TEXT_NOTEBOOK_EXPORT_MARK_MESSAGE
 				: verdict.reason === 'not-code'
 					? exportIneligibleNotice(id)
-					: exportDirectiveNotice(verdict.alsoFlagged === true)
+					: verdict.reason === 'export-other-module'
+						? exportOtherModuleNotice(verdict.module ?? '<module>')
+						: exportDirectiveNotice(verdict.alsoFlagged === true)
 		);
 	}
 

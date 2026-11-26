@@ -483,26 +483,59 @@ describe('the two Svelte halves - source SHAPE guards, not behaviour', () => {
 		expect(chain.indexOf('exportHazards.length')).toBeLessThan(chain.indexOf('importWarning'));
 	});
 
-	it('both manual-export surfaces branch on hazards ahead of the success wording', () => {
-		// `doExport`'s feedback line and the shell's notice are the two places a manual
-		// export is spoken. Both narrow the set through the SHARED human-surface rule
-		// and branch on what is left BEFORE the success wording, so an agent-only kind
-		// can neither raise the warning nor be dropped from a set that does.
+	it('the export bar branches on hazards ahead of the success wording', () => {
+		// `doExport`'s feedback line narrows the set through the SHARED human-surface
+		// rule and branches on what is left BEFORE the success wording, so an agent-only
+		// kind can neither raise the warning nor be dropped from a set that does.
 		const nb = read('lib/Notebook.svelte');
 		const fn = nb.slice(nb.indexOf('async function doExport()'), nb.indexOf('</script>'));
 		expect(fn).toContain('humanExportHazards(r.hazards ?? [])');
 		expect(fn).toContain('shown.length');
 		expect(fn.indexOf('shown.length')).toBeLessThan(fn.indexOf('exportFeedback = `Exported'));
+	});
 
-		const page = read('routes/+page.svelte');
-		const notice = page.slice(page.indexOf('async function exportPy()'), page.indexOf('// Toggle the active notebook'));
-		expect(notice).toContain('humanExportHazards(r.hazards ?? [])');
-		expect(notice).toContain('shown.length');
-		expect(notice.indexOf('shown.length')).toBeLessThan(notice.indexOf('say(`Exported'));
-		// EVERY message, through the one shared joining rule - never `hazards[0]`,
-		// which silently dropped every finding after the first.
-		expect(notice).toContain('hazardReport(shown)');
-		expect(notice).not.toContain('r.hazards[0]');
+	it('the shell notice never words a hazardous export as a plain success, and says every hazard', async () => {
+		// Behavior: the sentence the shell shows after a manual export. Oracle: the
+		// product rule that a module which will not import is never reported as a
+		// plain success, and that every finding is said. Rejected: `hazards[0]` alone,
+		// or the success wording over a hazardous module.
+		const { exportShellNotice } = await import('../../src/lib/exportNotice');
+		const { futureImportJoinedHazard } = await import('../../src/lib/exportHazard');
+		const first = futureImportJoinedHazard(JOINED);
+		const second = futureImportJoinedHazard('from __future__ import division; y = 2');
+		const hazardous = exportShellNotice({ written: true, target: 'm.py', count: 2, hazards: [first, second] });
+		expect(hazardous.text.startsWith('Wrote m.py, but ')).toBe(true);
+		expect(hazardous.text).not.toContain('Exported');
+		expect(hazardous.text).toContain(first.message);
+		expect(hazardous.text).toContain(second.message);
+		expect(hazardous.refresh).toBe(true);
+
+		expect(exportShellNotice({ written: true, target: 'm.py', count: 2, hazards: [] })).toEqual({
+			text: 'Exported 2 cells → m.py.',
+			refresh: true
+		});
+
+		// What the `#| export <module>` cells did follows the own module's sentence.
+		const fed = exportShellNotice({
+			written: true,
+			target: 'm.py',
+			count: 1,
+			hazards: [],
+			modules: [{ target: 'core.py', owner: 'core.ipynb', written: true, count: 1, hazards: [] }]
+		});
+		expect(fed.text).toBe('Exported 1 cell → m.py. Wrote 1 cell into core.py, the module of core.ipynb.');
+
+		// A notebook with no module of its own reports only the fed module.
+		expect(
+			exportShellNotice({
+				written: false,
+				target: null,
+				count: 0,
+				reason: 'no-target',
+				modules: [{ target: 'core.py', owner: 'core.ipynb', written: true, count: 1, hazards: [] }]
+			})
+		).toEqual({ text: 'Wrote 1 cell into core.py, the module of core.ipynb.', refresh: true });
+		expect(exportShellNotice({ written: false, target: null, count: 0, reason: 'no-target' }).refresh).toBe(false);
 	});
 
 	it('LiveNotebook mentions the load seed and the live event in its dispatcher', () => {

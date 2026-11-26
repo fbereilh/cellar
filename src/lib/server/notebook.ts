@@ -55,6 +55,7 @@ import {
 	canExportCell,
 	exportDirectiveOwnsCell,
 	exportMarkedTwice,
+	exportOtherModuleName,
 	exportTargetLanguage,
 	moduleExtension,
 	notebookHoldsExport,
@@ -65,7 +66,7 @@ import { isHiddenFromAgent } from '../agentVisibility';
 import { isExportBase, type ExportBase } from '../exportTarget';
 import { gitRootOf } from './git';
 import { resolveInWorkspace } from './fstree';
-import { exportPeers } from './export-peers';
+import { exportPeers, type ExportPeers } from './export-peers';
 import {
 	InvalidNotebookLanguageError,
 	isLogicalCellType,
@@ -321,7 +322,7 @@ function regenerateExportModule(doc: NotebookDoc): void {
  * Every other notebook in the workspace, for `#| export <module>` (`export-peers.ts`):
  * an open one as its live document.
  */
-function peersOf(doc: NotebookDoc): NotebookDoc[] {
+function peersOf(doc: NotebookDoc): ExportPeers {
 	return exportPeers(doc.path, (abs) => docs.get(abs));
 }
 
@@ -1223,7 +1224,12 @@ export function setCellRole(id: string, role: string | null, nb?: string | null,
  * rule adds, and `py-notebook` a MARK on a `.py` text notebook, which can hold no
  * export state at all (`notebookHoldsExport`).
  */
-export type SetCellExportRefusal = 'no-such-cell' | 'not-code' | 'export-directive-owns-cell' | 'py-notebook';
+export type SetCellExportRefusal =
+	| 'no-such-cell'
+	| 'not-code'
+	| 'export-directive-owns-cell'
+	| 'export-other-module'
+	| 'py-notebook';
 
 /**
  * A refused `setCellExport`, and - for the directive case - whether Cellar's own
@@ -1240,7 +1246,7 @@ export type SetCellExportRefusal = 'no-such-cell' | 'not-code' | 'export-directi
  */
 export type SetCellExportResult =
 	| { ok: true }
-	| { ok: false; reason: SetCellExportRefusal; alsoFlagged?: boolean };
+	| { ok: false; reason: SetCellExportRefusal; alsoFlagged?: boolean; module?: string };
 
 /**
  * Mark (or unmark) a code cell for nbdev-style export in the allowlisted `cellar`
@@ -1278,12 +1284,19 @@ export function setCellExport(
 	// none in a `.mojo` one.
 	const lang = docExportLanguage(doc);
 	if (exported && !canExportCell(cell, lang)) return { ok: false, reason: 'not-code' };
-	// The source owns the mark (see `setCellExports`). A MARK request is already
-	// satisfied - the cell really is exported - so it is an honest no-op; an UNMARK
-	// is refused, because nothing Cellar may write would take the mark away.
+	// A valued `#| export <module>` line sends the cell to that module and never to
+	// this notebook's own, so a MARK cannot be satisfied and is refused with the
+	// module the line names.
+	//
+	// The source owns the mark (see `setCellExports`). A MARK request on a bare
+	// `#| export` cell is already satisfied - the cell really is exported - so it is
+	// an honest no-op; an UNMARK is refused, because nothing Cellar may write would
+	// take the mark away.
 	//
 	// `alsoFlagged` rides the refusal because the REMEDY differs and only this side
 	// can see it - see `SetCellExportResult`.
+	const otherModule = exportOtherModuleName(cell, lang);
+	if (exported && otherModule !== null) return { ok: false, reason: 'export-other-module', module: otherModule };
 	if (exportDirectiveOwnsCell(cell, lang))
 		return exported
 			? { ok: true }
