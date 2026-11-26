@@ -351,7 +351,8 @@ as a `notebook:export-derived` event. Before the first scan finishes no badge is
 
 **An export never guesses the workspace.** With no finished scan an export is refused, never
 run as a single-notebook export. A walked notebook that cannot be read or parsed is kept as
-unread. An export refuses to rebuild a module when the generated file lists an unread
+unread. So is one that names no module but is not a whole JSON object, such as an emptied,
+truncated or conflicted file. An export refuses to rebuild a module when the generated file lists an unread
 notebook in an `# Also from notebook:` line, or when an unparseable notebook's raw text holds
 a `#| export <module>` line naming that module. The error names the notebook and the module,
 and no module is written.
