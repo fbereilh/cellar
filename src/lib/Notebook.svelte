@@ -877,6 +877,25 @@
 		io.observe(el);
 		return () => io.disconnect();
 	});
+	// The full form can wrap onto more rows than the compact one. The bar keeps
+	// the full form's height in the flow while compact, as extra bottom margin,
+	// so the switch moves no cell and scroll anchoring has nothing to chase.
+	let toolbarEl = $state<HTMLElement | null>(null);
+	let toolbarFullHeight = 0;
+	let toolbarReserve = $state(0);
+	$effect(() => {
+		const el = toolbarEl;
+		if (!el) return;
+		const ro = new ResizeObserver(() => {
+			const height = el.getBoundingClientRect().height;
+			// A hidden pane measures nothing: keep what was measured while it showed.
+			if (!height) return;
+			if (toolbarCompact) toolbarReserve = Math.max(0, toolbarFullHeight - height);
+			else toolbarFullHeight = height;
+		});
+		ro.observe(el);
+		return () => ro.disconnect();
+	});
 	let restarting = $state(false);
 	async function restartKernel() {
 		if (restarting) return;
@@ -1362,12 +1381,16 @@
 		     accessible name, so the whole bar stays on one row at an ordinary width.
 		     STICKY: once the user scrolls past it, this same bar stays pinned to the
 		     top of the pane in its compact form (`toolbarCompact`), every button an
-		     icon with its tooltip, name, state and action unchanged. Both forms are
-		     one 2rem row, so the switch moves no cell. The pane's `scroll-padding-top`
+		     icon with its tooltip, name, state and action unchanged. The compact form
+		     is one 2rem row. The full form can wrap onto more, so while compact the
+		     bar reserves the difference as bottom margin (`toolbarReserve`) and the
+		     switch moves no cell. The pane's `scroll-padding-top`
 		     keeps scrolled-to cells clear of it, and the compact icons pack to the
 		     left so the find bar at the pane's top right never covers them. -->
 		<div bind:this={toolbarSentinel} class="h-0" aria-hidden="true"></div>
 		<div
+			bind:this={toolbarEl}
+			style:margin-bottom={toolbarCompact && toolbarReserve ? `calc(0.75rem + ${toolbarReserve}px)` : undefined}
 			class="@container group sticky top-0 z-30 -mx-4 mb-3 flex flex-wrap items-center gap-2 border-b px-4 py-1 {toolbarCompact
 				? 'border-base-300 bg-(--cellar-surface-page) shadow-sm'
 				: 'border-transparent'}"

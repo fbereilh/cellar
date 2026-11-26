@@ -20,6 +20,7 @@ import { tabPanelDomId } from '../../src/lib/tabIds';
  *  - Restart sends the existing kernel restart for THIS notebook.
  *  - Scrolled past, the same toolbar stays pinned at the top of the pane as icons,
  *    and a click there runs the same action. Scrolled back, it returns to full form.
+ *  - Where the full form wraps onto two rows, turning compact moves no cell.
  *
  * Every locator is scoped to one notebook's pane: each open notebook stays mounted.
  */
@@ -222,4 +223,29 @@ test('scrolled past, the toolbar stays on screen as icons and still acts', async
 	await pane.evaluate((el) => (el.scrollTop = 0));
 	await expect(bar).not.toHaveAttribute('data-compact');
 	await expect(pane.getByTestId('run-all')).toContainText('Run all');
+});
+
+test('a wrapped toolbar turning compact does not move the cells', async ({ page }) => {
+	await page.setViewportSize({ width: 640, height: 720 });
+	await openNotebook(page, NB.long);
+	const pane = paneFor(page, NB.long);
+	const bar = pane.getByTestId('notebook-toolbar');
+	const cell = pane.getByTestId('cell').first();
+	const barHeight = () => bar.evaluate((el) => el.getBoundingClientRect().height);
+	// Where the cell sits in the pane's content, whatever the scroll position is.
+	const cellOffset = () =>
+		pane.evaluate(
+			(el) => el.querySelector('[data-testid="cell"]')!.getBoundingClientRect().top - el.getBoundingClientRect().top + el.scrollTop
+		);
+	await expect(bar).not.toHaveAttribute('data-compact');
+	const fullHeight = await barHeight();
+	const before = await cellOffset();
+
+	await pane.evaluate((el) => (el.scrollTop = 150));
+	await expect(bar).toHaveAttribute('data-compact', '');
+	await expect(cell).toBeAttached();
+	// The full form took more than the one compact row, so the switch had a height to lose.
+	expect(fullHeight - (await barHeight()), 'the full toolbar did not wrap at this width').toBeGreaterThan(20);
+	await expect.poll(cellOffset).toBeCloseTo(before, 0);
+	await expect(bar).toHaveAttribute('data-compact', '');
 });
