@@ -39,3 +39,11 @@ export const MAX_FILE_BYTES = 2 * 1024 * 1024;
  * browser tab full of string.
  */
 export const MAX_HTML_FILE_BYTES = 15 * 1024 * 1024;
+
+/**
+ * Ceiling for one file pasted into the explorer from the system clipboard
+ * (`fstree.ts`'s `writeUploadChunk`). The bytes arrive in chunks, so this is
+ * not about request size. It stops a mistaken paste of a huge file from
+ * filling the disk of the project folder.
+ */
+export const MAX_UPLOAD_BYTES = 1024 * 1024 * 1024;

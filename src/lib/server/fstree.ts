@@ -18,11 +18,18 @@ import {
 	mkdirSync,
 	renameSync,
 	rmSync,
-	cpSync
+	cpSync,
+	appendFileSync,
+	openSync,
+	fsyncSync,
+	closeSync,
+	linkSync,
+	unlinkSync
 } from 'node:fs';
-import { join, resolve, relative, sep, basename, dirname, extname } from 'node:path';
+import { join, resolve, relative, sep, basename, dirname } from 'node:path';
 import { isHtmlPath } from '$lib/htmlPreview';
-import { MAX_FILE_BYTES, MAX_HTML_FILE_BYTES } from '$lib/server/limits.js';
+import { freeName } from '$lib/filePaste';
+import { MAX_FILE_BYTES, MAX_HTML_FILE_BYTES, MAX_UPLOAD_BYTES } from '$lib/server/limits.js';
 
 // Directories that are noise for a workspace file tree.
 const IGNORE_DIRS = new Set([
@@ -227,18 +234,11 @@ function assertSimpleName(name: string | null | undefined): string {
  * Given a desired absolute destination, return a non-colliding variant by
  * appending " copy", " copy 2", … before the extension (VS Code-style). Used on
  * paste so a move/copy into an occupied name never clobbers the existing entry.
+ * The naming rule itself is `$lib/filePaste`'s `freeName`, shared with the tests.
  */
 function dedupeDest(destAbs: string): string {
-	if (!existsSync(destAbs)) return destAbs;
 	const dir = dirname(destAbs);
-	const base = basename(destAbs);
-	const ext = extname(base);
-	const stem = ext ? base.slice(0, -ext.length) : base;
-	for (let i = 1; ; i++) {
-		const suffix = i === 1 ? ' copy' : ` copy ${i}`;
-		const candidate = join(dir, `${stem}${suffix}${ext}`);
-		if (!existsSync(candidate)) return candidate;
-	}
+	return join(dir, freeName(basename(destAbs), (name) => existsSync(join(dir, name))));
 }
 
 /**
@@ -332,4 +332,87 @@ export function copyEntry(fromRel: string, destDirRel: string): FsOpFromResult {
 	const destAbs = dedupeDest(join(destDirAbs, basename(fromAbs)));
 	cpSync(fromAbs, destAbs, { recursive: true });
 	return { from: toRel(fromAbs), path: toRel(destAbs) };
+}
+
+// ---- Paste from the system clipboard (chunked upload) ---------------------
+// A file pasted into the explorer from Finder or another app arrives in the
+// browser as bytes, and adapter-node caps every request body (see
+// `$lib/saveLimit.ts`). So the browser sends it in chunks: each one appends to
+// a hidden part file in the destination folder, and the last one links it into
+// place under a free name. The part file is dot-led, so the tree never lists
+// it, and it sits in the destination folder so the final step is one rename on
+// one filesystem.
+
+const UPLOAD_ID = /^[a-z0-9]{8,64}$/;
+
+function uploadPartPath(dirAbs: string, id: string): string {
+	if (!UPLOAD_ID.test(id ?? '')) throw new Error('invalid upload id');
+	return join(dirAbs, `.cellar-upload-${id}.part`);
+}
+
+function uploadDir(dirRel: string): string {
+	const dirAbs = resolveInWorkspace(dirRel);
+	if (!existsSync(dirAbs) || !statSync(dirAbs).isDirectory()) throw new Error('destination is not a folder');
+	return dirAbs;
+}
+
+/**
+ * Append one chunk of a pasted file. `offset` must equal the bytes already
+ * received, so a lost or repeated chunk is refused rather than corrupting the
+ * file. On the `last` chunk the file is flushed to disk and linked into the
+ * folder under `name`, or the next free ` copy` name. A link never replaces an
+ * existing entry, so a file created in the meantime cannot be clobbered.
+ */
+export function writeUploadChunk(opts: {
+	dir: string;
+	name: string;
+	id: string;
+	offset: number;
+	bytes: Uint8Array;
+	last: boolean;
+}): FsOpPathResult | { received: number } {
+	const cleanName = assertSimpleName(opts.name);
+	const dirAbs = uploadDir(opts.dir);
+	const part = uploadPartPath(dirAbs, opts.id);
+	const offset = Number(opts.offset);
+	if (!Number.isSafeInteger(offset) || offset < 0) throw new Error('invalid upload offset');
+	if (offset + opts.bytes.length > MAX_UPLOAD_BYTES) {
+		rmSync(part, { force: true });
+		throw new Error(`file too large to paste (over the ${Math.round(MAX_UPLOAD_BYTES / (1024 * 1024))} MB limit)`);
+	}
+	if (offset === 0) {
+		writeFileSync(part, opts.bytes, { flag: 'wx' });
+	} else {
+		const have = existsSync(part) ? statSync(part).size : -1;
+		if (have !== offset) throw new Error('upload chunk out of order');
+		appendFileSync(part, opts.bytes);
+	}
+	const received = offset + opts.bytes.length;
+	if (!opts.last) return { received };
+	const fd = openSync(part, 'r+');
+	try {
+		fsyncSync(fd);
+	} finally {
+		closeSync(fd);
+	}
+	for (;;) {
+		const dest = dedupeDest(join(dirAbs, cleanName));
+		try {
+			linkSync(part, dest);
+			unlinkSync(part);
+		} catch (err) {
+			const code = (err as NodeJS.ErrnoException)?.code;
+			if (code === 'EEXIST') continue; // taken since dedupe: pick again
+			// A filesystem without hard links (exFAT, some network mounts). The
+			// name was free a moment ago, so a plain rename is the same outcome.
+			if (code !== 'EPERM' && code !== 'ENOTSUP' && code !== 'ENOSYS') throw err;
+			renameSync(part, dest);
+		}
+		return { path: toRel(dest) };
+	}
+}
+
+/** Drop the part file of an upload the browser gave up on. */
+export function abortUpload(dirRel: string, id: string): void {
+	rmSync(uploadPartPath(uploadDir(dirRel), id), { force: true });
 }

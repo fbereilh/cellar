@@ -38,6 +38,7 @@
 	import type { NbdevState } from '$lib/nbdev';
 	import type { CellarFileOps, FileClipboard, NewEntry, FileDescriptor } from '$lib/fileOps';
 	import { dropVerdict, parentDirOf, refusalIsWorthReporting, refusalMessage, type DropTargetRow } from '$lib/fileDrag';
+	import { pasteSource, pasteTargetDir, uploadChunks } from '$lib/filePaste';
 	import type { NotebookRef } from '$lib/types';
 
 	/** A file/dir/root descriptor the context menu + selection act on. */
@@ -452,8 +453,10 @@
 			// same name open; a reveal that arrived before this tree did gets its turn.
 			expandedDirs = pruneExpanded(expandedDirs, next.tree);
 			const pending = pendingReveal;
+			const focus = pendingFocus;
 			pendingReveal = null;
-			if (pending) revealInTree(pending);
+			pendingFocus = false;
+			if (pending) revealInTree(pending, focus);
 		} catch (err) {
 			treeError = String((err as Error)?.message ?? err);
 		}
@@ -528,6 +531,12 @@
 	// refreshed after each op, and tab impact (rename/move/delete) is reported up
 	// via onFsChange so no tab is left pointing at a gone/moved file.
 	let clipboard = $state<FileClipboard | null>(null);
+	// Whether the current `clipboard` entry is confirmed on the SYSTEM clipboard
+	// too (its path, as text). It is what lets a paste tell which copy is newer:
+	// see `$lib/filePaste`'s `pasteSource`. `clipboardWrite` drops the answer of
+	// a write that a later Cut/Copy has overtaken.
+	let clipboardOnSystem = $state(false);
+	let clipboardWrite = 0;
 	let renaming = $state<string | null>(null); // relPath being renamed inline
 	let newEntry = $state<NewEntry | null>(null);
 	let selectedNode = $state<MenuNode | null>(null);
@@ -551,16 +560,30 @@
 	 * the tree would take the keyboard away from the file they just switched to.
 	 * Returns false when the tree does not hold the path.
 	 */
-	function revealInTree(path: string): boolean {
+	function revealInTree(path: string, focus = false): boolean {
 		const node = findTreeNode(treeRoot?.tree, path);
 		if (!node) return false;
 		expandedDirs = expandAncestors(expandedDirs, path);
 		selectedNode = { type: node.type, path: node.path, name: node.name };
 		void tick().then(() => {
-			const row = filesBodyEl?.querySelector(`[data-path="${CSS.escape(path)}"]`);
+			const row = filesBodyEl?.querySelector<HTMLElement>(`[data-path="${CSS.escape(path)}"]`);
 			row?.scrollIntoView({ block: 'nearest' });
+			if (focus) row?.focus();
 		});
 		return true;
+	}
+
+	/**
+	 * Select and focus an entry a file op just created (a paste or a duplicate),
+	 * so the keyboard acts on it next. The tree reload that will hold it is
+	 * usually still in flight, so the reveal waits for it when it must.
+	 */
+	let pendingFocus = false;
+	function selectCreated(path: string) {
+		pendingReveal = null;
+		if (revealInTree(path, true)) return;
+		pendingReveal = path;
+		pendingFocus = true;
 	}
 
 	$effect(() => {
@@ -570,6 +593,7 @@
 		// must not turn every later setting change into another reveal.
 		untrack(() => {
 			pendingReveal = null;
+			pendingFocus = false;
 			if (!getUserSettingDefaultOn(TREE_AUTO_REVEAL_KEY)) return;
 			if (!revealInTree(req.path)) pendingReveal = req.path;
 		});
@@ -653,10 +677,7 @@
 
 	// The folder a "new" / "paste" targets: a dir uses itself, a file its parent,
 	// the tree root the workspace root ('').
-	function targetDirFor(node: MenuNode | null): string {
-		if (!node || node.type === 'root') return '';
-		return node.type === 'dir' ? node.path : parentDirOf(node.path);
-	}
+	const targetDirFor = pasteTargetDir;
 
 	async function runOp(payload: Record<string, unknown>) {
 		opError = '';
@@ -746,24 +767,161 @@
 		}
 	}
 
-	function cutEntry(node: MenuNode) {
+	/**
+	 * Hold a Cut/Copy. `onSystem` writes its path to the system clipboard too
+	 * (the menu route). The keyboard route passes false: the browser's own
+	 * `copy`/`cut` event that follows the keystroke writes it instead, see
+	 * `onFilesClipboard`.
+	 */
+	function holdEntry(op: 'cut' | 'copy', node: MenuNode, onSystem: boolean) {
 		closeMenu();
-		clipboard = { op: 'cut', path: node.path };
+		clipboard = { op, path: node.path };
+		clipboardOnSystem = false;
+		const write = ++clipboardWrite;
+		if (!onSystem) return;
+		navigator.clipboard
+			?.writeText(node.path)
+			.then(() => {
+				if (write === clipboardWrite) clipboardOnSystem = true;
+			})
+			.catch(() => {}); // unconfirmed: the explorer's own clipboard keeps first claim
 	}
-	function copyEntry(node: MenuNode) {
-		closeMenu();
-		clipboard = { op: 'copy', path: node.path };
+	const cutEntry = (node: MenuNode, onSystem = true) => holdEntry('cut', node, onSystem);
+	const copyEntry = (node: MenuNode, onSystem = true) => holdEntry('copy', node, onSystem);
+
+	/**
+	 * Whether a clipboard event belongs to the Files section: focus is on one of
+	 * its rows, not in an inline rename/new input. Chrome fires `copy`/`cut`/
+	 * `paste` at the document body when focus is on a button rather than in
+	 * editable content, so the event's own target cannot answer this.
+	 */
+	function filesHasFocus(): boolean {
+		const el = document.activeElement as HTMLElement | null;
+		return !!el && !!filesBodyEl?.contains(el) && el.tagName !== 'INPUT';
 	}
+	$effect(() => {
+		const onClip = (e: ClipboardEvent) => {
+			if (!filesHasFocus()) return;
+			if (e.type === 'paste') onFilesPaste(e);
+			else onFilesClipboard(e);
+		};
+		for (const t of ['copy', 'cut', 'paste'] as const) window.addEventListener(t, onClip);
+		return () => {
+			for (const t of ['copy', 'cut', 'paste'] as const) window.removeEventListener(t, onClip);
+		};
+	});
+
+	/** The browser's `copy`/`cut` event after Cmd/Ctrl+C/X on a tree row: put the path on the system clipboard. */
+	function onFilesClipboard(e: ClipboardEvent) {
+		const held = clipboard;
+		if (!held || held.path !== selectedNode?.path || !e.clipboardData) return;
+		e.preventDefault();
+		e.clipboardData.setData('text/plain', held.path);
+		clipboardWrite++;
+		clipboardOnSystem = true;
+	}
+
 	async function pasteEntry(node: MenuNode) {
 		closeMenu();
 		if (!clipboard) return;
 		const dest = targetDirFor(node);
 		const from = clipboard.path;
 		if (clipboard.op === 'copy') {
-			await runOp({ op: 'copy', path: from, dest });
-			return; // a copy stays on the clipboard for repeat pastes
+			// A copy stays on the clipboard for repeat pastes.
+			const res = await runOp({ op: 'copy', path: from, dest });
+			if (res?.path) selectCreated(res.path);
+			return;
 		}
-		if (await commitMove(from, dest)) clipboard = null; // a cut is consumed
+		const moved = await commitMove(from, dest);
+		if (moved) {
+			clipboard = null; // a cut is consumed
+			selectCreated(moved);
+		}
+	}
+
+	/** Copy an entry beside itself under the next free name (`utils copy.py`), and select the copy. */
+	async function duplicateEntry(node: MenuNode) {
+		closeMenu();
+		const res = await runOp({ op: 'copy', path: node.path, dest: parentDirOf(node.path) });
+		if (res?.path) selectCreated(res.path);
+	}
+
+	// ---- Paste from the system clipboard --------------------------------------
+	// Files copied in Finder or another app, or a screenshot, arrive on the
+	// browser's `paste` event as File objects. They are written through the
+	// chunked `/api/fs/upload` route, which picks a free name the same way a
+	// Copy/Paste does. A paste event is the only way to read them without a
+	// permission prompt, which is why only Cmd/Ctrl+V reaches them and the menu's
+	// Paste does not.
+	let pasteProgress = $state('');
+
+	async function uploadFile(dir: string, file: File): Promise<string> {
+		const id = crypto.randomUUID().replace(/-/g, '');
+		const chunks = uploadChunks(file.size);
+		try {
+			let path = '';
+			for (let i = 0; i < chunks.length; i++) {
+				const [start, end] = chunks[i];
+				const last = i === chunks.length - 1;
+				const q = new URLSearchParams({ dir, name: file.name, id, offset: String(start), last: last ? '1' : '0' });
+				const res = await fetch(`/api/fs/upload?${q}`, {
+					method: 'POST',
+					headers: { 'content-type': 'application/octet-stream' },
+					body: file.slice(start, end)
+				});
+				const body = await res.json().catch(() => ({}));
+				if (!res.ok) throw new Error(body?.message || `could not paste ${file.name} (HTTP ${res.status})`);
+				if (last) path = body.path;
+			}
+			return path;
+		} catch (err) {
+			const q = new URLSearchParams({ dir, id });
+			void fetch(`/api/fs/upload?${q}`, { method: 'DELETE' }).catch(() => {});
+			throw err;
+		}
+	}
+
+	async function pasteSystemFiles(node: MenuNode, data: DataTransfer) {
+		closeMenu();
+		opError = '';
+		// A folder copied in Finder arrives as an entry with no readable bytes.
+		const folder = Array.from(data.items ?? []).some(
+			(item) => item.kind === 'file' && item.webkitGetAsEntry?.()?.isDirectory
+		);
+		if (folder) {
+			opError = 'Folders copied in another app cannot be pasted here. Copy the files inside it instead.';
+			return;
+		}
+		const files = Array.from(data.files);
+		const dir = targetDirFor(node);
+		let last = '';
+		try {
+			for (const [i, file] of files.entries()) {
+				pasteProgress = files.length > 1 ? `Pasting ${file.name} (${i + 1} of ${files.length})…` : `Pasting ${file.name}…`;
+				last = await uploadFile(dir, file);
+			}
+		} catch (err) {
+			opError = String((err as Error)?.message ?? err);
+		} finally {
+			pasteProgress = '';
+			refreshFiles();
+		}
+		if (last && !opError) selectCreated(last);
+	}
+
+	/** Cmd/Ctrl+V in the Files section. The most recent copy wins, see `pasteSource`. */
+	function onFilesPaste(e: ClipboardEvent) {
+		e.preventDefault();
+		const node: MenuNode = selectedNode ?? { type: 'root', path: '' };
+		const data = e.clipboardData;
+		const source = pasteSource({
+			cellar: clipboard != null,
+			cellarOnSystemClipboard: clipboardOnSystem,
+			osFiles: (data?.files.length ?? 0) > 0
+		});
+		if (source === 'cellar') void pasteEntry(node);
+		else if (source === 'os' && data) void pasteSystemFiles(node, data);
+		else opError = 'Nothing to paste. The clipboard holds no files this browser can read.';
 	}
 
 	/**
@@ -771,14 +929,14 @@
 	 * gestures cannot drift about what a move does: the same path-guarded route,
 	 * the same `onFsChange` so an open tab follows the file, the same refresh.
 	 * The server is what decides the final name (it de-duplicates rather than
-	 * clobbering), so the moved path is read back from its answer.
+	 * clobbering), so the moved path is read back from its answer and returned.
 	 */
-	async function commitMove(from: string, dest: string): Promise<boolean> {
+	async function commitMove(from: string, dest: string): Promise<string | null> {
 		const res = await runOp({ op: 'move', path: from, dest });
-		if (!res?.path) return false;
+		if (!res?.path) return null;
 		expandedDirs = remapExpanded(expandedDirs, from, res.path);
 		onFsChange?.({ type: 'move', from, path: res.path });
-		return true;
+		return res.path;
 	}
 
 	/** The row (or root area) a drag is over, in the shape the pure rule reads. */
@@ -918,12 +1076,12 @@
 			e.preventDefault();
 			askDelete(n);
 		} else if (meta && (e.key === 'c' || e.key === 'C')) {
-			copyEntry(n);
+			copyEntry(n, false);
 		} else if (meta && (e.key === 'x' || e.key === 'X')) {
-			cutEntry(n);
-		} else if (meta && (e.key === 'v' || e.key === 'V') && clipboard && n.type === 'dir') {
-			pasteEntry(n);
+			cutEntry(n, false);
 		}
+		// Cmd/Ctrl+V is the browser's `paste` event, `onFilesPaste`: only that
+		// event carries files copied in another app.
 	}
 
 	// Shared file-ops surface for the recursive tree nodes (avoids prop-drilling
@@ -1172,6 +1330,9 @@
 				>
 					Drop here to move to {treeRoot?.name ?? 'the workspace root'}
 				</div>
+			{/if}
+			{#if pasteProgress}
+				<p class="mt-1 px-2 text-xs text-base-content/60" data-testid="files-paste-progress">{pasteProgress}</p>
 			{/if}
 			{#if opError}
 				<p class="mt-1 px-2 text-xs text-error" data-testid="files-op-error">{opError}</p>
@@ -2011,10 +2172,13 @@
 </aside>
 
 <!-- ==== File-tree context menu =========================================== -->
-{#snippet menuItem(label: string, testid: string, action: () => void, danger = false)}
+{#snippet menuItem(label: string, testid: string, action: () => void, danger = false, disabledReason = '')}
+	<!-- A disabled item stays hoverable so its reason shows: `aria-disabled`, not `disabled`. -->
 	<button
-		class="flex w-full items-center px-3 py-1 text-left hover:bg-base-300/70 {danger ? 'text-error' : 'text-base-content/90'}"
-		onclick={action}
+		class="flex w-full items-center px-3 py-1 text-left {disabledReason ? 'cursor-default text-base-content/35' : `hover:bg-base-300/70 ${danger ? 'text-error' : 'text-base-content/90'}`}"
+		onclick={disabledReason ? undefined : action}
+		aria-disabled={disabledReason ? 'true' : undefined}
+		title={disabledReason || undefined}
 		data-testid={testid}
 	>
 		{label}
@@ -2026,7 +2190,7 @@
 
 {#if ctxMenu}
 	{@const node = ctxMenu.node}
-	{@const canPaste = clipboard && (node.type === 'dir' || node.type === 'root')}
+	{@const pasteDisabled = clipboard ? '' : 'Nothing copied in Files. Press ⌘V or Ctrl+V to paste files copied in another app.'}
 	<!-- Backdrop: any click / right-click / scroll dismisses the menu. -->
 	<!-- svelte-ignore a11y_no_static_element_interactions -->
 	<div
@@ -2049,10 +2213,12 @@
 			{@render menuSep()}
 			{@render menuItem('Cut', 'ctx-cut', () => cutEntry(node))}
 			{@render menuItem('Copy', 'ctx-copy', () => copyEntry(node))}
+		{:else}
+			{@render menuSep()}
 		{/if}
-		{#if canPaste}
-			{#if node.type === 'root'}{@render menuSep()}{/if}
-			{@render menuItem('Paste', 'ctx-paste', () => pasteEntry(node))}
+		{@render menuItem('Paste', 'ctx-paste', () => pasteEntry(node), false, pasteDisabled)}
+		{#if node.type !== 'root'}
+			{@render menuItem('Duplicate', 'ctx-duplicate', () => duplicateEntry(node))}
 		{/if}
 	</div>
 {/if}
