@@ -49,8 +49,13 @@ test.describe(runtimeAvailable() ? 'file tree: paste and duplicate' : `file tree
 		await page.goto(url);
 		await openSidebarSection(page, 'files', 'files-body');
 		await expect(fileRow(page, 'notes.md')).toBeVisible();
-		await dirRow(page, 'src').click();
-		await expect(fileRow(page, 'src/utils.py')).toBeVisible();
+		// An earlier test leaves `src/utils.py` in the saved tab session. Its
+		// restore reveals `src` on its own, possibly just after a click, which
+		// would then fold it again. Expand until it stays open.
+		await expect(async () => {
+			if ((await dirRow(page, 'src').getAttribute('aria-expanded')) !== 'true') await dirRow(page, 'src').click();
+			await expect(fileRow(page, 'src/utils.py')).toBeVisible({ timeout: 2_000 });
+		}).toPass();
 	}
 
 	async function menu(page: Page, row: ReturnType<typeof fileRow>, item: string): Promise<void> {
