@@ -56,6 +56,7 @@ beforeAll(async () => {
 	WS = mkdtempSync(join(tmpdir(), 'cellar-export-orphan-'));
 	process.env.CELLAR_WORKSPACE = WS;
 	nbmod = await import('../../src/lib/server/notebook');
+	await nbmod.syncExportPeers();
 });
 
 /** A notebook with one marked code cell, exporting to `target`. */

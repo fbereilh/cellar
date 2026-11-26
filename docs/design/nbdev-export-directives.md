@@ -349,6 +349,13 @@ or a persist never waits: the cell badges answer from the last finished scan, a 
 with a valued `#| export` starts one scan in the background, and a changed result arrives
 as a `notebook:export-derived` event. Before the first scan finishes no badge is shown.
 
+**An export never guesses the workspace.** With no finished scan an export is refused, never
+run as a single-notebook export. A walked notebook that cannot be read or parsed is kept as
+unread. An export refuses to rebuild a module when the generated file lists an unread
+notebook in an `# Also from notebook:` line, or when an unparseable notebook's raw text holds
+a `#| export <module>` line naming that module. The error names the notebook and the module,
+and no module is written.
+
 The UI: a fed cell's export toggle shows ON, and a neutral chip beside it names the file it
 goes into. Its title names the module, its owner, and the line to remove.
 

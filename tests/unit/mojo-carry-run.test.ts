@@ -123,6 +123,7 @@ beforeAll(async () => {
 	process.env.CELLAR_WORKSPACE = mkdtempSync(join(tmpdir(), 'cellar-mojo-carry-'));
 	process.env.CELLAR_KERNEL_IDLE_TIMEOUT_MS = '0';
 	nbmod = await import('../../src/lib/server/notebook');
+	await nbmod.syncExportPeers();
 	queue = await import('../../src/lib/server/run-queue');
 	runmod = await import('../../src/lib/server/run');
 	kernelmod = await import('../../src/lib/server/kernel');

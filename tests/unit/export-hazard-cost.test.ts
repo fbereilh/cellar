@@ -104,6 +104,7 @@ beforeAll(async () => {
 	WS = mkdtempSync(join(tmpdir(), 'cellar-hazard-cost-'));
 	process.env.CELLAR_WORKSPACE = WS;
 	nbmod = await import('../../src/lib/server/notebook');
+	await nbmod.syncExportPeers();
 	svc = await import('../../src/lib/server/mcp/service');
 });
 

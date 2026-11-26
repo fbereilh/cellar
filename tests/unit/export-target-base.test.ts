@@ -61,6 +61,7 @@ beforeAll(async () => {
 
 	process.env.CELLAR_WORKSPACE = WS;
 	nbmod = await import('../../src/lib/server/notebook');
+	await nbmod.syncExportPeers();
 	expy = await import('../../src/lib/server/export-py');
 	gitmod = await import('../../src/lib/server/git');
 	events = await import('../../src/lib/server/events');

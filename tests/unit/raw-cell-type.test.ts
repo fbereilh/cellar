@@ -38,6 +38,7 @@ beforeAll(async () => {
 	WS = mkdtempSync(join(tmpdir(), 'cellar-raw-cell-'));
 	process.env.CELLAR_WORKSPACE = WS;
 	nbmod = await import('../../src/lib/server/notebook');
+	await nbmod.syncExportPeers();
 	ckmod = await import('../../src/lib/server/checkpoints');
 });
 

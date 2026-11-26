@@ -159,6 +159,7 @@ beforeAll(async () => {
 	WS = mkdtempSync(join(tmpdir(), 'cellar-to-chat-'));
 	process.env.CELLAR_WORKSPACE = WS;
 	nbmod = await import('../../src/lib/server/notebook');
+	await nbmod.syncExportPeers();
 });
 
 /** A fresh `.ipynb` of `n` code cells; returns its path and their ids. */

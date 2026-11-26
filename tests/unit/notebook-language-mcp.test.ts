@@ -81,6 +81,7 @@ beforeAll(async () => {
 	WS = mkdtempSync(join(tmpdir(), 'cellar-mojo-mcp-'));
 	process.env.CELLAR_WORKSPACE = WS;
 	nbmod = await import('../../src/lib/server/notebook');
+	await nbmod.syncExportPeers();
 	srv = await import('../../src/lib/server/mcp/server');
 });
 

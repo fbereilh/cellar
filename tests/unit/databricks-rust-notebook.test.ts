@@ -125,6 +125,7 @@ beforeAll(async () => {
 	delete process.env.CELLAR_PROJECT_VENV;
 	kernelmod = await import('../../src/lib/server/kernel');
 	nbmod = await import('../../src/lib/server/notebook');
+	await nbmod.syncExportPeers();
 	dbx = await import('../../src/lib/server/databricks');
 	nbmod.createNotebook('n.ipynb', null, { focus: false });
 	nbmod.setNotebookLanguage('rust', NB());

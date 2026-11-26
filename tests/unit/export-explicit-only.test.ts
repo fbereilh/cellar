@@ -49,6 +49,7 @@ beforeAll(async () => {
 	WS = mkdtempSync(join(tmpdir(), 'cellar-export-explicit-'));
 	process.env.CELLAR_WORKSPACE = WS;
 	nbmod = await import('../../src/lib/server/notebook');
+	await nbmod.syncExportPeers();
 	events = await import('../../src/lib/server/events');
 	svc = await import('../../src/lib/server/mcp/service');
 });

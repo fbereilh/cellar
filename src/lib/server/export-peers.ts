@@ -18,7 +18,8 @@
  * outputs: an export reads only source and metadata. An entry is dropped once
  * the walk no longer lists its file. A file whose text names no module
  * (`NAMES_A_MODULE`) can neither own nor feed one, so it is not parsed at all. A
- * file that cannot be read or parsed takes no part: nothing about it is known.
+ * file that cannot be read or parsed gives no document. It is reported as unread
+ * (`ExportPeers.unread`), so an export refuses to rebuild a module it feeds.
  *
  * The scan is asynchronous (`refreshExportPeers`), so it never blocks the process
  * that carries the kernel sockets. `exportPeers` answers from the last finished
@@ -31,7 +32,7 @@ import { deserialize, isIpynbPath } from './ipynb';
 import type { NotebookDoc } from './types';
 
 /** The parse of one notebook file, kept while its size and mtime hold. */
-const parsed = new Map<string, { size: number; mtimeMs: number; doc: NotebookDoc | null }>();
+const parsed = new Map<string, { size: number; mtimeMs: number; doc: NotebookDoc | null; unread?: Unread }>();
 
 /** The notebook paths the last finished scan listed, sorted. Null before the first one. */
 let walked: string[] | null = null;
@@ -47,6 +48,23 @@ export interface ExportPeers {
 	 * notebook exported.
 	 */
 	excluded: string | null;
+	/**
+	 * The other notebooks the scan reached but could not read or parse. What they
+	 * feed is not known, so a module one of them sends cells to is never rebuilt
+	 * without it.
+	 */
+	unread: UnreadNotebook[];
+}
+
+/** Why a notebook file gave no document, and the modules its raw text names. */
+interface Unread {
+	reason: string;
+	/** The module of each valued `#| export <module>` line found in the raw text. */
+	modules: string[];
+}
+
+export interface UnreadNotebook extends Unread {
+	path: string;
 }
 
 /**
@@ -58,16 +76,19 @@ export interface ExportPeers {
 export function exportPeers(self: string, live: (abs: string) => NotebookDoc | undefined): ExportPeers | null {
 	if (!walked) return null;
 	const peers: NotebookDoc[] = [];
+	const unread: UnreadNotebook[] = [];
 	let reached = false;
 	for (const abs of walked) {
 		if (abs === self) {
 			reached = true;
 			continue;
 		}
-		const doc = live(abs) ?? parsed.get(abs)?.doc;
+		const hit = parsed.get(abs);
+		const doc = live(abs) ?? hit?.doc;
 		if (doc) peers.push(doc);
+		else if (hit?.unread) unread.push({ path: abs, ...hit.unread });
 	}
-	return { peers, excluded: reached ? null : skipReason(self) };
+	return { peers, excluded: reached ? null : skipReason(self), unread };
 }
 
 let running: Promise<boolean> | null = null;
@@ -150,6 +171,9 @@ async function notebookPaths(): Promise<string[]> {
  */
 const NAMES_A_MODULE = /#(?: |\\t)*\|(?: |\\t)*export(?: |\\t|:)+[^ :"\\]|default_exp|"export_target"/;
 
+/** Each valued `#| export <module>` line in a file's raw JSON text, capturing the module. */
+const VALUED_EXPORT = /#(?: |\\t)*\|(?: |\\t)*export(?: |\\t|:)+([^ :"\\]+)/g;
+
 /** Refresh one file's cached parse. True when its document appeared, went or changed. */
 async function readPeer(abs: string): Promise<boolean> {
 	let st;
@@ -163,15 +187,24 @@ async function readPeer(abs: string): Promise<boolean> {
 	const hit = parsed.get(abs);
 	if (hit && hit.size === st.size && hit.mtimeMs === st.mtimeMs) return false;
 	let doc: NotebookDoc | null = null;
+	let unread: Unread | undefined;
+	let text: string | null = null;
 	try {
-		const text = await readFile(abs, 'utf8');
-		if (NAMES_A_MODULE.test(text)) {
+		text = await readFile(abs, 'utf8');
+	} catch {
+		unread = { reason: 'could not be read', modules: [] };
+	}
+	if (text !== null && NAMES_A_MODULE.test(text)) {
+		try {
 			const nb = deserialize(JSON.parse(text));
 			doc = { path: abs, cells: nb.cells.map(({ outputs: _outputs, ...cell }) => cell), metadata: nb.metadata };
+		} catch {
+			unread = {
+				reason: 'could not be parsed as a notebook',
+				modules: [...text.matchAll(VALUED_EXPORT)].map((m) => m[1])
+			};
 		}
-	} catch {
-		doc = null;
 	}
-	parsed.set(abs, { size: st.size, mtimeMs: st.mtimeMs, doc });
-	return doc !== null || !!hit?.doc;
+	parsed.set(abs, { size: st.size, mtimeMs: st.mtimeMs, doc, ...(unread ? { unread } : {}) });
+	return doc !== null || !!hit?.doc || !!unread || !!hit?.unread;
 }

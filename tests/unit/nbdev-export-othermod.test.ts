@@ -28,6 +28,7 @@ beforeAll(async () => {
 	WS = mkdtempSync(join(tmpdir(), 'cellar-export-othermod-'));
 	process.env.CELLAR_WORKSPACE = WS;
 	nbmod = await import('../../src/lib/server/notebook');
+	await nbmod.syncExportPeers();
 	role = await import('../../src/lib/exportRole');
 });
 
@@ -448,6 +449,54 @@ describe('the workspace scan', () => {
 		const res = await exportPy(x);
 		expect(res.modules).toMatchObject([{ target: `${T}/core.py`, written: true, count: 1 }]);
 		expect(read(`${T}/core.py`)).toContain('B = 2');
+	});
+});
+
+describe('a contributor notebook that cannot be parsed', () => {
+	// Oracle: the repo rule "Refuse, never degrade". A module is never rebuilt
+	// without the cells of a notebook that feeds it and could not be read.
+	// Rejected: rewriting the module without those cells and reporting success.
+	const conflicted = (rel: string) => {
+		const abs = join(WS, rel);
+		writeFileSync(abs, `<<<<<<< HEAD\n${readFileSync(abs, 'utf8')}\n=======\n{}\n>>>>>>> theirs\n`);
+	};
+
+	it('refuses to rebuild a module whose header lists it, from the owner and by toggle', async () => {
+		const core = writeNb(`${T}/core.ipynb`, [
+			{ id: 'c', source: `#| default_exp ${T}.core\n#| export\nA = 1` },
+			{ id: 'd', source: 'D = 4' }
+		]);
+		writeNb(`${T}/extra.ipynb`, [{ id: 'e', source: `#| export ${T}.core\nB = 2` }]);
+		await exportPy(core);
+		const before = read(`${T}/core.py`);
+		expect(before).toContain('B = 2');
+
+		conflicted(`${T}/extra.ipynb`);
+		await expect(exportPy(core)).rejects.toThrow(
+			new RegExp(`refusing to rebuild ${T}/core\\.py: ${T}/extra\\.ipynb .* could not be parsed as a notebook`)
+		);
+		expect(read(`${T}/core.py`)).toBe(before);
+
+		// The export toggle regenerates too: the module stays, and the reason is kept.
+		nbmod.setCellExport('d', true, core);
+		expect(read(`${T}/core.py`)).toBe(before);
+		expect(nbmod.lastExportError(core)).toContain(`${T}/extra.ipynb`);
+	});
+
+	it('refuses a module it names even before that module ever listed it', async () => {
+		const core = writeNb(`${T}/core.ipynb`, [{ id: 'c', source: `#| default_exp ${T}.core\n#| export\nA = 1` }]);
+		writeNb(`${T}/extra.ipynb`, [{ id: 'e', source: `#| export ${T}.core\nB = 2` }]);
+		conflicted(`${T}/extra.ipynb`);
+		await expect(exportPy(core)).rejects.toThrow(/could not be parsed as a notebook/);
+		expect(existsSync(join(WS, T, 'core.py'))).toBe(false);
+	});
+
+	it('leaves an unrelated module alone', async () => {
+		writeNb(`${T}/core.ipynb`, [{ id: 'c', source: `#| default_exp ${T}.core\n#| export\nA = 1` }]);
+		writeNb(`${T}/extra.ipynb`, [{ id: 'e', source: `#| export ${T}.core\nB = 2` }]);
+		conflicted(`${T}/extra.ipynb`);
+		const other = writeNb(`${T}/other.ipynb`, [{ id: 'o', source: `#| default_exp ${T}.other\n#| export\nO = 1` }]);
+		expect(await exportPy(other)).toMatchObject({ written: true, target: `${T}/other.py` });
 	});
 });
 

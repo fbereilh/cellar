@@ -311,7 +311,7 @@ function persist(doc: NotebookDoc): void {
 function regenerateExportModule(doc: NotebookDoc): void {
 	if (doc.jpFormat) return; // `.py` text notebooks carry no cellar cell metadata
 	try {
-		exportNotebookToPy(doc, peersOf(doc) ?? undefined);
+		exportNotebookToPy(doc, peersForExport(doc));
 		doc.lastExportError = null;
 	} catch (err) {
 		doc.lastExportError = String((err as Error)?.message ?? err);
@@ -324,6 +324,19 @@ function regenerateExportModule(doc: NotebookDoc): void {
  */
 function peersOf(doc: NotebookDoc): ExportPeers | null {
 	return exportPeers(doc.path, (abs) => docs.get(abs));
+}
+
+/**
+ * The workspace around `doc` for an export. An export never runs as if the
+ * notebook were alone: with no finished scan it is refused.
+ */
+function peersForExport(doc: NotebookDoc): ExportPeers {
+	const around = peersOf(doc);
+	if (!around)
+		throw new Error(
+			'the workspace has not been scanned for other notebooks yet, so the module was not written - export again'
+		);
+	return around;
 }
 
 /**
@@ -2050,7 +2063,7 @@ export function exportPy(nb?: string | null): ExportResult {
 	const doc = docFor(nb);
 	if (!notebookHoldsExport(!!doc.jpFormat)) throw new Error('cannot export a .py text notebook to a module');
 	try {
-		const res = exportNotebookToPy(doc, peersOf(doc) ?? undefined);
+		const res = exportNotebookToPy(doc, peersForExport(doc));
 		doc.lastExportError = null;
 		return res;
 	} catch (err) {
