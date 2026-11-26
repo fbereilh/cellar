@@ -282,6 +282,19 @@ describe('a module is the same bytes whichever notebook exports', () => {
 			expect(nbmod.exportPy(extra).modules).toBeUndefined();
 		});
 
+	it('never empties a module a second notebook owns', () => {
+		// Oracle: an export with nothing marked writes nothing, and an empty rebuild is
+		// only for a module one notebook owns. Rejected: wiping the other owner's code.
+		const b = writeNb(`${T}/b.ipynb`, [{ id: 'b', source: `#| default_exp ${T}.core\n#| export\nA = 1` }]);
+		writeNb(`${T}/x.ipynb`, [{ id: 'x', source: `#| export ${T}.core\nB = 2` }]);
+		nbmod.exportPy(b);
+		const before = read(`${T}/core.py`);
+		expect(before).toContain(`# Also from notebook: ${T}/x.ipynb`);
+		const a = writeNb(`${T}/a.ipynb`, [{ id: 'a', source: 'Z = 0' }], { export_target: `${T}/core.py` });
+		expect(nbmod.exportPy(a)).toMatchObject({ written: false, reason: 'no-cells' });
+		expect(read(`${T}/core.py`)).toBe(before);
+	});
+
 	it('writes nothing for a notebook with no cells and no module on disk', () => {
 		const core = writeNb(`${T}/core.ipynb`, [{ id: 'c', source: `#| default_exp ${T}.core` }]);
 		expect(nbmod.exportPy(core)).toMatchObject({ written: false, reason: 'no-cells' });

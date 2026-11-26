@@ -1458,7 +1458,8 @@ function composeModule(
 /**
  * The module to write for `owner` at `target`, or null when there is nothing to
  * write: no cell from any notebook, and no generated module on disk that still
- * lists contributors. That second half is what lets a module drop its last fed
+ * lists contributors. An empty module is written only for a target exactly one
+ * notebook owns, so it never replaces what a second owner wrote. That second half is what lets a module drop its last fed
  * cell: the same empty module is written whether the owner or the former
  * contributor exports. One rule for the owner's export and a contributor's.
  */
@@ -1470,6 +1471,7 @@ function moduleToWrite(
 ): ReturnType<typeof composeModule> | null {
 	const composed = composeModule(owner, target, all);
 	if (composed.cells.length) return composed;
+	if (all.filter((c) => c.own?.ok && c.own.target === target).length !== 1) return null;
 	const head = readHead(abs);
 	const lists =
 		head !== null && isGeneratedModule(head) && head.split('\n').some((l) => l.startsWith(ALSO_FROM_PREFIX));

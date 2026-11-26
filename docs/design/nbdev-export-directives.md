@@ -310,8 +310,9 @@ its cell. That holds when the contributor itself exports after removing or retar
 line: an export also rebuilds every generated module, owned by exactly one walked notebook,
 whose `# Also from notebook:` header still lists the exporting notebook. The result lists
 such a module with a count of zero. A module left with no cell at all is still rewritten,
-as a header and an empty `__all__`, while the file on disk lists a contributor. With none
-listed, an export with nothing marked writes nothing, as before. nbdev instead appends to the file the previous notebook wrote, in file-name order,
+as a header and an empty `__all__`, while the file on disk lists a contributor and exactly
+one notebook owns it. Otherwise an export with nothing marked writes nothing, as before.
+nbdev instead appends to the file the previous notebook wrote, in file-name order,
 so its result depends on which notebook it reaches first. That order difference is the one
 deliberate divergence.
 
