@@ -309,7 +309,9 @@ same bytes from all of them, so a repeated export is a no-op and a removed direc
 its cell. That holds when the contributor itself exports after removing or retargeting the
 line: an export also rebuilds every generated module, owned by exactly one walked notebook,
 whose `# Also from notebook:` header still lists the exporting notebook. The result lists
-such a module with a count of zero. nbdev instead appends to the file the previous notebook wrote, in file-name order,
+such a module with a count of zero. A module left with no cell at all is still rewritten,
+as a header and an empty `__all__`, while the file on disk lists a contributor. With none
+listed, an export with nothing marked writes nothing, as before. nbdev instead appends to the file the previous notebook wrote, in file-name order,
 so its result depends on which notebook it reaches first. That order difference is the one
 deliberate divergence.
 
@@ -335,7 +337,7 @@ the PATCH route and MCP `set_cell_export`: the cell never goes into the notebook
 **Finding the other notebooks.** `server/export-peers.ts` walks the workspace for `.ipynb`
 files on nbdev's `nbglob` skip rule (no `.` or `_` names) and the file tree's noise folders.
 An open notebook is read from its live document, any other from disk with a stat-keyed
-parse cache. A `.py` text notebook takes no part. The cell badges ask only when the notebook
+parse cache that keeps no cell outputs. A `.py` text notebook takes no part. The cell badges ask only when the notebook
 carries a valued `#| export`, so an ordinary notebook pays nothing.
 
 The UI: a fed cell's export toggle shows ON, and a neutral chip beside it names the file it

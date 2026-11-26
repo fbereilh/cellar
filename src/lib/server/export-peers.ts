@@ -14,7 +14,9 @@
  *
  * A notebook that is open is read from its live document. Persist is
  * synchronous, so that is what is on disk. Any other notebook is read from disk,
- * and the parse is cached on the file's size and mtime. A file whose text says
+ * and the parse is cached on the file's size and mtime, without the cells'
+ * outputs: an export reads only source and metadata. An entry is dropped once
+ * the walk no longer lists its file. A file whose text says
  * neither `export` nor `default_exp` can neither own nor feed a module, so it is
  * not parsed at all. A file that cannot be read or parsed takes no part: nothing
  * about it is known.
@@ -52,7 +54,9 @@ export interface ExportPeers {
 export function exportPeers(self: string, live: (abs: string) => NotebookDoc | undefined): ExportPeers {
 	const peers: NotebookDoc[] = [];
 	let reached = false;
-	for (const abs of notebookPaths()) {
+	const paths = new Set(notebookPaths());
+	for (const abs of parsed.keys()) if (!paths.has(abs)) parsed.delete(abs);
+	for (const abs of paths) {
 		if (abs === self) {
 			reached = true;
 			continue;
@@ -112,7 +116,7 @@ function readPeer(abs: string): NotebookDoc | null {
 		// `export_target` and every `#| export` line contain `export`; `default_exp` does not.
 		if (text.includes('export') || text.includes('default_exp')) {
 			const nb = deserialize(JSON.parse(text));
-			doc = { path: abs, cells: nb.cells, metadata: nb.metadata };
+			doc = { path: abs, cells: nb.cells.map(({ outputs: _outputs, ...cell }) => cell), metadata: nb.metadata };
 		}
 	} catch {
 		doc = null;

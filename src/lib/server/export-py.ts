@@ -1172,7 +1172,7 @@ export function exportNotebookToPy(doc: NotebookDoc, around: ExportPeers = ALONE
 	// (`$lib/server/export-peers`); with none, the export is exactly the
 	// single-notebook one it always was.
 	const all = contributorsOf(doc, around);
-	const own = exportOwnModule(doc, all);
+	const own = exportOwnModule(doc, around.excluded === null ? all : null);
 	const cells = otherModuleCells(doc, all, around.excluded);
 	const left = modulesLeft(doc, all, new Set(cells.flatMap((o) => (o.ok ? [o.target] : []))));
 	if (!cells.length && !left.length) return own;
@@ -1192,17 +1192,20 @@ export function exportNotebookToPy(doc: NotebookDoc, around: ExportPeers = ALONE
 		...[...byTarget.values()].map((fed) => ({ owner: fed[0].owner, target: fed[0].target, abs: fed[0].abs, count: fed.length })),
 		...left.map((m) => ({ ...m, count: 0 }))
 	].sort((a, b) => (a.target < b.target ? -1 : a.target > b.target ? 1 : 0));
-	const modules: OtherModuleWrite[] = rebuilt.map(({ owner, target, abs, count }) => {
-		const composed = composeModule(owner, target, all);
+	const modules: OtherModuleWrite[] = rebuilt.flatMap(({ owner, target, abs, count }) => {
+		const composed = moduleToWrite(owner, target, abs, all);
+		if (!composed) return [];
 		const out = writeModule(abs, target, composed.text);
-		return {
-			target,
-			owner: workspaceRel(owner.path),
-			written: out.written,
-			count,
-			...(out.reason ? { reason: out.reason } : {}),
-			hazards: out.reason === 'foreign-module' ? [] : hazardsFor(composed.cells, 'python')
-		};
+		return [
+			{
+				target,
+				owner: workspaceRel(owner.path),
+				written: out.written,
+				count,
+				...(out.reason ? { reason: out.reason } : {}),
+				hazards: out.reason === 'foreign-module' ? [] : hazardsFor(composed.cells, 'python')
+			}
+		];
 	});
 	return {
 		...own,
@@ -1213,9 +1216,11 @@ export function exportNotebookToPy(doc: NotebookDoc, around: ExportPeers = ALONE
 
 /**
  * The notebook's OWN module: its marked cells, then every `#| export <this
- * module>` cell of the workspace's notebooks (see `composeModule`).
+ * module>` cell of the workspace's notebooks (see `composeModule`). `all` is
+ * null for a notebook the workspace walk skips: it takes no fed cells, so it is
+ * the single-notebook export.
  */
-function exportOwnModule(doc: NotebookDoc, all: readonly Contributor[]): ExportResult {
+function exportOwnModule(doc: NotebookDoc, all: readonly Contributor[] | null): ExportResult {
 	const info = resolveExportTarget(doc);
 	if (!info) return { written: false, target: null, count: 0, reason: 'no-target', hazards: [] };
 
@@ -1229,9 +1234,11 @@ function exportOwnModule(doc: NotebookDoc, all: readonly Contributor[]): ExportR
 	const lang = docExportLanguage(doc);
 	// Cells other notebooks send here with `#| export <module>`. Python only, and
 	// only to a target that resolves: a fed cell is matched by the file it names.
-	const composed = lang === 'python' && info.ok ? composeModule(doc, info.target, all) : null;
+	// With no cell at all the module is still rebuilt when it lists contributors
+	// (`moduleToWrite`), so the cells they no longer send drop from it.
+	const composed = lang === 'python' && info.ok && all ? moduleToWrite(doc, info.target, info.abs, all) : null;
 	const exportedCells = composed ? composed.cells : doc.cells.filter((c: Cell) => isExportCell(c, lang));
-	if (!exportedCells.length)
+	if (!composed && !exportedCells.length)
 		return { written: false, target: info.ok ? info.target : info.path, count: 0, reason: 'no-cells', hazards: [] };
 	// Computed once, from the cells this call is about to assemble, and attached
 	// to whichever result it returns below.
@@ -1446,6 +1453,27 @@ function composeModule(
 		alsoFrom
 	);
 	return { cells, fromOwner, alsoFrom, text };
+}
+
+/**
+ * The module to write for `owner` at `target`, or null when there is nothing to
+ * write: no cell from any notebook, and no generated module on disk that still
+ * lists contributors. That second half is what lets a module drop its last fed
+ * cell: the same empty module is written whether the owner or the former
+ * contributor exports. One rule for the owner's export and a contributor's.
+ */
+function moduleToWrite(
+	owner: NotebookDoc,
+	target: string,
+	abs: string,
+	all: readonly Contributor[]
+): ReturnType<typeof composeModule> | null {
+	const composed = composeModule(owner, target, all);
+	if (composed.cells.length) return composed;
+	const head = readHead(abs);
+	const lists =
+		head !== null && isGeneratedModule(head) && head.split('\n').some((l) => l.startsWith(ALSO_FROM_PREFIX));
+	return lists ? composed : null;
 }
 
 /**
