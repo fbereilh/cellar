@@ -336,6 +336,46 @@
 	$effect(() => {
 		searchHighlight.notebookPath = findOpen ? activeNotebookPath : null;
 	});
+	// The open find bar sits in a band at the bottom of the active notebook's
+	// toolbar, pinned or not, so it covers neither a toolbar button nor a cell.
+	// `--cellar-find-reserve` on `<main>` is the band's height: `Notebook` pads its
+	// toolbar by it, which also grows the pane's `scroll-padding-top`, so a match
+	// scrolled into view lands below the band. The bar follows the toolbar as the
+	// pane scrolls.
+	const FIND_GAP = 6;
+	let mainEl = $state<HTMLElement | null>(null);
+	let findTop = $state(12);
+	let findRight = $state(16);
+	let findHeight = $state(0);
+	$effect(() => {
+		if (!findOpen || !mainEl) return;
+		const main = mainEl;
+		const height = findHeight;
+		const pane = activeTabId ? document.getElementById(tabPanelDomId(activeTabId)) : null;
+		const bar = pane?.querySelector<HTMLElement>('[data-testid="notebook-toolbar"]') ?? null;
+		const place = () => {
+			const box = bar?.getBoundingClientRect();
+			const area = main.getBoundingClientRect();
+			findTop = box?.height ? Math.round(box.bottom - area.top - FIND_GAP - height) : 12;
+			findRight = box?.height ? Math.max(0, Math.round(area.right - box.right)) : 16;
+		};
+		place();
+		pane?.addEventListener('scroll', place, { passive: true });
+		window.addEventListener('resize', place);
+		const ro = bar ? new ResizeObserver(place) : null;
+		if (bar) ro?.observe(bar, { box: 'border-box' });
+		return () => {
+			pane?.removeEventListener('scroll', place);
+			window.removeEventListener('resize', place);
+			ro?.disconnect();
+		};
+	});
+	$effect(() => {
+		const main = mainEl;
+		if (!main) return;
+		if (findOpen && findHeight) main.style.setProperty('--cellar-find-reserve', `${findHeight + 2 * FIND_GAP}px`);
+		else main.style.removeProperty('--cellar-find-reserve');
+	});
 	// Transient, dismissable status line (jupytext env not ready, convert progress
 	// and result, a notebook action the document invariants refused, …). The channel
 	// owns the auto-dismiss + repeat-nonce rules, so a `{sticky:true}` caller is the
@@ -2065,8 +2105,9 @@
 			></div>
 		{/if}
 
-		<main class="relative min-w-0 flex-1 overflow-hidden">
-			<!-- Floating find-in-page bar over the active notebook pane (Search P3).
+		<main bind:this={mainEl} class="relative min-w-0 flex-1 overflow-hidden">
+			<!-- Floating find-in-page bar over the active notebook pane (Search P3),
+			     parked in a band at the bottom of its toolbar (`findTop`).
 			     Reads the active notebook's cells + shared search cache; every jump
 			     routes to the active notebook's `jumpToCell` (mounts a windowed-out
 			     match before scrolling). -->
@@ -2079,15 +2120,18 @@
 				onClose={closeFindBar}
 				onJump={jumpToMatch}
 				highlight={searchHighlight}
+				top={findTop}
+				right={findRight}
+				bind:height={findHeight}
 			/>
 			<!-- Every open notebook stays mounted (editor + run state preserved),
 			     just hidden. The default notebook and opened `.ipynb` files use the
 			     same live component; each persists to its own file. -->
-			<!-- `scroll-pt-12` reserves the notebook toolbar's sticky compact row, so a
-			     cell scrolled into view lands below it rather than under it. -->
+			<!-- The notebook sets each pane's `scroll-padding-top` to its pinned toolbar's
+			     height, so a cell scrolled into view lands below the bar rather than under it. -->
 			{#if notebookOpen}
 				<div
-					class="h-full scroll-pt-12 overflow-y-auto {activeTabId === 'notebook' ? '' : 'hidden'}"
+					class="h-full overflow-y-auto {activeTabId === 'notebook' ? '' : 'hidden'}"
 					role="tabpanel"
 					id={tabPanelDomId('notebook')}
 					aria-labelledby={tabDomId('notebook')}
@@ -2127,7 +2171,7 @@
 
 			{#each ipynbTabs as tab (tab.id)}
 				<div
-					class="h-full scroll-pt-12 overflow-y-auto {activeTabId === tab.id ? '' : 'hidden'}"
+					class="h-full overflow-y-auto {activeTabId === tab.id ? '' : 'hidden'}"
 					role="tabpanel"
 					id={tabPanelDomId(tab.id)}
 					aria-labelledby={tabDomId(tab.id)}

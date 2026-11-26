@@ -18,9 +18,14 @@ import { tabPanelDomId } from '../../src/lib/tabIds';
  *  - Export with no target writes nothing: it opens the language-and-export menu
  *    with the cursor in the target field.
  *  - Restart sends the existing kernel restart for THIS notebook.
- *  - Scrolled past, the same toolbar stays pinned at the top of the pane as icons,
- *    and a click there runs the same action. Scrolled back, it returns to full form.
- *  - Where the full form wraps onto two rows, turning compact moves no cell.
+ *  - Scrolled past, the same toolbar stays pinned at the top of the pane with its
+ *    labelled buttons, edge to edge with the cells, and a click there acts.
+ *  - Scrolling back and forth across the pin point never moves a cell or the
+ *    scroll position, and the bar settles in the right state.
+ *  - A toolbar wrapped onto two rows keeps its size when pinned, and the pane's
+ *    scroll padding clears it.
+ *  - The find bar sits in a band below the toolbar, pinned or not, covering no
+ *    toolbar button and no cell, and a match lands below it.
  *
  * Every locator is scoped to one notebook's pane: each open notebook stays mounted.
  */
@@ -148,9 +153,9 @@ test('the editor keeps the cursor below the pinned toolbar', async ({ page }) =>
 	// Put the cursor on the last line, then walk it up past the top of the pane.
 	await pane.getByTestId('cell').first().getByTestId('editor-scroll').click();
 	await page.keyboard.press('ControlOrMeta+End');
-	await expect(bar).toHaveAttribute('data-compact', '');
+	await expect(bar).toHaveAttribute('data-pinned', '');
 	for (let i = 0; i < 120; i++) await page.keyboard.press('ArrowUp');
-	await expect(bar).toHaveAttribute('data-compact', '');
+	await expect(bar).toHaveAttribute('data-pinned', '');
 	const [barBottom, cursorTop] = await Promise.all([
 		bar.evaluate((el) => el.getBoundingClientRect().bottom),
 		pane.locator('.cm-focused .cm-activeLine').evaluate((el) => el.getBoundingClientRect().top)
@@ -197,23 +202,33 @@ test('Restart sends the kernel restart for this notebook', async ({ page }) => {
 	await expect(button).toBeEnabled({ timeout: 30_000 });
 });
 
-test('scrolled past, the toolbar stays on screen as icons and still acts', async ({ page }) => {
+/** Left and right edges of an element, in viewport px. */
+function edges(el: Element): [number, number] {
+	const r = el.getBoundingClientRect();
+	return [Math.round(r.left), Math.round(r.right)];
+}
+
+test('scrolled past, the toolbar stays on screen with its labels and still acts', async ({ page }) => {
 	rmSync(join(workspace, 'mod_long.py'), { force: true });
 	await openNotebook(page, NB.long);
 	const pane = paneFor(page, NB.long);
 	const bar = pane.getByTestId('notebook-toolbar');
-	await expect(bar).not.toHaveAttribute('data-compact');
-	await expect(pane.getByTestId('run-all')).toContainText('Run all');
+	const cell = pane.getByTestId('cell').first();
+	await expect(bar).not.toHaveAttribute('data-pinned');
+	// Edge to edge with the cells, pinned or not.
+	expect(await bar.evaluate(edges)).toEqual(await cell.evaluate(edges));
 
 	await pane.evaluate((el) => (el.scrollTop = el.scrollHeight));
-	await expect(bar).toHaveAttribute('data-compact', '');
-	// Pinned to the top of the pane, and the labels gave way to icons.
+	await expect(bar).toHaveAttribute('data-pinned', '');
 	const [paneTop, barTop] = await Promise.all([
 		pane.evaluate((el) => el.getBoundingClientRect().top),
 		bar.evaluate((el) => el.getBoundingClientRect().top)
 	]);
 	expect(Math.abs(barTop - paneTop)).toBeLessThanOrEqual(1);
-	await expect(pane.getByTestId('run-all').getByText('Run all')).toBeHidden();
+	expect(await bar.evaluate(edges)).toEqual(await pane.getByTestId('cell').last().evaluate(edges));
+	// The pinned bar keeps every label.
+	await expect(pane.getByTestId('run-all')).toContainText('Run all');
+	await expect(pane.getByTestId('toolbar-export')).toContainText('Export');
 	await expect(pane.getByTestId('toolbar-export')).toHaveAttribute('aria-label', 'Export to mod_long.py');
 
 	await pane.getByTestId('toolbar-export').click();
@@ -221,41 +236,109 @@ test('scrolled past, the toolbar stays on screen as icons and still acts', async
 	expect(existsSync(join(workspace, 'mod_long.py'))).toBe(true);
 
 	await pane.evaluate((el) => (el.scrollTop = 0));
-	await expect(bar).not.toHaveAttribute('data-compact');
-	await expect(pane.getByTestId('run-all')).toContainText('Run all');
+	await expect(bar).not.toHaveAttribute('data-pinned');
 });
 
-test('a wrapped toolbar turning compact does not move the cells', async ({ page }) => {
-	await page.setViewportSize({ width: 640, height: 720 });
+test('scrolling back and forth across the pin point moves no cell and no scroll', async ({ page }) => {
 	await openNotebook(page, NB.long);
 	const pane = paneFor(page, NB.long);
 	const bar = pane.getByTestId('notebook-toolbar');
-	const cell = pane.getByTestId('cell').first();
-	const barHeight = () => bar.evaluate((el) => el.getBoundingClientRect().height);
-	// Where the cell sits in the pane's content, whatever the scroll position is.
+	await expect(bar).not.toHaveAttribute('data-pinned');
+	// The bar's own offset in the pane: it pins once the pane scrolls past it.
+	const pinAt = await pane.evaluate(
+		(el) => el.querySelector('[data-testid="notebook-toolbar"]')!.getBoundingClientRect().top - el.getBoundingClientRect().top + el.scrollTop
+	);
 	const cellOffset = () =>
 		pane.evaluate(
 			(el) => el.querySelector('[data-testid="cell"]')!.getBoundingClientRect().top - el.getBoundingClientRect().top + el.scrollTop
 		);
-	await expect(bar).not.toHaveAttribute('data-compact');
+	const before = await cellOffset();
+	const barHeight = await bar.evaluate((el) => el.getBoundingClientRect().height);
+	for (const delta of [-2, 2, -1, 3, -3, 1, 6, -6, 2]) {
+		const target = Math.max(0, Math.round(pinAt + delta));
+		await pane.evaluate((el, top) => (el.scrollTop = top), target);
+		if (target > pinAt) await expect(bar).toHaveAttribute('data-pinned', '');
+		else await expect(bar).not.toHaveAttribute('data-pinned');
+		// Settled: the state holds, the pane stayed where it was put, no cell moved.
+		await page.waitForTimeout(150);
+		expect(await pane.evaluate((el) => el.scrollTop), `scroll jumped at ${target}`).toBe(target);
+		expect(await cellOffset()).toBeCloseTo(before, 0);
+		expect(await bar.evaluate((el) => el.getBoundingClientRect().height)).toBeCloseTo(barHeight, 0);
+	}
+});
+
+test('a wrapped toolbar keeps its size when pinned and the pane clears it', async ({ page }) => {
+	await page.setViewportSize({ width: 640, height: 720 });
+	await openNotebook(page, NB.long);
+	const pane = paneFor(page, NB.long);
+	const bar = pane.getByTestId('notebook-toolbar');
+	const barHeight = () => bar.evaluate((el) => el.getBoundingClientRect().height);
+	const cellOffset = () =>
+		pane.evaluate(
+			(el) => el.querySelector('[data-testid="cell"]')!.getBoundingClientRect().top - el.getBoundingClientRect().top + el.scrollTop
+		);
+	await expect(bar).not.toHaveAttribute('data-pinned');
 	const fullHeight = await barHeight();
+	expect(fullHeight, 'the toolbar did not wrap at this width').toBeGreaterThan(60);
 	const before = await cellOffset();
 
 	await pane.evaluate((el) => (el.scrollTop = 150));
-	await expect(bar).toHaveAttribute('data-compact', '');
-	await expect(cell).toBeAttached();
-	// The full form took more than the one compact row, so the switch had a height to lose.
-	expect(fullHeight - (await barHeight()), 'the full toolbar did not wrap at this width').toBeGreaterThan(20);
-	await expect.poll(cellOffset).toBeCloseTo(before, 0);
-	await expect(bar).toHaveAttribute('data-compact', '');
+	await expect(bar).toHaveAttribute('data-pinned', '');
+	expect(await barHeight()).toBeCloseTo(fullHeight, 0);
+	expect(await cellOffset()).toBeCloseTo(before, 0);
+	// Scrolled-to cells land below the whole two-row bar.
+	const padding = await pane.evaluate((el) => parseFloat(getComputedStyle(el).scrollPaddingTop));
+	expect(padding).toBeGreaterThanOrEqual(fullHeight);
+});
 
-	// Widened while compact, the full form fits one row: the two-row measure may not outlive it.
-	await page.setViewportSize({ width: 1400, height: 720 });
-	await pane.evaluate((el) => (el.scrollTop = 0));
-	await expect(bar).not.toHaveAttribute('data-compact');
-	const oneRow = await cellOffset();
-	expect(await barHeight(), 'the full toolbar still wraps at this width').toBeLessThan(fullHeight - 20);
-	await pane.evaluate((el) => (el.scrollTop = 150));
-	await expect(bar).toHaveAttribute('data-compact', '');
-	await expect.poll(cellOffset).toBeCloseTo(oneRow, 0);
+test('the find bar sits below the toolbar and covers no button or cell', async ({ page }) => {
+	await openNotebook(page, NB.long);
+	const pane = paneFor(page, NB.long);
+	const bar = pane.getByTestId('notebook-toolbar');
+	await pane.getByTestId('cell').first().click();
+	await page.keyboard.press('ControlOrMeta+f');
+	const find = page.getByTestId('find-bar');
+	await expect(find).toBeVisible();
+	await page.keyboard.type('print');
+	await expect(find).toContainText('/');
+
+	const rect = (el: Element) => {
+		const r = el.getBoundingClientRect();
+		return { top: r.top, bottom: r.bottom, left: r.left, right: r.right };
+	};
+	const check = async (state: string) => {
+		const f = await find.evaluate(rect);
+		const b = await bar.evaluate(rect);
+		// Inside the toolbar's band, below every button.
+		expect(f.top, `${state}: the find bar starts above the toolbar's bottom band`).toBeGreaterThanOrEqual(b.top);
+		expect(f.bottom, `${state}: the find bar hangs below the toolbar`).toBeLessThanOrEqual(b.bottom);
+		expect(f.right).toBeLessThanOrEqual(b.right + 1);
+		for (const button of await bar.locator('button').all()) {
+			if (!(await button.isVisible())) continue;
+			const r = await button.evaluate(rect);
+			expect(r.bottom <= f.top || r.top >= f.bottom || r.right <= f.left || r.left >= f.right, `${state}: covers a button`).toBe(true);
+		}
+		// No cell reaches up under the find bar unless the pinned bar already hides it.
+		const firstCell = await pane.evaluate((el) => {
+			const cells = [...el.querySelectorAll('[data-testid="cell"]')].map((c) => c.getBoundingClientRect());
+			return cells.find((c) => c.bottom > el.getBoundingClientRect().top)?.top ?? Infinity;
+		});
+		if (state === 'unpinned') expect(firstCell).toBeGreaterThanOrEqual(f.bottom);
+	};
+	await expect(bar).not.toHaveAttribute('data-pinned');
+	await check('unpinned');
+
+	// Jump far down: the bar pins, and the active match lands below the find bar.
+	for (let i = 0; i < 30; i++) await page.keyboard.press('Enter');
+	await expect(bar).toHaveAttribute('data-pinned', '');
+	await check('pinned');
+	const findBottom = await find.evaluate((el) => el.getBoundingClientRect().bottom);
+	// The active match is a CSS highlight range on a static cell, or a CodeMirror mark in a built editor.
+	const activeTop = () =>
+		page.evaluate(() => {
+			const range = [...((CSS as any).highlights?.get('cellar-search-active') ?? [])][0] as Range | undefined;
+			const el = document.querySelector('.cm-searchMatch-selected');
+			return (range ?? el)?.getBoundingClientRect().top ?? -1;
+		});
+	await expect.poll(activeTop).toBeGreaterThanOrEqual(findBottom);
 });
