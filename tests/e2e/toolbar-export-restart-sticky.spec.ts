@@ -7,7 +7,7 @@ import { runtimeAvailable, bootCellar, killCellar, removeWorkspace } from './har
 import { tabPanelDomId } from '../../src/lib/tabIds';
 
 /**
- * E2E: the notebook toolbar's Export and Restart buttons, and its sticky compact form.
+ * E2E: the notebook toolbar's Export and Restart buttons, and its sticky pinned form.
  *
  *  - Export with a target writes the module, says so on the notice line and
  *    shows the new file in the tree. A hazard is worded in full on that line.
