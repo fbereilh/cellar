@@ -1709,7 +1709,7 @@
 			exportHazards = body.notebook.exportHazards ?? []; // why the generated module would not import
 			exportOrphanedModule = body.notebook.exportOrphanedModule ?? null; // a generated module this notebook stopped writing
 			exportOtherModules = body.notebook.exportOtherModules ?? []; // where each `#| export <module>` cell goes
-			const early = earlyExportDerived.get(canonicalId);
+			const early = canonicalId === null ? undefined : earlyExportDerived.get(canonicalId);
 			earlyExportDerived.clear();
 			if (early) applyStructuralEvent(early as unknown as StructuralEvent);
 			headerNumbering = body.notebook.headerNumbering ?? []; // display-only heading numbering
