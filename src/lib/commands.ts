@@ -40,6 +40,7 @@ export interface AppCommandHandlers {
 	restartKernel: () => void;
 	newNotebook: () => void;
 	consolidateImports: () => void;
+	exportModule: () => void;
 	openSettings: () => void;
 }
 
@@ -161,6 +162,11 @@ export function buildCommands({
 					})
 				]
 			: []),
+		// The keyboard twin of the toolbar's Export button. The navbar Options menu
+		// no longer carries it: an action promoted to the toolbar leaves that menu.
+		cmd('export-module', 'Export to module', 'Application', () => app.exportModule(), {
+			disabled: !hasNotebook
+		}),
 		cmd('open-settings', 'Open settings', 'Application', () => app.openSettings())
 	];
 }

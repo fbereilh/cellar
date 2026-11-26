@@ -24,7 +24,6 @@
 		tabRunState?: Record<string, 'running' | 'queued'>;
 		sidebarOpen: boolean;
 		kernelInfo: KernelInfo | null;
-		canExportPy?: boolean;
 		canSaveAsPy?: boolean;
 		canConvertToIpynb?: boolean;
 		converting?: boolean;
@@ -59,7 +58,6 @@
 		 */
 		onReorderTabs?: (id: string, insertAt: number) => void;
 		onToggleSidebar: () => void;
-		onExportPy: () => void;
 		onSaveAsPy: () => void;
 		onConvertToIpynb: () => void;
 		onExportHtml: () => void;
@@ -83,7 +81,6 @@
 		tabRunState = {},
 		sidebarOpen,
 		kernelInfo,
-		canExportPy = false, // a notebook is active, so the export has a target
 		canSaveAsPy = false, // a notebook is active → it can be exported to a .py
 		canConvertToIpynb = false, // the active notebook is a .py → it can be run into an .ipynb
 		converting = false,
@@ -101,7 +98,6 @@
 		onPromoteTab,
 		onReorderTabs,
 		onToggleSidebar,
-		onExportPy,
 		onSaveAsPy,
 		onConvertToIpynb,
 		onExportHtml,
@@ -501,17 +497,6 @@
 					>
 						<svg class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" /><path d="m7 10 5 5 5-5" /><path d="M12 15V3" /></svg>
 						Export to HTML
-					</button>
-				</li>
-				<li>
-					<button
-						onclick={onExportPy}
-						disabled={!canExportPy}
-						title="Write the cells marked for export to the notebook's generated module (nbdev-style; a .py, .mojo or .rs file, whichever the target names). Mark cells and set the target from the notebook's Language and export menu."
-						data-testid="export-py-menu"
-					>
-						<svg class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v12" /><path d="m8 11 4 4 4-4" /><path d="M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2" /></svg>
-						Export to module
 					</button>
 				</li>
 				<div class="divider my-1"></div>
