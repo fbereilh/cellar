@@ -872,12 +872,13 @@
 			window.removeEventListener('scroll', follow, true);
 		};
 	});
-	// The toolbar turns compact once its top has scrolled past the top of the pane:
+	// The toolbar is pinned once its top has scrolled past the top of the pane:
 	// a zero-height sentinel sits where the bar starts, and the bar is stuck exactly
-	// while the sentinel is above the pane's top edge. A hidden pane reports no
-	// bounds, so a background notebook stays in the full form.
+	// while the sentinel is above the pane's top edge. Pinned only changes the bar's
+	// edge and shadow, never its size, so the switch moves no cell. A hidden pane
+	// reports no bounds, so a background notebook stays unpinned.
 	let toolbarSentinel = $state<HTMLElement | null>(null);
-	let toolbarCompact = $state(false);
+	let toolbarPinned = $state(false);
 	$effect(() => {
 		const el = toolbarSentinel;
 		if (!el || !containerEl) return;
@@ -886,39 +887,36 @@
 			(entries) => {
 				const e = entries[entries.length - 1];
 				const top = e.rootBounds?.top;
-				toolbarCompact = !e.isIntersecting && top !== undefined && e.boundingClientRect.top < top;
+				toolbarPinned = !e.isIntersecting && top !== undefined && e.boundingClientRect.top < top;
 			},
 			{ root, threshold: 0 }
 		);
 		io.observe(el);
 		return () => io.disconnect();
 	});
-	// The full form can wrap onto more rows than the compact one. The bar keeps
-	// the full form's height in the flow while compact, as extra bottom margin,
-	// so the switch moves no cell and scroll anchoring has nothing to chase.
+	// The pane's `scroll-padding-top` is the band the pinned bar covers, so native
+	// `scrollIntoView`, the jump paths (`stickyTopInset`) and the editor's cursor
+	// scrolling land below it. It follows the bar's height: a narrow window wraps
+	// the bar onto more rows, and the open find bar adds its band. A hidden pane
+	// measures nothing, so it keeps the last value.
+	// Room between the pinned bar and a cell scrolled up to meet it.
+	const TOOLBAR_CLEARANCE = 8;
 	let toolbarEl = $state<HTMLElement | null>(null);
-	let toolbarFullHeight = 0;
-	let toolbarReserve = $state(0);
 	$effect(() => {
 		const el = toolbarEl;
-		if (!el) return;
+		if (!el || !containerEl) return;
+		const pane = scrollParent(containerEl);
+		if (!pane) return;
 		const ro = new ResizeObserver(() => {
 			const height = el.getBoundingClientRect().height;
-			// A hidden pane measures nothing: keep what was measured while it showed.
-			if (!height) return;
-			if (toolbarCompact) toolbarReserve = Math.max(0, toolbarFullHeight - height);
-			else toolbarFullHeight = height;
+			if (height) pane.style.scrollPaddingTop = `${Math.ceil(height) + TOOLBAR_CLEARANCE}px`;
 		});
-		ro.observe(el);
-		return () => ro.disconnect();
-	});
-	// Back in the full form the reserve is spent, and the full height is measured
-	// again: a one-row full bar is the compact bar's size, so no resize reports it.
-	$effect(() => {
-		if (toolbarCompact || !toolbarEl) return;
-		toolbarReserve = 0;
-		const height = toolbarEl.getBoundingClientRect().height;
-		if (height) toolbarFullHeight = height;
+		// Border box: the find bar's band is padding, which a content-box observer misses.
+		ro.observe(el, { box: 'border-box' });
+		return () => {
+			ro.disconnect();
+			pane.style.removeProperty('scroll-padding-top');
+		};
 	});
 	let restarting = $state(false);
 	async function restartKernel() {
@@ -1404,25 +1402,27 @@
 		     Clear all outputs and Export drop their words and keep icon, tooltip and
 		     accessible name, so the whole bar stays on one row at an ordinary width.
 		     STICKY: once the user scrolls past it, this same bar stays pinned to the
-		     top of the pane in its compact form (`toolbarCompact`), every button an
-		     icon with its tooltip, name, state and action unchanged. The compact form
-		     is one 2rem row. The full form can wrap onto more, so while compact the
-		     bar reserves the difference as bottom margin (`toolbarReserve`) and the
-		     switch moves no cell. The pane's `scroll-padding-top`
-		     keeps scrolled-to cells clear of it, and the compact icons pack to the
-		     left so the find bar at the pane's top right never covers them. -->
+		     top of the pane with the same labelled buttons (`toolbarPinned`). Pinning
+		     adds only a bottom edge and a shadow, so the bar keeps its size and no
+		     cell moves. It spans the content column, edge to edge with the cells.
+		     Two side box-shadows in the page color fill the column's 1rem gutters, so
+		     a cell's git change bar never peeks out beside the pinned bar. A shadow
+		     paints without adding scrollable overflow, which a wider child would.
+		     The pane's `scroll-padding-top` follows its height, so scrolled-to cells
+		     land below it. While the find bar is open, the shell's
+		     `--cellar-find-reserve` pads the bar's bottom into a band the find bar
+		     floats in, so the find bar covers no button and no cell. -->
 		<div bind:this={toolbarSentinel} class="h-0" aria-hidden="true"></div>
 		<div
 			bind:this={toolbarEl}
-			style:margin-bottom={toolbarCompact && toolbarReserve ? `calc(0.75rem + ${toolbarReserve}px)` : undefined}
-			class="@container group sticky top-0 z-30 -mx-4 mb-3 flex flex-wrap items-center gap-2 border-b px-4 py-1 {toolbarCompact
-				? 'border-base-300 bg-(--cellar-surface-page) shadow-sm'
-				: 'border-transparent'}"
-			data-compact={toolbarCompact ? '' : undefined}
+			class="@container sticky top-0 z-30 mb-3 flex flex-wrap items-center gap-2 border-b bg-(--cellar-surface-page) pt-1 pb-[calc(0.25rem+var(--cellar-find-reserve,0px))] transition-[border-color,box-shadow] duration-150 motion-reduce:transition-none {toolbarPinned
+				? 'border-base-300 shadow-[-1rem_0_0_var(--cellar-surface-page),1rem_0_0_var(--cellar-surface-page),0_1px_3px_0_rgb(0_0_0/0.1),0_1px_2px_-1px_rgb(0_0_0/0.1)]'
+				: 'border-transparent shadow-[-1rem_0_0_var(--cellar-surface-page),1rem_0_0_var(--cellar-surface-page)]'}"
+			data-pinned={toolbarPinned ? '' : undefined}
 			data-testid="notebook-toolbar"
 		>
 			<button
-				class="btn btn-ghost btn-sm gap-1.5 text-success group-data-compact:btn-square"
+				class="btn btn-ghost btn-sm gap-1.5 text-success"
 				onclick={() => onRunAll?.()}
 				disabled={!hasCodeCell}
 				title="Run all cells top to bottom"
@@ -1430,7 +1430,7 @@
 				data-testid="run-all"
 			>
 				<svg class="h-4 w-4" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M8 5v14l11-7z" /></svg>
-				<span class="group-data-compact:hidden">Run all</span>
+				Run all
 			</button>
 			<!-- Disabled only while this notebook looks idle from here, so no interrupt
 			     request is fired at a kernel with nothing to stop and no queue to drop.
@@ -1439,7 +1439,7 @@
 			     run being enqueued and the `queue:changed` broadcast landing, the
 			     button is briefly disabled while there really is something to cancel. -->
 			<button
-				class="btn btn-ghost btn-sm gap-1.5 @max-[54rem]:btn-square group-data-compact:btn-square"
+				class="btn btn-ghost btn-sm gap-1.5 @max-[54rem]:btn-square"
 				onclick={() => onInterrupt?.()}
 				disabled={!notebookBusy}
 				title="Interrupt the kernel (stop the running cell and drop this notebook's queued runs)"
@@ -1447,13 +1447,13 @@
 				data-testid="interrupt-all"
 			>
 				<svg class="h-4 w-4" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><rect x="6" y="6" width="12" height="12" rx="1.5" /></svg>
-				<span class="@max-[54rem]:hidden group-data-compact:hidden">Interrupt</span>
+				<span class="@max-[54rem]:hidden">Interrupt</span>
 			</button>
 			<!-- The palette's and the Kernels card's restart, bound to this notebook's
 			     kernel. Like theirs it asks no confirmation. Disabled only while its own
 			     request is in flight, so one click sends one restart. -->
 			<button
-				class="btn btn-ghost btn-sm gap-1.5 @max-[54rem]:btn-square group-data-compact:btn-square"
+				class="btn btn-ghost btn-sm gap-1.5 @max-[54rem]:btn-square"
 				onclick={restartKernel}
 				disabled={restarting}
 				title="Restart the kernel - clear this notebook's variables from memory (keeps the notebook)"
@@ -1465,10 +1465,10 @@
 				{:else}
 					<svg class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 12a9 9 0 0 1 15-6.7L21 8" /><path d="M21 3v5h-5" /><path d="M21 12a9 9 0 0 1-15 6.7L3 16" /><path d="M3 21v-5h5" /></svg>
 				{/if}
-				<span class="@max-[54rem]:hidden group-data-compact:hidden">Restart</span>
+				<span class="@max-[54rem]:hidden">Restart</span>
 			</button>
 			<button
-				class="btn btn-ghost btn-sm gap-1.5 @max-[54rem]:btn-square group-data-compact:btn-square"
+				class="btn btn-ghost btn-sm gap-1.5 @max-[54rem]:btn-square"
 				onclick={() => onClearAll?.()}
 				disabled={!hasOutputs}
 				title="Clear every cell's outputs"
@@ -1478,7 +1478,7 @@
 				<svg class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
 					<path d="m7 21-4.3-4.3a1 1 0 0 1 0-1.4l9.3-9.3a1 1 0 0 1 1.4 0l5.6 5.6a1 1 0 0 1 0 1.4L13 21" /><path d="M22 21H7" /><path d="m5 11 9 9" />
 				</svg>
-				<span class="@max-[54rem]:hidden group-data-compact:hidden">Clear all outputs</span>
+				<span class="@max-[54rem]:hidden">Clear all outputs</span>
 			</button>
 			<!-- HIDDEN outright on a Mojo notebook, not disabled: the sweep lifts
 			     top-level PYTHON imports into the Python-kernel imports cell, and a Mojo
@@ -1498,7 +1498,7 @@
 			     a new claim, not the same button in a new place. -->
 			{#if offersConsolidateImports}
 				<button
-					class="btn btn-ghost btn-sm gap-1.5 group-data-compact:btn-square"
+					class="btn btn-ghost btn-sm gap-1.5"
 					onclick={() => onConsolidateImports?.()}
 					disabled={consolidating}
 					title="Move every top-level import into one pinned cell at the top of the notebook, and run it"
@@ -1516,7 +1516,7 @@
 						     distinct and the right direction. -->
 						<svg class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 3h14" /><path d="M12 21V9" /><path d="m7 14 5-5 5 5" /></svg>
 					{/if}
-					<span class="group-data-compact:hidden">Consolidate imports</span>
+					Consolidate imports
 				</button>
 			{/if}
 			<!-- The notebook-settings menu: the notebook's LANGUAGE and its nbdev-style
@@ -1530,13 +1530,13 @@
 			{#if showSettingsMenu}
 				<!-- One group at the right end, so a wrap moves Export and the menu
 				     button together and Export always sits beside the language. -->
-				<div class="ml-auto flex items-center gap-2 group-data-compact:ml-0">
+				<div class="ml-auto flex items-center gap-2">
 				{#if showExportBar}
 					<!-- One-click export, the menu's own Export action without opening the
 					     menu (`onToolbarExport`). With no target set it opens the menu at
 					     the target field instead of pretending to export. -->
 					<button
-						class="btn btn-ghost btn-sm gap-1.5 @max-[54rem]:btn-square group-data-compact:btn-square"
+						class="btn btn-ghost btn-sm gap-1.5 @max-[54rem]:btn-square"
 						onclick={onToolbarExport}
 						popovertarget={exportOpensMenu ? settingsMenuId : undefined}
 						disabled={exporting}
@@ -1551,12 +1551,12 @@
 						{:else}
 							<svg class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v12" /><path d="m8 11 4 4 4-4" /><path d="M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2" /></svg>
 						{/if}
-						<span class="@max-[54rem]:hidden group-data-compact:hidden">Export</span>
+						<span class="@max-[54rem]:hidden">Export</span>
 					</button>
 				{/if}
 				<button
 					bind:this={settingsBtnEl}
-					class="btn btn-ghost btn-sm relative gap-1.5 group-data-compact:btn-square"
+					class="btn btn-ghost btn-sm relative gap-1.5"
 					popovertarget={settingsMenuId}
 					title={settingsWarning
 						? 'Language and export settings - the export needs attention'
@@ -1569,8 +1569,8 @@
 					data-warning={settingsWarning ? '' : undefined}
 				>
 					<svg class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 21v-7" /><path d="M4 10V3" /><path d="M12 21v-9" /><path d="M12 8V3" /><path d="M20 21v-5" /><path d="M20 12V3" /><path d="M1 14h6" /><path d="M9 8h6" /><path d="M17 16h6" /></svg>
-					<span class="group-data-compact:hidden">{settingsLabel}</span>
-					<svg class="h-3 w-3 opacity-60 group-data-compact:hidden" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 9 6 6 6-6" /></svg>
+					{settingsLabel}
+					<svg class="h-3 w-3 opacity-60" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 9 6 6 6-6" /></svg>
 					{#if settingsWarning}
 						<span class="absolute right-1 top-1 h-2 w-2 rounded-full bg-warning" data-testid="notebook-settings-warning" aria-hidden="true"></span>
 					{/if}

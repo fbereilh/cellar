@@ -1,6 +1,6 @@
 <script lang="ts">
-	// The floating find-in-page bar (Search P3 + P5). A small widget over the
-	// top-right of the active notebook pane: a query box, a live `i / N` match
+	// The floating find-in-page bar (Search P3 + P5). A small widget at the right of
+	// the active notebook pane, just below its toolbar: a query box, a live `i / N` match
 	// count, prev/next chevrons, and case (`Aa`) / whole-word (`\b`) / regex (`.*`)
 	// toggle chips.
 	//
@@ -51,8 +51,27 @@
 		 * active notebook to paint in place. The shell sets `notebookPath`.
 		 */
 		highlight?: SearchHighlightState | null;
+		/** Distance in px from the top of the shell's main area. The shell parks the
+		 *  bar just below the active notebook's toolbar so it never covers a button. */
+		top?: number;
+		/** Distance in px from the right edge of the main area: the toolbar's right edge. */
+		right?: number;
+		/** The bar's rendered height, for the shell's scroll reserve. 0 while closed. */
+		height?: number;
 	}
-	let { open, cells, searchCache, seed = '', reseedSignal = 0, onClose, onJump, highlight = null }: Props = $props();
+	let {
+		open,
+		cells,
+		searchCache,
+		seed = '',
+		reseedSignal = 0,
+		onClose,
+		onJump,
+		highlight = null,
+		top = 12,
+		right = 16,
+		height = $bindable(0)
+	}: Props = $props();
 
 	let query = $state('');
 	let debouncedQuery = $state('');
@@ -243,7 +262,11 @@
 
 {#if open}
 	<div
-		class="absolute right-4 top-3 z-40 flex items-center gap-1.5 rounded-lg border border-base-300 bg-base-100 px-2 py-1.5 shadow-lg"
+		bind:offsetHeight={height}
+		style:top="{top}px"
+		style:right="{right}px"
+		style:max-width="calc(100% - {2 * right}px)"
+		class="absolute z-40 flex items-center gap-1.5 rounded-lg border border-base-300 bg-base-100 px-2 py-1.5 shadow-lg"
 		data-testid="find-bar"
 		role="search"
 		aria-label="Find in notebook"
@@ -254,7 +277,7 @@
 			bind:value={query}
 			onkeydown={onInputKeydown}
 			type="text"
-			class="w-44 bg-transparent text-xs outline-none placeholder:text-base-content/40 {regexInvalid ? 'text-error' : ''}"
+			class="w-44 min-w-0 shrink bg-transparent text-xs outline-none placeholder:text-base-content/40 {regexInvalid ? 'text-error' : ''}"
 			placeholder="Find in notebook…"
 			spellcheck="false"
 			autocomplete="off"
