@@ -38,6 +38,8 @@
 		estimateHeight,
 		DEFAULT_OVERSCAN_PX,
 		ROW_GAP_PX,
+		WINDOW_HYSTERESIS_PX,
+		mountedIds,
 		type PlanItem
 	} from '$lib/virtualization';
 
@@ -452,10 +454,14 @@
 	const pinned = $derived.by(() =>
 		virtualize ? pinnedCellIds({ runningId, queued, activeId, focusedId, scrollPins }) : undefined
 	);
+	// The cells the last plan mounted, so the next one can hold them a little past the
+	// window edge (`WINDOW_HYSTERESIS_PX`). Plain, not `$state`: it is the plan's own
+	// memory of its previous answer, and must not itself trigger a re-plan.
+	let lastMounted = new Set<string>();
 	const plan = $derived.by<PlanItem[]>(() => {
 		if (!virtualize) return EMPTY_PLAN;
 		void heightsVersion; // re-plan as measured heights land
-		return planWindow({
+		const next = planWindow({
 			order: visibleOrder,
 			heights,
 			estimate: estimateFor,
@@ -464,8 +470,12 @@
 			viewportHeight,
 			overscanPx: Math.max(DEFAULT_OVERSCAN_PX, viewportHeight * 1.5),
 			pinned,
-			gapPx: ROW_GAP_PX
+			gapPx: ROW_GAP_PX,
+			mounted: lastMounted,
+			hysteresisPx: WINDOW_HYSTERESIS_PX
 		});
+		lastMounted = mountedIds(next);
+		return next;
 	});
 
 	function recordHeight(id: string, px: number) {
@@ -476,6 +486,11 @@
 		// the cache + re-plans; it holds no explicit scrollTop compensation. `planWindow`
 		// accounts for the `space-y-4` inter-cell gap so its model tracks the real
 		// scrollTop and the window never blanks.
+		//
+		// `px` is the box's exact (often fractional) size, never rounded: a spacer must
+		// reproduce the flow space its cells occupied. A rounded height left every
+		// spacer short by a fraction of a pixel per cell, and that error is what fed the
+		// window-edge oscillation `WINDOW_HYSTERESIS_PX` exists to stop.
 		heights.set(id, px);
 		if (virtualize) heightsVersion++;
 	}
@@ -515,7 +530,7 @@
 		if (!attach) {
 			attach = (node: HTMLElement) => {
 				const read = (px: number | undefined) => {
-					if (px && px > 0) recordHeight(id, Math.round(px));
+					if (px && px > 0) recordHeight(id, px);
 				};
 				if (typeof ResizeObserver === 'undefined') {
 					read(node.offsetHeight);
