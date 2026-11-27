@@ -378,8 +378,11 @@ test('with no notebook open, the toggle cannot fake a restart over a live runtim
 		runtime: { kernelStarted: true, liveVersion: '15.4', envForced: null, versionEnvForced: null }
 	});
 	await page.goto(`${baseURL}/?ws=${encodeURIComponent(workspace)}`);
-	const closers = page.getByTestId('tab-close');
-	for (let i = 0; i < 8 && (await closers.count()) > 0; i++) await closers.first().click();
+	// Forget the restored tab session through the store, as the test above does: the
+	// close-button loop raced the tab removal against its own persist and left a tab
+	// open under load.
+	await clearTabSession(page);
+	await page.reload();
 	await expect(page.getByTestId('empty-state')).toBeVisible();
 	await openDatabricksSection(page);
 

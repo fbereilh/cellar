@@ -454,6 +454,19 @@ export interface ExecuteOptions {
 	 * ends the run with that error, and nothing is sent to the kernel.
 	 */
 	prepare?: () => Promise<void>;
+	/**
+	 * Time limit for an `internal` probe, in ms. Past it the kernel is interrupted;
+	 * a probe that still does not end is left running and the kernel refuses new
+	 * runs until it does (see `execute()`). Ignored for user runs.
+	 */
+	timeoutMs?: number;
+	/**
+	 * Told when the time limit fires: `interrupting` as the interrupt is sent, then
+	 * `stuck` if the probe did not end within the interrupt grace window. The run's
+	 * own promise stays pending in the stuck case, so this is how a caller learns it
+	 * may stop waiting.
+	 */
+	onTimeout?: (phase: 'interrupting' | 'stuck') => void;
 }
 
 /** Result of `executeCellRun` (run.js). */

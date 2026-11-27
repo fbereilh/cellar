@@ -17,7 +17,7 @@
  *   try { return await executeCellRun({ nb, cellId, actor, source: ticket.source() }); }
  *   finally { ticket.done(); }
  */
-import { currentSessionId, execute, ensureMojoMagic, KernelExecuteAborted } from './kernel';
+import { currentSessionId, execute, ensureMojoMagic, KernelExecuteAborted, PROBE_STUCK_REASON } from './kernel';
 import {
 	setOutputs,
 	setOutputsLive,
@@ -317,6 +317,10 @@ export async function executeCellRun({ nb, cellId, actor, source, originId, onEv
 					traceback: [message]
 				});
 				status = 'error';
+				// Refused because Cellar's own probe is stuck in the kernel: nothing of this
+				// run was sent, and the failure is live, so it is marked like the other
+				// refusals rather than read as a leftover from a previous session.
+				if (err instanceof KernelExecuteAborted && err.reason === PROBE_STUCK_REASON) refused = true;
 				// `kernelDown` means one thing only: execute() threw before it ever had a
 				// kernel in hand (the sidecar was unreachable), which is why the absent
 				// session epoch stands in for it. A chat run never has a kernel, so its

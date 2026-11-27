@@ -21,7 +21,8 @@ import {
 	namespaceOf,
 	namespaceSurvives,
 	anyNamespaceDied,
-	shutdownEnds
+	shutdownEnds,
+	rowsSurviveBusyReply
 } from '../../src/lib/variablesNamespace';
 
 const h = vi.hoisted(() => ({
@@ -173,5 +174,22 @@ describe('inspectVariables names the namespace it read', () => {
 		h.status = 'not_started';
 		expect(await inspectVariables()).toEqual({ variables: [], path: 'nb.ipynb', session_id: null });
 		expect(h.execute).not.toHaveBeenCalled();
+	});
+});
+
+describe('rowsSurviveBusyReply - a busy reply keeps only the same notebook\'s rows', () => {
+	const ns = { path: 'a.ipynb', session: 3 };
+
+	it('keeps rows that describe the notebook the reply is about', () => {
+		expect(rowsSurviveBusyReply(ns, 'a.ipynb')).toBe(true);
+	});
+
+	it('drops rows from another notebook after a tab switch onto a busy kernel', () => {
+		expect(rowsSurviveBusyReply(ns, 'b.ipynb')).toBe(false);
+	});
+
+	it('cannot tell without a namespace or a reply path, so keeps the rows', () => {
+		expect(rowsSurviveBusyReply(null, 'b.ipynb')).toBe(true);
+		expect(rowsSurviveBusyReply(ns, undefined)).toBe(true);
 	});
 });

@@ -1252,7 +1252,9 @@ export function searchCells(query: string, where: 'input' | 'output' | 'both' = 
  * cannot disagree with `kernel_state`.
  */
 async function liveKernelNames(nb?: string | null): Promise<Set<string> | null> {
-	const state = await kernelState(nb);
+	// A probe that ran past its time limit leaves the namespace unknowable, not empty.
+	const state = await kernelState(nb).catch(() => null);
+	if (!state) return null;
 	// Only an idle, current-session namespace has readable buckets; {started:false},
 	// {busy:true}, and a stale namespace all carry no trustworthy names.
 	if (!('variables' in state) || state.stale) return null;
@@ -1261,6 +1263,7 @@ async function liveKernelNames(nb?: string | null): Promise<Set<string> | null> 
 	for (const f of state.functions || []) names.add(f.name);
 	for (const c of state.classes || []) names.add(c.name);
 	for (const v of state.variables || []) names.add(v.name);
+	for (const u of state.uninspected || []) names.add(u.name);
 	return names;
 }
 

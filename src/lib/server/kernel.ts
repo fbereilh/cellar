@@ -191,6 +191,18 @@ interface NotebookKernel {
 	 * path), so a wedged/aborted run can never hold it. See `execute()` + `runSilent`.
 	 */
 	execChain: Promise<void>;
+	/**
+	 * Set while a Cellar probe that ran past its time limit is still executing and did
+	 * not stop when interrupted (see `execute()`'s `timeoutMs`). Until it ends, every
+	 * new run on this kernel is refused with `PROBE_STUCK_REASON` instead of parking
+	 * behind it, so a user's cell never reads "running" while Cellar's own code is
+	 * what holds the kernel. Holds the stuck probe's execute msg_id. Cleared when the
+	 * probe's own reply arrives, when the kernel reports idle for that msg_id, or by
+	 * `beginSession` when a restart, autorestart or teardown replaces the process. An
+	 * interrupt or watchdog force-settle leaves it set until one of those: the kernel
+	 * may still be executing the probe.
+	 */
+	stuckProbe: string | null;
 }
 
 /**
@@ -423,6 +435,13 @@ const INTERRUPT_ABORT_REASON = 'interrupt_unresponsive';
  * interrupt path exists to retire.
  */
 const INTERRUPT_UNDELIVERED_REASON = 'interrupt_undelivered';
+
+/**
+ * The reason a run is refused, never sent, because a Cellar probe is stuck in the
+ * kernel (`NotebookKernel.stuckProbe`). Its own reason so the run's message can say
+ * that Cellar's code, not the user's, is what holds the kernel.
+ */
+export const PROBE_STUCK_REASON = 'probe_stuck';
 
 /**
  * How long the interrupt REST POST may take before Cellar stops waiting for it and
@@ -712,6 +731,12 @@ export class KernelExecuteAborted extends Error {
  *     sentence names no cause beyond it.
  */
 function abortMessage(reason: string, { sent = true }: { sent?: boolean } = {}): string {
+	if (reason === PROBE_STUCK_REASON) {
+		return (
+			"Run not started: Cellar's own variable inspection is still running in this kernel and did not stop when " +
+			'interrupted, so this code was not executed. Restart the kernel to recover.'
+		);
+	}
 	// An interrupt that stopped a run BEFORE its code was sent - parked on the kernel
 	// start, the socket refresh, the Mojo pre-flight or the exec lock - knows MORE than
 	// the two sentences below, not less: nothing of this run reached the kernel, so
@@ -862,6 +887,7 @@ function beginSession(nbKernel: NotebookKernel): void {
 	// The %%mojo magic lives in the namespace too (`import mojo.notebook` registers
 	// it), so a new session has none until a mojo cell asks for it again.
 	nbKernel.mojoSetup = null;
+	nbKernel.stuckProbe = null;
 	// A fresh namespace has no widgets: drop this kernel's progress/interactive
 	// models and forget their comms so a send can never target a dead model.
 	const commIds = [...nbKernel.widgetComms.keys()];
@@ -1965,7 +1991,8 @@ function getKernel(nbPath: string): Promise<KernelConnection> {
 		widgetComms: new Map(),
 		activeRuns: new Set(),
 		refreshInFlight: null,
-		execChain: Promise.resolve()
+		execChain: Promise.resolve(),
+		stuckProbe: null
 	};
 
 	nbKernel.startPromise = (async () => {
@@ -3415,7 +3442,7 @@ export async function execute(
 	nbPath: string,
 	code: string,
 	onEvent: (event: RunStreamEvent) => void,
-	{ internal = false, prepare }: ExecuteOptions = {}
+	{ internal = false, prepare, timeoutMs, onTimeout }: ExecuteOptions = {}
 ): Promise<KernelMessage.IExecuteReplyMsg['content']> {
 	const abs = resolveNb(nbPath);
 	// `getKernel` creates and registers this notebook's Map entry SYNCHRONOUSLY (or
@@ -3464,9 +3491,11 @@ export async function execute(
 	// promise never rejects, and while it is live the `await`s below handle it — this
 	// only marks it handled so a post-settle no-op can never surface unhandled.
 	abortRace.catch(() => {});
+	let abortReason: string | null = null;
 	const triggerAbort = (err: Error) => {
 		if (settled || aborted) return;
 		aborted = true;
+		if (err instanceof KernelExecuteAborted) abortReason = err.reason;
 		run.aborted = true;
 		abortReject?.(err);
 	};
@@ -3531,6 +3560,14 @@ export async function execute(
 	} catch (err) {
 		dropBeforeSend();
 		throw err;
+	}
+
+	// A Cellar probe is stuck in this kernel. Parking behind it would leave this run
+	// reading "running" over code that is not the user's, for as long as the probe
+	// lasts, so it is refused now and says why.
+	if (nbKernel.stuckProbe) {
+		dropBeforeSend();
+		throw new KernelExecuteAborted(abortMessage(PROBE_STUCK_REASON, { sent: false }), PROBE_STUCK_REASON);
 	}
 
 	// CLAIM our place in the execute queue, then wait for it — racing the wait
@@ -3696,6 +3733,59 @@ export async function execute(
 		armWatchdog();
 	};
 	resetWatchdog(); // arm before any traffic can arrive
+
+	// --- Time limit for a Cellar probe ----------------------------------------
+	// Only an internal probe that asks for one gets it: user code may run for hours.
+	// Past the limit the kernel is interrupted. That is safe here because this run
+	// holds the exec lock, so the probe is the only code on the wire, and an idle
+	// ipykernel ignores a SIGINT that lands after it finished. The lock is not handed
+	// on until that signal has landed, so it can never reach the next run. A probe that surrenders
+	// ends through its normal reply. One that does not is left running, since the
+	// kernel really is still executing it, but the kernel is marked `stuckProbe` and
+	// every run parked behind it is refused, so none of them reads as hanging.
+	let internalTimer: ReturnType<typeof setTimeout> | undefined;
+	let markedStuck = false;
+	let internalSignal: Promise<boolean> | undefined;
+	const onInternalTimeout = async () => {
+		if (settled || aborted) return;
+		logWarn('kernel', `a Cellar probe on ${abs} ran past ${timeoutMs}ms; interrupting it`);
+		onTimeout?.('interrupting');
+		internalSignal = signalInterrupt(kernel);
+		const signalled = await internalSignal;
+		const deadline = Date.now() + (signalled ? interruptGraceMs() : 0);
+		while (!settled && !aborted && Date.now() < deadline) {
+			await new Promise((r) => setTimeout(r, INTERRUPT_POLL_MS));
+		}
+		if (settled || aborted) return;
+		markStuck();
+	};
+	const markStuck = () => {
+		logWarn('kernel', `a Cellar probe on ${abs} did not stop when interrupted; refusing new runs until it ends`);
+		const stuckId = future.msg.header.msg_id;
+		nbKernel.stuckProbe = stuckId;
+		markedStuck = true;
+		const onStuckIopub = (_sender: unknown, msg: KernelMessage.IIOPubMessage) => {
+			if (nbKernel.stuckProbe === stuckId) {
+				const parentId = (msg.parent_header as { msg_id?: string } | undefined)?.msg_id;
+				const idle = msg.header.msg_type === 'status' && (msg.content as { execution_state?: string }).execution_state === 'idle';
+				if (!idle || parentId !== stuckId) return;
+				nbKernel.stuckProbe = null;
+			}
+			kernel.iopubMessage.disconnect(onStuckIopub);
+		};
+		kernel.iopubMessage.connect(onStuckIopub);
+		abortActiveRuns(
+			nbKernel,
+			PROBE_STUCK_REASON,
+			[...nbKernel.activeRuns].filter((r) => r !== run && !r.sent)
+		);
+		onTimeout?.('stuck');
+	};
+	if (internal && timeoutMs != null && timeoutMs > 0) {
+		// A timer-fired rejection has no awaiter, so it is swallowed here (see armWatchdog).
+		internalTimer = setTimeout(() => void onInternalTimeout().catch(() => {}), timeoutMs);
+		internalTimer.unref?.();
+	}
 	// A reply or stdin request on any channel is kernel activity: reset the watchdog.
 	future.onReply = () => resetWatchdog();
 	future.onStdin = () => resetWatchdog();
@@ -3770,6 +3860,17 @@ export async function execute(
 	} finally {
 		settled = true;
 		if (watchdogTimer) clearTimeout(watchdogTimer);
+		if (internalTimer) clearTimeout(internalTimer);
+		if (markedStuck && !aborted) nbKernel.stuckProbe = null;
+		if (
+			internal &&
+			timeoutMs != null &&
+			timeoutMs > 0 &&
+			!markedStuck &&
+			(abortReason === INTERRUPT_ABORT_REASON || abortReason === INTERRUPT_UNDELIVERED_REASON)
+		) {
+			markStuck();
+		}
 		// A probe still in flight can no longer change anything (its verdict is discarded
 		// by the settled/aborted guard), so cancel its request rather than let a hung GET
 		// hold a socket for the rest of the probe timeout.
@@ -3792,7 +3893,8 @@ export async function execute(
 		}
 		// Hand this kernel's execute lock to the next run — even on abort, so a wedged
 		// run the watchdog kills can never block every later execute behind it.
-		releaseExec();
+		if (internalSignal) void internalSignal.then(releaseExec, releaseExec);
+		else releaseExec();
 	}
 }
 
