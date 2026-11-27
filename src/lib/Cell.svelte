@@ -1814,9 +1814,9 @@
 		// Report this card's rendered height into the notebook's virtualization
 		// height cache (a spacer of this height later stands in for the cell when it
 		// scrolls off-screen). Reads the observer's `borderBoxSize` — the same box as
-		// `offsetHeight`, but unrounded, so the spacer matches the cell exactly — and so
-		// it never forces a synchronous reflow. Passive: it only
-		// writes the cache; nothing downstream acts on it while windowing is off.
+		// `offsetHeight`, so it never forces a synchronous reflow. It stays unrounded so
+		// the spacer matches the cell exactly. Passive: it only writes the cache;
+		// nothing downstream acts on it while windowing is off.
 		if (typeof ResizeObserver !== 'undefined' && cardEl && onMeasure) {
 			cardResizeObserver = new ResizeObserver((entries) => {
 				const box = entries[0]?.borderBoxSize?.[0];
