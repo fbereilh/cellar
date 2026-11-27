@@ -127,6 +127,7 @@ beforeAll(async () => {
 	PY = join(WS, 'dbx.py');
 	writeFileSync(PY, PY_BYTES);
 	nbmod = await import('../../src/lib/server/notebook');
+	await nbmod.syncExportPeers();
 	imports = await import('../../src/lib/server/imports-cell');
 });
 

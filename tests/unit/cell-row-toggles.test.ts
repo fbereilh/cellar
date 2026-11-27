@@ -79,6 +79,7 @@ beforeAll(async () => {
 	PY = join(WS, 'dbx.py');
 	writeFileSync(PY, PY_BYTES);
 	nbmod = await import('../../src/lib/server/notebook');
+	await nbmod.syncExportPeers();
 	events = await import('../../src/lib/server/events');
 	svc = await import('../../src/lib/server/mcp/service');
 	PATCH = (await import('../../src/routes/api/cells/[id]/+server.js')).PATCH as unknown as typeof PATCH;

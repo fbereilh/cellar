@@ -14,7 +14,7 @@
 
 import type { ImportChangeStamps } from './importBindings';
 import type { ExportHazard } from '../exportHazard';
-import type { ExportLanguage } from '../exportRole';
+import type { ExportLanguage, OtherModuleView } from '../exportRole';
 import type { NotebookLanguage } from '../cellLanguage';
 
 export type { ImportChangeStamps };
@@ -266,6 +266,11 @@ export interface NotebookView {
 	 * another notebook generated is never reported (`orphanedGeneratedModule`).
 	 */
 	exportOrphanedModule: string | null;
+	/**
+	 * Each `#| export <module>` cell: the module it goes into and the notebook that
+	 * owns it, or why it goes into none. Empty for a notebook without such a cell.
+	 */
+	exportOtherModules: OtherModuleView[];
 	/**
 	 * Declared code root: the workspace-relative directory this notebook's KERNEL
 	 * resolves code from (cwd + `sys.path`), or null for the workspace root.

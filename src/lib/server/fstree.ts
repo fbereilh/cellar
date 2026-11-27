@@ -36,7 +36,7 @@ import { copyName, freeName } from '$lib/filePaste';
 import { MAX_FILE_BYTES, MAX_HTML_FILE_BYTES, MAX_UPLOAD_BYTES } from '$lib/server/limits.js';
 
 // Directories that are noise for a workspace file tree.
-const IGNORE_DIRS = new Set([
+export const IGNORE_DIRS: ReadonlySet<string> = new Set([
 	'node_modules',
 	'.git',
 	'.venv',
@@ -47,7 +47,7 @@ const IGNORE_DIRS = new Set([
 	'.ipynb_checkpoints'
 ]);
 
-const MAX_DEPTH = 8; // guard against pathological deep trees
+export const MAX_DEPTH = 8; // guard against pathological deep trees
 
 /**
  * Byte ceiling for opening `relPath` into a tab. HTML gets the higher one (see

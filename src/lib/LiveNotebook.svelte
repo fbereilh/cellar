@@ -40,12 +40,14 @@
 		exportLanguageOf,
 		exportModuleLanguage as exportModuleLanguageOf,
 		exportMarkedTwice,
+		exportOtherModuleName,
 		exportStrandedSummary,
 		exportTargetLanguage,
 		isExportCell,
 		notebookHoldsExport,
 		TEXT_NOTEBOOK_EXPORT_MARK_MESSAGE,
-		moduleExtension
+		moduleExtension,
+		type OtherModuleView
 	} from '$lib/exportRole';
 	import { mojoMainDroppedIds } from '$lib/mojoExport';
 	import { rustExportDrops, rustMainMarked } from '$lib/rustExport';
@@ -197,6 +199,7 @@
 				resolved?: string | null;
 				resolveError?: string | null;
 				orphanedModule?: string | null;
+				otherModules?: OtherModuleView[];
 		  }
 		| { type: 'notebook:root'; root: string | null }
 		| { type: 'notebook:header-numbering'; levels: number[] }
@@ -394,6 +397,11 @@
 	// the server can see it), seeded on load and kept live by the same
 	// `notebook:export-derived` push as the three fields above.
 	let exportOrphanedModule = $state<string | null>(null);
+	// Each `#| export <module>` cell: the module another notebook owns that it goes
+	// into, or why it goes into none. Server-derived (it needs the workspace's other
+	// notebooks), seeded on load and kept live by the same push as the fields above.
+	let exportOtherModules = $state<OtherModuleView[]>([]);
+	const otherModules = $derived(new Map(exportOtherModules.map((o) => [o.id, o])));
 	let exportBaseBusy = $state(false);
 	// Code root: the workspace-relative directory THIS notebook's kernel runs in and
 	// imports from (null = the workspace root, the default and today's behavior).
@@ -612,6 +620,12 @@
 	// (the load itself is the initial sync).
 	let canonicalId: string | null = null;
 	let lastSeq: number | null = null; // last per-notebook `seq` seen (gap detection → refetch)
+	// The latest `notebook:export-derived` push per notebook id that arrived before
+	// the first load resolved. The server answers that load from its last workspace
+	// scan and starts a fresh one, whose result can reach this tab before
+	// `canonicalId` is known. Derived state is published only when it changes, so a
+	// dropped push would never come again. `load()` applies this tab's entry.
+	const earlyExportDerived = new Map<string, PublishedEvent>();
 
 	// ---- Staleness -----------------------------------------------------------
 	// Per-cell staleness verdict (id → {state, reason, upstream}), computed on the
@@ -1700,6 +1714,10 @@
 			exportResolveError = body.notebook.exportResolveError ?? null; // or why it cannot resolve
 			exportHazards = body.notebook.exportHazards ?? []; // why the generated module would not import
 			exportOrphanedModule = body.notebook.exportOrphanedModule ?? null; // a generated module this notebook stopped writing
+			exportOtherModules = body.notebook.exportOtherModules ?? []; // where each `#| export <module>` cell goes
+			const early = canonicalId === null ? undefined : earlyExportDerived.get(canonicalId);
+			earlyExportDerived.clear();
+			if (early) applyStructuralEvent(early as unknown as StructuralEvent);
 			headerNumbering = body.notebook.headerNumbering ?? []; // display-only heading numbering
 			hideAllCode = !!body.notebook.hideAllCode; // notebook-wide hide-code (report view)
 			// The notebook's language, read back through the shared guard so a hand-edited
@@ -1877,6 +1895,7 @@
 			exportResolveError = ev.resolveError ?? null;
 			exportHazards = (ev.hazards ?? []) as ExportHazard[];
 			exportOrphanedModule = ev.orphanedModule ?? null;
+			exportOtherModules = ev.otherModules ?? [];
 		} else if (ev.type === 'notebook:root') {
 			// The code root changed in another tab or from an agent (this tab's own
 			// change is echo-suppressed by originId and refreshes the list itself). The
@@ -2135,7 +2154,11 @@
 			}
 			// Past this point every event is a per-notebook `PublishedEvent`.
 			const pe = ev as PublishedEvent;
-			if (!canonicalId || pe.nb !== canonicalId) return;
+			if (!canonicalId) {
+				if (pe.type === 'notebook:export-derived') earlyExportDerived.set(pe.nb, pe);
+				return;
+			}
+			if (pe.nb !== canonicalId) return;
 			// A gap in this notebook's monotonic seq means we missed events → refetch.
 			if (lastSeq !== null && pe.seq > lastSeq + 1) load();
 			lastSeq = pe.seq; // advance even for our own echo, so it isn't seen as a gap
@@ -2498,7 +2521,8 @@
 	 */
 	function moduleSourceIds(addressed: readonly string[] = []): string[] {
 		const ids = new Set(addressed);
-		for (const c of cells) if (isExportCell(c, exportLanguage)) ids.add(c.id);
+		for (const c of cells)
+			if (isExportCell(c, exportLanguage) || exportOtherModuleName(c, exportLanguage) !== null) ids.add(c.id);
 		return [...ids];
 	}
 
@@ -2695,6 +2719,11 @@
 			: 'That cell is marked for export by an "#| export" line in its own source - remove that line to stop exporting it.';
 	}
 
+	/** What to say when a cell's own `#| export <module>` line decides where it goes. */
+	function exportOtherModuleNotice(module: string): string {
+		return `That cell's "#| export ${module}" line sends it to another module, so Cellar cannot mark or unmark it here - edit or remove that line instead.`;
+	}
+
 	/**
 	 * What to say when the server refuses a MARK because the cell is not eligible.
 	 *
@@ -2760,6 +2789,13 @@
 		// refreshed for a MOUNTED cell whose remote edit is stashed behind the "changed
 		// on server" banner. In that window the directive is on the server's copy and
 		// not on ours, so the server's own refusal below is what keeps the promise.
+		// A `#| export <module>` line decides BOTH directions: the cell goes into that
+		// module and never into this notebook's, so a mark here would change nothing.
+		const otherModule = exportOtherModuleName(cell, exportLanguage);
+		if (otherModule !== null) {
+			onNotice?.(exportOtherModuleNotice(otherModule));
+			return;
+		}
 		if (!exported && exportDirectiveOwnsCell(cell, exportLanguage)) {
 			onNotice?.(exportDirectiveNotice(exportMarkedTwice(cell, exportLanguage)));
 			return;
@@ -2795,9 +2831,9 @@
 		// put the toggle back ON over a cell nothing said is exported.
 		const verdict = await res
 			.json()
-			.then((b) => (b as { reason?: string; alsoFlagged?: boolean } | null) ?? null)
+			.then((b) => (b as { reason?: string; alsoFlagged?: boolean; module?: string } | null) ?? null)
 			.catch(() => null);
-		// THREE refusals revert (`py-notebook` is the server backstop for the gate
+		// FOUR refusals revert (`py-notebook` is the server backstop for the gate
 		// above), and `not-code` is the one this tab could not predict at
 		// all: eligibility is a NOTEBOOK-level fact mirrored over SSE, so a target
 		// change still in flight lets this tab offer a mark the document refuses.
@@ -2807,6 +2843,7 @@
 		// `notebook:export-target` event lands - so no cross-tab coordination is
 		// involved.
 		if (
+			verdict?.reason !== 'export-other-module' &&
 			verdict?.reason !== 'export-directive-owns-cell' &&
 			verdict?.reason !== 'not-code' &&
 			verdict?.reason !== 'py-notebook'
@@ -2826,7 +2863,9 @@
 				? TEXT_NOTEBOOK_EXPORT_MARK_MESSAGE
 				: verdict.reason === 'not-code'
 					? exportIneligibleNotice(id)
-					: exportDirectiveNotice(verdict.alsoFlagged === true)
+					: verdict.reason === 'export-other-module'
+						? exportOtherModuleNotice(verdict.module ?? '<module>')
+						: exportDirectiveNotice(verdict.alsoFlagged === true)
 		);
 	}
 
@@ -3736,7 +3775,8 @@
 			});
 			const body = await res.json().catch(() => ({}));
 			if (!res.ok) throw new Error(body?.message || 'export failed');
-			if (body.written) onModuleWritten?.();
+			// Another notebook's module this export rebuilt counts too.
+			if (body.written || body.modules?.some((m: { written: boolean }) => m.written)) onModuleWritten?.();
 			return body as ExportPyResult;
 		} catch (err) {
 			onNotice?.(`Export failed: ${(err as Error)?.message || 'export failed'}`);
@@ -5014,6 +5054,7 @@
 			onSetExportMain={setExportMain}
 			{rustDrops}
 			{rustMainIsMarked}
+			{otherModules}
 			exportTarget={exportTarget}
 			exportCount={exportCount}
 			exportStranded={exportStranded}

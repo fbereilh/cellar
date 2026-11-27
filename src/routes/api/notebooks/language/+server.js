@@ -4,7 +4,8 @@ import {
 	getExportTargetState,
 	getNotebookLanguage,
 	isNotebookUnavailable,
-	NotebookUnavailableError
+	NotebookUnavailableError,
+	syncExportPeers
 } from '$lib/server/notebook';
 import { InvalidNotebookLanguageError, TextNotebookLanguageError } from '$lib/cellLanguage';
 import { reasonWithoutServerPath } from '$lib/serverMessage';
@@ -70,6 +71,7 @@ export async function POST({ request }) {
 		}
 	};
 	try {
+		await syncExportPeers();
 		const language = setNotebookLanguage(String(body.language ?? ''), body.path, body.originId);
 		// A switch to or from Rust changes which KERNEL runs the notebook, so a live
 		// kernel of the other kind is freed. Python and Mojo share one and keep it.

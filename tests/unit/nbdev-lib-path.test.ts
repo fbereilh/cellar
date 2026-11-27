@@ -49,6 +49,7 @@ beforeAll(async () => {
 	mkdirSync(WS);
 	process.env.CELLAR_WORKSPACE = WS;
 	nbmod = await import('../../src/lib/server/notebook');
+	await nbmod.syncExportPeers();
 	expy = await import('../../src/lib/server/export-py');
 	nbdev = await import('../../src/lib/server/nbdev');
 });
@@ -192,6 +193,19 @@ describe('a directive target resolves under lib_path', () => {
 			ok: true,
 			target: 'pkg/sub/utils.py'
 		});
+	});
+
+	it('resolves a `#| export <module>` cell under lib_path too, into the owner module', async () => {
+		pyproject('[project]\nname = "pkg"\n[tool.nbdev]\nlib_path = "nbs/pkg"\n');
+		directiveNb('sub.tools');
+		const fed = writeNb(`fed-${NB}`, [{ id: 'f', source: '#| export sub.tools\ndef fed(): return 2' }]);
+		await nbmod.syncExportPeers();
+		expect(nbmod.exportPy(fed).modules).toMatchObject([
+			{ target: 'pkg/sub/tools.py', owner: NB, written: true, count: 1 }
+		]);
+		const text = readFileSync(join(WS, 'pkg/sub/tools.py'), 'utf8');
+		expect(text).toContain("__all__ = ['marked', 'fed']");
+		expect(text).toContain(`# Also from notebook: fed-${NB}`);
 	});
 
 	it('refuses when lib_path resolves OUTSIDE the workspace, rather than writing there', () => {

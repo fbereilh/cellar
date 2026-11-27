@@ -40,6 +40,7 @@ beforeAll(async () => {
 	WS = mkdtempSync(join(tmpdir(), 'cellar-nbdev-export-'));
 	process.env.CELLAR_WORKSPACE = WS;
 	nbmod = await import('../../src/lib/server/notebook');
+	await nbmod.syncExportPeers();
 	expy = await import('../../src/lib/server/export-py');
 	svc = await import('../../src/lib/server/mcp/service');
 	role = await import('../../src/lib/exportRole');

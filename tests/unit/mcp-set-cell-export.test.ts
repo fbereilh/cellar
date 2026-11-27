@@ -78,6 +78,7 @@ beforeAll(async () => {
 	process.env.CELLAR_WORKSPACE = WS;
 	svc = await import('../../src/lib/server/mcp/service');
 	nbmod = await import('../../src/lib/server/notebook');
+	await nbmod.syncExportPeers();
 	events = await import('../../src/lib/server/events');
 	srv = await import('../../src/lib/server/mcp/server');
 });

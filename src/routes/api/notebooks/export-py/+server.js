@@ -5,7 +5,8 @@ import {
 	setExportBase,
 	getExportTargetState,
 	exportPy,
-	isPyTextNotebook
+	isPyTextNotebook,
+	syncExportPeers
 } from '$lib/server/notebook';
 import { notebookHoldsExport } from '$lib/exportRole';
 
@@ -66,6 +67,7 @@ import { notebookHoldsExport } from '$lib/exportRole';
 export async function POST({ request }) {
 	const body = await request.json().catch(() => ({}));
 	try {
+		await syncExportPeers();
 		if (body.op === 'set-target')
 			return applyTargetWrite(body, () =>
 				setExportTarget(

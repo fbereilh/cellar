@@ -1,6 +1,6 @@
 import { json } from '@sveltejs/kit';
 import { exportMainRefusalMessage } from '$lib/rustExport';
-import { setSource, setCellType, deleteCell, setOutputScrolled, setCellRole, setCellExport, setCellExportMain, setHideInput, setVisibility } from '$lib/server/notebook';
+import { setSource, setCellType, deleteCell, setOutputScrolled, setCellRole, setCellExport, setCellExportMain, setHideInput, setVisibility, syncExportPeers } from '$lib/server/notebook';
 import { TextNotebookCellTypeError, isLogicalCellTypeName } from '$lib/cellLanguage';
 
 /** Edit a cell's source, type ('code' | 'sql' | 'markdown' | 'raw'), imports-cell
@@ -51,6 +51,7 @@ import { TextNotebookCellTypeError, isLogicalCellTypeName } from '$lib/cellLangu
  *  of it. */
 export async function PATCH({ params, request }) {
 	const body = await request.json();
+	if ('export' in body || 'exportMain' in body) await syncExportPeers();
 	if (body.cell_type != null) {
 		if (!isLogicalCellTypeName(body.cell_type)) return json({ ok: false, reason: 'bad-cell-type' }, { status: 400 });
 		try {
@@ -62,7 +63,7 @@ export async function PATCH({ params, request }) {
 		}
 	}
 	// REPORTED, unlike its `source`/`role`/`scrolled`/`hideInput` siblings, and for
-	// exactly THREE of its refusals - the scope is deliberate: `no-such-cell` stays
+	// exactly FOUR of its refusals - the scope is deliberate: `no-such-cell` stays
 	// silent exactly as it always was (widening the sibling setters is a separate
 	// change - see `hiddenFromAgent` below). What cannot stay silent is a refusal the
 	// browser applied a mark for and cannot see:
@@ -84,6 +85,10 @@ export async function PATCH({ params, request }) {
 	//     so this is the authoritative backstop: applied, the mark lived only in
 	//     memory and was gone after a relaunch while the row showed it ON.
 	//
+	//   - `export-other-module` - a MARK on a cell whose `#| export <module>` line
+	//     sends it to another module. The cell never goes into this notebook's own
+	//     module, so the mark cannot be satisfied. `module` names what the line names.
+	//
 	// Every time the client reverts its optimistic write and says why.
 	//
 	// `alsoFlagged` travels WITH the reason because the remedy differs and the client
@@ -96,8 +101,17 @@ export async function PATCH({ params, request }) {
 	if (typeof body.source === 'string') setSource(params.id, body.source, body.nb, body.originId);
 	if ('export' in body) {
 		const r = setCellExport(params.id, !!body.export, body.nb, body.originId);
-		if (!r.ok && (r.reason === 'export-directive-owns-cell' || r.reason === 'not-code' || r.reason === 'py-notebook'))
-			return json({ ok: false, reason: r.reason, alsoFlagged: !!r.alsoFlagged }, { status: 409 });
+		if (
+			!r.ok &&
+			(r.reason === 'export-directive-owns-cell' ||
+				r.reason === 'export-other-module' ||
+				r.reason === 'not-code' ||
+				r.reason === 'py-notebook')
+		)
+			return json(
+				{ ok: false, reason: r.reason, alsoFlagged: !!r.alsoFlagged, ...(r.module ? { module: r.module } : {}) },
+				{ status: 409 }
+			);
 	}
 	// The `.rs` module's main cell. Every refusal is reported, for the same reason
 	// as `export` above: the tab applies the mark optimistically, and `{ok:true}`

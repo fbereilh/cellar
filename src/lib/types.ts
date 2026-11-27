@@ -97,6 +97,21 @@ export interface ExportPyResult {
 	 * Empty means none of the checks fired - never that the module compiles.
 	 */
 	hazards?: ExportHazard[];
+	/** Other notebooks whose `#| export <this module>` cells the module also holds. */
+	contributors?: string[];
+	/** How many cells those notebooks added. */
+	contributed?: number;
+	/** Modules other notebooks own that this notebook's `#| export <module>` cells went into. */
+	modules?: Array<{
+		target: string;
+		owner: string;
+		written: boolean;
+		count: number;
+		reason?: 'unchanged' | 'foreign-module';
+		hazards: ExportHazard[];
+	}>;
+	/** This notebook's `#| export <module>` cells that went into no module, and why. */
+	refused?: Array<{ cell: string; module: string; reason: string }>;
 }
 
 /**

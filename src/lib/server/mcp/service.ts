@@ -75,6 +75,7 @@ import {
 	exportEligibilityLanguage,
 	exportLanguageOf,
 	exportMarkedTwice,
+	exportOtherModuleName,
 	exportTargetLanguage,
 	notebookHoldsExport
 } from '../../exportRole';
@@ -2383,8 +2384,9 @@ export function setCellExport(ids: string[], exported: boolean, nb?: string | nu
 		// Cellar never writes a directive, so clearing the metadata half would leave
 		// the cell exported while the result claimed it was not. Reported by name, and
 		// all-or-nothing like its siblings - a batch that cannot fully take must not
-		// half-apply. MARKING such a cell is fine: it is already exported, so the call
-		// is satisfied and `setCellExportsDoc` simply writes nothing for it.
+		// half-apply. MARKING a cell with a BARE `#| export` is fine: it is already
+		// exported, so the call is satisfied and `setCellExportsDoc` simply writes
+		// nothing for it.
 		//
 		// `exportDirectiveOwnsCell` is the ELIGIBILITY-gated rule `isExportCell` itself
 		// applies, so an INELIGIBLE cell (markdown/SQL/raw) whose source merely opens
@@ -2398,6 +2400,11 @@ export function setCellExport(ids: string[], exported: boolean, nb?: string | nu
 		// agent surface and the two human ones cannot say different things.
 		if (!exported && exportDirectiveOwnsCell(cell, lang))
 			return { ok: false as const, exportDirective: ref, alsoFlagged: exportMarkedTwice(cell, lang) };
+		// A valued `#| export <module>` line sends the cell to that module and never
+		// to this notebook's own, so a MARK cannot be satisfied: `export_target` would
+		// name a module the cell does not land in.
+		const otherModule = exported ? exportOtherModuleName(cell, lang) : null;
+		if (otherModule !== null) return { ok: false as const, otherModule: ref, module: otherModule };
 		seen.add(id);
 		full.push(id);
 	}

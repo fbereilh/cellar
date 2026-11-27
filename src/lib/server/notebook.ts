@@ -38,6 +38,7 @@ import { IMPORTS_ROLE, isImportsCell, clampMoveIndex } from '../importsRole';
 import { moveSelectionPlan } from '../cellSelection';
 import {
 	exportNotebookToPy,
+	otherModuleView,
 	resolveExportTarget,
 	docExportHazards,
 	docHumanExportHazards,
@@ -49,10 +50,12 @@ import {
 	type ResolvedExportTarget
 } from './export-py';
 import type { ExportHazard } from '../exportHazard';
+import type { OtherModuleView } from '../exportRole';
 import {
 	canExportCell,
 	exportDirectiveOwnsCell,
 	exportMarkedTwice,
+	exportOtherModuleName,
 	exportTargetLanguage,
 	moduleExtension,
 	notebookHoldsExport,
@@ -63,6 +66,7 @@ import { isHiddenFromAgent } from '../agentVisibility';
 import { isExportBase, type ExportBase } from '../exportTarget';
 import { gitRootOf } from './git';
 import { resolveInWorkspace } from './fstree';
+import { exportPeers, refreshExportPeers, type ExportPeers } from './export-peers';
 import {
 	InvalidNotebookLanguageError,
 	isLogicalCellType,
@@ -307,12 +311,60 @@ function persist(doc: NotebookDoc): void {
 function regenerateExportModule(doc: NotebookDoc): void {
 	if (doc.jpFormat) return; // `.py` text notebooks carry no cellar cell metadata
 	try {
-		exportNotebookToPy(doc);
+		exportNotebookToPy(doc, peersForExport(doc));
 		doc.lastExportError = null;
 	} catch (err) {
 		doc.lastExportError = String((err as Error)?.message ?? err);
 	}
 }
+
+/**
+ * Every other notebook in the workspace, for `#| export <module>` (`export-peers.ts`):
+ * an open one as its live document.
+ */
+function peersOf(doc: NotebookDoc): ExportPeers | null {
+	return exportPeers(doc.path, (abs) => docs.get(abs));
+}
+
+/**
+ * The workspace around `doc` for an export. An export never runs as if the
+ * notebook were alone: with no finished scan it is refused.
+ */
+function peersForExport(doc: NotebookDoc): ExportPeers {
+	const around = peersOf(doc);
+	if (!around)
+		throw new Error(
+			'the workspace has not been scanned for other notebooks yet, so the module was not written - export again'
+		);
+	return around;
+}
+
+/**
+ * Scan the workspace for the notebooks `#| export <module>` reads, without
+ * blocking, and publish every open notebook's derived export state when the
+ * result changed. Every export action awaits this before it regenerates, so it
+ * builds from the workspace as it is now.
+ */
+export async function syncExportPeers(): Promise<void> {
+	if (await refreshExportPeers()) for (const doc of docs.values()) publishExportDerived(doc);
+}
+
+/**
+ * The last scan's answer for the cell badges, with a fresh scan started in the
+ * background. A persist or a load never waits for the workspace: a changed
+ * result arrives as a `notebook:export-derived` event.
+ */
+function peersForView(doc: NotebookDoc): ExportPeers | null {
+	viewSync ??= syncExportPeers()
+		.catch(() => {})
+		.finally(() => {
+			viewSync = null;
+		});
+	return peersOf(doc);
+}
+
+/** The one background scan a view may have in flight, so views never stack scans. */
+let viewSync: Promise<void> | null = null;
 
 /**
  * Broadcast everything the export DERIVES - the target's RESOLUTION and the marks'
@@ -391,10 +443,19 @@ function publishExportDerived(doc: NotebookDoc): void {
 	// differently. It is in the key too, so a leftover appearing or being deleted is
 	// itself a change worth one event.
 	const orphanedModule = orphanedGeneratedModule(doc, info);
-	const key = [resolved ?? '', resolveError ?? '', orphanedModule ?? '', ...hazards.map((h) => h.message)].join('\u0000');
+	// Where each `#| export <module>` cell goes, or why it goes nowhere. Empty, with
+	// no workspace scan, for a notebook without such a cell.
+	const otherModules = otherModuleView(doc, () => peersForView(doc));
+	const key = [
+		resolved ?? '',
+		resolveError ?? '',
+		orphanedModule ?? '',
+		...hazards.map((h) => h.message),
+		...otherModules.map((o) => [o.id, o.target ?? '', o.error ?? ''].join('\u0001'))
+	].join('\u0000');
 	if (key === doc.lastExportDerivedKey) return;
 	doc.lastExportDerivedKey = key;
-	emit(doc, 'notebook:export-derived', { resolved, resolveError, hazards, orphanedModule });
+	emit(doc, 'notebook:export-derived', { resolved, resolveError, hazards, orphanedModule, otherModules });
 }
 
 /**
@@ -583,6 +644,7 @@ function exportTargetView(doc: NotebookDoc): {
 	exportResolveError: string | null;
 	exportHazards: ExportHazard[];
 	exportOrphanedModule: string | null;
+	exportOtherModules: OtherModuleView[];
 } {
 	const info = resolveExportTarget(doc);
 	return {
@@ -604,7 +666,10 @@ function exportTargetView(doc: NotebookDoc): {
 		// stays and this notebook stops writing it. Threaded the SAME `info` rather than
 		// resolved again, and narrowed before it touches the filesystem, so an ordinary
 		// notebook pays nothing (`orphanedGeneratedModule`).
-		exportOrphanedModule: orphanedGeneratedModule(doc, info)
+		exportOrphanedModule: orphanedGeneratedModule(doc, info),
+		// Each `#| export <module>` cell's module, or why it goes into none. Empty,
+		// with no workspace scan, for a notebook without such a cell.
+		exportOtherModules: otherModuleView(doc, () => peersForView(doc))
 	};
 }
 
@@ -1199,7 +1264,12 @@ export function setCellRole(id: string, role: string | null, nb?: string | null,
  * rule adds, and `py-notebook` a MARK on a `.py` text notebook, which can hold no
  * export state at all (`notebookHoldsExport`).
  */
-export type SetCellExportRefusal = 'no-such-cell' | 'not-code' | 'export-directive-owns-cell' | 'py-notebook';
+export type SetCellExportRefusal =
+	| 'no-such-cell'
+	| 'not-code'
+	| 'export-directive-owns-cell'
+	| 'export-other-module'
+	| 'py-notebook';
 
 /**
  * A refused `setCellExport`, and - for the directive case - whether Cellar's own
@@ -1216,7 +1286,7 @@ export type SetCellExportRefusal = 'no-such-cell' | 'not-code' | 'export-directi
  */
 export type SetCellExportResult =
 	| { ok: true }
-	| { ok: false; reason: SetCellExportRefusal; alsoFlagged?: boolean };
+	| { ok: false; reason: SetCellExportRefusal; alsoFlagged?: boolean; module?: string };
 
 /**
  * Mark (or unmark) a code cell for nbdev-style export in the allowlisted `cellar`
@@ -1254,12 +1324,19 @@ export function setCellExport(
 	// none in a `.mojo` one.
 	const lang = docExportLanguage(doc);
 	if (exported && !canExportCell(cell, lang)) return { ok: false, reason: 'not-code' };
-	// The source owns the mark (see `setCellExports`). A MARK request is already
-	// satisfied - the cell really is exported - so it is an honest no-op; an UNMARK
-	// is refused, because nothing Cellar may write would take the mark away.
+	// A valued `#| export <module>` line sends the cell to that module and never to
+	// this notebook's own, so a MARK cannot be satisfied and is refused with the
+	// module the line names.
+	//
+	// The source owns the mark (see `setCellExports`). A MARK request on a bare
+	// `#| export` cell is already satisfied - the cell really is exported - so it is
+	// an honest no-op; an UNMARK is refused, because nothing Cellar may write would
+	// take the mark away.
 	//
 	// `alsoFlagged` rides the refusal because the REMEDY differs and only this side
 	// can see it - see `SetCellExportResult`.
+	const otherModule = exportOtherModuleName(cell, lang);
+	if (exported && otherModule !== null) return { ok: false, reason: 'export-other-module', module: otherModule };
 	if (exportDirectiveOwnsCell(cell, lang))
 		return exported
 			? { ok: true }
@@ -1986,7 +2063,7 @@ export function exportPy(nb?: string | null): ExportResult {
 	const doc = docFor(nb);
 	if (!notebookHoldsExport(!!doc.jpFormat)) throw new Error('cannot export a .py text notebook to a module');
 	try {
-		const res = exportNotebookToPy(doc);
+		const res = exportNotebookToPy(doc, peersForExport(doc));
 		doc.lastExportError = null;
 		return res;
 	} catch (err) {

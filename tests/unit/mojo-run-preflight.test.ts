@@ -188,6 +188,7 @@ beforeAll(async () => {
 	process.env.CELLAR_KERNEL_INTERRUPT_GRACE_MS = '60'; // a parked run never surrenders; do not wait 5s for it
 	process.env.CELLAR_KERNEL_INTERRUPT_START_TIMEOUT_MS = '80'; // a held-open start: do not wait 5s for it either
 	nbmod = await import('../../src/lib/server/notebook');
+	await nbmod.syncExportPeers();
 	queue = await import('../../src/lib/server/run-queue');
 	runmod = await import('../../src/lib/server/run');
 	kernelmod = await import('../../src/lib/server/kernel');

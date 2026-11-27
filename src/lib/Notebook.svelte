@@ -26,8 +26,10 @@
 		orphanedModuleExplanation,
 		type ExportLanguage,
 		type ExportStrandedSummary,
+		type OtherModuleView,
 		exportTargetPlaceholder,
-		moduleExtension
+		moduleExtension,
+		otherModulesReport
 	} from '$lib/exportRole';
 	import { reservedFailureHeight, failureDetail } from '$lib/cellRenderFailure';
 	import type { RustCellDrop } from '$lib/rustExport';
@@ -49,6 +51,7 @@
 	const EMPTY_SELECTION: ReadonlySet<string> = new Set();
 	const EMPTY_MAIN_DROPPED: ReadonlySet<string> = new Set();
 	const EMPTY_RUST_DROPS: ReadonlyMap<string, RustCellDrop> = new Map();
+	const EMPTY_OTHER_MODULES: ReadonlyMap<string, OtherModuleView> = new Map();
 
 	interface Props {
 		cells: UICell[];
@@ -162,6 +165,8 @@
 		rustDrops?: ReadonlyMap<string, RustCellDrop>;
 		/** Whether any cell is marked as the main cell of the `.rs` module. */
 		rustMainIsMarked?: boolean;
+		/** Each `#| export <module>` cell's module, or why it goes into none, by cell id. */
+		otherModules?: ReadonlyMap<string, OtherModuleView>;
 		/** How many cells are currently marked for export. */
 		exportCount?: number;
 		/**
@@ -325,6 +330,7 @@
 		mojoMainDropped = EMPTY_MAIN_DROPPED,
 		rustDrops = EMPTY_RUST_DROPS,
 		rustMainIsMarked = false,
+		otherModules = EMPTY_OTHER_MODULES,
 		hidden = new Set(),
 		foldedIds = new Set(),
 		hiddenSegs = new Map(),
@@ -1086,7 +1092,11 @@
 		// agent-only kind may neither raise the warning branch nor word it
 		// (`$lib/exportHazard`).
 		const shown = humanExportHazards(r.hazards ?? []);
-		if (r.reason === 'no-target') exportFeedback = 'Set a target module path first (.py, .mojo or .rs).';
+		// What the `#| export <module>` cells did, said after the own module's line -
+		// or INSTEAD of it, when this notebook has no module of its own to report.
+		const fed = otherModulesReport(r, (h) => hazardSummaryClause(humanExportHazards(h as ExportHazard[])));
+		if (fed && (r.reason === 'no-target' || r.reason === 'no-cells')) exportFeedback = fed;
+		else if (r.reason === 'no-target') exportFeedback = 'Set a target module path first (.py, .mojo or .rs).';
 		else if (r.reason === 'no-cells') exportFeedback = 'No cells are marked for export.';
 		// Nothing was written and that is deliberate, so the button may not read as a
 		// dead control: Cellar never overwrites a file it did not generate.
@@ -1107,6 +1117,7 @@
 		else if (shown.length)
 			exportFeedback = `Wrote ${r.count} ${r.count === 1 ? 'cell' : 'cells'} → ${r.target}, but ${hazardSummaryClause(shown)} - see the warning.`;
 		else exportFeedback = `Exported ${r.count} ${r.count === 1 ? 'cell' : 'cells'} → ${r.target}`;
+		if (fed && r.reason !== 'no-target' && r.reason !== 'no-cells') exportFeedback = `${exportFeedback.replace(/\.?$/, '.')} ${fed}`;
 	}
 	// The toolbar Export button beside the menu button. With a target that names a
 	// module it runs the shell's export, whose result lands on the notice line:
@@ -1341,6 +1352,7 @@
 				mainDropped={mojoMainDropped.has(cell.id)}
 				rustDrop={rustDrops.get(cell.id) ?? null}
 				{rustMainIsMarked}
+				otherModule={otherModules.get(cell.id) ?? null}
 				onSetExport={onSetExport}
 				{onSetExportMain}
 				onSetScrolled={onSetScrolled}
