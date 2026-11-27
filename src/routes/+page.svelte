@@ -43,6 +43,7 @@
 	import type { KernelInfo, KernelListEntry, KernelCard } from '$lib/kernelBadge';
 	import {
 		namespaceOf,
+		rowsSurviveBusyReply,
 		namespaceSurvives,
 		anyNamespaceDied,
 		shutdownEnds,
@@ -1516,6 +1517,10 @@
 			if (!body.busy) {
 				variables = body.variables;
 				varsNamespace = namespaceOf(body);
+			} else if (!rowsSurviveBusyReply(varsNamespace, body.path)) {
+				// Busy, and the rows describe ANOTHER notebook (a tab switch onto a busy
+				// kernel). Keeping them would list names this notebook does not have.
+				wipeVariablesLocally();
 			}
 		} catch (err) {
 			if (seq !== varsReqSeq) return; // superseded → its error is stale too

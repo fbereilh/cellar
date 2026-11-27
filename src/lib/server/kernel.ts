@@ -191,6 +191,15 @@ interface NotebookKernel {
 	 * path), so a wedged/aborted run can never hold it. See `execute()` + `runSilent`.
 	 */
 	execChain: Promise<void>;
+	/**
+	 * Set while a Cellar probe that ran past its time limit is still executing and did
+	 * not stop when interrupted (see `execute()`'s `timeoutMs`). Until it ends, every
+	 * new run on this kernel is refused with `PROBE_STUCK_REASON` instead of parking
+	 * behind it, so a user's cell never reads "running" while Cellar's own code is
+	 * what holds the kernel. Cleared by the probe's own `finally`: when its reply
+	 * finally arrives, or when a restart or teardown aborts it.
+	 */
+	stuckProbe: boolean;
 }
 
 /**
@@ -423,6 +432,13 @@ const INTERRUPT_ABORT_REASON = 'interrupt_unresponsive';
  * interrupt path exists to retire.
  */
 const INTERRUPT_UNDELIVERED_REASON = 'interrupt_undelivered';
+
+/**
+ * The reason a run is refused, never sent, because a Cellar probe is stuck in the
+ * kernel (`NotebookKernel.stuckProbe`). Its own reason so the run's message can say
+ * that Cellar's code, not the user's, is what holds the kernel.
+ */
+const PROBE_STUCK_REASON = 'probe_stuck';
 
 /**
  * How long the interrupt REST POST may take before Cellar stops waiting for it and
@@ -712,6 +728,12 @@ export class KernelExecuteAborted extends Error {
  *     sentence names no cause beyond it.
  */
 function abortMessage(reason: string, { sent = true }: { sent?: boolean } = {}): string {
+	if (reason === PROBE_STUCK_REASON) {
+		return (
+			"Run not started: Cellar's own variable inspection is still running in this kernel and did not stop when " +
+			'interrupted, so this code was not executed. Restart the kernel to recover.'
+		);
+	}
 	// An interrupt that stopped a run BEFORE its code was sent - parked on the kernel
 	// start, the socket refresh, the Mojo pre-flight or the exec lock - knows MORE than
 	// the two sentences below, not less: nothing of this run reached the kernel, so
@@ -1965,7 +1987,8 @@ function getKernel(nbPath: string): Promise<KernelConnection> {
 		widgetComms: new Map(),
 		activeRuns: new Set(),
 		refreshInFlight: null,
-		execChain: Promise.resolve()
+		execChain: Promise.resolve(),
+		stuckProbe: false
 	};
 
 	nbKernel.startPromise = (async () => {
@@ -3415,7 +3438,7 @@ export async function execute(
 	nbPath: string,
 	code: string,
 	onEvent: (event: RunStreamEvent) => void,
-	{ internal = false, prepare }: ExecuteOptions = {}
+	{ internal = false, prepare, timeoutMs, onTimeout }: ExecuteOptions = {}
 ): Promise<KernelMessage.IExecuteReplyMsg['content']> {
 	const abs = resolveNb(nbPath);
 	// `getKernel` creates and registers this notebook's Map entry SYNCHRONOUSLY (or
@@ -3531,6 +3554,14 @@ export async function execute(
 	} catch (err) {
 		dropBeforeSend();
 		throw err;
+	}
+
+	// A Cellar probe is stuck in this kernel. Parking behind it would leave this run
+	// reading "running" over code that is not the user's, for as long as the probe
+	// lasts, so it is refused now and says why.
+	if (nbKernel.stuckProbe) {
+		dropBeforeSend();
+		throw new KernelExecuteAborted(abortMessage(PROBE_STUCK_REASON, { sent: false }), PROBE_STUCK_REASON);
 	}
 
 	// CLAIM our place in the execute queue, then wait for it — racing the wait
@@ -3696,6 +3727,42 @@ export async function execute(
 		armWatchdog();
 	};
 	resetWatchdog(); // arm before any traffic can arrive
+
+	// --- Time limit for a Cellar probe ----------------------------------------
+	// Only an internal probe that asks for one gets it: user code may run for hours.
+	// Past the limit the kernel is interrupted. That is safe here because this run
+	// holds the exec lock, so the probe is the only code on the wire, and an idle
+	// ipykernel ignores a SIGINT that lands after it finished. A probe that surrenders
+	// ends through its normal reply. One that does not is left running, since the
+	// kernel really is still executing it, but the kernel is marked `stuckProbe` and
+	// every run parked behind it is refused, so none of them reads as hanging.
+	let internalTimer: ReturnType<typeof setTimeout> | undefined;
+	let markedStuck = false;
+	const onInternalTimeout = async () => {
+		if (settled || aborted) return;
+		logWarn('kernel', `a Cellar probe on ${abs} ran past ${timeoutMs}ms; interrupting it`);
+		onTimeout?.('interrupting');
+		const signalled = await signalInterrupt(kernel);
+		const deadline = Date.now() + (signalled ? interruptGraceMs() : 0);
+		while (!settled && !aborted && Date.now() < deadline) {
+			await new Promise((r) => setTimeout(r, INTERRUPT_POLL_MS));
+		}
+		if (settled || aborted) return;
+		logWarn('kernel', `a Cellar probe on ${abs} did not stop when interrupted; refusing new runs until it ends`);
+		nbKernel.stuckProbe = true;
+		markedStuck = true;
+		abortActiveRuns(
+			nbKernel,
+			PROBE_STUCK_REASON,
+			[...nbKernel.activeRuns].filter((r) => r !== run && !r.sent)
+		);
+		onTimeout?.('stuck');
+	};
+	if (internal && timeoutMs != null && timeoutMs > 0) {
+		// A timer-fired rejection has no awaiter, so it is swallowed here (see armWatchdog).
+		internalTimer = setTimeout(() => void onInternalTimeout().catch(() => {}), timeoutMs);
+		internalTimer.unref?.();
+	}
 	// A reply or stdin request on any channel is kernel activity: reset the watchdog.
 	future.onReply = () => resetWatchdog();
 	future.onStdin = () => resetWatchdog();
@@ -3770,6 +3837,8 @@ export async function execute(
 	} finally {
 		settled = true;
 		if (watchdogTimer) clearTimeout(watchdogTimer);
+		if (internalTimer) clearTimeout(internalTimer);
+		if (markedStuck) nbKernel.stuckProbe = false;
 		// A probe still in flight can no longer change anything (its verdict is discarded
 		// by the settled/aborted guard), so cancel its request rather than let a hung GET
 		// hold a socket for the rest of the probe timeout.

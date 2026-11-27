@@ -85,3 +85,15 @@ export function shutdownEnds(ns: VarsNamespace, rel: string | null, session: unk
 	if (!rel || norm(rel) !== norm(ns.path)) return false;
 	return typeof session !== 'number' || session === ns.session;
 }
+
+/**
+ * May the rows on screen stay when a probe reply says the kernel was busy and
+ * read nothing? Only when they describe the SAME notebook the reply is about.
+ * Rows from another notebook, after a tab switch onto a busy kernel, would list
+ * names the active notebook does not have, so they must go.
+ */
+export function rowsSurviveBusyReply(ns: VarsNamespace | null, replyPath: unknown): boolean {
+	if (!ns) return true;
+	if (typeof replyPath !== 'string' || !replyPath) return true;
+	return norm(replyPath) === norm(ns.path);
+}

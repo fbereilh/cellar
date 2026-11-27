@@ -42,12 +42,24 @@ interface VariableRecord {
 	columns?: string[];
 }
 
-/** The bucketed namespace the shared PROBE prints. */
+/**
+ * A namespace name the probe could not describe: reading it ran past its time
+ * budget, or raised. Only the name and its type are known, so it is reported in a
+ * bucket of its own rather than guessed into one of the four.
+ */
+interface UninspectedRecord {
+	name: string;
+	type: string;
+	reason: string;
+}
+
+/** The bucketed namespace the shared KERNEL_STATE_PROBE prints. */
 interface ProbeState {
 	imports: ImportRecord[];
 	functions: FunctionRecord[];
 	classes: ClassRecord[];
 	variables: VariableRecord[];
+	uninspected?: UninspectedRecord[];
 }
 
 /** One `_cellar_describe` entry (list_variables); many fields are library-dependent. */
@@ -62,6 +74,8 @@ interface VariableDescriptor {
 	dtype?: string;
 	columns?: Array<{ name: string; dtype: string }>;
 	columns_truncated?: boolean;
+	/** Why the value was not described: it ran past its time budget, or raised. */
+	not_inspected?: string;
 	[key: string]: unknown;
 }
 
@@ -72,6 +86,89 @@ interface InspectDetail {
 	[key: string]: unknown;
 }
 
+// --- Probe safety: what a probe may assume about a user value ---------------
+//
+// A probe reads arbitrary user objects, and an object can answer EVERY attribute.
+// fastcore's `null` (exported by `from fasthtml.common import *`) returns itself
+// for any attribute and any index, so `hasattr(x, 'shape')` is true and iterating
+// `x.shape` never ends: Python falls back to the `__getitem__` protocol, which
+// never raises IndexError. The probe spun forever at full CPU with growing memory,
+// and every cell queued behind it. Three rules close that class of bug:
+//   1. An attribute counts only when the value's TYPE defines it (or it sits in the
+//      instance dict), read with `inspect.getattr_static`, never `hasattr`, which
+//      `__getattr__` can answer for anything. `len()` likewise needs `__len__` on
+//      the type.
+//   2. Every iteration over a user object is bounded with `itertools.islice`.
+//   3. Each value is described under a wall-clock budget (`_cellar_bounded`), so a
+//      slow `__repr__` or property costs at most that budget. A value that runs
+//      past it is reported as not inspected, never silently dropped.
+
+/** Seconds one value may take to describe before the probe moves on without it. */
+export const PROBE_VALUE_BUDGET_S = 1;
+/** Seconds a whole probe may spend describing values. Later values are then not inspected. */
+export const PROBE_TOTAL_BUDGET_S = 5;
+
+// `_cellar_bounded(fn, secs)` runs `fn()` under a one-shot SIGALRM timer and
+// returns `(True, result)`, or `(False, None)` when the timer fired first. The timer
+// is used only where it is safe: on the main thread (where ipykernel runs cells),
+// on a platform with `setitimer`, and only when no ITIMER_REAL is already armed, so
+// a user's own timer is never clobbered. Elsewhere `fn()` runs unbounded and the
+// Node-side backstop (`probeTimeoutMs`) still applies. The timer is one-shot and
+// disarmed in an inner `finally`, and the previous handler is restored in the
+// outer one, so the alarm can fire at most once and always inside the `try` that
+// catches it. `_CellarProbeTimeout` derives from BaseException so the probe's own
+// `except Exception` guards cannot swallow it.
+const PROBE_GUARD = `
+import signal as _cellar_sig, threading as _cellar_thr, time as _cellar_time
+from itertools import islice as _cellar_islice
+from inspect import getattr_static as _cellar_ins_g
+_CELLAR_VALUE_S = ${PROBE_VALUE_BUDGET_S}
+_CELLAR_TOTAL_S = ${PROBE_TOTAL_BUDGET_S}
+class _CellarProbeTimeout(BaseException):
+    pass
+def _cellar_bounded(_fn, _secs):
+    if _secs <= 0:
+        return False, None
+    try:
+        _can = (hasattr(_cellar_sig, 'setitimer')
+                and _cellar_thr.current_thread() is _cellar_thr.main_thread()
+                and _cellar_sig.getitimer(_cellar_sig.ITIMER_REAL) == (0.0, 0.0))
+    except Exception:
+        _can = False
+    if not _can:
+        return True, _fn()
+    def _cellar_on_alarm(_s, _f):
+        raise _CellarProbeTimeout()
+    _prev = _cellar_sig.signal(_cellar_sig.SIGALRM, _cellar_on_alarm)
+    try:
+        try:
+            _cellar_sig.setitimer(_cellar_sig.ITIMER_REAL, _secs)
+            return True, _fn()
+        finally:
+            _cellar_sig.setitimer(_cellar_sig.ITIMER_REAL, 0)
+    except _CellarProbeTimeout:
+        return False, None
+    finally:
+        _cellar_sig.signal(_cellar_sig.SIGALRM, _prev if _prev is not None else _cellar_sig.SIG_DFL)
+def _cellar_has(_v, _attr):
+    try:
+        _cellar_ins_g(_v, _attr)
+        return True
+    except AttributeError:
+        return False
+def _cellar_sized(_v):
+    return hasattr(type(_v), '__len__')
+def _cellar_tname(_v):
+    try:
+        return type(_v).__name__
+    except Exception:
+        return '?'
+`;
+
+/** Python statement that removes every name `PROBE_GUARD` defines. */
+const PROBE_GUARD_DEL =
+	'del _cellar_bounded, _CellarProbeTimeout, _cellar_has, _cellar_sized, _cellar_tname, _cellar_ins_g, _cellar_islice, _cellar_sig, _cellar_thr, _cellar_time, _CELLAR_VALUE_S, _CELLAR_TOTAL_S';
+
 // One probe, four buckets. We start from IPython's user namespace minus the
 // names it already marks hidden (its injected builtins) and classify each name:
 //   - modules            -> `imports` (plain `import x` / `import x as y`)
@@ -81,8 +178,84 @@ interface InspectDetail {
 //   - everything else     -> `variables` (data), dropping library scaffolding
 // Everything the probe defines is underscore-prefixed, so it hides itself and
 // never lands in any bucket.
-const PROBE = `
+export const KERNEL_STATE_PROBE = `
 import json as _cellar_json, inspect as _cellar_ins, sys as _cellar_sys
+${PROBE_GUARD}
+def _cellar_shape(_v, _mod):
+    # pandas-on-Spark answers .shape and len() by running a Spark job.
+    if _mod.startswith('pyspark'):
+        return ''
+    if isinstance(_v, (str, bytes)):
+        return str(len(_v))
+    if _cellar_has(_v, 'shape'):
+        _s = _v.shape
+        if isinstance(_s, (tuple, list)) or _cellar_sized(_s):
+            return 'x'.join(str(_d) for _d in _cellar_islice(_s, 32))
+        return ''
+    if _cellar_sized(_v):
+        return str(len(_v))
+    return ''
+def _cellar_entry(_k, _v, _skip_type_mods):
+    # Modules -> plain import; reconstruction is exact.
+    if _cellar_ins.ismodule(_v):
+        _mod = getattr(_v, '__name__', _k)
+        _stmt = ('import ' + _mod) if _mod == _k else ('import ' + _mod + ' as ' + _k)
+        return 'imports', {'alias': _k, 'module': _mod, 'statement': _stmt}
+    _is_func = (_cellar_ins.isfunction(_v) or _cellar_ins.isbuiltin(_v)
+                or _cellar_ins.isroutine(_v))
+    _is_class = _cellar_ins.isclass(_v)
+    if _is_func or _is_class:
+        _owner = getattr(_v, '__module__', None)
+        if _owner in (None, '__main__'):
+            # Defined by the user in this notebook.
+            if _is_class:
+                return 'classes', {'name': _k}
+            try:
+                _sig = str(_cellar_ins.signature(_v))
+            except Exception:
+                _sig = ''
+            return 'functions', {'name': _k, 'signature': _sig}
+        # Brought in by a from-import. __module__ can be a private
+        # submodule (e.g. Path -> pathlib._local on 3.13), so only emit a
+        # runnable statement when the TOP-LEVEL package re-exports this
+        # exact object; otherwise keep the name for display/dedup with a
+        # null statement rather than a misleading one.
+        _top = str(_owner).split('.')[0]
+        _stmt = None
+        try:
+            _topmod = _cellar_sys.modules.get(_top)
+            _orig = getattr(_v, '__name__', _k)
+            if _topmod is not None and getattr(_topmod, _orig, None) is _v:
+                _stmt = ('from ' + _top + ' import ' + _orig) if _orig == _k \\
+                    else ('from ' + _top + ' import ' + _orig + ' as ' + _k)
+        except Exception:
+            _stmt = None
+        return 'imports', {'alias': _k, 'module': _top, 'statement': _stmt}
+    # Data variable. Drop library scaffolding types (typing/abc/magics).
+    _mod = getattr(type(_v), '__module__', '') or ''
+    if _mod in _skip_type_mods:
+        return None
+    _shape = ''
+    try:
+        _shape = _cellar_shape(_v, _mod)
+    except Exception:
+        pass
+    try:
+        _p = repr(_v)
+    except Exception:
+        _p = '<unreprable>'
+    _p = ' '.join(_p.split())
+    if len(_p) > 140:
+        _p = _p[:137] + '...'
+    _entry = {'name': _k, 'type': type(_v).__name__, 'shape': _shape, 'preview': _p}
+    try:
+        if _cellar_has(_v, 'columns'):
+            _c = _v.columns
+            if isinstance(_c, (tuple, list)) or _cellar_sized(_c):
+                _entry['columns'] = [str(_x) for _x in _cellar_islice(_c, 100)]
+    except Exception:
+        pass
+    return 'variables', _entry
 def _cellar_kernel_state():
     try:
         _ip = get_ipython()
@@ -92,86 +265,39 @@ def _cellar_kernel_state():
         _ns = globals()
         _hidden = set()
     _skip_type_mods = {'typing', 'abc', 'IPython.core.magic'}
-    _imports, _functions, _classes, _variables = [], [], [], []
+    _out = {'imports': [], 'functions': [], 'classes': [], 'variables': []}
+    _uninspected = []
+    _deadline = _cellar_time.monotonic() + _CELLAR_TOTAL_S
     for _k, _v in list(_ns.items()):
         if _k.startswith('_') or _k in _hidden:
             continue
         if _k in ('In', 'Out', 'exit', 'quit', 'get_ipython'):
             continue
-        # Modules -> plain import; reconstruction is exact.
-        if _cellar_ins.ismodule(_v):
-            _mod = getattr(_v, '__name__', _k)
-            _stmt = ('import ' + _mod) if _mod == _k else ('import ' + _mod + ' as ' + _k)
-            _imports.append({'alias': _k, 'module': _mod, 'statement': _stmt})
-            continue
-        _is_func = (_cellar_ins.isfunction(_v) or _cellar_ins.isbuiltin(_v)
-                    or _cellar_ins.isroutine(_v))
-        _is_class = _cellar_ins.isclass(_v)
-        if _is_func or _is_class:
-            _owner = getattr(_v, '__module__', None)
-            if _owner in (None, '__main__'):
-                # Defined by the user in this notebook.
-                if _is_class:
-                    _classes.append({'name': _k})
-                else:
-                    try:
-                        _sig = str(_cellar_ins.signature(_v))
-                    except Exception:
-                        _sig = ''
-                    _functions.append({'name': _k, 'signature': _sig})
-            else:
-                # Brought in by a from-import. __module__ can be a private
-                # submodule (e.g. Path -> pathlib._local on 3.13), so only emit a
-                # runnable statement when the TOP-LEVEL package re-exports this
-                # exact object; otherwise keep the name for display/dedup with a
-                # null statement rather than a misleading one.
-                _top = _owner.split('.')[0]
-                _stmt = None
-                try:
-                    _topmod = _cellar_sys.modules.get(_top)
-                    _orig = getattr(_v, '__name__', _k)
-                    if _topmod is not None and getattr(_topmod, _orig, None) is _v:
-                        _stmt = ('from ' + _top + ' import ' + _orig) if _orig == _k \
-                            else ('from ' + _top + ' import ' + _orig + ' as ' + _k)
-                except Exception:
-                    _stmt = None
-                _imports.append({'alias': _k, 'module': _top, 'statement': _stmt})
-            continue
-        # Data variable. Drop library scaffolding types (typing/abc/magics).
-        if getattr(type(_v), '__module__', '') in _skip_type_mods:
-            continue
-        _shape = ''
+        _left = min(_CELLAR_VALUE_S, _deadline - _cellar_time.monotonic())
         try:
-            if hasattr(_v, 'shape'):
-                _shape = 'x'.join(str(_d) for _d in _v.shape)
-            elif isinstance(_v, (str, bytes)):
-                _shape = str(len(_v))
-            elif hasattr(_v, '__len__'):
-                _shape = str(len(_v))
-        except Exception:
-            pass
-        try:
-            _p = repr(_v)
-        except Exception:
-            _p = '<unreprable>'
-        _p = ' '.join(_p.split())
-        if len(_p) > 140:
-            _p = _p[:137] + '...'
-        _entry = {'name': _k, 'type': type(_v).__name__, 'shape': _shape, 'preview': _p}
-        try:
-            if hasattr(_v, 'columns'):
-                _entry['columns'] = [str(_c) for _c in list(_v.columns)[:100]]
-        except Exception:
-            pass
-        _variables.append(_entry)
-    _imports.sort(key=lambda _r: _r['alias'])
-    _functions.sort(key=lambda _r: _r['name'])
-    _classes.sort(key=lambda _r: _r['name'])
-    _variables.sort(key=lambda _r: _r['name'])
-    return {'imports': _imports, 'functions': _functions,
-            'classes': _classes, 'variables': _variables}
+            _ok, _got = _cellar_bounded(lambda: _cellar_entry(_k, _v, _skip_type_mods), _left)
+        except Exception as _e:
+            _uninspected.append({'name': _k, 'type': _cellar_tname(_v),
+                                 'reason': 'reading it raised ' + type(_e).__name__})
+            continue
+        if not _ok:
+            _uninspected.append({'name': _k, 'type': _cellar_tname(_v),
+                                 'reason': 'not inspected: reading it ran past the %gs budget' % _CELLAR_VALUE_S
+                                 if _left > 0 else
+                                 'not inspected: the probe spent its %gs budget on earlier names' % _CELLAR_TOTAL_S})
+            continue
+        if _got is not None:
+            _out[_got[0]].append(_got[1])
+    _out['imports'].sort(key=lambda _r: _r['alias'])
+    for _b in ('functions', 'classes', 'variables'):
+        _out[_b].sort(key=lambda _r: _r['name'])
+    _uninspected.sort(key=lambda _r: _r['name'])
+    if _uninspected:
+        _out['uninspected'] = _uninspected
+    return _out
 print(_cellar_json.dumps(_cellar_kernel_state()))
-del _cellar_kernel_state
+del _cellar_kernel_state, _cellar_entry, _cellar_shape
+${PROBE_GUARD_DEL}
 `;
 
 /**
@@ -186,6 +312,8 @@ del _cellar_kernel_state
  * cell the agent ran.
  */
 async function execProbe(code: string, nbPath?: string | null): Promise<{ session: SessionId | null; line: string | undefined }> {
+	const limitMs = inspectTimeoutMs();
+	const limitS = Number((limitMs / 1000).toFixed(2));
 	let stdout = '';
 	let errored: string | null = null;
 	let session: SessionId | null = null;
@@ -205,10 +333,62 @@ async function execProbe(code: string, nbPath?: string | null): Promise<{ sessio
 	// namespace snapshot and its `session` epoch belong to that notebook. The
 	// sidebar inspector passes no path and reflects the ACTIVE notebook's kernel
 	// (per-notebook inspection there is a later phase).
-	await execute(nbPath ?? getActiveNotebookPath(), code, onEvent, { internal: true });
-	if (errored) throw new Error(errored);
+	//
+	// The probe also carries a time limit (`inspectTimeoutMs`), the backstop behind
+	// the Python-side budget in PROBE_GUARD. Past it the kernel interrupts the probe.
+	// If the probe does not stop, `execute()` keeps waiting for it in the background,
+	// and this call stops waiting now, so `kernel_state` and the sidebar never block
+	// on it.
+	const limit: { phase: 'interrupting' | 'stuck' | null } = { phase: null };
+	let giveUp!: (err: Error) => void;
+	const gaveUp = new Promise<never>((_, reject) => {
+		giveUp = reject;
+	});
+	gaveUp.catch(() => {});
+	const running = execute(nbPath ?? getActiveNotebookPath(), code, onEvent, {
+		internal: true,
+		timeoutMs: limitMs,
+		onTimeout: (phase) => {
+			limit.phase = phase;
+			if (phase === 'stuck') {
+				giveUp(
+					new Error(
+						`Cellar's variable inspection ran past ${limitS}s and did not stop when interrupted, so Cellar stopped waiting for it. ` +
+							'It is still running in the kernel, and no cell can run until it ends. Restart the kernel to recover.'
+					)
+				);
+			}
+		}
+	});
+	running.catch(() => {});
+	try {
+		await Promise.race([running, gaveUp]);
+	} catch (err) {
+		if (limit.phase === 'interrupting') throw new Error(interruptedMessage(limitS));
+		throw err;
+	}
+	if (errored) throw new Error(limit.phase ? interruptedMessage(limitS) : errored);
 	const line = stdout.trim().split('\n').filter(Boolean).at(-1);
 	return { session, line };
+}
+
+/** What a probe that ran past its limit and stopped when interrupted reports. */
+function interruptedMessage(limitS: number): string {
+	return `Cellar's variable inspection ran past ${limitS}s, so Cellar interrupted it and read nothing. The kernel is free again.`;
+}
+
+/**
+ * Default time limit for one Cellar probe, in ms. The Python-side budget
+ * (`PROBE_TOTAL_BUDGET_S`) stops a slow value well before this, so it only fires
+ * when that budget could not: a value that swallows the timeout, or a platform
+ * without `setitimer`. Override with `CELLAR_INSPECT_TIMEOUT_MS`.
+ */
+export const DEFAULT_INSPECT_TIMEOUT_MS = 10_000;
+
+function inspectTimeoutMs(): number {
+	const raw = process.env.CELLAR_INSPECT_TIMEOUT_MS;
+	const n = raw == null || raw === '' ? NaN : Number(raw);
+	return Number.isFinite(n) && n > 0 ? n : DEFAULT_INSPECT_TIMEOUT_MS;
 }
 
 /**
@@ -216,9 +396,9 @@ async function execProbe(code: string, nbPath?: string | null): Promise<{ sessio
  * with `session`.
  */
 async function runProbe(nbPath?: string | null): Promise<{ session: SessionId | null } & ProbeState> {
-	const { session, line } = await execProbe(PROBE, nbPath);
+	const { session, line } = await execProbe(KERNEL_STATE_PROBE, nbPath);
 	if (!line) return { session, imports: [], functions: [], classes: [], variables: [] };
-	// The shared PROBE prints exactly the ProbeState bucketed namespace.
+	// KERNEL_STATE_PROBE prints exactly the ProbeState bucketed namespace.
 	return { session, ...(JSON.parse(line) as ProbeState) };
 }
 
@@ -263,12 +443,12 @@ export async function inspectVariables(): Promise<{
 		return { variables: [], busy: true, path, session_id: kernelSession(nbPath).session_id };
 	const state = await runProbe(nbPath);
 	return {
-		variables: (state.variables || []).map(({ name, type, shape, preview }) => ({
-			name,
-			type,
-			shape,
-			preview
-		})),
+		// A name the probe could not describe still exists, so it stays listed, with
+		// the reason in place of a preview it never read.
+		variables: [
+			...(state.variables || []).map(({ name, type, shape, preview }) => ({ name, type, shape, preview })),
+			...(state.uninspected || []).map(({ name, type, reason }) => ({ name, type, shape: '', preview: `(${reason})` }))
+		].sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0)),
 		path,
 		session_id: state.session
 	};
@@ -320,7 +500,8 @@ export async function kernelState(nbPath?: string | null) {
 		imports,
 		functions: state.functions || [],
 		classes: state.classes || [],
-		variables: state.variables || []
+		variables: state.variables || [],
+		...(state.uninspected?.length ? { uninspected: state.uninspected } : {})
 	};
 }
 
@@ -357,7 +538,7 @@ def _cellar_describe(_k, _v):
         _r = _r[:137] + '...'
     _entry['repr_short'] = _r
     try:
-        if hasattr(_v, '__len__') and not (_mod.startswith('pyspark')):
+        if _cellar_sized(_v) and not (_mod.startswith('pyspark')):
             _entry['size'] = len(_v)
     except Exception:
         pass
@@ -367,7 +548,7 @@ def _cellar_describe(_k, _v):
             _entry['kind'] = 'dataframe'
             _entry['shape'] = [int(_v.shape[0]), int(_v.shape[1])]
             _entry['columns'] = [{'name': str(_c), 'dtype': str(_dt)}
-                                 for _c, _dt in list(zip(_v.columns, _v.dtypes))[:100]]
+                                 for _c, _dt in _cellar_islice(zip(_v.columns, _v.dtypes), 100)]
             if _v.shape[1] > 100:
                 _entry['columns_truncated'] = True
         elif _pkg == 'pandas' and _tn == 'Series':
@@ -381,7 +562,7 @@ def _cellar_describe(_k, _v):
         elif _mod.startswith('pyspark') and _tn == 'DataFrame':
             _entry['kind'] = 'spark_dataframe'
             _entry['columns'] = [{'name': _f.name, 'dtype': _f.dataType.simpleString()}
-                                 for _f in list(_v.schema.fields)[:200]]
+                                 for _f in _cellar_islice(_v.schema.fields, 200)]
     except Exception:
         pass
     return _entry
@@ -390,8 +571,9 @@ def _cellar_describe(_k, _v):
 // list_variables: every user DATA variable (skipping modules/functions/classes/
 // dunders/library scaffolding — the same filter kernel_state uses) with its type
 // and, for frames/arrays, its schema.
-const LIST_VARS_PROBE = `
+export const LIST_VARS_PROBE = `
 import json as _cj, inspect as _cellar_ins
+${PROBE_GUARD}
 ${DESCRIBE_HELPER}
 def _cellar_list_vars():
     try:
@@ -400,6 +582,7 @@ def _cellar_list_vars():
         _ns = globals(); _hidden = set()
     _skip_type_mods = {'typing', 'abc', 'IPython.core.magic'}
     _out = []
+    _deadline = _cellar_time.monotonic() + _CELLAR_TOTAL_S
     for _k, _v in list(_ns.items()):
         if _k.startswith('_') or _k in _hidden:
             continue
@@ -414,14 +597,25 @@ def _cellar_list_vars():
             continue
         if getattr(type(_v), '__module__', '') in _skip_type_mods:
             continue
+        _left = min(_CELLAR_VALUE_S, _deadline - _cellar_time.monotonic())
         try:
-            _out.append(_cellar_describe(_k, _v))
-        except Exception:
-            pass
+            _ok, _d = _cellar_bounded(lambda: _cellar_describe(_k, _v), _left)
+        except Exception as _e:
+            _out.append({'name': _k, 'type': _cellar_tname(_v),
+                         'not_inspected': 'reading it raised ' + type(_e).__name__})
+            continue
+        if not _ok:
+            _out.append({'name': _k, 'type': _cellar_tname(_v),
+                         'not_inspected': 'reading it ran past the %gs budget' % _CELLAR_VALUE_S
+                         if _left > 0 else
+                         'the probe spent its %gs budget on earlier names' % _CELLAR_TOTAL_S})
+            continue
+        _out.append(_d)
     _out.sort(key=lambda _r: _r['name'])
     return _out
 print(_cj.dumps(_cellar_list_vars()))
 del _cellar_list_vars, _cellar_describe
+${PROBE_GUARD_DEL}
 `;
 
 // --- inspect_variable head bounds -------------------------------------------
@@ -468,6 +662,7 @@ export const INSPECT_ARRAY_REPR_CHARS = 400;
 // injected as a JSON literal (valid Python).
 export const INSPECT_PROBE_HEAD = `
 import json as _cj
+${PROBE_GUARD}
 _CELLAR_ARR_N = ${INSPECT_ARRAY_ITEMS}
 _CELLAR_STR_N = ${INSPECT_STR_CHARS}
 _CELLAR_BUDGET = ${INSPECT_HEAD_BUDGET}
@@ -480,7 +675,8 @@ def _cellar_arrayish(_vals):
         if isinstance(_val, (list, tuple, dict, set, frozenset)):
             return True
         try:
-            if getattr(_val, 'ndim', 0) >= 1:
+            _nd = _val.ndim if _cellar_has(_val, 'ndim') else 0
+            if isinstance(_nd, int) and _nd >= 1:
                 return True
         except Exception:
             pass
@@ -558,6 +754,18 @@ def _cellar_inspect(_target):
     _v = _ns.get(_target, _MISS)
     if _v is _MISS:
         return {'found': False, 'name': _target}
+    # One value, so it gets the whole probe budget rather than the per-value one.
+    try:
+        _ok, _d = _cellar_bounded(lambda: _cellar_inspect_value(_target, _v), _CELLAR_TOTAL_S)
+    except Exception as _e:
+        return {'found': True, 'name': _target, 'type': _cellar_tname(_v),
+                'not_inspected': 'reading it raised ' + type(_e).__name__ + '; look at it in a cell'}
+    if not _ok:
+        return {'found': True, 'name': _target, 'type': _cellar_tname(_v),
+                'not_inspected': 'reading it ran past the %gs budget; look at it in a cell' % _CELLAR_TOTAL_S}
+    return _d
+
+def _cellar_inspect_value(_target, _v):
     _N = ${INSPECT_HEAD_ROWS}
     _AN = ${INSPECT_ARRAY_HEAD_ROWS}
     # The aggregate character budget guards against ARRAY explosion (a wide frame
@@ -588,7 +796,7 @@ def _cellar_inspect(_target):
             _entry['kind'] = 'dataframe'
             _entry['shape'] = [int(_v.shape[0]), int(_v.shape[1])]
             _entry['columns'] = [{'name': str(_c), 'dtype': str(_dt)}
-                                 for _c, _dt in list(zip(_v.columns, _v.dtypes))[:200]]
+                                 for _c, _dt in _cellar_islice(zip(_v.columns, _v.dtypes), 200)]
             _entry['index_names'] = [None if _n is None else str(_n) for _n in _v.index.names]
             # Decide the row cap BEFORE serializing: with array-valued cells,
             # to_json on ten rows materializes the very payload we are bounding.
@@ -659,12 +867,12 @@ def _cellar_inspect(_target):
         elif _mod.startswith('pyspark') and _tn == 'DataFrame':
             _entry['kind'] = 'spark_dataframe'
             _entry['columns'] = [{'name': _f.name, 'dtype': _f.dataType.simpleString()}
-                                 for _f in list(_v.schema.fields)[:200]]
+                                 for _f in _cellar_islice(_v.schema.fields, 200)]
             _entry['note'] = 'schema only; not collected to avoid triggering a Spark job. Use databricks_preview_table or .limit(N).toPandas().'
         elif isinstance(_v, dict):
             _entry['kind'] = 'dict'
             _entry['size'] = len(_v)
-            _entry['keys'] = [str(_key) for _key in list(_v.keys())[:100]]
+            _entry['keys'] = [str(_key) for _key in _cellar_islice(_v.keys(), 100)]
             if len(_v) > 100:
                 _entry['keys_truncated'] = True
         elif isinstance(_v, (list, tuple, set, frozenset)):
@@ -672,7 +880,7 @@ def _cellar_inspect(_target):
             _entry['size'] = len(_v)
             # Same rule as a frame: when the ITEMS are themselves arrays, ten of
             # them (each a 200-char repr) is a page of noise for one look.
-            _items = list(_v)[:_N]
+            _items = list(_cellar_islice(_v, _N))
             _arrayish = _cellar_arrayish(_items[:3])
             _b['arrayish'] = _b['arrayish'] or _arrayish
             if _arrayish:
@@ -695,7 +903,7 @@ def _cellar_inspect(_target):
         else:
             _entry['kind'] = 'scalar'
             try:
-                if hasattr(_v, '__len__'):
+                if _cellar_sized(_v):
                     _entry['size'] = len(_v)
             except Exception:
                 pass
@@ -713,6 +921,17 @@ def _cellar_inspect(_target):
         _entry['repr_truncated'] = True
     return _entry
 `;
+
+/** The full `inspect_variable` probe for one name: prints its detail, then cleans up. */
+export function inspectProbeCode(name: string): string {
+	return (
+		INSPECT_PROBE_HEAD +
+		`\nprint(_cj.dumps(_cellar_inspect(${JSON.stringify(String(name))})))\n` +
+		'del _cellar_inspect, _cellar_inspect_value, _cellar_shrink, _cellar_arrayish, _cellar_head_note, _CELLAR_ARR_N, _CELLAR_STR_N, _CELLAR_BUDGET, _CELLAR_REPR_N\n' +
+		PROBE_GUARD_DEL +
+		'\n'
+	);
+}
 
 /** Guard shared by the two agent inspection tools: never boot a kernel, never
  *  queue a probe behind a running cell. Reads the target notebook's OWN kernel
@@ -791,8 +1010,7 @@ export async function listVariables(nbPath?: string | null) {
 export async function inspectVariable(name: string, nbPath?: string | null) {
 	const guard = inspectionGuard(nbPath);
 	if (guard) return guard;
-	const code = INSPECT_PROBE_HEAD + `\nprint(_cj.dumps(_cellar_inspect(${JSON.stringify(String(name))})))\ndel _cellar_inspect, _cellar_shrink, _cellar_arrayish, _cellar_head_note, _CELLAR_ARR_N, _CELLAR_STR_N, _CELLAR_BUDGET, _CELLAR_REPR_N\n`;
-	const { session, line } = await execProbe(code, nbPath);
+	const { session, line } = await execProbe(inspectProbeCode(name), nbPath);
 	const stale = session !== currentSessionId(nbPath);
 	// INSPECT_PROBE_HEAD prints one _cellar_inspect detail object (or {found:false}).
 	const detail: InspectDetail = line ? (JSON.parse(line) as InspectDetail) : { found: false, name };
