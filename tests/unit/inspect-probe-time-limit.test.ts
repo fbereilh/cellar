@@ -11,7 +11,11 @@
  *   - a probe that does not surrender stops being waited on, so the caller returns,
  *     and every user run parked behind it, or started while it lasts, is refused
  *     with a message naming Cellar's probe. Its code is never sent;
- *   - once the probe ends, the kernel runs cells again.
+ *   - once the probe ends, the kernel runs cells again;
+ *   - the time-limit interrupt lands before any parked run is sent, so it can never
+ *     raise KeyboardInterrupt inside the user's cell;
+ *   - a forced interrupt of a stuck probe keeps refusing runs until a restart, since
+ *     the kernel may still be executing the probe.
  *
  * The REAL run queue, run.ts, kernel.ts and inspect.ts run here. Only the Jupyter
  * layer is faked, the same way kernel-interrupt-stops.test.ts fakes it.
@@ -53,6 +57,9 @@ const h = vi.hoisted(() => {
 		hangingUser: null as Future | null,
 		kernelObeysInterrupt: false,
 		interrupts: 0,
+		probeEndsDuringSignal: false,
+		signalDelayMs: 0,
+		events: [] as string[],
 		makeFuture
 	};
 	function makeFakeKernel() {
@@ -68,6 +75,7 @@ const h = vi.hoisted(() => {
 			requestExecute: (args: { code?: string }) => {
 				const code = typeof args?.code === 'string' ? args.code : '';
 				state.sentCodes.push(code);
+				state.events.push(`sent:${code}`);
 				const f = makeFuture();
 				if (code.includes('def _cellar_kernel_state')) {
 					state.hangingProbe = f;
@@ -91,6 +99,13 @@ const h = vi.hoisted(() => {
 		startNew: async () => makeFakeKernel(),
 		interruptKernel: async () => {
 			state.interrupts += 1;
+			if (state.probeEndsDuringSignal && state.hangingProbe) {
+				const ending = state.hangingProbe;
+				state.hangingProbe = null;
+				ending.finish('ok');
+			}
+			if (state.signalDelayMs > 0) await new Promise((r) => setTimeout(r, state.signalDelayMs));
+			state.events.push('signal-landed');
 			const f = state.hangingProbe;
 			if (!state.kernelObeysInterrupt || !f) return;
 			state.hangingProbe = null;
@@ -128,6 +143,7 @@ let nbmod: typeof import('../../src/lib/server/notebook');
 let queue: typeof import('../../src/lib/server/run-queue');
 let runmod: typeof import('../../src/lib/server/run');
 let inspect: typeof import('../../src/lib/server/inspect');
+let kernel: typeof import('../../src/lib/server/kernel');
 
 const NB = 'probe-limit.ipynb';
 const LIMIT_MS = 150;
@@ -164,6 +180,7 @@ beforeAll(async () => {
 	queue = await import('../../src/lib/server/run-queue');
 	runmod = await import('../../src/lib/server/run');
 	inspect = await import('../../src/lib/server/inspect');
+	kernel = await import('../../src/lib/server/kernel');
 	nbmod.createNotebook(NB, null, { focus: false });
 	nbmod.setActiveNotebook(NB);
 	// Start the kernel with an ordinary cell, so kernel_state has one to probe.
@@ -175,6 +192,9 @@ beforeEach(() => {
 	h.state.hangingUser = null;
 	h.state.kernelObeysInterrupt = false;
 	h.state.interrupts = 0;
+	h.state.probeEndsDuringSignal = false;
+	h.state.signalDelayMs = 0;
+	h.state.events = [];
 });
 
 describe('a probe past its time limit', () => {
@@ -220,6 +240,23 @@ describe('a probe past its time limit', () => {
 		expect((await runCell('after = 1')).status).toBe('ok');
 		expect(h.state.sentCodes.some((c) => c.includes(PROBE_MARK))).toBe(true);
 	});
+
+	it('lands its interrupt before the run parked behind it is sent', async () => {
+		// The probe's reply arrives while the interrupt POST is still in flight.
+		h.state.probeEndsDuringSignal = true;
+		h.state.signalDelayMs = 200;
+		const probe = inspect.kernelState(abs());
+		probe.catch(() => {});
+		await until(() => h.state.hangingProbe != null, 'the probe to reach the kernel');
+		const parkedCode = 'parked_during_signal = 1';
+		const parked = runCell(parkedCode);
+		expect((await parked).status).toBe('ok');
+		await probe.catch(() => {});
+		const landed = h.state.events.indexOf('signal-landed');
+		const sentParked = h.state.events.indexOf(`sent:${parkedCode}`);
+		expect(landed).toBeGreaterThanOrEqual(0);
+		expect(sentParked).toBeGreaterThan(landed);
+	});
 });
 
 describe('a user run', () => {
@@ -230,5 +267,28 @@ describe('a user run', () => {
 		expect(h.state.interrupts).toBe(0);
 		h.state.hangingUser!.finish('ok');
 		expect((await run).status).toBe('ok');
+	});
+});
+
+describe('a stuck probe force-settled by the user\'s interrupt', () => {
+	it('keeps refusing runs, since the kernel may still be running it, until a restart', async () => {
+		const probe = inspect.kernelState(abs());
+		probe.catch(() => {});
+		await until(() => h.state.hangingProbe != null, 'the probe to reach the kernel');
+		await expect(probe).rejects.toThrow(/did not stop when interrupted/);
+
+		// The user presses Interrupt. The kernel ignores it, so Cellar force-settles the probe.
+		const res = await kernel.interruptKernel(abs());
+		expect(res.stopped).toBe('forced');
+
+		const laterCode = 'after_forced = 1';
+		const later = await runCell(laterCode);
+		expect(later.status).toBe('error');
+		expect(errorText(later.outputs)).toMatch(/Cellar's own variable inspection is still running/);
+		expect(h.state.sentCodes).not.toContain(laterCode);
+
+		// A restart replaces the process, so the kernel runs cells again.
+		await kernel.restartKernel(abs());
+		expect((await runCell('after_restart = 1')).status).toBe('ok');
 	});
 });

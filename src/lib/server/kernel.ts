@@ -196,8 +196,10 @@ interface NotebookKernel {
 	 * not stop when interrupted (see `execute()`'s `timeoutMs`). Until it ends, every
 	 * new run on this kernel is refused with `PROBE_STUCK_REASON` instead of parking
 	 * behind it, so a user's cell never reads "running" while Cellar's own code is
-	 * what holds the kernel. Cleared by the probe's own `finally`: when its reply
-	 * finally arrives, or when a restart or teardown aborts it.
+	 * what holds the kernel. Cleared when the probe's own reply finally arrives, or by
+	 * `beginSession` when a restart, autorestart or teardown replaces the process. An
+	 * interrupt or watchdog force-settle leaves it set: the kernel may still be
+	 * executing the probe.
 	 */
 	stuckProbe: boolean;
 }
@@ -884,6 +886,7 @@ function beginSession(nbKernel: NotebookKernel): void {
 	// The %%mojo magic lives in the namespace too (`import mojo.notebook` registers
 	// it), so a new session has none until a mojo cell asks for it again.
 	nbKernel.mojoSetup = null;
+	nbKernel.stuckProbe = false;
 	// A fresh namespace has no widgets: drop this kernel's progress/interactive
 	// models and forget their comms so a send can never target a dead model.
 	const commIds = [...nbKernel.widgetComms.keys()];
@@ -3732,17 +3735,20 @@ export async function execute(
 	// Only an internal probe that asks for one gets it: user code may run for hours.
 	// Past the limit the kernel is interrupted. That is safe here because this run
 	// holds the exec lock, so the probe is the only code on the wire, and an idle
-	// ipykernel ignores a SIGINT that lands after it finished. A probe that surrenders
+	// ipykernel ignores a SIGINT that lands after it finished. The lock is not handed
+	// on until that signal has landed, so it can never reach the next run. A probe that surrenders
 	// ends through its normal reply. One that does not is left running, since the
 	// kernel really is still executing it, but the kernel is marked `stuckProbe` and
 	// every run parked behind it is refused, so none of them reads as hanging.
 	let internalTimer: ReturnType<typeof setTimeout> | undefined;
 	let markedStuck = false;
+	let internalSignal: Promise<boolean> | undefined;
 	const onInternalTimeout = async () => {
 		if (settled || aborted) return;
 		logWarn('kernel', `a Cellar probe on ${abs} ran past ${timeoutMs}ms; interrupting it`);
 		onTimeout?.('interrupting');
-		const signalled = await signalInterrupt(kernel);
+		internalSignal = signalInterrupt(kernel);
+		const signalled = await internalSignal;
 		const deadline = Date.now() + (signalled ? interruptGraceMs() : 0);
 		while (!settled && !aborted && Date.now() < deadline) {
 			await new Promise((r) => setTimeout(r, INTERRUPT_POLL_MS));
@@ -3838,7 +3844,7 @@ export async function execute(
 		settled = true;
 		if (watchdogTimer) clearTimeout(watchdogTimer);
 		if (internalTimer) clearTimeout(internalTimer);
-		if (markedStuck) nbKernel.stuckProbe = false;
+		if (markedStuck && !aborted) nbKernel.stuckProbe = false;
 		// A probe still in flight can no longer change anything (its verdict is discarded
 		// by the settled/aborted guard), so cancel its request rather than let a hung GET
 		// hold a socket for the rest of the probe timeout.
@@ -3861,7 +3867,8 @@ export async function execute(
 		}
 		// Hand this kernel's execute lock to the next run — even on abort, so a wedged
 		// run the watchdog kills can never block every later execute behind it.
-		releaseExec();
+		if (internalSignal) void internalSignal.then(releaseExec, releaseExec);
+		else releaseExec();
 	}
 }
 
