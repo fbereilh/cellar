@@ -33,7 +33,6 @@ import {
 	deleteCell,
 	addCellAt,
 	setCellRole,
-	getImportsCell,
 	getNotebookLanguage,
 	resolveNotebookPath
 } from './notebook';
@@ -98,17 +97,28 @@ export interface ConsolidateResult {
  * up WITHOUT creating it, use `getImportsCell`.
  */
 export function ensureImportsCell(nb?: string | null, originId?: string | null): Cell | CellView {
+	const target = importsCellTarget(nb);
+	if (!target) return addCellAt(0, 'code', nb, originId, '', IMPORTS_ROLE);
+	// Honor the user's designation wherever it is — do NOT hoist it to the top.
+	if (!target.designated) setCellRole(target.id, IMPORTS_ROLE, nb, originId);
+	return getCell(target.id, nb)!;
+}
+
+/**
+ * The existing cell `ensureImportsCell` would hand back, decided without touching
+ * the document: the designated imports cell, else an adoptable first cell, else
+ * `null` (a fresh cell would be inserted). One rule for both, so the routing skip
+ * below can never disagree with the cell routing would write into.
+ */
+function importsCellTarget(nb?: string | null): { id: string; designated: boolean } | null {
 	const cells = listCells(nb);
 	const existing = cells.find(isImportsCell);
-	// Honor the user's designation wherever it is — do NOT hoist it to the top.
-	if (existing) return getCell(existing.id, nb)!;
-
+	if (existing) return { id: existing.id, designated: true };
 	const first = cells[0];
 	if (first && isPythonCodeCell(first, getNotebookLanguage(nb)) && isImportsOnly(first.source)) {
-		setCellRole(first.id, IMPORTS_ROLE, nb, originId);
-		return getCell(first.id, nb)!;
+		return { id: first.id, designated: false };
 	}
-	return addCellAt(0, 'code', nb, originId, '', IMPORTS_ROLE);
+	return null;
 }
 
 /**
@@ -168,6 +178,9 @@ export async function runImportsCell(
  * the imports cell (it should, whenever `added` is non-empty).
  *
  * `skipCellId` keeps an edit to the imports cell itself from routing into itself.
+ * That includes the imports-only first cell that would be ADOPTED as the imports
+ * cell: routing into it would merge its own lines back, find them all present,
+ * and strip them from the edit, leaving the cell without its imports.
  * No import in the code (or an unparseable one) means no imports cell is created:
  * an agent writing `x = 1` must not conjure an empty pinned cell.
  */
@@ -186,7 +199,7 @@ export function routeImports(
 	// routing needs the same guard at ITS entry, since it is handed raw source rather
 	// than a cell.
 	if (getNotebookLanguage(nb) !== 'python') return none;
-	if (skipCellId && getImportsCell(nb)?.id === skipCellId) return none;
+	if (skipCellId && importsCellTarget(nb)?.id === skipCellId) return none;
 	// A cell magic (`%%bash`, `%%writefile foo.py`, …) is a deliberate special cell
 	// whose body is not ordinary Python — never rearrange its lines, even if the body
 	// happens to contain an `import`-looking line (a writefile of a .py file does).
