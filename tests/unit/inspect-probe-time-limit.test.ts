@@ -36,7 +36,9 @@ const h = vi.hoisted(() => {
 		done: Promise<{ content: { status: string; execution_count: number } }>;
 		dispose: () => void;
 		finish: (status?: string) => void;
+		msg: { header: { msg_id: string } };
 	};
+	let nextMsgId = 0;
 	function makeFuture(): Future {
 		let resolveDone: (v: { content: { status: string; execution_count: number } }) => void = () => {};
 		const f: Future = {
@@ -47,7 +49,8 @@ const h = vi.hoisted(() => {
 				resolveDone = res;
 			}),
 			dispose: () => {},
-			finish: (status = 'ok') => resolveDone({ content: { status, execution_count: 1 } })
+			finish: (status = 'ok') => resolveDone({ content: { status, execution_count: 1 } }),
+			msg: { header: { msg_id: `msg-${++nextMsgId}` } }
 		};
 		return f;
 	}
@@ -60,6 +63,7 @@ const h = vi.hoisted(() => {
 		probeEndsDuringSignal: false,
 		signalDelayMs: 0,
 		events: [] as string[],
+		iopubListeners: new Set<(sender: unknown, msg: unknown) => void>(),
 		makeFuture
 	};
 	function makeFakeKernel() {
@@ -71,7 +75,10 @@ const h = vi.hoisted(() => {
 			commsOverSubshells: undefined as unknown,
 			registerCommTarget: () => {},
 			statusChanged: { connect: () => {}, disconnect: () => {} },
-			iopubMessage: { connect: () => {} },
+			iopubMessage: {
+				connect: (fn: (sender: unknown, msg: unknown) => void) => void state.iopubListeners.add(fn),
+				disconnect: (fn: (sender: unknown, msg: unknown) => void) => void state.iopubListeners.delete(fn)
+			},
 			requestExecute: (args: { code?: string }) => {
 				const code = typeof args?.code === 'string' ? args.code : '';
 				state.sentCodes.push(code);
@@ -94,8 +101,14 @@ const h = vi.hoisted(() => {
 			dispose: () => {}
 		};
 	}
+	/** Publish an iopub `status: idle` whose parent is the request `parentMsgId`, as ipykernel does. */
+	function emitIdle(parentMsgId: string) {
+		const msg = { header: { msg_type: 'status' }, parent_header: { msg_id: parentMsgId }, content: { execution_state: 'idle' } };
+		for (const fn of [...state.iopubListeners]) fn(null, msg);
+	}
 	return {
 		state,
+		emitIdle,
 		startNew: async () => makeFakeKernel(),
 		interruptKernel: async () => {
 			state.interrupts += 1;
@@ -290,5 +303,25 @@ describe('a stuck probe force-settled by the user\'s interrupt', () => {
 		// A restart replaces the process, so the kernel runs cells again.
 		await kernel.restartKernel(abs());
 		expect((await runCell('after_restart = 1')).status).toBe('ok');
+	});
+
+	it('runs cells again once the kernel reports the probe itself idle, and only then', async () => {
+		const probe = inspect.kernelState(abs());
+		probe.catch(() => {});
+		await until(() => h.state.hangingProbe != null, 'the probe to reach the kernel');
+		const stuckId = h.state.hangingProbe!.msg.header.msg_id;
+		await expect(probe).rejects.toThrow(/did not stop when interrupted/);
+		expect((await kernel.interruptKernel(abs())).stopped).toBe('forced');
+
+		// An idle status for some other request proves nothing about the probe.
+		h.emitIdle('some-other-request');
+		const early = await runCell('early = 1');
+		expect(errorText(early.outputs)).toMatch(/Cellar's own variable inspection is still running/);
+		expect(h.state.sentCodes).not.toContain('early = 1');
+
+		// The kernel finishes the probe and reports idle for its own request.
+		h.emitIdle(stuckId);
+		expect((await runCell('after_probe_idle = 1')).status).toBe('ok');
+		expect(h.state.sentCodes).toContain('after_probe_idle = 1');
 	});
 });

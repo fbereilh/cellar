@@ -196,12 +196,13 @@ interface NotebookKernel {
 	 * not stop when interrupted (see `execute()`'s `timeoutMs`). Until it ends, every
 	 * new run on this kernel is refused with `PROBE_STUCK_REASON` instead of parking
 	 * behind it, so a user's cell never reads "running" while Cellar's own code is
-	 * what holds the kernel. Cleared when the probe's own reply finally arrives, or by
+	 * what holds the kernel. Holds the stuck probe's execute msg_id. Cleared when the
+	 * probe's own reply arrives, when the kernel reports idle for that msg_id, or by
 	 * `beginSession` when a restart, autorestart or teardown replaces the process. An
-	 * interrupt or watchdog force-settle leaves it set: the kernel may still be
-	 * executing the probe.
+	 * interrupt or watchdog force-settle leaves it set until one of those: the kernel
+	 * may still be executing the probe.
 	 */
-	stuckProbe: boolean;
+	stuckProbe: string | null;
 }
 
 /**
@@ -886,7 +887,7 @@ function beginSession(nbKernel: NotebookKernel): void {
 	// The %%mojo magic lives in the namespace too (`import mojo.notebook` registers
 	// it), so a new session has none until a mojo cell asks for it again.
 	nbKernel.mojoSetup = null;
-	nbKernel.stuckProbe = false;
+	nbKernel.stuckProbe = null;
 	// A fresh namespace has no widgets: drop this kernel's progress/interactive
 	// models and forget their comms so a send can never target a dead model.
 	const commIds = [...nbKernel.widgetComms.keys()];
@@ -1991,7 +1992,7 @@ function getKernel(nbPath: string): Promise<KernelConnection> {
 		activeRuns: new Set(),
 		refreshInFlight: null,
 		execChain: Promise.resolve(),
-		stuckProbe: false
+		stuckProbe: null
 	};
 
 	nbKernel.startPromise = (async () => {
@@ -3755,8 +3756,19 @@ export async function execute(
 		}
 		if (settled || aborted) return;
 		logWarn('kernel', `a Cellar probe on ${abs} did not stop when interrupted; refusing new runs until it ends`);
-		nbKernel.stuckProbe = true;
+		const stuckId = future.msg.header.msg_id;
+		nbKernel.stuckProbe = stuckId;
 		markedStuck = true;
+		const onStuckIopub = (_sender: unknown, msg: KernelMessage.IIOPubMessage) => {
+			if (nbKernel.stuckProbe === stuckId) {
+				const parentId = (msg.parent_header as { msg_id?: string } | undefined)?.msg_id;
+				const idle = msg.header.msg_type === 'status' && (msg.content as { execution_state?: string }).execution_state === 'idle';
+				if (!idle || parentId !== stuckId) return;
+				nbKernel.stuckProbe = null;
+			}
+			kernel.iopubMessage.disconnect(onStuckIopub);
+		};
+		kernel.iopubMessage.connect(onStuckIopub);
 		abortActiveRuns(
 			nbKernel,
 			PROBE_STUCK_REASON,
@@ -3844,7 +3856,7 @@ export async function execute(
 		settled = true;
 		if (watchdogTimer) clearTimeout(watchdogTimer);
 		if (internalTimer) clearTimeout(internalTimer);
-		if (markedStuck && !aborted) nbKernel.stuckProbe = false;
+		if (markedStuck && !aborted) nbKernel.stuckProbe = null;
 		// A probe still in flight can no longer change anything (its verdict is discarded
 		// by the settled/aborted guard), so cancel its request rather than let a hung GET
 		// hold a socket for the rest of the probe timeout.
