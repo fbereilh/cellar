@@ -3491,9 +3491,11 @@ export async function execute(
 	// promise never rejects, and while it is live the `await`s below handle it — this
 	// only marks it handled so a post-settle no-op can never surface unhandled.
 	abortRace.catch(() => {});
+	let abortReason: string | null = null;
 	const triggerAbort = (err: Error) => {
 		if (settled || aborted) return;
 		aborted = true;
+		if (err instanceof KernelExecuteAborted) abortReason = err.reason;
 		run.aborted = true;
 		abortReject?.(err);
 	};
@@ -3755,6 +3757,9 @@ export async function execute(
 			await new Promise((r) => setTimeout(r, INTERRUPT_POLL_MS));
 		}
 		if (settled || aborted) return;
+		markStuck();
+	};
+	const markStuck = () => {
 		logWarn('kernel', `a Cellar probe on ${abs} did not stop when interrupted; refusing new runs until it ends`);
 		const stuckId = future.msg.header.msg_id;
 		nbKernel.stuckProbe = stuckId;
@@ -3857,6 +3862,15 @@ export async function execute(
 		if (watchdogTimer) clearTimeout(watchdogTimer);
 		if (internalTimer) clearTimeout(internalTimer);
 		if (markedStuck && !aborted) nbKernel.stuckProbe = null;
+		if (
+			internal &&
+			timeoutMs != null &&
+			timeoutMs > 0 &&
+			!markedStuck &&
+			(abortReason === INTERRUPT_ABORT_REASON || abortReason === INTERRUPT_UNDELIVERED_REASON)
+		) {
+			markStuck();
+		}
 		// A probe still in flight can no longer change anything (its verdict is discarded
 		// by the settled/aborted guard), so cancel its request rather than let a hung GET
 		// hold a socket for the rest of the probe timeout.

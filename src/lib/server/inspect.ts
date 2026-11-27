@@ -349,24 +349,22 @@ async function execProbe(code: string, nbPath?: string | null): Promise<{ sessio
 		internal: true,
 		timeoutMs: limitMs,
 		onTimeout: (phase) => {
-			limit.phase = phase;
 			if (phase === 'stuck') {
 				giveUp(
 					new Error(
-						`Cellar's variable inspection ran past ${limitS}s and did not stop when interrupted, so Cellar stopped waiting for it. ` +
-							'It is still running in the kernel, and no cell can run until it ends. Restart the kernel to recover.'
+						limit.phase === 'interrupting'
+							? `Cellar's variable inspection ran past ${limitS}s and did not stop when interrupted, so Cellar stopped waiting for it. ` +
+									'It is still running in the kernel, and no cell can run until it ends. Restart the kernel to recover.'
+							: "Cellar's variable inspection did not stop when the kernel was interrupted, so Cellar stopped waiting for it. " +
+									'It may still be running in the kernel, and no cell can run until it ends. Restart the kernel to recover.'
 					)
 				);
 			}
+			limit.phase = phase;
 		}
 	});
 	running.catch(() => {});
-	try {
-		await Promise.race([running, gaveUp]);
-	} catch (err) {
-		if (limit.phase === 'interrupting') throw new Error(interruptedMessage(limitS));
-		throw err;
-	}
+	await Promise.race([running, gaveUp]);
 	if (errored) throw new Error(limit.phase ? interruptedMessage(limitS) : errored);
 	const line = stdout.trim().split('\n').filter(Boolean).at(-1);
 	return { session, line };

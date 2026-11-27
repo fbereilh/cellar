@@ -327,4 +327,31 @@ describe('a stuck probe force-settled by the user\'s interrupt', () => {
 		expect((await runCell('after_probe_idle = 1')).status).toBe('ok');
 		expect(h.state.sentCodes).toContain('after_probe_idle = 1');
 	});
+
+	it('before its time limit still marks the kernel busy with the probe until the probe reports idle', async () => {
+		process.env.CELLAR_INSPECT_TIMEOUT_MS = '60000';
+		try {
+			const probe = inspect.kernelState(abs());
+			probe.catch(() => {});
+			await until(() => h.state.hangingProbe != null, 'the probe to reach the kernel');
+			const stuckId = h.state.hangingProbe!.msg.header.msg_id;
+
+			// The user presses Interrupt well before the probe's own limit, and the kernel ignores it.
+			expect((await kernel.interruptKernel(abs())).stopped).toBe('forced');
+			await expect(probe).rejects.toThrow(/did not stop when the kernel was interrupted.*may still be running/s);
+			await expect(probe).rejects.not.toThrow(/free again/);
+
+			const earlyCode = 'early_after_user_interrupt = 1';
+			const early = await runCell(earlyCode);
+			expect(early.status).toBe('error');
+			expect(errorText(early.outputs)).toMatch(/Cellar's own variable inspection is still running/);
+			expect(h.state.sentCodes).not.toContain(earlyCode);
+
+			h.emitIdle(stuckId);
+			expect((await runCell('after_user_interrupt_idle = 1')).status).toBe('ok');
+			expect(h.state.sentCodes).toContain('after_user_interrupt_idle = 1');
+		} finally {
+			process.env.CELLAR_INSPECT_TIMEOUT_MS = String(LIMIT_MS);
+		}
+	});
 });
