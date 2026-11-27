@@ -12,6 +12,7 @@ import {
 	OUTPUT_CAP_PX,
 	QUEUED_PIN_LIMIT,
 	ROW_GAP_PX,
+	WINDOW_HYSTERESIS_PX,
 	type PlanItem
 } from '../../src/lib/virtualization';
 
@@ -249,6 +250,99 @@ describe('planWindow — inter-cell gap accounting (space-y-4)', () => {
 		const withZero = planWindow({ order, heights, estimate: () => 100, virtualize: true, viewportTop: 250, viewportHeight: 200, overscanPx: 0, gapPx: 0 });
 		expect(cellIds(withDefault)).toEqual(cellIds(withZero));
 		expect(spacerSum(withDefault)).toBe(spacerSum(withZero));
+	});
+});
+
+describe('planWindow — hysteresis at the window edge', () => {
+	const { order, heights } = uniform(10, 100);
+	const at = (viewportTop: number, mounted?: Set<string>, hysteresisPx = 0) =>
+		cellIds(
+			planWindow({ order, heights, estimate: () => 100, virtualize: true, viewportTop, viewportHeight: 200, overscanPx: 0, mounted, hysteresisPx })
+		);
+
+	it('keeps an already-mounted cell until it is more than hysteresisPx past the edge', () => {
+		// c1 [100,200] sits just above a window that starts at 205.
+		expect(at(205)).toEqual(['c2', 'c3', 'c4']);
+		expect(at(205, new Set(['c1', 'c2', 'c3', 'c4']), 16)).toEqual(['c1', 'c2', 'c3', 'c4']);
+		// Past the margin it goes.
+		expect(at(217, new Set(['c1', 'c2', 'c3', 'c4']), 16)).toEqual(['c2', 'c3', 'c4']);
+	});
+
+	it('never widens the window for a cell that was not mounted', () => {
+		expect(at(205, new Set(['c2', 'c3', 'c4']), 16)).toEqual(['c2', 'c3', 'c4']);
+	});
+
+	it('holds the bottom edge the same way', () => {
+		// c5 [500,600] starts just below a window that ends at 495.
+		expect(at(295)).toEqual(['c2', 'c3', 'c4']);
+		expect(at(295, new Set(['c2', 'c3', 'c4', 'c5']), 16)).toEqual(['c2', 'c3', 'c4', 'c5']);
+	});
+
+	/**
+	 * The defect this guards, replayed: native `overflow-anchor` moves `scrollTop` by
+	 * whatever a re-plan changed ABOVE the first visible cell. When a cached height
+	 * sits a fraction of a pixel off the real box, swapping the edge cell for its
+	 * spacer moves that layout, `scrollTop` crosses the edge, and the cell swaps back -
+	 * every frame, forever. MEASURED in a CI trace and locally: cards rendered
+	 * 176.421875px, the cache held 176, and `scrollTop` flipped 11532 <-> 11533. The
+	 * browser keeps a fractional scroll offset but reports it rounded, which is how a
+	 * 0.42px correction becomes a whole-pixel step - modeled here as `offset`.
+	 */
+	function settle(cached: number, hysteresisPx: number, offset: number): Set<string> {
+		const real = 176.421875;
+		const ids = Array.from({ length: 120 }, (_, i) => `c${i}`);
+		const cache = new Map(ids.map((id) => [id, cached]));
+		const plan = (top: number, mounted: Set<string>) =>
+			planWindow({
+				order: ids,
+				heights: cache,
+				estimate: () => cached,
+				virtualize: true,
+				viewportTop: top,
+				viewportHeight: 534,
+				overscanPx: 801,
+				gapPx: ROW_GAP_PX,
+				mounted,
+				hysteresisPx
+			});
+		// The real layout top of each mounted cell under a plan.
+		const tops = (p: PlanItem[]) => {
+			const out = new Map<string, number>();
+			let y = 0;
+			p.forEach((item, i) => {
+				if (i > 0) y += ROW_GAP_PX;
+				if (item.kind === 'cell') {
+					out.set(item.id, y);
+					y += real;
+				} else y += item.px;
+			});
+			return out;
+		};
+		const seen = new Set<string>();
+		// The page on screen was planned one pixel away: a scroll just landed here.
+		let current = plan(Math.round(offset) + 1, new Set());
+		for (let frame = 0; frame < 20; frame++) {
+			const before = tops(current);
+			const anchor = [...before].find(([, y]) => y + real > offset)![0];
+			const next = plan(Math.round(offset), mountedIds(current));
+			offset += tops(next).get(anchor)! - before.get(anchor)!;
+			seen.add(`${Math.round(offset)}|${cellIds(next).join(',')}`);
+			current = next;
+		}
+		return seen;
+	}
+
+	it('a rounded cache with no hysteresis oscillates forever (the replayed defect)', () => {
+		const states = [...Array(768).keys()].map((d) => settle(176, 0, 11300 + d / 4).size);
+		expect(Math.max(...states)).toBeGreaterThan(1);
+	});
+
+	it('the shipped hysteresis comes to rest from every starting offset', () => {
+		for (let d = 0; d < 768; d++) expect(settle(176, WINDOW_HYSTERESIS_PX, 11300 + d / 4).size).toBe(1);
+	});
+
+	it('an exact cache comes to rest from every starting offset, even without hysteresis', () => {
+		for (let d = 0; d < 768; d++) expect(settle(176.421875, 0, 11300 + d / 4).size).toBe(1);
 	});
 });
 

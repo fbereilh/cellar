@@ -73,6 +73,14 @@ export interface PlanWindowArgs {
 	 * DEFAULT 0 (the uniform-height tests assume no gap).
 	 */
 	gapPx?: number;
+	/**
+	 * The cells the PREVIOUS plan mounted. Each keeps its place in the window until it
+	 * is more than `hysteresisPx` outside the edge, so a cell's own mount or unmount
+	 * cannot flip the decision about it. See `WINDOW_HYSTERESIS_PX`.
+	 */
+	mounted?: Set<string>;
+	/** How far past the window edge an already-mounted cell stays mounted. */
+	hysteresisPx?: number;
 }
 
 // ---- Height estimation constants (§4.1) ------------------------------------
@@ -96,6 +104,17 @@ export const ROW_GAP_PX = 16;
 // screen reserves the space of the editor + output it is not rendering, so the
 // window plans against a flow that is metres too tall.
 export const COLLAPSED_CELL_PX = 34;
+// How far outside the window an ALREADY-mounted cell may drift before it unmounts.
+// Without it the window edge is a knife-edge with a feedback path: swapping a cell
+// for its spacer moves the layout above the viewport by however much the cached
+// height differs from the real box, native `overflow-anchor` moves `scrollTop` to
+// match, and the new `scrollTop` re-plans the cell back across the edge. A cell
+// whose bottom sat exactly on the edge then mounted and unmounted on alternate
+// frames for as long as the pane was left alone - the pane never came to rest, so a
+// click on anything in it waited forever for a stable target. A margin larger than
+// any such correction breaks that cycle. A row gap is far above the sub-pixel
+// error a measured height leaves, and far below the overscan, so it costs nothing.
+export const WINDOW_HYSTERESIS_PX = ROW_GAP_PX;
 
 /**
  * Estimate a cell's rendered height from its source line count (+ a coarse
@@ -143,7 +162,9 @@ export function planWindow(args: PlanWindowArgs): PlanItem[] {
 		viewportHeight,
 		overscanPx = DEFAULT_OVERSCAN_PX,
 		pinned,
-		gapPx = 0
+		gapPx = 0,
+		mounted,
+		hysteresisPx = 0
 	} = args;
 
 	// No windowing without an explicit opt-in AND a viewport to window against.
@@ -177,7 +198,10 @@ export function planWindow(args: PlanWindowArgs): PlanItem[] {
 		if (i > 0) offset += gapPx;
 		const cellTop = offset;
 		const cellBottom = offset + h;
-		const inWindow = cellBottom >= top && cellTop <= bottom;
+		// A cell already on the page holds its place a little past the edge, so its own
+		// mount/unmount cannot re-plan it (see `WINDOW_HYSTERESIS_PX`).
+		const slack = mounted?.has(id) ? hysteresisPx : 0;
+		const inWindow = cellBottom >= top - slack && cellTop <= bottom + slack;
 		if (inWindow || pins.has(id)) {
 			flushSpacer();
 			items.push({ kind: 'cell', id });
