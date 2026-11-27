@@ -214,7 +214,7 @@
 		| { type: 'run:start'; cellId?: string; at?: number; actor?: Actor }
 		| { type: 'run:output'; cellId?: string; output: CellOutput; index?: number }
 		| { type: 'run:output-append'; cellId?: string; index: number; base: number; keep: number; chunk: string }
-		| { type: 'run:end'; cellId?: string; at?: number; durationMs?: number; actor?: Actor };
+		| { type: 'run:end'; cellId?: string; at?: number; durationMs?: number; actor?: Actor; refused?: boolean };
 
 	/**
 	 * A run-queue snapshot (queue:changed). `running` lists EVERY busy kernel's
@@ -2118,12 +2118,16 @@
 	// Store runtime-only run metadata on a cell so `Cell.svelte` renders its badge.
 	// Reassigns `metadata` (not a deep mutation) to trigger reactivity even when
 	// the cell had no `cellar` namespace yet. Ignores events without `at` (older
-	// run:end shapes / non-run events).
-	function stampLastRun(cell: UICell | undefined, ev: { at?: number; durationMs?: number; actor?: Actor }) {
+	// run:end shapes / non-run events). `refused` rides along so the badge can say
+	// a run Cellar refused never ran, instead of "ran … · <how long it waited>".
+	function stampLastRun(
+		cell: UICell | undefined,
+		ev: { at?: number; durationMs?: number; actor?: Actor; refused?: boolean }
+	) {
 		if (!cell || ev.at == null) return;
 		const cellar: CellarNamespace = {
 			...(cell.metadata?.cellar ?? {}),
-			lastRun: { at: ev.at, durationMs: ev.durationMs, actor: ev.actor } as LastRun
+			lastRun: { at: ev.at, durationMs: ev.durationMs, actor: ev.actor, ...(ev.refused ? { refused: true } : {}) } as LastRun
 		};
 		cell.metadata = { ...(cell.metadata ?? {}), cellar };
 	}

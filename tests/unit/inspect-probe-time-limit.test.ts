@@ -238,6 +238,9 @@ describe('a probe past its time limit', () => {
 		// never reached the kernel.
 		const parkedRun = await parked;
 		expect(parkedRun.status).toBe('error');
+		// Stamped as refused, like the other runs Cellar declines before sending, so
+		// agents read it as a live failure and the header never says it "ran".
+		expect(parkedRun.lastRun.refused).toBe(true);
 		expect(errorText(parkedRun.outputs)).toMatch(/Cellar's own variable inspection is still running/);
 		expect(h.state.sentCodes).not.toContain(parkedCode);
 

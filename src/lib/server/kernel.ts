@@ -441,7 +441,7 @@ const INTERRUPT_UNDELIVERED_REASON = 'interrupt_undelivered';
  * kernel (`NotebookKernel.stuckProbe`). Its own reason so the run's message can say
  * that Cellar's code, not the user's, is what holds the kernel.
  */
-const PROBE_STUCK_REASON = 'probe_stuck';
+export const PROBE_STUCK_REASON = 'probe_stuck';
 
 /**
  * How long the interrupt REST POST may take before Cellar stops waiting for it and

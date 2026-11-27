@@ -722,7 +722,15 @@
 		if (!lastRun) return;
 		return subscribeNow();
 	});
-	const ranText = $derived(lastRun ? `ran ${relativeTime(lastRun.at, nowMs())} · ${formatDuration(lastRun.durationMs)}` : '');
+	// A refused run never reached a kernel, so "ran … · <how long it waited>" would
+	// claim a run that did not happen. It says when it was refused instead.
+	const ranText = $derived(
+		!lastRun
+			? ''
+			: lastRun.refused
+				? `refused ${relativeTime(lastRun.at, nowMs())}`
+				: `ran ${relativeTime(lastRun.at, nowMs())} · ${formatDuration(lastRun.durationMs)}`
+	);
 	const isAgentRun = $derived(lastRun?.actor === 'agent');
 
 	// ---- Clipboard: cell id, input, output ----------------------------------
@@ -816,7 +824,14 @@
 	const staleState_ = $derived(staleState?.state ?? null);
 	const isStale = $derived(isRunnable && staleState_ === 'stale' && !showRunning && !isQueued);
 	const notRunThisSession = $derived(
-		isRunnable && staleState_ === 'not_run' && !showRunning && !isQueued && (lastRun || (cell.outputs || []).length > 0)
+		isRunnable &&
+			staleState_ === 'not_run' &&
+			!showRunning &&
+			!isQueued &&
+			// A refused run's own output already says nothing ran, and the badge's
+			// "saved output is from a previous session" would be false for it.
+			!lastRun?.refused &&
+			(lastRun || (cell.outputs || []).length > 0)
 	);
 	const staleTitle = $derived(
 		staleState?.reason ? `Stale — ${staleState.reason}. Re-run to refresh.` : 'Stale — an input changed after this cell ran. Re-run to refresh.'
@@ -3021,6 +3036,11 @@
 		</div>
 
 		<!-- Output (code cells only) -->
+		<!-- Room for the scroll toggle, which floats over the output's top-right
+		     corner. Floated INSIDE the first text block, so only its first line wraps
+		     around the toggle and every other line keeps the full width. Empty and
+		     aria-hidden, so it adds nothing to the text a reader or a copy sees. -->
+		{#snippet chipClearance()}<span class="float-right h-4 w-16" aria-hidden="true" data-testid="output-toggle-clearance"></span>{/snippet}
 		{#if isRunnable && outputs.length}
 			<div class="relative border-t border-base-300 bg-(--cellar-surface-output) {cellCollapsed ? 'hidden' : ''}" data-testid="output">
 				<!-- Scroll-outputs toggle (Jupyter "Enable Scrolling for Outputs"). The
@@ -3086,15 +3106,15 @@
 									{@html o.markdownHtml}
 								</div>
 							{:else if o.segments}
-								{#each o.segments as seg}
+								{#each o.segments as seg, si}
 									{#if seg.type === 'table'}
 										<div class="cellar-output-table overflow-x-auto px-3 py-1" data-testid="output-table">{@html seg.html}</div>
 									{:else if seg.text.trim()}
-										<pre class="overflow-x-auto whitespace-pre-wrap break-words border-l-2 py-1 pl-3 font-mono text-sm {toneClass[o.tone]}">{seg.text}</pre>
+										<pre class="overflow-x-auto whitespace-pre-wrap break-words border-l-2 py-1 pl-3 font-mono text-sm {toneClass[o.tone]}">{#if i === 0 && si === 0 && !ownsScroll}{@render chipClearance()}{/if}{seg.text}</pre>
 									{/if}
 								{/each}
 							{:else}
-								<pre class="overflow-x-auto whitespace-pre-wrap break-words border-l-2 py-1 pl-3 font-mono text-sm {toneClass[o.tone]}">{o.text}</pre>
+								<pre class="overflow-x-auto whitespace-pre-wrap break-words border-l-2 py-1 pl-3 font-mono text-sm {toneClass[o.tone]}">{#if i === 0 && !ownsScroll}{@render chipClearance()}{/if}{o.text}</pre>
 							{/if}
 						{/each}
 					</div>
