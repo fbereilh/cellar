@@ -618,7 +618,7 @@ pre.code.raw{ color: var(--muted); white-space: pre-wrap; }
 .output-image{ display:block; max-width:100%; height:auto; padding: 0.4rem 1rem; }
 /* A text/markdown output (a chat cell's reply) reads as prose, laid out like the
    text outputs beside it rather than like a markdown CELL. */
-.output-markdown{ padding: 0.25rem 1rem 0.35rem 0.85rem; border-left: 2px solid transparent; font-size: 14px; }
+.output-markdown{ padding: 0.25rem 1rem 0.35rem 0.85rem; border-left: 2px solid transparent; }
 
 .export-table{ overflow-x:auto; padding: 0.4rem 1rem; }
 .export-table table{ border-collapse: collapse; font-size: 12.5px; }
@@ -639,35 +639,45 @@ pre.code.raw{ color: var(--muted); white-space: pre-wrap; }
 .tok-operator{ color: var(--tok-operator); }
 .tok-meta{ color: var(--tok-meta); }
 
-/* Rendered markdown — ports Cell.svelte's .cellar-md rules so a markdown cell
-   reads identically in the export. */
+/* Rendered markdown — ports app.css's .cellar-md rules so a markdown cell
+   reads identically in the export: the same type size, measure, heading scale
+   and rhythm. Colours use this document's own tokens. */
+.cellar-md{ font-size: 15px; line-height: 1.65; }
+.cellar-md :is(p,li,blockquote,h1,h2,h3,h4,h5,h6):not(:has(pre,table,img)){ max-width: 60ch; }
 .cellar-md > *:first-child{ margin-top: 0; }
 .cellar-md > *:last-child{ margin-bottom: 0; }
-.cellar-md :is(h1,h2,h3,h4,h5,h6){ margin: 0.5em 0 0.3em; line-height: 1.25; }
-.cellar-md h1{ font-size: 1.5em; font-weight: 700; }
-.cellar-md h2{ font-size: 1.3em; font-weight: 700; }
-.cellar-md h3{ font-size: 1.1em; font-weight: 600; }
-.cellar-md :is(h4,h5,h6){ font-size: 1em; font-weight: 600; }
-.cellar-md p{ margin: 0.5em 0; }
-.cellar-md ul{ list-style: disc; padding-left: 1.5em; margin: 0.5em 0; }
-.cellar-md ol{ list-style: decimal; padding-left: 1.5em; margin: 0.5em 0; }
-.cellar-md li{ margin: 0.2em 0; }
+.cellar-md :is(h1,h2,h3,h4,h5,h6){
+	--md-h: 1; font-size: calc(var(--md-h) * 1em); line-height: 1.3;
+	margin: calc(1.5em / var(--md-h)) 0 calc(0.5em / var(--md-h));
+}
+.cellar-md h1{ --md-h: 1.6; font-weight: 700; letter-spacing: -0.01em; }
+.cellar-md h2{ --md-h: 1.35; font-weight: 700; }
+.cellar-md h3{ --md-h: 1.15; font-weight: 600; }
+.cellar-md :is(h4,h5,h6){ font-weight: 600; }
+.cellar-md p{ margin: 0.75em 0; }
+.cellar-md ul{ list-style: disc; padding-left: 1.5em; margin: 0.75em 0; }
+.cellar-md ol{ list-style: decimal; padding-left: 1.5em; margin: 0.75em 0; }
+.cellar-md li{ margin: 0.35em 0; }
+.cellar-md li > :is(ul,ol){ margin: 0.35em 0; }
 .cellar-md a{ color: var(--link); text-decoration: underline; }
 .cellar-md code{
 	font-family: ui-monospace, Menlo, monospace; font-size: 0.9em;
-	background: rgba(127,127,127,0.2); padding: 0.1em 0.35em; border-radius: 0.25em;
+	background: color-mix(in oklab, var(--fg) 9%, transparent);
+	box-shadow: inset 0 0 0 1px color-mix(in oklab, var(--fg) 12%, transparent);
+	padding: 0.1em 0.35em; border-radius: 0.25em;
 }
 .cellar-md pre{
 	background: var(--code-bg); padding: 0.75em 1em; border-radius: 0.4em;
-	overflow-x: auto; margin: 0.6em 0;
+	overflow-x: auto; margin: 1em 0; line-height: 1.5;
 }
-.cellar-md pre code{ background: none; padding: 0; }
+.cellar-md pre code{ background: none; box-shadow: none; padding: 0; }
 .cellar-md blockquote{
 	border-left: 3px solid var(--border); padding-left: 1em;
-	color: var(--muted); margin: 0.6em 0;
+	color: var(--muted); margin: 1em 0;
 }
-.cellar-md table{ border-collapse: collapse; margin: 0.6em 0; }
+.cellar-md table{ border-collapse: collapse; margin: 1em 0; }
 .cellar-md :is(th,td){ border: 1px solid var(--border); padding: 0.3em 0.6em; }
+.cellar-md :is(h1,h2,h3,h4,h5,h6) + *{ margin-top: 0; }
 .cellar-md img{ max-width: 100%; height: auto; }
 
 .doc-footer{

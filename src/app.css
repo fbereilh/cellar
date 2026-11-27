@@ -355,25 +355,53 @@ mark.cellar-search-mark-active {
 /*
  * Rendered markdown (`.cellar-md`).
  *
- * Shared by notebook markdown cells (`Cell.svelte`) and the `.md` file preview
- * (`MarkdownView.svelte`), so both surfaces render identically. Lived in
- * `Cell.svelte`'s `:global` block originally; moved here when the file preview
- * needed the same look, to keep one source of truth. Headings are deliberately
- * plain (no underline rule): size and weight carry the hierarchy so rendered
- * markdown reads the same in every theme.
+ * Shared by notebook markdown cells and `display(Markdown())` / chat-reply
+ * outputs (`Cell.svelte`) and the `.md` file preview (`MarkdownView.svelte`), so
+ * every surface renders identically. Lived in `Cell.svelte`'s `:global` block
+ * originally; moved here when the file preview needed the same look, to keep one
+ * source of truth. Headings are deliberately plain (no underline rule): size and
+ * weight carry the hierarchy so rendered markdown reads the same in every theme.
+ *
+ * The type size and line height live HERE, not as utility classes on each
+ * container, so the surfaces cannot drift apart. Prose is a notch larger than
+ * the 13.5px code it sits between, because it is read rather than scanned.
  */
+.cellar-md {
+	font-size: 0.9375rem;
+	line-height: 1.65;
+}
+/* Readable measure: prose stops at about 75 characters on a wide screen. `ch` is
+ * the width of a "0", wider than an average letter, so 60ch lands near 75
+ * characters of real text in the UI font. Only
+ * TEXT blocks are capped - a table, code block, display equation or image keeps
+ * the full width, including one nested in a list item or quote (`:has`), and
+ * `p.katex-block` (a display equation's wrapper) is caught by the same test. */
+.cellar-md :is(p, li, blockquote, h1, h2, h3, h4, h5, h6):not(:has(pre, table, img, .katex-display)) {
+	max-width: 60ch;
+}
 .cellar-md > *:first-child {
 	margin-top: 0;
 }
 .cellar-md > *:last-child {
 	margin-bottom: 0;
 }
+/* Headings get more space above than below, so each one visibly belongs to the
+ * text it introduces. The gaps are in BODY ems on every surface: a heading's own
+ * `em` is its larger size, so each level divides the gap by its scale
+ * (`--md-h`). */
+.cellar-md :is(h1, h2, h3, h4, h5, h6) {
+	--md-h: 1;
+	font-size: calc(var(--md-h) * 1em);
+	line-height: 1.3;
+	margin: calc(1.5em / var(--md-h)) 0 calc(0.5em / var(--md-h));
+}
 /* The heading and the body it introduces are separate blocks (each heading is
-   independently foldable), so the vertical rhythm lives on the wrappers and the
-   heading elements themselves are flush - that also keeps the fold chevron
-   centred on the heading's line. */
+   independently foldable), so in a notebook cell the vertical rhythm lives on the
+   wrappers and the heading elements themselves are flush - that also keeps the
+   fold chevron centred on the heading's line. The wrapper's `em` is the body
+   size, so these match the plain-heading gaps above. */
 .cellar-md .md-heading {
-	margin: 0.6em 0 0.25em;
+	margin: 1.5em 0 0.5em;
 }
 .cellar-md .md-heading:first-child {
 	margin-top: 0;
@@ -384,52 +412,55 @@ mark.cellar-search-mark-active {
 .cellar-md .md-heading :is(h1, h2, h3, h4, h5, h6) {
 	margin: 0;
 }
-.cellar-md :is(h1, h2, h3, h4, h5, h6) {
-	margin: 0.5em 0 0.3em;
-}
 .cellar-md h1 {
-	font-size: 1.5em;
+	--md-h: 1.6;
 	font-weight: 700;
+	letter-spacing: -0.01em;
 }
 .cellar-md h2 {
-	font-size: 1.3em;
+	--md-h: 1.35;
 	font-weight: 700;
 }
 .cellar-md h3 {
-	font-size: 1.1em;
+	--md-h: 1.15;
 	font-weight: 600;
 }
 /* Tailwind's preflight resets h4-h6 to plain body text, leaving them
    indistinguishable from the paragraph beneath. Weight alone separates them,
    identically in both themes. */
 .cellar-md :is(h4, h5, h6) {
-	font-size: 1em;
 	font-weight: 600;
 }
 .cellar-md p {
-	margin: 0.5em 0;
+	margin: 0.75em 0;
 }
 .cellar-md ul {
 	list-style: disc;
 	padding-left: 1.5em;
-	margin: 0.5em 0;
+	margin: 0.75em 0;
 }
 .cellar-md ol {
 	list-style: decimal;
 	padding-left: 1.5em;
-	margin: 0.5em 0;
+	margin: 0.75em 0;
 }
 .cellar-md li {
-	margin: 0.2em 0;
+	margin: 0.35em 0;
+}
+.cellar-md li > :is(ul, ol) {
+	margin: 0.35em 0;
 }
 .cellar-md a {
 	color: var(--color-primary);
 	text-decoration: underline;
 }
+/* Inline code: a tinted chip with a hairline edge, so it stands apart from the
+   prose in both themes (a bare 20% grey wash barely registered on `dim`). */
 .cellar-md code {
 	font-family: ui-monospace, Menlo, monospace;
 	font-size: 0.9em;
-	background: rgba(127, 127, 127, 0.2);
+	background: color-mix(in oklab, var(--color-base-content) 9%, transparent);
+	box-shadow: inset 0 0 0 1px color-mix(in oklab, var(--color-base-content) 12%, transparent);
 	padding: 0.1em 0.35em;
 	border-radius: 0.25em;
 }
@@ -438,10 +469,12 @@ mark.cellar-search-mark-active {
 	padding: 0.75em 1em;
 	border-radius: 0.4em;
 	overflow-x: auto;
-	margin: 0.6em 0;
+	margin: 1em 0;
+	line-height: 1.5;
 }
 .cellar-md pre code {
 	background: none;
+	box-shadow: none;
 	padding: 0;
 }
 
@@ -535,20 +568,30 @@ mark.cellar-search-mark-active {
 	display: inline;
 	color: var(--color-success);
 }
+/* Secondary text that still reads: a visible rule and ink a step below the
+   body, rather than a faint rule and 70% ink. */
 .cellar-md blockquote {
-	border-left: 3px solid var(--color-base-300);
+	border-left: 3px solid color-mix(in oklab, var(--color-base-content) 25%, transparent);
 	padding-left: 1em;
-	color: color-mix(in oklab, var(--color-base-content) 70%, transparent);
-	margin: 0.6em 0;
+	color: color-mix(in oklab, var(--color-base-content) 80%, transparent);
+	margin: 1em 0;
 }
 .cellar-md table {
 	border-collapse: collapse;
-	margin: 0.6em 0;
+	margin: 1em 0;
 }
 .cellar-md th,
 .cellar-md td {
 	border: 1px solid var(--color-base-300);
 	padding: 0.3em 0.6em;
+}
+/* The block right under a heading starts flush, so the heading's own small
+   bottom gap is what separates them (a paragraph's larger top margin would
+   otherwise win the collapse). Placed after the block rules it overrides, which
+   share its specificity. */
+.cellar-md :is(h1, h2, h3, h4, h5, h6) + *,
+.cellar-md .md-heading + .md-body > *:first-child {
+	margin-top: 0;
 }
 
 /* --- TeX math (KaTeX) -------------------------------------------------------
